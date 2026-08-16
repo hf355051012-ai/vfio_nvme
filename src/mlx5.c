@@ -3374,17 +3374,26 @@ static void mlx5_dump_phys_layer(mlx5_dev_t *dev, const char *label) {
 }
 
 /*
- * ACCESS_REG(MTMP)でチップ温度を読む。
+ * ACCESS_REG(MTMP)でチップ温度を読む。値はいずれも 1/8 度単位。
+ *
+ * out_peak は「許容最大」ではなく **これまでに記録された最高温度**
+ * (struct mlx5_ifc_mtmp_reg_bits の max_temperature、Linux hwmon の
+ * temp1_highest 相当。mtr ビットでリセットでき、mte ビットで記録の
+ * 有効/無効を切り替えられる履歴値)。許容最大は out_crit の方
+ * (temp_threshold_hi、hwmon の temp1_crit 相当)。
  *
  * 引数:
- *   dev            - 対象 HCA
- *   out_temp_c_x8  - 温度(1/8 度単位)の格納先
+ *   dev       - 対象 HCA
+ *   out_temp  - 現在の温度の格納先(不要なら NULL)
+ *   out_peak  - 記録された最高温度の格納先(不要なら NULL)
+ *   out_crit  - 許容最大(critical しきい値)の格納先(不要なら NULL)
  * 戻り値:
  *   0=成功、-1=コマンド失敗
  * コール元:
  *   mlx5_monitor_summary3()
  */
-static int mlx5_query_mtmp(mlx5_dev_t *dev, int16_t *out_temp, int16_t *out_max) {
+static int mlx5_query_mtmp(mlx5_dev_t *dev, int16_t *out_temp, int16_t *out_peak,
+                           int16_t *out_crit) {
     uint8_t in[16 + 32];
     for (unsigned i = 0; i < sizeof(in); i++) in[i] = 0;
     in[0] = (uint8_t)(MLX5_CMD_OP_ACCESS_REG >> 8);
@@ -3398,8 +3407,11 @@ static int mlx5_query_mtmp(mlx5_dev_t *dev, int16_t *out_temp, int16_t *out_max)
     if (mlx5_cmd_exec(dev, in, sizeof(in), out, sizeof(out)) != 0) return -1;
     if (out[0] != 0) return -1;
     const uint8_t *rd = &out[16];
+    // バイト位置は mtmp_reg のビットオフセットそのまま:
+    //   temperature=0x30 -> 6, max_temperature=0x50 -> 10, temp_threshold_hi=0x70 -> 14
     if (out_temp) *out_temp = (int16_t)(((uint16_t)rd[6] << 8) | rd[7]);
-    if (out_max)  *out_max  = (int16_t)(((uint16_t)rd[10] << 8) | rd[11]);
+    if (out_peak) *out_peak = (int16_t)(((uint16_t)rd[10] << 8) | rd[11]);
+    if (out_crit) *out_crit = (int16_t)(((uint16_t)rd[14] << 8) | rd[15]);
     return 0;
 }
 
@@ -3537,12 +3549,12 @@ void mlx5_monitor_summary3(mlx5_dev_t *d0, mlx5_dev_t *d1,
     void *cx[2] = { cx0, cx1 };
     mlx5_pcie_info_t pi[2];
     uint32_t ef[2];
-    int16_t tc[2] = { 0, 0 }, tm[2] = { 0, 0 };
+    int16_t tc[2] = { 0, 0 }, tp[2] = { 0, 0 }, tk[2] = { 0, 0 };
     uint8_t op[2] = { 0, 0 };
     for (int i = 0; i < 2; i++) {
         mlx5_pcie_query_cfg(rd, cx[i], &pi[i]);
         ef[i] = mlx5_hw_error_flags(dv[i], pi[i].valid ? pi[i].devsta : 0);
-        mlx5_query_mtmp(dv[i], &tc[i], &tm[i]);
+        mlx5_query_mtmp(dv[i], &tc[i], &tp[i], &tk[i]);
         uint8_t admin = 0;
         mlx5_query_port_status(dv[i], &admin, &op[i]);
     }
@@ -3563,8 +3575,10 @@ void mlx5_monitor_summary3(mlx5_dev_t *d0, mlx5_dev_t *d1,
             uart_printf("]");
         }
     }
-    uart_printf("  |  temp PF0/PF1=%d/%dC (max %d/%d)  |  FW=%s\n",
-                tc[0] / 8, tc[1] / 8, tm[0] / 8, tm[1] / 8,
+    // peak=これまでの最高記録、crit=許容最大(MTMP の max_temperature /
+    // temp_threshold_hi、mlx5_query_mtmp() のコメント参照)。
+    uart_printf("  |  temp PF0/PF1=%d/%dC (peak %d/%d, crit %d/%d)  |  FW=%s\n",
+                tc[0] / 8, tc[1] / 8, tp[0] / 8, tp[1] / 8, tk[0] / 8, tk[1] / 8,
                 (all & MLX5_HWERR_FW) ? "ASSERT" : "ok");
     // --- 2行目: Ether ポートのリンク状態 ---
     uart_printf("mlx5: Ether:  PF0(port1) link=%s   PF1(port2) link=%s\n",

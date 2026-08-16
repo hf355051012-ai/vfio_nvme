@@ -86,6 +86,12 @@ sudo ~/vfio_nvme/build/vfio_nvme 0000:01:00.0 0000:01:00.1
 | `bench [KB[,KB...]] [r\|w\|rw] [qd]` | NVMe-oF RDMA スループット |
 | `tcpbench [KB[,KB...]] [r\|w\|rw]` | NVMe/TCP スループット(qd は内部固定) |
 | `monitor` | 温度 / health / PCIe リンク / MAC・PHY エラーカウンタ |
+
+`monitor` の温度表示 `temp 55/55C (peak 65/65, crit 105/105)` は MTMP
+レジスタ由来で、それぞれ **現在値 / これまでに記録された最高温度
+(`max_temperature`、Linux hwmon の `temp1_highest` 相当。`mtr` ビットで
+リセットできる履歴値であって上限ではない) / 許容最大
+(`temp_threshold_hi`、hwmon の `temp1_crit` 相当)**。
 | `nvmet [port]` | NVMe/TCP ターゲットを常駐起動 |
 | `ts [core N] [num N] [mask M V]` / `ts pause\|resume` | `ts_log` ダンプ |
 | `simdelay <core> <us>` | 律速要因の切り分け(コアへ遅延注入) |
