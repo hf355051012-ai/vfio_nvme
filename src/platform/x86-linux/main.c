@@ -23,31 +23,55 @@
 #include "timestamp.h" /* ts コマンド(ts_log ダンプ) */
 #include "tcp.h"       /* ackthresh コマンド(g_tcp_ack_threshold) */
 
-/*
- * CRC32C の既知テストベクタ CRC32C("123456789")=0xE3069283 を確認する。
+/*=================================================================
+ * CRC32C を 2 段階で確認する。
+ *  (1) 既知テストベクタ CRC32C("123456789")=0xE3069283
+ *  (2) ポインタのアライメント 0〜7 の全パターンで、1 バイト単位の基準計算と
+ *      一致すること(crc32c() は先頭端数を食って 8 整列させてから 8 バイト
+ *      単位で回すため、オフセットごとに通る経路が変わる。ダイジェストを
+ *      有効にすると実際にデータ開始位置が 4 整列になるので、この検証が
+ *      無いと片方の経路だけ壊れていても気づけない)
  * crc32c() は生の実行中 CRC を返す規約なので、ここで ~ を取る。
  *
  * 戻り値:
- *   0=一致、-1=不一致
+ *   0=全て一致、-1=不一致
  * コール元:
  *   main()
- */
+ * ===============================================================*/
 static int crc32c_selftest(void)
 {
     const char *v = "123456789";
-    uint32_t raw = crc32c(0xFFFFFFFFu, v, 9);
-    uint32_t digest = ~raw;
+    uint32_t digest = ~crc32c(0xFFFFFFFFu, v, 9);
+    int ok = (digest == 0xE3069283u);
     uart_printf("[selftest] crc32c(\"123456789\") = 0x%08X (期待 0xE3069283) -> %s\n",
-                digest, (digest == 0xE3069283u) ? "OK" : "NG");
-    return (digest == 0xE3069283u) ? 0 : -1;
+                digest, ok ? "OK" : "NG");
+
+    static uint8_t buf[4096 + 8];
+    for (unsigned i = 0; i < sizeof(buf); i++) buf[i] = (uint8_t)(i * 31u + 7u);
+    int align_ok = 1;
+    for (unsigned off = 0; off < 8u; off++) {
+        /* 基準: 長さ1で呼べば必ず1バイト単位の経路を通る */
+        uint32_t ref = 0xFFFFFFFFu;
+        for (unsigned i = 0; i < 4096u; i++) ref = crc32c(ref, &buf[off + i], 1);
+        uint32_t got = crc32c(0xFFFFFFFFu, &buf[off], 4096u);
+        if (got != ref) {
+            uart_printf("[selftest] crc32c align off=%u: 0x%08X != 基準 0x%08X -> NG\n",
+                        off, got, ref);
+            align_ok = 0;
+        }
+    }
+    uart_printf("[selftest] crc32c 全アライメント(offset 0-7, 4096B) -> %s\n",
+                align_ok ? "OK" : "NG");
+
+    return (ok && align_ok) ? 0 : -1;
 }
 
-/*
+/*=================================================================
  * タイマ周波数を表示し、timer_delay_ms(10) の実測経過を出す。
  *
  * コール元:
  *   main()
- */
+ * ===============================================================*/
 static void timer_selftest(void)
 {
     uart_printf("[selftest] timer_freq = %u Hz\n", (uint32_t)timer_freq());
@@ -58,12 +82,12 @@ static void timer_selftest(void)
                 (uint32_t)us);
 }
 
-/*
+/*=================================================================
  * スピンロックの lock/unlock が期待通り状態を変えるかを確認する。
  *
  * コール元:
  *   main()
- */
+ * ===============================================================*/
 static void spinlock_selftest(void)
 {
     smp_spinlock_t lock = 0;
@@ -75,13 +99,13 @@ static void spinlock_selftest(void)
                 (held && freed) ? "OK" : "NG");
 }
 
-/*
+/*=================================================================
  * core1 を起動し、ハートビートが増加すること(pthread が実際に回っている
  * こと)を確認する。
  *
  * コール元:
  *   main()
- */
+ * ===============================================================*/
 static void smp_selftest(void)
 {
     uart_printf("[selftest] smp_core_index()(メインスレッド) = %u (期待 0)\n",
@@ -100,7 +124,7 @@ static void smp_selftest(void)
 
 static mlx5_dev_t s_dev0, s_dev1; /* 大きい構造体なので static */
 
-/*
+/*=================================================================
  * VFIO スロットの PF を掴んで ConnectX を bring-up する。Bus Master を
  * 有効化し BAR0 を mmap して dev->bar0_base に入れ、mlx5_hca_bringup() を
  * 通す。
@@ -114,7 +138,7 @@ static mlx5_dev_t s_dev0, s_dev1; /* 大きい構造体なので static */
  *   0=成功、-1=失敗
  * コール元:
  *   run_dual_pf()
- */
+ * ===============================================================*/
 static int bringup_pf(int slot, mlx5_dev_t *dev, uint8_t pf_index, const char *label)
 {
     if (slot < 0) {
@@ -146,7 +170,7 @@ static nvmet_ctx_t s_x86_nvmet; /* .bss(内蔵 RAM ディスク含む、TCP 経�
 
 static uint8_t s_nvmetcp_buf[262144] __attribute__((aligned(4096)));
 
-/*
+/*=================================================================
  * mlx5_monitor_summary3() へ渡す PCI コンフィグ空間リード関数。
  *
  * 引数:
@@ -156,7 +180,7 @@ static uint8_t s_nvmetcp_buf[262144] __attribute__((aligned(4096)));
  *   読んだ 32bit 値
  * コール元:
  *   shell_dispatch() から関数ポインタとして
- */
+ * ===============================================================*/
 static uint32_t x86_cfg_rd(void *ctx, uint32_t off)
 {
     return vfio_cfg_read32((int)(intptr_t)ctx, off);
@@ -177,7 +201,7 @@ static uint32_t x86_cfg_rd(void *ctx, uint32_t off)
 static int s_shell_nvmet_started = 0;
 static int s_shell_tcp_connected = 0;
 
-/*
+/*=================================================================
  * NVMe/TCP の常駐セッション(target@core1 + initiator@core0)を 1 回だけ
  * 確立し、以後の tcpbench で再利用する。`nvmet` コマンドで既にターゲットが
  * 常駐していればそれを使う。
@@ -186,10 +210,28 @@ static int s_shell_tcp_connected = 0;
  *   0=確立済み、-1=インターフェース未登録/接続タイムアウト
  * コール元:
  *   shell_tcpbench()
- */
-static int shell_ensure_tcp_session(void)
+ * ===============================================================*/
+static int shell_ensure_tcp_session(uint8_t want_hdgst, uint8_t want_ddgst)
 {
+    /* ダイジェストは ICReq/ICResp でコネクション確立時に一度だけ合意する。
+     * 要求が変わったら既存セッションは使い回せないので張り直す。 */
+    if (s_shell_tcp_connected &&
+        (s_nvme_ctx.req_hdgst != want_hdgst || s_nvme_ctx.req_ddgst != want_ddgst)) {
+        uart_printf("tcpbench: digest設定が変わったのでセッションを張り直します\n");
+        nvme_tcp_close(&s_nvme_ctx.io);
+        nvme_tcp_close(&s_nvme_ctx.admin);
+        s_nvme_ctx.io_connected = 0;
+        s_shell_tcp_connected   = 0;
+        /* 常駐 target が FIN を検出して次のクライアント待ちへ戻るまで回す。 */
+        uint64_t t0 = timer_now();
+        while (!timeout_ms(t0, 1500u)) {
+            job_scheduler_tick();
+            net_poll_all_and_dispatch();
+        }
+    }
     if (s_shell_tcp_connected) return 0;
+    s_nvme_ctx.req_hdgst = want_hdgst;
+    s_nvme_ctx.req_ddgst = want_ddgst;
     netif_t *ctx0 = netif_find("mlx5-pf0");
     netif_t *ctx1 = netif_find("mlx5-pf1");
     if (!ctx0 || !ctx1) { uart_printf("netif 未登録\n"); return -1; }
@@ -221,10 +263,22 @@ static int shell_ensure_tcp_session(void)
 
 /* ---- ベンチ引数パース + サマリ表示(bench/tcpbench 共通) ---- */
 #define BENCH_MAX_CHUNKS 8u
-typedef struct { uint32_t chunk; int is_read; uint32_t mbps_x100; } bench_res_t;
-typedef struct { uint32_t chunks[BENCH_MAX_CHUNKS]; unsigned nchunks; int do_r, do_w; uint32_t qd; } bench_plan_t;
+typedef struct {
+    uint32_t chunk;       /* 1 コマンドあたりの転送バイト数 */
+    int      is_read;     /* 1=read、0=write */
+    uint64_t bytes;       /* 転送できた総バイト数 */
+    uint32_t count;       /* 完了コマンド数 */
+    uint32_t elapsed_ms;  /* 実測時間(0 なら測定失敗) */
+} bench_res_t;
+typedef struct {
+    uint32_t chunks[BENCH_MAX_CHUNKS];
+    unsigned nchunks;
+    int      do_r, do_w;
+    uint32_t qd;
+    uint8_t  hdgst, ddgst;  /* NVMe/TCP のみ。RDMA には digest の概念が無い */
+} bench_plan_t;
 
-/*
+/*=================================================================
  * 文字列を空白区切りで最大 n トークンに分割する(s を破壊する)。
  *
  * 引数:
@@ -235,7 +289,7 @@ typedef struct { uint32_t chunks[BENCH_MAX_CHUNKS]; unsigned nchunks; int do_r, 
  *   実際に得られたトークン数
  * コール元:
  *   bench_plan_parse(), shell_simdelay(), shell_ts()
- */
+ * ===============================================================*/
 static unsigned shell_tokenize(char *s, char *tok[], unsigned n)
 {
     unsigned c = 0;
@@ -249,21 +303,35 @@ static unsigned shell_tokenize(char *s, char *tok[], unsigned n)
     return c;
 }
 
-/*
- * ベンチ引数 "[KB[,KB...]] [r|w|rw] [qd]" を解析する。省略時は
- * 8/64/256KB・read+write・qd=8。
+/*=================================================================
+ * ベンチ引数 "[KB[,KB...]] [r|w|rw] [qd] [hdgst] [ddgst]" を解析する。
+ * 省略時は 8/64/256KB・read+write・qd=8・digest 無効。hdgst/ddgst は
+ * 位置ではなくキーワードで判定するので、qd の有無に関わらず書ける
+ * (NVMe/TCP 専用。RDMA トランスポートには digest の概念が無い)。
  *
  * 引数:
  *   args - 引数文字列(破壊される)
  *   pl   - 解析結果の格納先
  * コール元:
  *   shell_tcpbench(), shell_rdmabench()
- */
+ * ===============================================================*/
 static void bench_plan_parse(char *args, bench_plan_t *pl)
 {
-    char *tok[3];
-    unsigned nt = shell_tokenize(args, tok, 3);
+    char *tok[5];
+    unsigned nt = shell_tokenize(args, tok, 5);
     pl->qd = 8u; pl->do_r = 1; pl->do_w = 1;
+    pl->hdgst = 0; pl->ddgst = 0;
+
+    /* 先に digest キーワードを抜き取り、残りを従来通り位置引数として扱う。 */
+    unsigned kept = 0;
+    for (unsigned i = 0; i < nt; i++) {
+        if (strcmp(tok[i], "hdgst") == 0)  { pl->hdgst = 1; continue; }
+        if (strcmp(tok[i], "ddgst") == 0)  { pl->ddgst = 1; continue; }
+        if (strcmp(tok[i], "digest") == 0) { pl->hdgst = 1; pl->ddgst = 1; continue; }
+        tok[kept++] = tok[i];
+    }
+    nt = kept;
+
     if (nt == 0) {
         pl->chunks[0] = 8192u; pl->chunks[1] = 65536u; pl->chunks[2] = 262144u; pl->nchunks = 3;
     } else {
@@ -286,62 +354,158 @@ static void bench_plan_parse(char *args, bench_plan_t *pl)
     if (nt >= 3) { uint32_t q = (uint32_t)atoi(tok[2]); if (q) pl->qd = q; }
 }
 
-/*
- * ベンチ結果を chunk ごとの write/read 表として表示する。
+/*=================================================================
+ * 符号なし 10 進を文字列にする。
  *
  * 引数:
- *   tag - 見出し("NVMe/TCP" / "RDMA")
- *   qd  - 表示する queue depth
- *   r   - 測定結果の配列
- *   n   - その件数
+ *   v   - 変換する値
+ *   out - 出力先(NUL 終端する)
+ *   cap - out のバイト数
+ * 戻り値:
+ *   書き込んだ文字数(NUL を除く)
+ * コール元:
+ *   bench_summary()
+ * ===============================================================*/
+static unsigned bench_u32_str(uint32_t v, char *out, unsigned cap)
+{
+    char rev[12];
+    unsigned n = 0;
+    if (v == 0u) rev[n++] = '0';
+    while (v > 0u && n < sizeof(rev)) { rev[n++] = (char)('0' + (v % 10u)); v /= 10u; }
+    unsigned o = 0;
+    while (n > 0u && o + 1u < cap) out[o++] = rev[--n];
+    out[o] = 0;
+    return o;
+}
+
+/*=================================================================
+ * 100 倍固定小数点値を "整数部.小数2桁" の文字列にする。uart_printf は
+ * %f を持たないため、右詰めの数値列は一度文字列へ組み立ててから %s で出す。
+ *
+ * 引数:
+ *   x100 - 実値の 100 倍
+ *   out  - 出力先(NUL 終端する)
+ *   cap  - out のバイト数
+ * 戻り値:
+ *   書き込んだ文字数(NUL を除く)
+ * コール元:
+ *   bench_lat_str(), bench_summary()
+ * ===============================================================*/
+static unsigned bench_fx2_str(uint64_t x100, char *out, unsigned cap)
+{
+    char rev[24];
+    unsigned n = 0;
+    uint64_t ip = x100 / 100ull;
+    unsigned fp = (unsigned)(x100 % 100ull);
+    if (ip == 0ull) rev[n++] = '0';
+    while (ip > 0ull && n < sizeof(rev)) { rev[n++] = (char)('0' + (unsigned)(ip % 10ull)); ip /= 10ull; }
+    unsigned o = 0;
+    while (n > 0u && o + 4u < cap) out[o++] = rev[--n];
+    if (o + 3u < cap) {
+        out[o++] = '.';
+        out[o++] = (char)('0' + fp / 10u);
+        out[o++] = (char)('0' + fp % 10u);
+    }
+    out[o] = 0;
+    return o;
+}
+
+/*=================================================================
+ * 平均レイテンシ(ns)を linux_loopback.sh と同じ "N.NN us" / "N.NN ms"
+ * 表記にする(1ms 以上なら ms)。
+ *
+ * 引数:
+ *   ns  - 平均レイテンシ(ナノ秒)
+ *   out - 出力先(NUL 終端する)
+ *   cap - out のバイト数
+ * コール元:
+ *   bench_summary()
+ * ===============================================================*/
+static void bench_lat_str(uint64_t ns, char *out, unsigned cap)
+{
+    const char *unit;
+    unsigned o;
+    if (ns >= 1000000ull) { o = bench_fx2_str(ns / 10000ull, out, cap); unit = " ms"; }
+    else                  { o = bench_fx2_str(ns / 10ull,    out, cap); unit = " us"; }
+    for (unsigned i = 0; unit[i] && o + 1u < cap; i++) out[o++] = unit[i];
+    out[o] = 0;
+}
+
+/*=================================================================
+ * ベンチ結果を linux_loopback.sh と同じ書式の表で表示する
+ * (rw / bs / qd / MiB/s / IOPS / avg latency)。行の並びも同じで、
+ * write を全 chunk 分並べたあとに read を並べる。avg latency は、
+ * このベンチが qd 本を常時 outstanding に保つ設計であることから
+ * Little の法則(平均レイテンシ = qd / IOPS)で求めている。
+ *
+ * 引数:
+ *   transport  - トランスポート名("tcp" / "rocev2")
+ *   qd         - queue depth
+ *   runtime_ms - 1 条件あたりの測定時間
+ *   r          - 測定結果の配列
+ *   n          - その件数
  * コール元:
  *   shell_tcpbench(), shell_rdmabench()
- */
-static void bench_summary(const char *tag, uint32_t qd, const bench_res_t *r, unsigned n)
+ * ===============================================================*/
+static void bench_summary(const char *transport, uint32_t qd, uint32_t runtime_ms,
+                          const bench_res_t *r, unsigned n)
 {
-    uart_printf("\n==== %s スループットまとめ (qd=%u, MB/s) ====\n", tag, qd);
-    uart_printf("   chunk       write        read\n");
-    uint32_t seen[BENCH_MAX_CHUNKS]; unsigned ns = 0;
-    for (unsigned i = 0; i < n; i++) {
-        int f = 0;
-        for (unsigned j = 0; j < ns; j++) if (seen[j] == r[i].chunk) f = 1;
-        if (!f && ns < BENCH_MAX_CHUNKS) seen[ns++] = r[i].chunk;
-    }
-    for (unsigned s = 0; s < ns; s++) {
-        int32_t w = -1, rd = -1;
-        for (unsigned i = 0; i < n; i++) if (r[i].chunk == seen[s]) {
-            if (r[i].is_read) rd = (int32_t)r[i].mbps_x100; else w = (int32_t)r[i].mbps_x100;
+    uart_printf("\nスタック: vfio_nvme / トランスポート: %s / qd=%u / runtime=%us\n\n",
+                transport, qd, runtime_ms / 1000u);
+    uart_printf("%-10s %-8s %-6s %12s %12s %14s\n",
+                "rw", "bs", "qd", "MiB/s", "IOPS", "avg latency");
+    uart_printf("%-10s %-8s %-6s %12s %12s %14s\n",
+                "----------", "--------", "------", "------------", "------------", "--------------");
+
+    for (int pass = 0; pass < 2; pass++) {   /* 0=write を先に、1=read を後に */
+        for (unsigned i = 0; i < n; i++) {
+            if (r[i].is_read != pass) continue;
+
+            char bs[16], mib[24], iops[24], lat[24];
+            unsigned o = bench_u32_str(r[i].chunk / 1024u, bs, sizeof(bs));
+            if (o + 1u < sizeof(bs)) bs[o++] = 'k';
+            bs[o] = 0;
+
+            const char *rw = r[i].is_read ? "read" : "write";
+            uint32_t el = r[i].elapsed_ms;
+            if (el == 0u || r[i].count == 0u) {
+                uart_printf("%-10s %-8s %-6u %12s %12s %14s\n", rw, bs, qd, "-", "-", "-");
+                continue;
+            }
+            bench_fx2_str((r[i].bytes * 100000ull) / ((uint64_t)el * 1048576ull), mib, sizeof(mib));
+            bench_fx2_str(((uint64_t)r[i].count * 100000ull) / (uint64_t)el, iops, sizeof(iops));
+            bench_lat_str(((uint64_t)qd * (uint64_t)el * 1000000ull) / (uint64_t)r[i].count,
+                          lat, sizeof(lat));
+            uart_printf("%-10s %-8s %-6u %12s %12s %14s\n", rw, bs, qd, mib, iops, lat);
         }
-        uart_printf("  %5uK  ", seen[s] / 1024u);
-        if (w >= 0) uart_printf("%8u.%02u", (unsigned)(w / 100), (unsigned)(w % 100)); else uart_printf("       -   ");
-        uart_printf("  ");
-        if (rd >= 0) uart_printf("%8u.%02u", (unsigned)(rd / 100), (unsigned)(rd % 100)); else uart_printf("       -   ");
-        uart_printf("\n");
     }
 }
 
-/*
+/*=================================================================
  * NVMe/TCP を 1 条件だけ 3 秒間回してスループットを測る。
  *
  * 引数:
  *   chunk   - 1 コマンドあたりの転送バイト数
  *   is_read - 1=read、0=write
- * 戻り値:
- *   MB/s の 100 倍固定小数点値
+ *   out     - 測定結果の格納先
  * コール元:
  *   shell_tcpbench()
- */
-static uint32_t tcp_measure(uint32_t chunk, int is_read)
+ * ===============================================================*/
+static void tcp_measure(uint32_t chunk, int is_read, bench_res_t *out)
 {
     uint32_t nlb = chunk / s_nvme_ctx.lba_size;
     uint32_t cnt = 0, el = 0; uint64_t by = 0;
     if (is_read) nvme_read_pipelined_run(&s_nvme_ctx, 1u, 0u, s_nvmetcp_buf, nlb, 3000u, &cnt, &by, &el);
     else         nvme_write_pipelined_run(&s_nvme_ctx, 1u, 0u, s_nvmetcp_buf, nlb, 3000u, &cnt, &by, &el);
     uart_printf("[tcp] chunk=%u %s: %u 回, %u ms\n", chunk, is_read ? "read " : "write", cnt, el);
-    return (el > 0) ? (uint32_t)((by * 100000ull) / ((uint64_t)el * 1000000ull)) : 0u;
+    out->chunk      = chunk;
+    out->is_read    = is_read;
+    out->bytes      = by;
+    out->count      = cnt;
+    out->elapsed_ms = el;
 }
 
-/*
+/*=================================================================
  * シェルの `tcpbench`。セッションを確立(既にあれば再利用)し、指定 chunk ×
  * read/write でスループットを測って表を出す。
  *
@@ -349,21 +513,36 @@ static uint32_t tcp_measure(uint32_t chunk, int is_read)
  *   args - "[KB[,KB...]] [r|w|rw]"
  * コール元:
  *   shell_dispatch()
- */
+ * ===============================================================*/
 static void shell_tcpbench(char *args)
 {
-    if (shell_ensure_tcp_session() != 0) return;
     bench_plan_t pl; bench_plan_parse(args, &pl);
+    if (shell_ensure_tcp_session(pl.hdgst, pl.ddgst) != 0) return;
+    if (pl.hdgst != s_nvme_ctx.io.hdgst || pl.ddgst != s_nvme_ctx.io.ddgst) {
+        uart_printf("[!] tcpbench: digestの合意結果が要求と異なります "
+                    "(要求 hdgst=%u ddgst=%u / 合意 hdgst=%u ddgst=%u)\n",
+                    pl.hdgst, pl.ddgst, s_nvme_ctx.io.hdgst, s_nvme_ctx.io.ddgst);
+    }
     for (unsigned i = 0; i < sizeof(s_nvmetcp_buf); i++) s_nvmetcp_buf[i] = (uint8_t)(0x5au ^ (i * 7u));
     bench_res_t res[2u * BENCH_MAX_CHUNKS]; unsigned nr = 0;
     for (unsigned c = 0; c < pl.nchunks; c++) {
-        if (pl.do_w) { res[nr].chunk = pl.chunks[c]; res[nr].is_read = 0; res[nr].mbps_x100 = tcp_measure(pl.chunks[c], 0); nr++; }
-        if (pl.do_r) { res[nr].chunk = pl.chunks[c]; res[nr].is_read = 1; res[nr].mbps_x100 = tcp_measure(pl.chunks[c], 1); nr++; }
+        if (pl.do_w) tcp_measure(pl.chunks[c], 0, &res[nr++]);
+        if (pl.do_r) tcp_measure(pl.chunks[c], 1, &res[nr++]);
     }
-    bench_summary("NVMe/TCP", 8u, res, nr);
+    char transport[32];
+    unsigned o = 0;
+    const char *base = "tcp";
+    while (base[o]) { transport[o] = base[o]; o++; }
+    if (s_nvme_ctx.io.hdgst || s_nvme_ctx.io.ddgst) {
+        const char *suffix = s_nvme_ctx.io.hdgst && s_nvme_ctx.io.ddgst ? "+hdgst+ddgst"
+                            : (s_nvme_ctx.io.hdgst ? "+hdgst" : "+ddgst");
+        for (unsigned k = 0; suffix[k] && o + 1u < sizeof(transport); k++) transport[o++] = suffix[k];
+    }
+    transport[o] = 0;
+    bench_summary(transport, NVME_IO_QDEPTH, 3000u, res, nr);
 }
 
-/*
+/*=================================================================
  * シェルの `bench`。NVMe-oF RDMA のスループットを指定 chunk × read/write ×
  * qdepth で測って表を出す。
  *
@@ -371,26 +550,40 @@ static void shell_tcpbench(char *args)
  *   args - "[KB[,KB...]] [r|w|rw] [qd]"
  * コール元:
  *   shell_dispatch()
- */
+ * ===============================================================*/
 static void shell_rdmabench(char *args)
 {
     bench_plan_t pl; bench_plan_parse(args, &pl);
+    if (pl.hdgst || pl.ddgst) {
+        /* ダイジェストは NVMe/TCP トランスポート固有の機能。RDMA には
+         * 該当する仕組みが無い(RoCE のパケット CRC が担う)ので無視する。 */
+        uart_printf("[!] bench: NVMe-oF RDMA に digest はありません(無視します。tcpbench で指定してください)\n");
+    }
+    /* nvme_rdma_run_bench() 側でも丸められるが、表と平均レイテンシ計算を
+     * 実際に使われた qd に合わせるためここでも同じ上限を適用する。 */
+    uint32_t qd = (pl.qd > NVME_RDMA_PL_QDEPTH_MAX) ? NVME_RDMA_PL_QDEPTH_MAX : pl.qd;
     bench_res_t res[2u * BENCH_MAX_CHUNKS]; unsigned nr = 0;
     for (unsigned c = 0; c < pl.nchunks; c++) {
-        if (pl.do_w) { uint32_t m = 0; nvme_rdma_run_bench(&s_dev0, &s_dev1, 3000u, 0, pl.chunks[c], pl.qd, &m); res[nr].chunk = pl.chunks[c]; res[nr].is_read = 0; res[nr].mbps_x100 = m; nr++; }
-        if (pl.do_r) { uint32_t m = 0; nvme_rdma_run_bench(&s_dev0, &s_dev1, 3000u, 1, pl.chunks[c], pl.qd, &m); res[nr].chunk = pl.chunks[c]; res[nr].is_read = 1; res[nr].mbps_x100 = m; nr++; }
+        for (int is_read = 0; is_read < 2; is_read++) {
+            if (!(is_read ? pl.do_r : pl.do_w)) continue;
+            bench_res_t *e = &res[nr++];
+            e->chunk = pl.chunks[c];
+            e->is_read = is_read;
+            nvme_rdma_run_bench(&s_dev0, &s_dev1, 3000u, is_read, pl.chunks[c], qd,
+                                &e->bytes, &e->count, &e->elapsed_ms);
+        }
     }
-    bench_summary("RDMA", pl.qd, res, nr);
+    bench_summary("rocev2", qd, 3000u, res, nr);
 }
 
-/*
+/*=================================================================
  * シェルの `ts`。ts_log リングのダンプと pause/resume/mode 切り替えを行う。
  *
  * 引数:
  *   args - "[core N] [num N] [mask M V] | pause | resume"
  * コール元:
  *   shell_dispatch()
- */
+ * ===============================================================*/
 static void shell_ts(char *args)
 {
     char *tok[8];
@@ -418,7 +611,7 @@ static void shell_ts(char *args)
     ts_log_dump_core(core, start, num, mask, val);
 }
 
-/*
+/*=================================================================
  * シェルの `simdelay`。指定コアのメインループへ注入する人為的遅延(us)を
  * 設定する(律速要因の切り分け用)。
  *
@@ -426,7 +619,7 @@ static void shell_ts(char *args)
  *   args - "<core> <us>" または "show"
  * コール元:
  *   shell_dispatch()
- */
+ * ===============================================================*/
 static void shell_simdelay(char *args)
 {
     char *tok[2];
@@ -443,7 +636,7 @@ static void shell_simdelay(char *args)
     uart_printf("simdelay: core%u = %uus\n", core, (unsigned)g_sim_delay_us[core]);
 }
 
-/*
+/*=================================================================
  * シェルの `ackthresh`。TCP の遅延 ACK 閾値(フルサイズ何セグメントごとに
  * ACK するか)を設定/表示する。
  *
@@ -451,7 +644,7 @@ static void shell_simdelay(char *args)
  *   args - 新しい閾値。省略時は現在値を表示
  * コール元:
  *   shell_dispatch()
- */
+ * ===============================================================*/
 static void shell_ackthresh(char *args)
 {
     while (*args == ' ') args++;
@@ -464,7 +657,7 @@ static void shell_ackthresh(char *args)
                 (unsigned)g_tcp_ack_threshold, (unsigned)g_tcp_ack_threshold);
 }
 
-/*
+/*=================================================================
  * 入力 1 行をコマンドとして解釈し実行する(monitor / nvmet / tcpbench /
  * bench / simdelay / ackthresh / ts / jobs / help / quit)。
  *
@@ -473,7 +666,7 @@ static void shell_ackthresh(char *args)
  *   s0, s1 - PF0/PF1 の VFIO スロット番号(monitor が config 空間を読む)
  * コール元:
  *   run_shell()
- */
+ * ===============================================================*/
 static void shell_dispatch(char *line, int s0, int s1)
 {
     /* 先頭の空白を飛ばし、コマンド語を取り出す。 */
@@ -517,11 +710,14 @@ static void shell_dispatch(char *line, int s0, int s1)
         uart_printf("commands:\n"
                     "  monitor                              HW状態(温度/エラー/PCIe/リンク)\n"
                     "  bench [KB[,KB...]] [r|w|rw] [qd]      NVMe-oF RDMA スループット\n"
-                    "  tcpbench [KB[,KB...]] [r|w|rw]        NVMe/TCP スループット(qdは内部固定)\n"
+                    "  tcpbench [KB[,KB...]] [r|w|rw] [hdgst] [ddgst] [digest]\n"
+                    "                                        NVMe/TCP スループット(qdは内部固定)\n"
+                    "                                        hdgst/ddgst/digest でCRC32Cダイジェストを有効化\n"
+                    "                                        (指定が前回と変わるとセッションを張り直す)\n"
                     "  ts [core N] [num N] [mask M V] | ts pause|resume   ts_log ダンプ\n"
                     "  simdelay <core> <us> | simdelay show   律速切り分け(遅延注入)\n"
                     "  nvmet [port] | jobs | help | quit    (↑↓で履歴呼び出し)\n"
-                    "  例: bench 8,64,256 rw 8 / tcpbench 64,256 w / ts core 1 num 40\n");
+                    "  例: bench 8,64,256 rw 8 / tcpbench 64,256 w digest / ts core 1 num 40\n");
     } else if (strncmp(line, "quit", 4) == 0 || strncmp(line, "exit", 4) == 0) {
         uart_printf("bye\n");
         exit(0);
@@ -547,14 +743,14 @@ typedef struct {
     int      esc;        /* 0=通常, 1=ESC受信, 2=ESC[受信 */
 } shell_editor_t;
 
-/*
+/*=================================================================
  * 確定した入力行をコマンド履歴へ積む(上下キーで呼び出せるようにする)。
  *
  * 引数:
  *   l - 積む行
  * コール元:
  *   run_shell()
- */
+ * ===============================================================*/
 static void shell_hist_push(const char *l)
 {
     if (l[0] == 0) return;
@@ -569,7 +765,7 @@ static void shell_hist_push(const char *l)
     s_hist_count++;
 }
 
-/*
+/*=================================================================
  * 行編集バッファの内容を src で置き換え、画面の表示も更新する
  * (履歴の呼び出しに使う)。
  *
@@ -578,7 +774,7 @@ static void shell_hist_push(const char *l)
  *   src - 新しい行内容
  * コール元:
  *   shell_editor_byte()
- */
+ * ===============================================================*/
 static void shell_set_line(shell_editor_t *ed, const char *src)
 {
     unsigned i = 0;
@@ -587,7 +783,7 @@ static void shell_set_line(shell_editor_t *ed, const char *src)
     uart_printf("\r\033[K> %s", ed->line);   /* 行クリア + プロンプト + 再描画 */
 }
 
-/*
+/*=================================================================
  * 入力 1 バイトを行エディタへ与える。通常文字の挿入・バックスペース・
  * 上下キー(履歴)・改行による行確定を扱う。
  *
@@ -598,7 +794,7 @@ static void shell_set_line(shell_editor_t *ed, const char *src)
  *   1=行が確定した(ed->line が有効)、0=編集継続中
  * コール元:
  *   run_shell()
- */
+ * ===============================================================*/
 static int shell_editor_byte(shell_editor_t *ed, unsigned char ch)
 {
     if (ed->esc == 1) { ed->esc = (ch == '[') ? 2 : 0; return 0; }
@@ -635,13 +831,13 @@ static int shell_editor_byte(shell_editor_t *ed, unsigned char ch)
 static struct termios s_orig_tio;
 static int s_raw_active = 0;
 static void shell_restore_tty(void) { if (s_raw_active) { tcsetattr(0, TCSANOW, &s_orig_tio); s_raw_active = 0; } }
-/*
+/*=================================================================
  * 端末を raw モード(canonical/echo 無効)にする。矢印キーと 1 文字ずつの
  * 即時エコーのため。プロセス終了時に元へ戻す atexit ハンドラも登録する。
  *
  * コール元:
  *   run_shell()
- */
+ * ===============================================================*/
 static void shell_raw_mode(void)
 {
     if (!isatty(0)) return;
@@ -652,7 +848,7 @@ static void shell_raw_mode(void)
     if (tcsetattr(0, TCSANOW, &t) == 0) { s_raw_active = 1; atexit(shell_restore_tty); }
 }
 
-/*
+/*=================================================================
  * 常駐シェル。起動時に 1 回だけ arp/ip ハンドラ登録と netif 登録を行い、
  * 以後はコマンドを対話的に受け付けつつ、アイドル時に job_scheduler_tick()
  * と net_poll_all_and_dispatch() を回し続ける(戻らない)。
@@ -661,7 +857,7 @@ static void shell_raw_mode(void)
  *   s0, s1 - PF0/PF1 の VFIO スロット番号
  * コール元:
  *   run_dual_pf()
- */
+ * ===============================================================*/
 static void run_shell(int s0, int s1)
 {
     /* Ethernet/TCP/nvmet 用の net_ctx を1回だけ登録(以後のコマンドで再利用)。 */
@@ -695,7 +891,7 @@ static void run_shell(int s0, int s1)
     }
 }
 
-/*
+/*=================================================================
  * PF0/PF1 を両方 bring-up し、常駐シェルへ入る(戻らない)。
  *
  * 引数:
@@ -704,7 +900,7 @@ static void run_shell(int s0, int s1)
  *   -1=bring-up 失敗(成功時は run_shell() から戻らない)
  * コール元:
  *   main()
- */
+ * ===============================================================*/
 static int run_dual_pf(const char *bdf0, const char *bdf1)
 {
     uart_printf("\n========== dual-PF bring-up: %s + %s ==========\n", bdf0, bdf1);
@@ -716,7 +912,7 @@ static int run_dual_pf(const char *bdf0, const char *bdf1)
     return 0;
 }
 
-/*
+/*=================================================================
  * エントリポイント。自己テスト(crc32c / timer / spinlock / smp)を行い、
  * 引数に 2 つの PCI アドレスが与えられていれば bring-up + 常駐シェルへ。
  *
@@ -724,7 +920,7 @@ static int run_dual_pf(const char *bdf0, const char *bdf1)
  *   argc, argv - argv[1], argv[2] が PF0/PF1 の PCI アドレス
  * 戻り値:
  *   0=正常、1=自己テスト失敗または bring-up 失敗
- */
+ * ===============================================================*/
 int main(int argc, char **argv)
 {
     uart_puts("\nvfio_nvme -- ConnectX-4 / VFIO / NVMe-oF (RoCEv2 + TCP)\n\n");

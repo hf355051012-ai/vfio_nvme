@@ -90,6 +90,7 @@ job_result_t nvme_rdma_connect_job_step(job_t *self);
 
 void nvme_rdma_run_bench(mlx5_dev_t *dev0, mlx5_dev_t *dev1, uint32_t duration_ms,
                          int is_read, uint32_t chunk_bytes, uint32_t qdepth,
-                         uint32_t *out_mbps_x100);
+                         uint64_t *out_bytes, uint32_t *out_count,
+                         uint32_t *out_elapsed_ms);
 
 #endif /* NVME_RDMA_H */
