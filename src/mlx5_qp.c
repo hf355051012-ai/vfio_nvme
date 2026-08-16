@@ -92,8 +92,13 @@ int mlx5_qp_post_send(mlx5_dev_t *dev, mlx5_qp_t *qp, const void *data, uint32_t
     uint32_t raw1 = (uint32_t)wqe[4] | ((uint32_t)wqe[5] << 8) |
                     ((uint32_t)wqe[6] << 16) | ((uint32_t)wqe[7] << 24);
     uint64_t uar_addr = dev->bar0_base + (uint64_t)qp->uarn * 4096u;
-    mmio_write32(uar_addr + MLX5_BF_OFFSET, raw0);
-    mmio_write32(uar_addr + MLX5_BF_OFFSET + 4u, raw1);
+    /* BlueFlame の 8 バイトは 1 命令でアトミックに書く。32bit x 2 に分けると
+     * PCIe 上で分割されうる(Linux の mlx5_write64() が「32bit システムでは
+     * ロックが必要」と注記しているのと同じ理由)。同時 RDMA_READ を 1 本から
+     * 16 本へ緩めてドアベル発行頻度が上がった途端、LOCAL_QP_OP_ERR
+     * (syndrome=0x02)として実機で顕在化した。 */
+    uint64_t raw64 = (uint64_t)raw0 | ((uint64_t)raw1 << 32);
+    mmio_write64(uar_addr + MLX5_BF_OFFSET, raw64);
 
     qp->sq_pc = new_pc;
 
@@ -211,8 +216,13 @@ int mlx5_qp_post_send_ud(mlx5_dev_t *dev, mlx5_qp_t *qp, const void *data, uint3
     uint32_t raw1 = (uint32_t)wqe0[4] | ((uint32_t)wqe0[5] << 8) |
                     ((uint32_t)wqe0[6] << 16) | ((uint32_t)wqe0[7] << 24);
     uint64_t uar_addr = dev->bar0_base + (uint64_t)qp->uarn * 4096u;
-    mmio_write32(uar_addr + MLX5_BF_OFFSET, raw0);
-    mmio_write32(uar_addr + MLX5_BF_OFFSET + 4u, raw1);
+    /* BlueFlame の 8 バイトは 1 命令でアトミックに書く。32bit x 2 に分けると
+     * PCIe 上で分割されうる(Linux の mlx5_write64() が「32bit システムでは
+     * ロックが必要」と注記しているのと同じ理由)。同時 RDMA_READ を 1 本から
+     * 16 本へ緩めてドアベル発行頻度が上がった途端、LOCAL_QP_OP_ERR
+     * (syndrome=0x02)として実機で顕在化した。 */
+    uint64_t raw64 = (uint64_t)raw0 | ((uint64_t)raw1 << 32);
+    mmio_write64(uar_addr + MLX5_BF_OFFSET, raw64);
 
     qp->sq_pc = new_pc;
 
@@ -307,8 +317,13 @@ static int mlx5_qp_post_rdma_common(mlx5_dev_t *dev, mlx5_qp_t *qp, uint32_t opc
     uint32_t raw1 = (uint32_t)wqe[4] | ((uint32_t)wqe[5] << 8) |
                     ((uint32_t)wqe[6] << 16) | ((uint32_t)wqe[7] << 24);
     uint64_t uar_addr = dev->bar0_base + (uint64_t)qp->uarn * 4096u;
-    mmio_write32(uar_addr + MLX5_BF_OFFSET, raw0);
-    mmio_write32(uar_addr + MLX5_BF_OFFSET + 4u, raw1);
+    /* BlueFlame の 8 バイトは 1 命令でアトミックに書く。32bit x 2 に分けると
+     * PCIe 上で分割されうる(Linux の mlx5_write64() が「32bit システムでは
+     * ロックが必要」と注記しているのと同じ理由)。同時 RDMA_READ を 1 本から
+     * 16 本へ緩めてドアベル発行頻度が上がった途端、LOCAL_QP_OP_ERR
+     * (syndrome=0x02)として実機で顕在化した。 */
+    uint64_t raw64 = (uint64_t)raw0 | ((uint64_t)raw1 << 32);
+    mmio_write64(uar_addr + MLX5_BF_OFFSET, raw64);
 
     qp->sq_pc = new_pc;
 

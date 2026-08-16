@@ -139,6 +139,46 @@ inline upcall → pull 型、送信のゼロコピー `send_c2h_async` → コ�
   無かった頃は 1 パスしか検証しておらず、**自作 initiator ↔ 自作 target だけで
   試すと両側が同じ間違い方をして絶対に検出できない**という穴があった。
 
+## RDMA の同時 RDMA_READ 数(write 性能を 2.3 倍にしたバグ 2 件)
+
+NVMe-oF の **write は target が host のメモリから RDMA_READ でデータを引き込む**
+構造なので、同時 RDMA_READ 数がそのまま write スループットの上限になる
+(read は target が RDMA_WRITE で押し込むだけなので影響を受けない)。
+「write だけ depth でスケールしない」ときはここを疑う。
+
+### 1. `log_max_ra_res_qp` のビット抽出が 4bit ずれていた
+
+```c
+/* 誤: bit 342-347 を読んでいて常に 0(= 同時 1 本)になる */
+dev->log_max_ra_res_qp = ((hca_cap[42] & 0x03u) << 4) | ((hca_cap[43] & 0xF0u) >> 4);
+/* 正: struct mlx5_ifc_cmd_hca_cap_bits より bit 0x15a-0x15f = byte43 の下位6bit */
+dev->log_max_ra_res_qp = hca_cap[43] & 0x3Fu;
+```
+
+実機の真値は req/res とも 4(= 16 本)。`ibv_devinfo -v` の
+`max_qp_rd_atom` / `max_qp_init_rd_atom` がカーネルドライバ側の同じ値なので、
+**自作の読み取りが正しいかはこれと突き合わせて確認できる**(mlx5_core に
+バインドし直す必要はあるが、疑わしいときは必ずやること)。
+
+### 2. `log_rra_max` を RTR2RTS で設定していた(INIT2RTR が正しい)
+
+`log_rra_max`(= IBTA の `max_dest_rd_atomic`、responder として受け付ける
+RDMA_READ 数)は **INIT2RTR でしか反映されない**。Linux の
+`mlx5_ib_modify_qp()` も `IB_QP_MAX_DEST_RD_ATOMIC` を INIT2RTR でのみ受ける。
+RTR2RTS で書いても FW は保持しないので、1. だけ直すと相手が 2 本目の
+RDMA_READ を投げた瞬間に **`REMOTE_INVAL_REQ_ERR`(syndrome=0x12)**になる。
+`log_sra_max`(`max_rd_atomic`、initiator 側)は RTR2RTS で正しい。
+
+### 3. 併発して露呈した: BlueFlame ドアベルが 32bit x 2 だった
+
+`mlx5_qp.c` のドアベルが `mmio_write32` 2 回で、8 バイトがアトミックに
+書かれていなかった(`mlx5_net.c` は修正済みだった)。同時 RDMA_READ を
+1 -> 16 に緩めてドアベル発行頻度が上がった途端、**`LOCAL_QP_OP_ERR`
+(syndrome=0x02)が数十万コマンドに 1 回**の頻度で出るようになった。
+`mmio_write64` 1 回に直して解消。Linux の `mlx5_write64()` が「32bit
+システムではロックが必要」と注記しているのと同じ理由で、**64bit CPU なら
+必ず単一の 64bit ストアで書くこと**。
+
 ## Linux 側比較ベンチ `~/script/linux_loopback.sh`
 
 **このリポジトリ外**(OptiPlex の `~/script/`、バージョン管理されていない)。
@@ -205,14 +245,14 @@ kernel/spdk × tcp/rocev2 を同じ書式で測る。`bench`/`tcpbench` の要�
 
 ### NVMe-oF RoCEv2(ダイジェストの概念は無い)
 
-| | kernel | spdk | **独自** |
-|---|---|---|---|
-| write 8k | 1315 | **3717** | 1849 |
-| write 64k | 2892 | **5206** | 4739 |
-| write 256k | 3084 | 5237 | **5608** |
-| read 8k | 1207 | 3667 | **4124** |
-| read 64k | 3318 | 5774 | **6730** |
-| read 256k | 3770 | **5778** | 5753 |
+| | kernel | spdk | **独自** | 独自/spdk |
+|---|---|---|---|---|
+| write 8k | 1315 | 3717 | **4310** | 1.16x |
+| write 64k | 2892 | 5206 | **5803** | 1.11x |
+| write 256k | 3084 | 5237 | **5787** | 1.11x |
+| read 8k | 1207 | 3667 | **4373** | 1.19x |
+| read 64k | 3318 | 5774 | **6813** | 1.18x |
+| read 256k | 3770 | 5778 | **6070** | 1.05x |
 
 ### 読み取り
 
@@ -220,9 +260,8 @@ kernel/spdk × tcp/rocev2 を同じ書式で測る。`bench`/`tcpbench` の要�
   カーネル/SPDK 側は netns + 実 TCP スタックを通るのに対し、独自は同一プロセス
   内でループバックするので条件は対等ではない。順位そのものより、変更前後で
   同じ列を比べることに意味がある。
-- **RoCEv2 は独自が一方的に速いわけではない。** 特に **write 8k は spdk が
-  独自の 2 倍(3717 対 1849)** で、小 I/O のコマンド発行効率で負けている。
-  64k write も spdk が上。read と大きい write では独自が勝つ。
+- **RoCEv2 は全条件で独自が最速**(spdk 比 1.05〜1.19 倍)。以前は write 8k で
+  spdk に 2 倍負けていたが、原因は下記「同時 RDMA_READ 数」のバグ 2 件だった。
 - ダイジェストのコストは独自で −1〜−27%。**最悪は read 8k の −27%**(小 I/O
   ほど 1 コマンドあたりの固定コストが相対的に重い)。256k write はほぼゼロ。
   spdk が 64k/256k で −20% と大きいのは、ISA-L の CRC が速い分ほかの要因が

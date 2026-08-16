@@ -291,8 +291,15 @@ int mlx5_hca_bringup(mlx5_dev_t *dev, const char *label, int monitor_only) {
                       ((uint32_t)hca_cap[158] << 8) | (uint32_t)hca_cap[159];
     uart_printf("mlx5: device_frequency_khz=%u\n", dev->clock_khz);
 
+    /* struct mlx5_ifc_cmd_hca_cap_bits より:
+     *   reserved_at_147[0x2] / roce_accl[0x1] / log_max_ra_req_qp[0x6]  -> bit 0x14a-0x14f
+     *   reserved_at_150[0xa]                  / log_max_ra_res_qp[0x6]  -> bit 0x15a-0x15f
+     * どちらもバイト内の下位 6bit(byte41 と byte43)。res 側は以前 byte42/43 を
+     * またぐ 4bit ずれた抽出になっており、常に 0(=同時 RDMA_READ 1 本)と読めて
+     * いた。その結果 write が RDMA_READ 1 本に直列化され、8k で SPDK の半分の
+     * スループットしか出ていなかった(実機の真値は req/res とも 4 = 16 本)。 */
     dev->log_max_ra_req_qp = hca_cap[41] & 0x3Fu;
-    dev->log_max_ra_res_qp = (uint8_t)(((hca_cap[42] & 0x03u) << 4) | ((hca_cap[43] & 0xF0u) >> 4));
+    dev->log_max_ra_res_qp = hca_cap[43] & 0x3Fu;
     uart_printf("mlx5: log_max_ra_req_qp=%u (max=%u) log_max_ra_res_qp=%u (max=%u)\n",
                 dev->log_max_ra_req_qp, 1u << dev->log_max_ra_req_qp,
                 dev->log_max_ra_res_qp, 1u << dev->log_max_ra_res_qp);
@@ -2529,6 +2536,16 @@ int mlx5_qp_modify_init2rtr(mlx5_dev_t *dev, mlx5_qp_t *qp, uint32_t remote_qpn,
     qpc[21] = (uint8_t)(remote_qpn >> 16);
     qpc[22] = (uint8_t)(remote_qpn >> 8);
     qpc[23] = (uint8_t)remote_qpn; // remote_qpn(byte21-23)
+    /* log_rra_max(= IBTA の max_dest_rd_atomic、responder として同時に受け付ける
+     * RDMA_READ 数)は **INIT2RTR で設定する**。Linux の mlx5_ib_modify_qp() も
+     * IB_QP_MAX_DEST_RD_ATOMIC を INIT2RTR でのみ受け付ける(RTR2RTS で書いても
+     * FW は保持しない)。ここが未設定だと相手が 2 本目以降の RDMA_READ を投げた
+     * 瞬間に REMOTE_INVAL_REQ_ERR(syndrome=0x12)を返してしまう。 */
+    {
+        uint8_t log_rra = dev->log_max_ra_res_qp;
+        if (log_rra > 4u) log_rra = 4u; // フィールド幅は3bit(0-7)、実用上16本で十分
+        qpc[145] = (uint8_t)(log_rra << 5); // log_rra_max(pos0-2)
+    }
     qpc[148] = (uint8_t)(12u & 0x1Fu); // min_rnr_nak(pos3-7)=12
     qpc[149] = (uint8_t)(qp->local_psn >> 16);
     qpc[150] = (uint8_t)(qp->local_psn >> 8);
@@ -2554,8 +2571,11 @@ int mlx5_qp_modify_init2rtr(mlx5_dev_t *dev, mlx5_qp_t *qp, uint32_t remote_qpn,
 }
 
 /*=================================================================
- * この HCA が同時に受け付けられる RDMA_READ の数を返す(general cap の
- * log_max_ra_req_qp / log_max_ra_res_qp の小さい方から求める)。実測では 1。
+ * この HCA が同時に扱える RDMA_READ の数を返す(general cap の
+ * log_max_ra_req_qp[initiator として発行できる数] と
+ * log_max_ra_res_qp[responder として受け付けられる数]の小さい方)。
+ * PF0<->PF1 ループバックでは両端が同じカードなので min で足りる。
+ * 実測ではどちらも 4 = 16 本。
  *
  * 引数:
  *   dev - 対象 HCA
