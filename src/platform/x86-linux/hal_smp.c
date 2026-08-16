@@ -106,7 +106,11 @@ static void *worker_main(void *argp)
 
 /* PF ごとに 1 度だけ起動する(二重起動しても実害は無いが再起動しない)。 */
 static worker_arg_t s_core1_arg;
+static worker_arg_t s_core2_arg;
+static worker_arg_t s_core3_arg;
 static pthread_t    s_core1_thr;
+static pthread_t    s_core2_thr;
+static pthread_t    s_core3_thr;
 
 /*
  * core1 ワーカスレッドを起動する(既に起動済みなら何もしない冪等関数)。
@@ -132,6 +136,70 @@ int smp_boot_core1(void)
     /* g_core1_alive が立つまで最大 2 秒待つ(RPi5 の smp_boot_core1 と同じ規約)。 */
     uint64_t start = timer_now();
     while (!g_core1_alive) {
+        if (timeout_sec(start, 2u)) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+/*
+ * core2 ワーカスレッドを起動する(smp_boot_core1() と同じ冪等関数)。
+ *
+ * 【現時点で呼び出し元は無い】複数コネクションの受信を複数コアへ振り分ける
+ * scale-out(フローステアリングで RQ を分け、per-RQ でポーリングする段階)で
+ * 使う予定の部品として意図的に残してある。bench / tcpbench は core0(initiator)
+ * と core1(target)の 2 コアだけで動くため、こちらは呼ばれない。
+ * **未使用に見えても削除しないこと** -- 一度、未到達関数の一括削除で消して
+ * しまい復活させた経緯がある。
+ *
+ * 戻り値:
+ *   0=起動済み/成功、-1=pthread 作成失敗
+ * コール元:
+ *   (未配線。複数コネクション scale-out の実装時に配線する)
+ */
+int smp_boot_core2(void)
+{
+    if (g_core2_alive) {
+        return 0;
+    }
+    s_core2_arg.core_index = 2u;
+    s_core2_arg.hb    = &g_core2_heartbeat;
+    s_core2_arg.alive = &g_core2_alive;
+    if (pthread_create(&s_core2_thr, 0, worker_main, &s_core2_arg) != 0) {
+        return -1;
+    }
+    uint64_t start = timer_now();
+    while (!g_core2_alive) {
+        if (timeout_sec(start, 2u)) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+/*
+ * core3 ワーカスレッドを起動する(smp_boot_core2() と同じ、未配線)。
+ * 削除しない理由は smp_boot_core2() のコメント参照。
+ *
+ * 戻り値:
+ *   0=起動済み/成功、-1=pthread 作成失敗
+ * コール元:
+ *   (未配線。複数コネクション scale-out の実装時に配線する)
+ */
+int smp_boot_core3(void)
+{
+    if (g_core3_alive) {
+        return 0;
+    }
+    s_core3_arg.core_index = 3u;
+    s_core3_arg.hb    = &g_core3_heartbeat;
+    s_core3_arg.alive = &g_core3_alive;
+    if (pthread_create(&s_core3_thr, 0, worker_main, &s_core3_arg) != 0) {
+        return -1;
+    }
+    uint64_t start = timer_now();
+    while (!g_core3_alive) {
         if (timeout_sec(start, 2u)) {
             return -1;
         }

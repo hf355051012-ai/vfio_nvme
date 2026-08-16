@@ -11,12 +11,19 @@ extern volatile int g_core1_alive;
 
 int smp_boot_core1(void);
 
-/* core2用。g_core1_*と同じ規約(単一ライタ=core2、複数リーダ=smpstat)。 */
+/* core2/core3用。g_core1_*と同じ規約(単一ライタ=そのコア、複数リーダ)。 */
 extern volatile uint64_t g_core2_heartbeat;
 extern volatile int      g_core2_alive;
 
 extern volatile uint64_t g_core3_heartbeat;
 extern volatile int      g_core3_alive;
+
+/* core2/core3 は現時点で呼び出し元が無い。複数コネクションの受信を複数コアへ
+ * 振り分ける scale-out で使う部品として意図的に残してある(bench/tcpbench は
+ * core0+core1 の2コアで動くため配線していない)。未使用に見えても削除しないこと
+ * -- 詳細は hal_smp.c の smp_boot_core2() のコメント参照。 */
+int smp_boot_core2(void);
+int smp_boot_core3(void);
 
 #if defined(__x86_64__)
 #define SMP_MAX_CORES 4u
