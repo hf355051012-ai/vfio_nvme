@@ -7,6 +7,7 @@
 #include "timestamp.h"
 #include "smp.h"
 #include "netif.h"
+#include "crc32c.h"
 
 #define NVME_QSIZE               32u    /* admin/IO両queueのsqsize(Fabrics Connectで通知) */
 #define NVME_ADMIN_CMD_TIMEOUT_MS 5000u
@@ -50,7 +51,7 @@ static void nvme_copy_str(char *dst, size_t capacity, const char *src)
     dst[i] = '\0';
 }
 
-/*
+/*=================================================================
  * 読み出しコマンドやデータを伴わないコマンド用の SGL descriptor を SQE へ
  * 書く(NVME_SGL_TYPE_TRANSPORT)。データはトランスポート(C2HData)が運ぶ。
  *
@@ -60,7 +61,7 @@ static void nvme_copy_str(char *dst, size_t capacity, const char *src)
  * コール元:
  *   nvme_build_identify_sqe(), nvme_build_property_set/get_sqe(),
  *   nvme_build_read_sqe()
- */
+ * ===============================================================*/
 static void nvme_set_sgl(nvme_sqe_t *sqe, uint32_t len)
 {
     wr64le(&sqe->dptr[0], 0);
@@ -71,7 +72,7 @@ static void nvme_set_sgl(nvme_sqe_t *sqe, uint32_t len)
     sqe->dptr[15] = (uint8_t)NVME_SGL_TYPE_TRANSPORT;
 }
 
-/*
+/*=================================================================
  * 書き込みコマンド(Fabrics Connect 含む)用の in-capsule SGL descriptor を
  * SQE へ書く。データは Command Capsule PDU の直後に連結して送る。
  *
@@ -80,7 +81,7 @@ static void nvme_set_sgl(nvme_sqe_t *sqe, uint32_t len)
  *   len - in-capsule データ長
  * コール元:
  *   nvme_build_fabrics_connect_sqe(), nvme_build_write_sqe()
- */
+ * ===============================================================*/
 static void nvme_set_sgl_inline(nvme_sqe_t *sqe, uint32_t len)
 {
     wr64le(&sqe->dptr[0], 0);
@@ -97,6 +98,7 @@ typedef enum {
     NVEXEC_ST_RECV_CQE,
     NVEXEC_ST_RECV_C2H_REST,
     NVEXEC_ST_RECV_C2H_DATA,
+    NVEXEC_ST_RECV_C2H_DDGST,
     NVEXEC_ST_RECV_R2T_REST,
     NVEXEC_ST_SEND_H2C,
     NVEXEC_ST_DONE,
@@ -104,7 +106,7 @@ typedef enum {
 
 #define NVEXEC_STATE_NAME_COUNT (sizeof(NVEXEC_STATE_NAMES) / sizeof(NVEXEC_STATE_NAMES[0]))
 
-/*
+/*=================================================================
  * 1 コマンドの送受信サブステートマシンを初期化する。SQE 送信 -> 応答待ち
  * (RSP 直行 / C2HData / R2T->H2CData)を nvme_exec_step() が進める。
  *
@@ -116,7 +118,7 @@ typedef enum {
  *   recv_buf / recv_buflen - C2HData を受け取るバッファ
  * コール元:
  *   nvme_connect_job_step()
- */
+ * ===============================================================*/
 void nvme_exec_begin(nvme_exec_ctx_t *ec, nvme_tcp_conn_t *conn, const nvme_sqe_t *sqe,
                       const void *send_data, uint32_t send_len,
                       void *recv_buf, uint32_t recv_buflen)
@@ -130,7 +132,51 @@ void nvme_exec_begin(nvme_exec_ctx_t *ec, nvme_tcp_conn_t *conn, const nvme_sqe_
     ec->recv_buflen = recv_buflen;
 }
 
-/*
+/*=================================================================
+ * 受信済みの共通ヘッダ + 型固有部に対し、直後に続くヘッダダイジェストを
+ * 検証する(無効なら何もせず 0)。rest_buf は 型固有部 16 バイトの直後に
+ * ダイジェスト 4 バイトが並ぶ形で 1 回にまとめて受信してある。
+ *
+ * 引数:
+ *   ec - exec コンテキスト
+ * 戻り値:
+ *   0=一致、-1=不一致
+ * コール元:
+ *   nvme_exec_step()
+ * ===============================================================*/
+static int nvme_exec_check_hdgst(const nvme_exec_ctx_t *ec)
+{
+    return nvme_tcp_verify_hdgst(ec->conn, ec->hdr_buf, NVME_TCP_HDR_LEN,
+                                  ec->rest_buf, NVME_CQE_LEN, &ec->rest_buf[NVME_CQE_LEN]);
+}
+
+/*=================================================================
+ * C2HData を 1 個受け切った後の共通処理。DATA_SUCCESS フラグが立っていれば
+ * その場で完了(別途 Response Capsule は来ない)、そうでなければ次の PDU
+ * ヘッダ待ちへ戻る。データダイジェストの有無で入口が 2 つあるため関数化した。
+ *
+ * 引数:
+ *   ec - exec コンテキスト
+ * 戻り値:
+ *   1=コマンド完了、0=継続
+ * コール元:
+ *   nvme_exec_step()
+ * ===============================================================*/
+static int nvme_exec_c2h_complete(nvme_exec_ctx_t *ec)
+{
+    if (ec->hdr_buf[1] & NVME_TCP_F_DATA_SUCCESS) {
+        nvme_zero(&ec->cqe_out, sizeof(ec->cqe_out));
+        wr16le(&ec->cqe_out.cid, ec->conn->pending_cid);
+        ec->result = 0;
+        ec->state = NVEXEC_ST_DONE;
+        return 1;
+    }
+    nvme_tcp_xfer_reset(&ec->xfer, ec->hdr_buf, NVME_TCP_HDR_LEN);
+    ec->state = NVEXEC_ST_RECV_HDR;
+    return 0;
+}
+
+/*=================================================================
  * nvme_exec_begin() で始めた 1 コマンドを 1 tick 分進める。
  *
  * 引数:
@@ -139,7 +185,7 @@ void nvme_exec_begin(nvme_exec_ctx_t *ec, nvme_tcp_conn_t *conn, const nvme_sqe_
  *   1=完了(ec->cqe_out に CQE)、0=継続中、-1=エラー/タイムアウト
  * コール元:
  *   nvme_connect_job_step()
- */
+ * ===============================================================*/
 int nvme_exec_step(nvme_exec_ctx_t *ec)
 {
     switch ((nvme_exec_state_t)ec->state) {
@@ -178,14 +224,16 @@ int nvme_exec_step(nvme_exec_ctx_t *ec)
         if (r == 0) return 0;
 
         uint8_t type = ec->hdr_buf[0];
+        /* 型固有部(16)とヘッダダイジェスト(有効なら4)を1回でまとめて受ける。 */
+        uint32_t rest_len = NVME_CQE_LEN + nvme_tcp_hdgst_len(ec->conn);
         if (type == NVME_TCP_PDU_RSP) {
-            nvme_tcp_xfer_reset(&ec->xfer, ec->rest_buf, NVME_CQE_LEN);
+            nvme_tcp_xfer_reset(&ec->xfer, ec->rest_buf, rest_len);
             ec->state = NVEXEC_ST_RECV_CQE;
         } else if (type == NVME_TCP_PDU_C2H_DATA) {
-            nvme_tcp_xfer_reset(&ec->xfer, ec->rest_buf, 16u);
+            nvme_tcp_xfer_reset(&ec->xfer, ec->rest_buf, rest_len);
             ec->state = NVEXEC_ST_RECV_C2H_REST;
         } else if (type == NVME_TCP_PDU_R2T) {
-            nvme_tcp_xfer_reset(&ec->xfer, ec->rest_buf, 16u);
+            nvme_tcp_xfer_reset(&ec->xfer, ec->rest_buf, rest_len);
             ec->state = NVEXEC_ST_RECV_R2T_REST;
         } else {
             uart_printf("[!] NVMe/TCP: 未対応のPDU種別 (type=%u) 受信、応答待ちを中断\n", type);
@@ -200,6 +248,7 @@ int nvme_exec_step(nvme_exec_ctx_t *ec)
         int r = nvme_tcp_recv_poll(ec->conn, &ec->xfer);
         if (r < 0) { ec->result = -1; ec->state = NVEXEC_ST_DONE; return 1; }
         if (r == 0) return 0;
+        if (nvme_exec_check_hdgst(ec) != 0) { ec->result = -1; ec->state = NVEXEC_ST_DONE; return 1; }
 
         uint16_t cid    = rd16le(&ec->rest_buf[12]);
         uint16_t status = rd16le(&ec->rest_buf[14]);
@@ -233,13 +282,16 @@ int nvme_exec_step(nvme_exec_ctx_t *ec)
         int r = nvme_tcp_recv_poll(ec->conn, &ec->xfer);
         if (r < 0) { ec->result = -1; ec->state = NVEXEC_ST_DONE; return 1; }
         if (r == 0) return 0;
+        if (nvme_exec_check_hdgst(ec) != 0) { ec->result = -1; ec->state = NVEXEC_ST_DONE; return 1; }
 
         uint8_t  hlen = ec->hdr_buf[2];
         uint32_t plen = rd32le(&ec->hdr_buf[4]);
         ec->datao = rd32le(&ec->rest_buf[4]);
         ec->datal = rd32le(&ec->rest_buf[8]);
 
-        uint32_t data_in_pdu = plen - hlen;
+        /* plen はヘッダ・両ダイジェストを含む総長。データ本体だけを取り出す。 */
+        uint32_t data_in_pdu = plen - hlen - nvme_tcp_hdgst_len(ec->conn)
+                                    - nvme_tcp_ddgst_len(ec->conn, ec->datal);
         if (data_in_pdu != ec->datal) {
             uart_printf("[!] NVMe/TCP: C2HDataのplen/datal不一致 (plen=%u datal=%u)\n",
                         plen, ec->datal);
@@ -261,7 +313,6 @@ int nvme_exec_step(nvme_exec_ctx_t *ec)
         if (r < 0) { ec->result = -1; ec->state = NVEXEC_ST_DONE; return 1; }
         if (r == 0) return 0;
 
-        uint8_t flags = ec->hdr_buf[1];
         /* NRCV: C2HData受信完了。 */
         {
             volatile ts_nvme_pdu_t info = {0};
@@ -274,22 +325,30 @@ int nvme_exec_step(nvme_exec_ctx_t *ec)
             info.data_length = ec->datal;
             ts_log_nvme_tcp_pdu(TS_MK(TS_FILE_NVME, TS_FUNC_nvme_exec_step, 2), &info);
         }
-        if (flags & NVME_TCP_F_DATA_SUCCESS) {
-            nvme_zero(&ec->cqe_out, sizeof(ec->cqe_out));
-            wr16le(&ec->cqe_out.cid, ec->conn->pending_cid);
-            ec->result = 0;
-            ec->state = NVEXEC_ST_DONE;
-            return 1;
+        if (nvme_tcp_ddgst_len(ec->conn, ec->datal) != 0u) {
+            nvme_tcp_xfer_reset(&ec->xfer, ec->dgst_buf, NVME_TCP_DGST_LEN);
+            ec->state = NVEXEC_ST_RECV_C2H_DDGST;
+            return 0;
         }
-        nvme_tcp_xfer_reset(&ec->xfer, ec->hdr_buf, NVME_TCP_HDR_LEN);
-        ec->state = NVEXEC_ST_RECV_HDR;
-        return 0;
+        return nvme_exec_c2h_complete(ec);
+    }
+
+    case NVEXEC_ST_RECV_C2H_DDGST: {
+        int r = nvme_tcp_recv_poll(ec->conn, &ec->xfer);
+        if (r < 0) { ec->result = -1; ec->state = NVEXEC_ST_DONE; return 1; }
+        if (r == 0) return 0;
+        if (nvme_tcp_verify_ddgst(ec->conn, (const uint8_t *)ec->recv_buf + ec->datao,
+                                   ec->datal, ec->dgst_buf) != 0) {
+            ec->result = -1; ec->state = NVEXEC_ST_DONE; return 1;
+        }
+        return nvme_exec_c2h_complete(ec);
     }
 
     case NVEXEC_ST_RECV_R2T_REST: {
         int r = nvme_tcp_recv_poll(ec->conn, &ec->xfer);
         if (r < 0) { ec->result = -1; ec->state = NVEXEC_ST_DONE; return 1; }
         if (r == 0) return 0;
+        if (nvme_exec_check_hdgst(ec) != 0) { ec->result = -1; ec->state = NVEXEC_ST_DONE; return 1; }
 
         ec->ttag  = rd16le(&ec->rest_buf[2]);
         ec->datao = rd32le(&ec->rest_buf[4]);  /* r2to(SEND_H2Cへそのまま渡す) */
@@ -339,7 +398,7 @@ int nvme_exec_step(nvme_exec_ctx_t *ec)
     }
 }
 
-/*
+/*=================================================================
  * Fabrics Property Set(fctype=0x00)の SQE を組み立てる。CC レジスタへの
  * 4 バイト書き込みに使う。
  *
@@ -349,7 +408,7 @@ int nvme_exec_step(nvme_exec_ctx_t *ec)
  *   value  - 書き込む値
  * コール元:
  *   nvme_connect_job_step()
- */
+ * ===============================================================*/
 static void nvme_build_property_set_sqe(nvme_sqe_t *sqe, uint32_t offset, uint64_t value)
 {
     nvme_zero(sqe, sizeof(*sqe));
@@ -362,7 +421,7 @@ static void nvme_build_property_set_sqe(nvme_sqe_t *sqe, uint32_t offset, uint64
     wr32le(&sqe->cdw13, (uint32_t)(value >> 32));
 }
 
-/*
+/*=================================================================
  * Fabrics Property Get(fctype=0x04)の SQE を組み立てる。読んだ値は CQE の
  * dw0 に載って返る。
  *
@@ -371,7 +430,7 @@ static void nvme_build_property_set_sqe(nvme_sqe_t *sqe, uint32_t offset, uint64
  *   offset - プロパティオフセット(CC=0x14 / CSTS=0x1c)
  * コール元:
  *   nvme_connect_job_step()
- */
+ * ===============================================================*/
 static void nvme_build_property_get_sqe(nvme_sqe_t *sqe, uint32_t offset)
 {
     nvme_zero(sqe, sizeof(*sqe));
@@ -382,7 +441,7 @@ static void nvme_build_property_get_sqe(nvme_sqe_t *sqe, uint32_t offset)
     wr32le(&sqe->cdw11, offset);
 }
 
-/*
+/*=================================================================
  * Fabrics Connect のデータペイロード(1024 バイト固定)を組み立てる
  * (admin/IO 共通)。
  *
@@ -392,7 +451,7 @@ static void nvme_build_property_get_sqe(nvme_sqe_t *sqe, uint32_t offset)
  *   subnqn - 接続先サブシステム NQN
  * コール元:
  *   nvme_connect_job_step()
- */
+ * ===============================================================*/
 static void nvme_build_connect_data(nvmf_connect_data_t *data, uint16_t cntlid, const char *subnqn)
 {
     nvme_zero(data, sizeof(*data));
@@ -402,7 +461,7 @@ static void nvme_build_connect_data(nvmf_connect_data_t *data, uint16_t cntlid, 
     nvme_copy_str(data->hostnqn, sizeof(data->hostnqn), NVME_HOST_NQN);
 }
 
-/*
+/*=================================================================
  * Fabrics Connect(fctype=0x01)の SQE を組み立てる。qid だけが admin(0)と
  * IO(1)の違い。データは in-capsule で送る。
  *
@@ -412,7 +471,7 @@ static void nvme_build_connect_data(nvmf_connect_data_t *data, uint16_t cntlid, 
  *   connect_data_len - 続けて送る connect data の長さ
  * コール元:
  *   nvme_connect_job_step()
- */
+ * ===============================================================*/
 static void nvme_build_fabrics_connect_sqe(nvme_sqe_t *sqe, uint16_t qid, uint32_t connect_data_len)
 {
     nvme_zero(sqe, sizeof(*sqe));
@@ -424,7 +483,7 @@ static void nvme_build_fabrics_connect_sqe(nvme_sqe_t *sqe, uint16_t qid, uint32
     wr32le(&sqe->cdw12, 0u);
 }
 
-/*
+/*=================================================================
  * Identify コマンドの SQE を組み立てる。
  *
  * 引数:
@@ -433,7 +492,7 @@ static void nvme_build_fabrics_connect_sqe(nvme_sqe_t *sqe, uint16_t qid, uint32
  *   nsid - 名前空間 ID
  * コール元:
  *   nvme_connect_job_step()
- */
+ * ===============================================================*/
 void nvme_build_identify_sqe(nvme_sqe_t *sqe, uint8_t cns, uint32_t nsid)
 {
     nvme_zero(sqe, sizeof(*sqe));
@@ -443,7 +502,7 @@ void nvme_build_identify_sqe(nvme_sqe_t *sqe, uint8_t cns, uint32_t nsid)
     wr32le(&sqe->cdw10, (uint32_t)cns);  /* CNS: bits[7:0]、残りは予約 */
 }
 
-/*
+/*=================================================================
  * Identify Namespace 応答から LBA サイズ(flbas が指す LBAF の lbads)と
  * 総ブロック数(NSZE)を取り出してコンテキストへ記録する。
  *
@@ -453,7 +512,7 @@ void nvme_build_identify_sqe(nvme_sqe_t *sqe, uint8_t cns, uint32_t nsid)
  *   buf4096  - Identify Namespace の応答データ
  * コール元:
  *   nvme_connect_job_step()
- */
+ * ===============================================================*/
 void nvme_update_lba_size_from_id_ns(nvme_ctx_t *ctx, uint32_t nsid, const void *buf4096)
 {
     const uint8_t *b = buf4096;
@@ -467,14 +526,14 @@ void nvme_update_lba_size_from_id_ns(nvme_ctx_t *ctx, uint32_t nsid, const void 
                 nsid, flbas, ctx->lba_size, (unsigned)ctx->nsze);
 }
 
-/*
+/*=================================================================
  * Set Features(Number of Queues)の SQE を組み立てる。
  *
  * 引数:
  *   sqe - 対象 SQE
  * コール元:
  *   nvme_connect_job_step()
- */
+ * ===============================================================*/
 static void nvme_build_set_features_num_queues_sqe(nvme_sqe_t *sqe)
 {
     nvme_zero(sqe, sizeof(*sqe));
@@ -535,7 +594,7 @@ static job_result_t nvme_connect_job_fail(nvme_connect_job_ctx_t *jc, int close_
     return JOB_DONE;
 }
 
-/*
+/*=================================================================
  * NVMe/TCP initiator の接続シーケンス 1 tick。admin TCP 接続 -> ICReq/ICResp
  * -> Fabrics Connect -> CC 有効化 -> CSTS.RDY 待ち -> Identify
  * Controller/Namespace -> Set Features -> IO キューについて同じ手順、と進む。
@@ -546,7 +605,7 @@ static job_result_t nvme_connect_job_fail(nvme_connect_job_ctx_t *jc, int close_
  *   JOB_WAITING=継続、JOB_DONE=接続完了/失敗で終了
  * コール元:
  *   job_scheduler_tick() から関数ポインタ経由
- */
+ * ===============================================================*/
 static job_result_t nvme_connect_job_step(job_t *self)
 {
     nvme_connect_job_ctx_t *jc  = (nvme_connect_job_ctx_t *)self->ctx;
@@ -770,7 +829,7 @@ static job_result_t nvme_connect_job_step(job_t *self)
     }
 }
 
-/*
+/*=================================================================
  * 接続シーケンスをジョブとして起動し、即座に呼び出し元へ返る(完了は
  * ctx->busy が 0 になったかで判定する)。同一コンテキストで既に実行中なら
  * 起動を拒否する。
@@ -784,7 +843,7 @@ static job_result_t nvme_connect_job_step(job_t *self)
  *   0=起動した、-1=実行中/ジョブテーブル満杯
  * コール元:
  *   shell_ensure_tcp_session()
- */
+ * ===============================================================*/
 int nvme_connect_job_start(nvme_ctx_t *ctx, uint32_t ip, uint16_t port, const char *subnqn)
 {
     if (ctx->busy) {
@@ -804,6 +863,10 @@ int nvme_connect_job_start(nvme_ctx_t *ctx, uint32_t ip, uint16_t port, const ch
     ctx->ctrlr_id     = NVME_CNTLID_DYNAMIC;
     ctx->lba_size     = 512u;  /* nvme_update_lba_size_from_id_ns()が上書きするまでの暫定値 */
     nvme_copy_str(ctx->subnqn, sizeof(ctx->subnqn), subnqn);
+    /* ICReq で要求するダイジェストを admin/IO 両キューへ配る(実際に有効に
+     * なるかは ICResp の合意結果次第)。 */
+    ctx->admin.req_hdgst = ctx->io.req_hdgst = ctx->req_hdgst;
+    ctx->admin.req_ddgst = ctx->io.req_ddgst = ctx->req_ddgst;
     ctx->busy = 1;
 
     s_nvme_connect_job_ctx.ctx     = ctx;
@@ -821,7 +884,7 @@ int nvme_connect_job_start(nvme_ctx_t *ctx, uint32_t ip, uint16_t port, const ch
     return 0;
 }
 
-/*
+/*=================================================================
  * Read コマンドの SQE を組み立てる。
  *
  * 引数:
@@ -832,7 +895,7 @@ int nvme_connect_job_start(nvme_ctx_t *ctx, uint32_t ip, uint16_t port, const ch
  *   total_len - 転送バイト数
  * コール元:
  *   nvme_read_pipelined_run()
- */
+ * ===============================================================*/
 void nvme_build_read_sqe(nvme_sqe_t *sqe, uint32_t nsid, uint64_t slba, uint32_t nlb, uint32_t total_len)
 {
     nvme_zero(sqe, sizeof(*sqe));
@@ -844,7 +907,7 @@ void nvme_build_read_sqe(nvme_sqe_t *sqe, uint32_t nsid, uint64_t slba, uint32_t
     wr32le(&sqe->cdw12, (uint32_t)(nlb - 1) & 0xFFFFu);    /* NLB(0's based) */
 }
 
-/*
+/*=================================================================
  * Write コマンドの SQE を組み立てる(データは in-capsule で送るため
  * SGL は inline 型)。
  *
@@ -852,7 +915,7 @@ void nvme_build_read_sqe(nvme_sqe_t *sqe, uint32_t nsid, uint64_t slba, uint32_t
  *   sqe / nsid / slba / nlb / total_len - nvme_build_read_sqe() と同じ
  * コール元:
  *   nvme_write_pipelined_run()
- */
+ * ===============================================================*/
 void nvme_build_write_sqe(nvme_sqe_t *sqe, uint32_t nsid, uint64_t slba, uint32_t nlb, uint32_t total_len)
 {
     nvme_zero(sqe, sizeof(*sqe));
@@ -892,9 +955,10 @@ typedef enum {
 static nvme_pipeline_rx_state_t s_pl_rx_state;
 static nvme_tcp_xfer_t          s_pl_xfer;
 static uint8_t                  s_pl_hdr_buf[NVME_TCP_HDR_LEN];
-static uint8_t                  s_pl_rest_buf[16];
+/* 型固有部(16)+ヘッダダイジェスト(4)を1回でまとめて受ける。 */
+static uint8_t                  s_pl_rest_buf[16 + 4];
 
-/*
+/*=================================================================
  * write パイプラインの送信済み・未完了スロットから cid が一致するものを探す。
  *
  * 引数:
@@ -903,7 +967,7 @@ static uint8_t                  s_pl_rest_buf[16];
  *   スロット番号。見つからなければ -1
  * コール元:
  *   nvme_pipeline_rx_tick()
- */
+ * ===============================================================*/
 static int nvme_pipeline_find_slot(uint16_t cid)
 {
     for (unsigned i = 0; i < NVME_IO_QDEPTH; i++) {
@@ -913,6 +977,39 @@ static int nvme_pipeline_find_slot(uint16_t cid)
         }
     }
     return -1;
+}
+
+/*=================================================================
+ * write パイプラインの未完了スロットを全て失敗にする(受信エラーや
+ * ダイジェスト不一致で、以後ストリームの同期を保証できなくなったとき)。
+ *
+ * コール元:
+ *   nvme_pipeline_rx_tick()
+ * ===============================================================*/
+static void nvme_pipeline_fail_all_slots(void)
+{
+    for (unsigned i = 0; i < NVME_IO_QDEPTH; i++) {
+        if (s_pl_slots[i].in_use && s_pl_slots[i].sent && !s_pl_slots[i].done) {
+            s_pl_slots[i].done   = 1;
+            s_pl_slots[i].result = -1;
+        }
+    }
+}
+
+/*=================================================================
+ * write パイプラインで受信した PDU のヘッダダイジェストを検証する。
+ *
+ * 引数:
+ *   ctx - initiator コンテキスト
+ * 戻り値:
+ *   0=一致(無効時も 0)、-1=不一致
+ * コール元:
+ *   nvme_pipeline_rx_tick()
+ * ===============================================================*/
+static int nvme_pipeline_check_hdgst(const nvme_ctx_t *ctx)
+{
+    return nvme_tcp_verify_hdgst(&ctx->io, s_pl_hdr_buf, NVME_TCP_HDR_LEN,
+                                  s_pl_rest_buf, NVME_CQE_LEN, &s_pl_rest_buf[NVME_CQE_LEN]);
 }
 
 typedef struct {
@@ -929,7 +1026,7 @@ static nvme_h2c_pending_t s_h2c_pending[NVME_H2C_PENDING_MAX];
 static unsigned s_h2c_pending_head;
 static unsigned s_h2c_pending_count;
 
-/*
+/*=================================================================
  * 受信した R2T を H2CData 送信待ちの FIFO へ積む(送信自体は
  * nvme_pipeline_h2c_pump() が行うので、受信ループはブロックしない)。
  *
@@ -941,7 +1038,7 @@ static unsigned s_h2c_pending_count;
  *   0=積めた、-1=キュー満杯
  * コール元:
  *   nvme_pipeline_rx_tick()
- */
+ * ===============================================================*/
 static int nvme_h2c_pending_push(int slot, uint16_t cid, uint16_t ttag, uint32_t r2to, uint32_t r2tl)
 {
     if (s_h2c_pending_count >= NVME_H2C_PENDING_MAX) {
@@ -958,7 +1055,7 @@ static int nvme_h2c_pending_push(int slot, uint16_t cid, uint16_t ttag, uint32_t
     return 0;
 }
 
-/*
+/*=================================================================
  * write パイプラインの受信側 1 tick。到着済み PDU を非ブロッキングで 1 段
  * だけ処理し、CQE ならスロットを完了に、R2T なら送信 FIFO へ積む。
  *
@@ -966,17 +1063,12 @@ static int nvme_h2c_pending_push(int slot, uint16_t cid, uint16_t ttag, uint32_t
  *   ctx - initiator コンテキスト
  * コール元:
  *   nvme_write_pipelined_run()
- */
+ * ===============================================================*/
 static void nvme_pipeline_rx_tick(nvme_ctx_t *ctx)
 {
     int r = nvme_tcp_recv_poll(&ctx->io, &s_pl_xfer);
     if (r < 0) {
-        for (unsigned i = 0; i < NVME_IO_QDEPTH; i++) {
-            if (s_pl_slots[i].in_use && s_pl_slots[i].sent && !s_pl_slots[i].done) {
-                s_pl_slots[i].done   = 1;
-                s_pl_slots[i].result = -1;
-            }
-        }
+        nvme_pipeline_fail_all_slots();
         return;
     }
     if (r == 0) {
@@ -992,11 +1084,13 @@ static void nvme_pipeline_rx_tick(nvme_ctx_t *ctx)
         ts_log(TS_MK(TS_FILE_NVME, TS_FUNC_nvme_pipeline_rx_tick, 1),
                ((uint32_t)type << 24) | ((uint32_t)s_pl_hdr_buf[2] << 16) |
                ((uint32_t)rd32le(&s_pl_hdr_buf[4]) & 0xFFFFu));
+        /* 型固有部(16)とヘッダダイジェスト(有効なら4)を1回でまとめて受ける。 */
+        uint32_t rest_len = NVME_CQE_LEN + nvme_tcp_hdgst_len(&ctx->io);
         if (type == NVME_TCP_PDU_RSP) {
-            nvme_tcp_xfer_reset(&s_pl_xfer, s_pl_rest_buf, NVME_CQE_LEN);
+            nvme_tcp_xfer_reset(&s_pl_xfer, s_pl_rest_buf, rest_len);
             s_pl_rx_state = PL_RX_RSP_REST;
         } else if (type == NVME_TCP_PDU_R2T) {
-            nvme_tcp_xfer_reset(&s_pl_xfer, s_pl_rest_buf, 16u);
+            nvme_tcp_xfer_reset(&s_pl_xfer, s_pl_rest_buf, rest_len);
             s_pl_rx_state = PL_RX_R2T_REST;
         } else {
             uart_printf("[!] nvme pipeline: 未対応のPDU種別 (type=%u)、読み捨てて再同期を試みます\n", type);
@@ -1007,6 +1101,10 @@ static void nvme_pipeline_rx_tick(nvme_ctx_t *ctx)
     }
 
     case PL_RX_RSP_REST: {
+        if (nvme_pipeline_check_hdgst(ctx) != 0) {
+            nvme_pipeline_fail_all_slots();
+            return;
+        }
         uint16_t cid    = rd16le(&s_pl_rest_buf[12]);
         uint16_t status = rd16le(&s_pl_rest_buf[14]);
         /* NRCV: Response Capsule(CQE)受信完了(write pipeline)。 */
@@ -1033,6 +1131,10 @@ static void nvme_pipeline_rx_tick(nvme_ctx_t *ctx)
     }
 
     case PL_RX_R2T_REST: {
+        if (nvme_pipeline_check_hdgst(ctx) != 0) {
+            nvme_pipeline_fail_all_slots();
+            return;
+        }
         uint16_t cccid = rd16le(&s_pl_rest_buf[0]);
         uint16_t ttag  = rd16le(&s_pl_rest_buf[2]);
         uint32_t r2to  = rd32le(&s_pl_rest_buf[4]);
@@ -1080,12 +1182,12 @@ typedef struct {
 
 static nvme_h2c_cursor_t s_h2c_cursor;
 
-/*
+/*=================================================================
  * H2CData 送信 FIFO と送信カーソルを初期状態へ戻す(ベンチ開始時)。
  *
  * コール元:
  *   nvme_write_pipelined_run()
- */
+ * ===============================================================*/
 static void nvme_h2c_pipeline_reset(void)
 {
     s_h2c_pending_head  = 0;
@@ -1096,7 +1198,7 @@ static void nvme_h2c_pipeline_reset(void)
     s_h2c_cursor.active = 0;
 }
 
-/*
+/*=================================================================
  * H2CData 送信 FIFO から 1 件取り出し、ヘッダ + データを MSS 単位で
  * tcp_send_async() へ非ブロッキングにキューする。1 PDU 分は必ず連続して
  * キューし切ってから次へ進む(PDU をバイト単位でインターリーブしてはならない)。
@@ -1105,7 +1207,7 @@ static void nvme_h2c_pipeline_reset(void)
  *   ctx - initiator コンテキスト
  * コール元:
  *   nvme_write_pipelined_run()
- */
+ * ===============================================================*/
 static void nvme_pipeline_h2c_pump(nvme_ctx_t *ctx)
 {
     if (!s_h2c_cursor.active) {
@@ -1126,18 +1228,24 @@ static void nvme_pipeline_h2c_pump(nvme_ctx_t *ctx)
         s_h2c_pending_count--;
     }
 
+    uint32_t hd = nvme_tcp_hdgst_len(&ctx->io);
+    uint32_t dd = nvme_tcp_ddgst_len(&ctx->io, s_h2c_cursor.r2tl);
+
     if (!s_h2c_cursor.header_sent) {
-        uint8_t hdr[NVME_TCP_DATA_PDU_LEN];
+        uint8_t hdr[NVME_TCP_DATA_PDU_LEN + NVME_TCP_DGST_LEN];
         hdr[0] = NVME_TCP_PDU_H2C_DATA;
-        hdr[1] = NVME_TCP_F_DATA_LAST;
+        hdr[1] = (uint8_t)(NVME_TCP_F_DATA_LAST |
+                           (ctx->io.hdgst ? NVME_TCP_F_HDGST : 0u) |
+                           (dd ? NVME_TCP_F_DDGST : 0u));
         hdr[2] = (uint8_t)NVME_TCP_DATA_PDU_LEN;
-        hdr[3] = (uint8_t)NVME_TCP_DATA_PDU_LEN;  /* pdo: データはこのPDU内の固定部直後 */
-        wr32le(&hdr[4], NVME_TCP_DATA_PDU_LEN + s_h2c_cursor.r2tl);
+        hdr[3] = (uint8_t)(NVME_TCP_DATA_PDU_LEN + hd);  /* pdo: データはヘッダ(+hdgst)直後 */
+        wr32le(&hdr[4], NVME_TCP_DATA_PDU_LEN + hd + s_h2c_cursor.r2tl + dd);
         wr16le(&hdr[8],  s_h2c_cursor.cid);
         wr16le(&hdr[10], s_h2c_cursor.ttag);
         wr32le(&hdr[12], s_h2c_cursor.r2to);
         wr32le(&hdr[16], s_h2c_cursor.r2tl);
         wr32le(&hdr[20], 0);  /* reserved */
+        nvme_tcp_append_hdgst(&ctx->io, hdr, NVME_TCP_DATA_PDU_LEN);
         {
             volatile ts_nvme_pdu_t info = {0};
             info.pdu_type    = hdr[0];
@@ -1150,7 +1258,7 @@ static void nvme_pipeline_h2c_pump(nvme_ctx_t *ctx)
             info.data_length = s_h2c_cursor.r2tl;
             ts_log_nvme_tcp_pdu(TS_MK(TS_FILE_NVME, TS_FUNC_nvme_pipeline_h2c_pump, 0), &info);
         }
-        if (tcp_send_async(&ctx->io.tcp, hdr, (uint16_t)NVME_TCP_DATA_PDU_LEN) < 0) {
+        if (tcp_send_async(&ctx->io.tcp, hdr, (uint16_t)(NVME_TCP_DATA_PDU_LEN + hd)) < 0) {
             uart_printf("[!] nvme pipeline: H2CDataヘッダ送信失敗 (cid=%u)\n", s_h2c_cursor.cid);
             s_pl_slots[s_h2c_cursor.slot].done   = 1;
             s_pl_slots[s_h2c_cursor.slot].result = -1;
@@ -1179,13 +1287,27 @@ static void nvme_pipeline_h2c_pump(nvme_ctx_t *ctx)
         }
         s_h2c_cursor.queued += (uint32_t)rc;
     }
+    if (dd) {
+        /* データはゼロコピーで送るので、ダイジェストは送信元バッファから
+         * まとめて計算して 4 バイトだけ追加でキューする。 */
+        uint8_t d[NVME_TCP_DGST_LEN];
+        wr32le(d, ~crc32c(0xFFFFFFFFu, src + s_h2c_cursor.r2to, s_h2c_cursor.r2tl));
+        if (tcp_send_async(&ctx->io.tcp, d, (uint16_t)NVME_TCP_DGST_LEN) < 0) {
+            uart_printf("[!] nvme pipeline: H2CDataダイジェスト送信失敗 (cid=%u)\n",
+                        s_h2c_cursor.cid);
+            s_pl_slots[s_h2c_cursor.slot].done   = 1;
+            s_pl_slots[s_h2c_cursor.slot].result = -1;
+            s_h2c_cursor.active = 0;
+            return;
+        }
+    }
     ts_log(TS_MK(TS_FILE_NVME, TS_FUNC_nvme_pipeline_h2c_pump, 2), s_h2c_cursor.cid);
 
     /* このPDUは完全にキューし終えた -- 次回の呼び出しで次のPDU(あれば)へ進む。 */
     s_h2c_cursor.active = 0;
 }
 
-/*
+/*=================================================================
  * ベンチのコマンドごとに開始 LBA を nlb ずつ進め、名前空間の終端を超えたら
  * 開始位置へ戻す(fio のシーケンシャルアクセスと条件を揃えるため)。
  *
@@ -1198,7 +1320,7 @@ static void nvme_pipeline_h2c_pump(nvme_ctx_t *ctx)
  *   次のコマンドで使う LBA
  * コール元:
  *   nvme_write_pipelined_run(), nvme_read_pipelined_run()
- */
+ * ===============================================================*/
 static uint64_t nvme_bench_next_lba(const nvme_ctx_t *ctx, uint64_t cur,
                                     uint64_t base, uint32_t nlb)
 {
@@ -1209,7 +1331,7 @@ static uint64_t nvme_bench_next_lba(const nvme_ctx_t *ctx, uint64_t cur,
     return next;
 }
 
-/*
+/*=================================================================
  * NVMe/TCP write を NVME_IO_QDEPTH 本まで同時 outstanding にして
  * duration_ms のあいだ回し続け、実行回数とバイト数を返す。SQE は非同期
  * 送信、R2T 受信と H2CData 送信は FIFO を介して分離してある。
@@ -1226,7 +1348,7 @@ static uint64_t nvme_bench_next_lba(const nvme_ctx_t *ctx, uint64_t cur,
  *   0=正常終了、-1=エラー
  * コール元:
  *   tcp_measure()
- */
+ * ===============================================================*/
 int nvme_write_pipelined_run(nvme_ctx_t *ctx, uint32_t nsid, uint64_t lba,
                               const void *buf, uint32_t nlb, uint32_t duration_ms,
                               uint32_t *out_count, uint64_t *out_bytes, uint32_t *out_elapsed_ms)
@@ -1363,18 +1485,21 @@ typedef enum {
     PL_READ_RX_RSP_REST,
     PL_READ_RX_C2H_REST,
     PL_READ_RX_C2H_DATA,
+    PL_READ_RX_C2H_DDGST,
 } nvme_pipeline_read_rx_state_t;
 
 static uint8_t s_pl_read_discard_buf[262144] __attribute__((aligned(64)));
 
-typedef enum { NRX_HDR, NRX_PSH, NRX_DATA } nvme_read_prx_phase_t;
+typedef enum { NRX_HDR, NRX_PSH, NRX_HDGST, NRX_DATA, NRX_DDGST } nvme_read_prx_phase_t;
 
 typedef struct {
     nvme_pipeline_read_slot_t     slots[NVME_IO_QDEPTH];
     nvme_pipeline_read_rx_state_t rx_state;
     nvme_tcp_xfer_t               xfer;
     uint8_t                       hdr_buf[NVME_TCP_HDR_LEN];
-    uint8_t                       rest_buf[16];
+    /* 型固有部(16)+ヘッダダイジェスト(4)を1回でまとめて受ける。 */
+    uint8_t                       rest_buf[16 + 4];
+    uint8_t                       dgst_buf[4];  /* データダイジェストの受信先 */
     int                           cur_slot;
     uint16_t                      cur_cccid;
     uint32_t                      cur_datao;
@@ -1390,10 +1515,14 @@ typedef struct {
     uint32_t  nrx_data_off, nrx_data_need;
     int       nrx_slot;
     int       nrx_error;
+    /* push型でのダイジェスト受信/照合。データはコピーしながら逐次CRCを積む。 */
+    uint8_t   nrx_dgst[4];
+    uint32_t  nrx_dgst_off;
+    uint32_t  nrx_ddgst_crc;
 } nvme_rd_state_t;
 static nvme_rd_state_t s_rd[SMP_MAX_CORES];
 
-/*
+/*=================================================================
  * read パイプラインの送信済み・未完了スロットから cid が一致するものを探す。
  *
  * 引数:
@@ -1402,7 +1531,7 @@ static nvme_rd_state_t s_rd[SMP_MAX_CORES];
  *   スロット番号。見つからなければ -1
  * コール元:
  *   nvme_read_rx_upcall(), nvme_pipeline_read_rx_tick()
- */
+ * ===============================================================*/
 static int nvme_pipeline_read_find_slot(uint16_t cid)
 {
     nvme_rd_state_t *rd = &s_rd[smp_core_index()];
@@ -1415,7 +1544,7 @@ static int nvme_pipeline_read_find_slot(uint16_t cid)
     return -1;
 }
 
-/*
+/*=================================================================
  * read パイプラインの push 型受信ハンドラ。tcp_input() から in-order データ
  * をその場で受け取り、C2HData のヘッダを解析してデータ本体を受信先へ直接
  * 配置する(rx_buf を経由しない 1 コピー)。
@@ -1426,10 +1555,124 @@ static int nvme_pipeline_read_find_slot(uint16_t cid)
  *   len  - そのバイト数
  * コール元:
  *   tcp_input() から tcp_recv_upcall として
- */
+ * ===============================================================*/
+/*=================================================================
+ * read パイプラインの未完了スロットを全て失敗にする(受信エラーや
+ * ダイジェスト不一致で、以後ストリームの同期を保証できなくなったとき)。
+ *
+ * 引数:
+ *   rd - このコアの read パイプライン状態
+ * コール元:
+ *   nvme_pipeline_read_rx_tick()
+ * ===============================================================*/
+static void nvme_read_fail_all_slots(nvme_rd_state_t *rd)
+{
+    for (unsigned i = 0; i < NVME_IO_QDEPTH; i++) {
+        if (rd->slots[i].in_use && rd->slots[i].sent && !rd->slots[i].done) {
+            rd->slots[i].done   = 1;
+            rd->slots[i].result = -1;
+        }
+    }
+}
+
+/*=================================================================
+ * read パイプライン(pull 型)で受信した PDU のヘッダダイジェストを検証する。
+ *
+ * 引数:
+ *   ctx - initiator コンテキスト
+ *   rd  - このコアの read パイプライン状態
+ * 戻り値:
+ *   0=一致(無効時も 0)、-1=不一致
+ * コール元:
+ *   nvme_pipeline_read_rx_tick()
+ * ===============================================================*/
+static int nvme_read_check_hdgst(const nvme_ctx_t *ctx, const nvme_rd_state_t *rd)
+{
+    return nvme_tcp_verify_hdgst(&ctx->io, rd->hdr_buf, NVME_TCP_HDR_LEN,
+                                  rd->rest_buf, NVME_CQE_LEN, &rd->rest_buf[NVME_CQE_LEN]);
+}
+
+/*=================================================================
+ * C2HData を 1 個受け切った後の共通処理(pull 型)。DATA_SUCCESS が立って
+ * いればスロットを完了させ、次の PDU ヘッダ待ちへ戻る。データダイジェストの
+ * 有無で入口が 2 つあるため関数化した。
+ *
+ * 引数:
+ *   rd - このコアの read パイプライン状態
+ * コール元:
+ *   nvme_pipeline_read_rx_tick()
+ * ===============================================================*/
+static void nvme_read_c2h_complete(nvme_rd_state_t *rd)
+{
+    if (rd->cur_slot >= 0 && (rd->hdr_buf[1] & NVME_TCP_F_DATA_SUCCESS)) {
+        rd->slots[rd->cur_slot].done   = 1;
+        rd->slots[rd->cur_slot].result = 0;
+    }
+    nvme_tcp_xfer_reset(&rd->xfer, rd->hdr_buf, NVME_TCP_HDR_LEN);
+    rd->rx_state = PL_READ_RX_HDR;
+}
+
+static void nvme_read_prx_finish_pdu(nvme_rd_state_t *rd)
+{
+    if (rd->nrx_slot >= 0 && (rd->nrx_hdr[1] & NVME_TCP_F_DATA_SUCCESS)) {
+        rd->slots[rd->nrx_slot].done = 1;
+        rd->slots[rd->nrx_slot].result = 0;
+    }
+    rd->nrx_phase = NRX_HDR;
+    rd->nrx_hdr_off = 0;
+}
+
+/*=================================================================
+ * push 型受信で、共通ヘッダ + 型固有部(+ヘッダダイジェスト)を読み切った
+ * 時点の分岐。C2HData ならデータ受信の準備をし、Response Capsule なら
+ * その場でスロットを完了させる。
+ *
+ * 引数:
+ *   ctx - initiator コンテキスト(ダイジェスト設定の参照に使う)
+ *   rd  - このコアの read パイプライン状態
+ * コール元:
+ *   nvme_read_rx_upcall()
+ * ===============================================================*/
+static void nvme_read_prx_dispatch(nvme_ctx_t *ctx, nvme_rd_state_t *rd)
+{
+    if (rd->nrx_type == NVME_TCP_PDU_C2H_DATA) {
+        uint16_t cccid = rd16le(&rd->nrx_psh[0]);
+        uint32_t datao = rd32le(&rd->nrx_psh[4]);
+        uint32_t datal = rd32le(&rd->nrx_psh[8]);
+        int slot = nvme_pipeline_read_find_slot(cccid);
+        if (slot < 0 || (uint64_t)datao + (uint64_t)datal > (uint64_t)rd->slots[slot].len) {
+            if (slot >= 0) { rd->slots[slot].done = 1; rd->slots[slot].result = -1; }
+            rd->nrx_slot = -1;   /* データは読み捨て(下記でコピーせず消費のみ) */
+        } else {
+            rd->nrx_slot = slot;
+            rd->nrx_data_dst = (volatile uint8_t *)rd->slots[slot].data + datao;
+        }
+        rd->nrx_data_need = datal;
+        if (datal == 0u) {
+            nvme_read_prx_finish_pdu(rd);
+        } else {
+            rd->nrx_data_off = 0;
+            rd->nrx_ddgst_crc = 0xFFFFFFFFu;
+            rd->nrx_phase = NRX_DATA;
+        }
+    } else if (rd->nrx_type == NVME_TCP_PDU_RSP) {
+        uint16_t cid    = rd16le(&rd->nrx_psh[12]);
+        uint16_t status = rd16le(&rd->nrx_psh[14]);
+        int slot = nvme_pipeline_read_find_slot(cid);
+        if (slot >= 0) {
+            rd->slots[slot].done = 1;
+            rd->slots[slot].result = (int)nvme_cqe_status_code(status);
+        }
+        rd->nrx_phase = NRX_HDR; rd->nrx_hdr_off = 0;
+    } else {
+        rd->nrx_error = 1;
+    }
+    (void)ctx;
+}
+
 static void nvme_read_rx_upcall(void *arg, const volatile uint8_t *data, uint16_t len)
 {
-    (void)arg;
+    nvme_ctx_t *ctx = (nvme_ctx_t *)arg;
     nvme_rd_state_t *rd = &s_rd[smp_core_index()];
     uint32_t i = 0;
     while (i < (uint32_t)len && !rd->nrx_error) {
@@ -1457,39 +1700,28 @@ static void nvme_read_rx_upcall(void *arg, const volatile uint8_t *data, uint16_
             rd->nrx_psh_off += take; i += take;
             if (rd->nrx_psh_off < rd->nrx_psh_need) break;
 
-            if (rd->nrx_type == NVME_TCP_PDU_C2H_DATA) {
-                uint16_t cccid = rd16le(&rd->nrx_psh[0]);
-                uint32_t datao = rd32le(&rd->nrx_psh[4]);
-                uint32_t datal = rd32le(&rd->nrx_psh[8]);
-                int slot = nvme_pipeline_read_find_slot(cccid);
-                if (slot < 0 || (uint64_t)datao + (uint64_t)datal > (uint64_t)rd->slots[slot].len) {
-                    if (slot >= 0) { rd->slots[slot].done = 1; rd->slots[slot].result = -1; }
-                    rd->nrx_slot = -1;   /* データは読み捨て(下記でコピーせず消費のみ) */
-                } else {
-                    rd->nrx_slot = slot;
-                    rd->nrx_data_dst = (volatile uint8_t *)rd->slots[slot].data + datao;
-                }
-                rd->nrx_data_need = datal;
-                if (datal == 0u) {
-                    if (rd->nrx_slot >= 0 && (rd->nrx_hdr[1] & NVME_TCP_F_DATA_SUCCESS)) {
-                        rd->slots[rd->nrx_slot].done = 1; rd->slots[rd->nrx_slot].result = 0;
-                    }
-                    rd->nrx_phase = NRX_HDR; rd->nrx_hdr_off = 0;
-                } else {
-                    rd->nrx_data_off = 0; rd->nrx_phase = NRX_DATA;
-                }
-            } else if (rd->nrx_type == NVME_TCP_PDU_RSP) {
-                uint16_t cid    = rd16le(&rd->nrx_psh[12]);
-                uint16_t status = rd16le(&rd->nrx_psh[14]);
-                int slot = nvme_pipeline_read_find_slot(cid);
-                if (slot >= 0) {
-                    rd->slots[slot].done = 1;
-                    rd->slots[slot].result = (int)nvme_cqe_status_code(status);
-                }
-                rd->nrx_phase = NRX_HDR; rd->nrx_hdr_off = 0;
+            if (nvme_tcp_hdgst_len(&ctx->io) != 0u) {
+                rd->nrx_dgst_off = 0;
+                rd->nrx_phase = NRX_HDGST;
             } else {
-                rd->nrx_error = 1;
+                nvme_read_prx_dispatch(ctx, rd);
             }
+            break;
+        }
+        case NRX_HDGST: {
+            uint32_t take = NVME_TCP_DGST_LEN - rd->nrx_dgst_off;
+            uint32_t avail = (uint32_t)len - i;
+            if (take > avail) take = avail;
+            for (uint32_t k = 0; k < take; k++) rd->nrx_dgst[rd->nrx_dgst_off + k] = data[i + k];
+            rd->nrx_dgst_off += take; i += take;
+            if (rd->nrx_dgst_off < NVME_TCP_DGST_LEN) break;
+
+            if (nvme_tcp_verify_hdgst(&ctx->io, rd->nrx_hdr, NVME_TCP_HDR_LEN,
+                                       rd->nrx_psh, rd->nrx_psh_need, rd->nrx_dgst) != 0) {
+                rd->nrx_error = 1;
+                break;
+            }
+            nvme_read_prx_dispatch(ctx, rd);
             break;
         }
         case NRX_DATA: {
@@ -1499,20 +1731,46 @@ static void nvme_read_rx_upcall(void *arg, const volatile uint8_t *data, uint16_
             if (rd->nrx_slot >= 0) {
                 volatile_fast_copy(rd->nrx_data_dst + rd->nrx_data_off, data + i, take);
             }
+            /* CRC は受信ストリームから直接積む(読み捨て時もダイジェストを
+             * 検証でき、コピー先を読み直す 2 パス目も要らない)。 */
+            if (ctx->io.ddgst) {
+                rd->nrx_ddgst_crc = crc32c(rd->nrx_ddgst_crc, data + i, take);
+            }
             rd->nrx_data_off += take; i += take;
             if (rd->nrx_data_off == rd->nrx_data_need) {
-                if (rd->nrx_slot >= 0 && (rd->nrx_hdr[1] & NVME_TCP_F_DATA_SUCCESS)) {
-                    rd->slots[rd->nrx_slot].done = 1; rd->slots[rd->nrx_slot].result = 0;
+                if (ctx->io.ddgst) {
+                    rd->nrx_dgst_off = 0;
+                    rd->nrx_phase = NRX_DDGST;
+                } else {
+                    nvme_read_prx_finish_pdu(rd);
                 }
-                rd->nrx_phase = NRX_HDR; rd->nrx_hdr_off = 0;
             }
+            break;
+        }
+        case NRX_DDGST: {
+            uint32_t take = NVME_TCP_DGST_LEN - rd->nrx_dgst_off;
+            uint32_t avail = (uint32_t)len - i;
+            if (take > avail) take = avail;
+            for (uint32_t k = 0; k < take; k++) rd->nrx_dgst[rd->nrx_dgst_off + k] = data[i + k];
+            rd->nrx_dgst_off += take; i += take;
+            if (rd->nrx_dgst_off < NVME_TCP_DGST_LEN) break;
+
+            if (nvme_tcp_check_ddgst_crc(&ctx->io, rd->nrx_ddgst_crc, rd->nrx_dgst) != 0) {
+                if (rd->nrx_slot >= 0) {
+                    rd->slots[rd->nrx_slot].done = 1;
+                    rd->slots[rd->nrx_slot].result = -1;
+                }
+                rd->nrx_error = 1;
+                break;
+            }
+            nvme_read_prx_finish_pdu(rd);
             break;
         }
         }
     }
 }
 
-/*
+/*=================================================================
  * read パイプラインの pull 型受信 1 tick(push 型を使わない経路のフォール
  * バック)。到着済み PDU を非ブロッキングで 1 段だけ処理する。
  *
@@ -1520,18 +1778,13 @@ static void nvme_read_rx_upcall(void *arg, const volatile uint8_t *data, uint16_
  *   ctx - initiator コンテキスト
  * コール元:
  *   nvme_read_pipelined_run()
- */
+ * ===============================================================*/
 static void nvme_pipeline_read_rx_tick(nvme_ctx_t *ctx)
 {
     nvme_rd_state_t *rd = &s_rd[smp_core_index()];
     int r = nvme_tcp_recv_poll(&ctx->io, &rd->xfer);
     if (r < 0) {
-        for (unsigned i = 0; i < NVME_IO_QDEPTH; i++) {
-            if (rd->slots[i].in_use && rd->slots[i].sent && !rd->slots[i].done) {
-                rd->slots[i].done   = 1;
-                rd->slots[i].result = -1;
-            }
-        }
+        nvme_read_fail_all_slots(rd);
         return;
     }
     if (r == 0) {
@@ -1541,11 +1794,13 @@ static void nvme_pipeline_read_rx_tick(nvme_ctx_t *ctx)
     switch (rd->rx_state) {
     case PL_READ_RX_HDR: {
         uint8_t type = rd->hdr_buf[0];
+        /* 型固有部(16)とヘッダダイジェスト(有効なら4)を1回でまとめて受ける。 */
+        uint32_t rest_len = NVME_CQE_LEN + nvme_tcp_hdgst_len(&ctx->io);
         if (type == NVME_TCP_PDU_RSP) {
-            nvme_tcp_xfer_reset(&rd->xfer, rd->rest_buf, NVME_CQE_LEN);
+            nvme_tcp_xfer_reset(&rd->xfer, rd->rest_buf, rest_len);
             rd->rx_state = PL_READ_RX_RSP_REST;
         } else if (type == NVME_TCP_PDU_C2H_DATA) {
-            nvme_tcp_xfer_reset(&rd->xfer, rd->rest_buf, 16u);
+            nvme_tcp_xfer_reset(&rd->xfer, rd->rest_buf, rest_len);
             rd->rx_state = PL_READ_RX_C2H_REST;
         } else {
             uart_printf("[!] nvme read pipeline: 未対応のPDU種別 (type=%u)、読み捨てて再同期を試みます\n", type);
@@ -1556,6 +1811,7 @@ static void nvme_pipeline_read_rx_tick(nvme_ctx_t *ctx)
     }
 
     case PL_READ_RX_RSP_REST: {
+        if (nvme_read_check_hdgst(ctx, rd) != 0) { nvme_read_fail_all_slots(rd); return; }
         uint16_t cid    = rd16le(&rd->rest_buf[12]);
         uint16_t status = rd16le(&rd->rest_buf[14]);
         /* NRCV: Response Capsule(CQE)受信完了(read pipeline)。 */
@@ -1582,6 +1838,7 @@ static void nvme_pipeline_read_rx_tick(nvme_ctx_t *ctx)
     }
 
     case PL_READ_RX_C2H_REST: {
+        if (nvme_read_check_hdgst(ctx, rd) != 0) { nvme_read_fail_all_slots(rd); return; }
         uint16_t cccid = rd16le(&rd->rest_buf[0]);
         uint32_t datao = rd32le(&rd->rest_buf[4]);
         uint32_t datal = rd32le(&rd->rest_buf[8]);
@@ -1627,18 +1884,35 @@ static void nvme_pipeline_read_rx_tick(nvme_ctx_t *ctx)
             info.data_length = rd->cur_datal;
             ts_log_nvme_tcp_pdu(TS_MK(TS_FILE_NVME, TS_FUNC_nvme_pipeline_read_rx_tick, 1), &info);
         }
-        if (rd->cur_slot >= 0 && (flags & NVME_TCP_F_DATA_SUCCESS)) {
-            rd->slots[rd->cur_slot].done   = 1;
-            rd->slots[rd->cur_slot].result = 0;
+        (void)flags;
+        if (nvme_tcp_ddgst_len(&ctx->io, rd->cur_datal) != 0u) {
+            nvme_tcp_xfer_reset(&rd->xfer, rd->dgst_buf, NVME_TCP_DGST_LEN);
+            rd->rx_state = PL_READ_RX_C2H_DDGST;
+            break;
         }
-        nvme_tcp_xfer_reset(&rd->xfer, rd->hdr_buf, NVME_TCP_HDR_LEN);
-        rd->rx_state = PL_READ_RX_HDR;
+        nvme_read_c2h_complete(rd);
+        break;
+    }
+
+    case PL_READ_RX_C2H_DDGST: {
+        /* 読み捨て中(cur_slot<0)はデータ本体を保持していないので検証できない。
+         * 4 バイトを消費してストリームの位置だけ合わせる。 */
+        if (rd->cur_slot >= 0 &&
+            nvme_tcp_verify_ddgst(&ctx->io,
+                                   (const uint8_t *)rd->slots[rd->cur_slot].data + rd->cur_datao,
+                                   rd->cur_datal, rd->dgst_buf) != 0) {
+            rd->slots[rd->cur_slot].done   = 1;
+            rd->slots[rd->cur_slot].result = -1;
+            nvme_read_fail_all_slots(rd);
+            return;
+        }
+        nvme_read_c2h_complete(rd);
         break;
     }
     }
 }
 
-/*
+/*=================================================================
  * NVMe/TCP read を NVME_IO_QDEPTH 本まで同時 outstanding にして
  * duration_ms のあいだ回し続け、実行回数とバイト数を返す。受信は push 型
  * upcall を登録して 1 コピーで済ませる。
@@ -1651,7 +1925,7 @@ static void nvme_pipeline_read_rx_tick(nvme_ctx_t *ctx)
  *   0=正常終了、-1=エラー
  * コール元:
  *   tcp_measure()
- */
+ * ===============================================================*/
 int nvme_read_pipelined_run(nvme_ctx_t *ctx, uint32_t nsid, uint64_t lba,
                              void *buf, uint32_t nlb, uint32_t duration_ms,
                              uint32_t *out_count, uint64_t *out_bytes, uint32_t *out_elapsed_ms)
@@ -1676,7 +1950,7 @@ int nvme_read_pipelined_run(nvme_ctx_t *ctx, uint32_t nsid, uint64_t lba,
     rd->cur_slot = -1;
 
     rd->nrx_phase = NRX_HDR; rd->nrx_hdr_off = 0; rd->nrx_error = 0; rd->nrx_slot = -1;
-    tcp_set_recv_upcall(&ctx->io.tcp, nvme_read_rx_upcall, NULL);
+    tcp_set_recv_upcall(&ctx->io.tcp, nvme_read_rx_upcall, ctx);
 
     uint64_t cur_lba = lba;  /* fio 同様、コマンドごとに進める(nvme_bench_next_lba) */
     uint32_t count = 0;

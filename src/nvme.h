@@ -16,6 +16,11 @@ typedef struct {
     uint64_t nsze;
     char     subnqn[NVME_SUBNQN_MAX];
 
+    /* 接続前に設定する。nvme_connect_job_start() が admin/IO 両キューの
+     * ICReq 要求値へ配る。 */
+    uint8_t  req_hdgst;
+    uint8_t  req_ddgst;
+
     volatile int busy;
 } nvme_ctx_t;
 
@@ -31,7 +36,9 @@ typedef struct {
     uint32_t          recv_buflen;
     nvme_tcp_xfer_t   xfer;
     uint8_t           hdr_buf[8];   /* NVME_TCP_HDR_LEN */
-    uint8_t           rest_buf[16];
+    /* 型固有部(16)+ヘッダダイジェスト(4)をまとめて 1 回で受ける。 */
+    uint8_t           rest_buf[16 + 4];
+    uint8_t           dgst_buf[4];  /* データダイジェストの受信先 */
     uint32_t          datao;
     uint32_t          datal;
     uint16_t          ttag;

@@ -50,6 +50,9 @@ int nvmet_tcp_verify_hdgst(const nvmet_tcp_conn_t *c,
                             const void *hdr1, uint32_t len1,
                             const void *hdr2, uint32_t len2,
                             const uint8_t got[4]);
+int nvmet_tcp_check_ddgst_crc(const nvmet_tcp_conn_t *c, uint32_t running_crc,
+                               const uint8_t got[4]);
+
 int nvmet_tcp_verify_ddgst(const nvmet_tcp_conn_t *c,
                             const void *data, uint32_t len,
                             const uint8_t got[4]);

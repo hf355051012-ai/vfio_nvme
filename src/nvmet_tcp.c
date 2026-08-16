@@ -12,7 +12,7 @@
 #define NVMET_TCP_MAXH2CDATA_UNSCALED 32768u
 #define NVMET_TCP_MAXH2CDATA_SCALED   262144u
 
-/*
+/*=================================================================
  * このコネクションで 1 回の H2CData PDU に載せてよい最大データ長を返す
  * (ICResp で相手へ広告した MAXH2CDATA と同じ値)。
  *
@@ -22,7 +22,7 @@
  *   最大バイト数
  * コール元:
  *   nvmet_tcp_send_icresp(), nvmet_io_dispatch_cmd(), nvmet_io_dispatch_h2c()
- */
+ * ===============================================================*/
 uint32_t nvmet_tcp_max_h2c_data(const nvmet_tcp_conn_t *c)
 {
     return tcp_window_scaling_enabled(&c->tcp)
@@ -30,7 +30,7 @@ uint32_t nvmet_tcp_max_h2c_data(const nvmet_tcp_conn_t *c)
         : NVMET_TCP_MAXH2CDATA_UNSCALED;
 }
 
-/*
+/*=================================================================
  * ヘッダダイジェストが有効なら buf[0..hlen) の CRC32C を buf[hlen..+4) へ
  * 書く。**呼び出し元は先に flags/plen/pdo など hlen 範囲の全フィールドを
  * 最終状態まで確定させておくこと**(実機で 2 度踏んだ、ダイジェスト計算後に
@@ -44,7 +44,7 @@ uint32_t nvmet_tcp_max_h2c_data(const nvmet_tcp_conn_t *c)
  *   付加したバイト数(0 か 4)
  * コール元:
  *   nvmet_tcp_send_r2t(), nvmet_tcp_send_resp(), nvmet_tcp_send_c2h()
- */
+ * ===============================================================*/
 static uint32_t nvmet_tcp_append_hdgst(nvmet_tcp_conn_t *c, uint8_t *buf, uint32_t hlen)
 {
     if (!c->hdgst) return 0;
@@ -53,7 +53,7 @@ static uint32_t nvmet_tcp_append_hdgst(nvmet_tcp_conn_t *c, uint8_t *buf, uint32
     return 4u;
 }
 
-/*
+/*=================================================================
  * データダイジェストが有効かつ dlen>0 なら、データ本体の CRC32C を
  * その直後へ書く。対象はデータのみでヘッダは範囲外。
  *
@@ -66,7 +66,7 @@ static uint32_t nvmet_tcp_append_hdgst(nvmet_tcp_conn_t *c, uint8_t *buf, uint32
  *   付加したバイト数(0 か 4)
  * コール元:
  *   nvmet_tcp_send_c2h()
- */
+ * ===============================================================*/
 static uint32_t nvmet_tcp_append_ddgst(nvmet_tcp_conn_t *c, uint8_t *buf,
                                         uint32_t data_off, uint32_t dlen)
 {
@@ -106,7 +106,7 @@ int nvmet_tcp_recv_poll(nvmet_tcp_conn_t *c, nvmet_tcp_xfer_t *x)
     return (x->got >= x->want) ? 1 : 0;
 }
 
-/*
+/*=================================================================
  * PDU ヘッダの plen/hlen とダイジェスト設定から、後続データ本体の長さを
  * 求める(I/O を伴わない純粋な計算)。
  *
@@ -117,7 +117,7 @@ int nvmet_tcp_recv_poll(nvmet_tcp_conn_t *c, nvmet_tcp_xfer_t *x)
  *   データ本体のバイト数
  * コール元:
  *   nvmet_admin_job_step(), nvmet_io_job_step_impl()
- */
+ * ===============================================================*/
 uint32_t nvmet_tcp_parse_cmd_dlen(const nvmet_tcp_conn_t *c, const uint8_t hdr_buf[NVME_TCP_HDR_LEN])
 {
     uint8_t  hlen = hdr_buf[2];
@@ -129,7 +129,7 @@ uint32_t nvmet_tcp_parse_cmd_dlen(const nvmet_tcp_conn_t *c, const uint8_t hdr_b
     return dlen;
 }
 
-/*
+/*=================================================================
  * 受信したヘッダダイジェストを検証する(I/O を伴わない純粋な計算)。
  *
  * 引数:
@@ -141,7 +141,7 @@ uint32_t nvmet_tcp_parse_cmd_dlen(const nvmet_tcp_conn_t *c, const uint8_t hdr_b
  *   0=一致、-1=不一致
  * コール元:
  *   nvmet_admin_job_step(), nvmet_io_job_step_impl()
- */
+ * ===============================================================*/
 int nvmet_tcp_verify_hdgst(const nvmet_tcp_conn_t *c,
                             const void *hdr1, uint32_t len1,
                             const void *hdr2, uint32_t len2,
@@ -161,7 +161,7 @@ int nvmet_tcp_verify_hdgst(const nvmet_tcp_conn_t *c,
     return 0;
 }
 
-/*
+/*=================================================================
  * 受信したデータダイジェストを検証する。
  *
  * 引数:
@@ -172,14 +172,34 @@ int nvmet_tcp_verify_hdgst(const nvmet_tcp_conn_t *c,
  *   0=一致、-1=不一致
  * コール元:
  *   nvmet_admin_job_step(), nvmet_io_job_step_impl()
- */
+ * ===============================================================*/
 int nvmet_tcp_verify_ddgst(const nvmet_tcp_conn_t *c,
                             const void *data, uint32_t len,
                             const uint8_t got[4])
 {
     if (!c->ddgst || len == 0) return 0;
-    uint32_t expected = ~crc32c(0xFFFFFFFFu, data, len);  /* 最終反転 */
+    return nvmet_tcp_check_ddgst_crc(c, crc32c(0xFFFFFFFFu, data, len), got);
+}
 
+/*=================================================================
+ * データを逐次受け取りながら積み上げた CRC32C(未反転)を、受信した
+ * データダイジェストと突き合わせる。push 型受信のようにデータ本体を
+ * 後からまとめて読み直せない経路で使う。
+ *
+ * 引数:
+ *   c           - 対象コネクション
+ *   running_crc - crc32c() を連鎖させた未反転の途中値
+ *   got         - 受信した 4 バイトのダイジェスト
+ * 戻り値:
+ *   0=一致(無効時も 0)、-1=不一致
+ * コール元:
+ *   nvmet_tcp_verify_ddgst(), nvmet_io_rx_upcall()
+ * ===============================================================*/
+int nvmet_tcp_check_ddgst_crc(const nvmet_tcp_conn_t *c, uint32_t running_crc,
+                               const uint8_t got[4])
+{
+    if (!c->ddgst) return 0;
+    uint32_t expected = ~running_crc;  /* 最終反転 */
     uint32_t g = rd32le(got);
     if (g != expected) {
         uart_printf("[!] NVMe/TCP target: データCRC32C不一致 (expected=%08x got=%08x)\n",
@@ -189,7 +209,7 @@ int nvmet_tcp_verify_ddgst(const nvmet_tcp_conn_t *c,
     return 0;
 }
 
-/*
+/*=================================================================
  * ブロックせずに accept の受け皿だけを用意する。早着 SYN を取りこぼさない
  * よう、実際に待ち始める前に呼んでおく。
  *
@@ -198,13 +218,13 @@ int nvmet_tcp_verify_ddgst(const nvmet_tcp_conn_t *c,
  *   listener - リッスン中のソケット
  * コール元:
  *   nvmet_admin_job_step(), nvmet_io_job_step_impl()
- */
+ * ===============================================================*/
 void nvmet_tcp_accept_arm(nvmet_tcp_conn_t *c, int listener)
 {
     tcp_accept_begin(listener, &c->tcp);
 }
 
-/*
+/*=================================================================
  * 受信した ICReq のダイジェスト設定をそのまま受理してコネクションへ記録し、
  * ICResp を返す(MAXH2CDATA もここで広告する)。
  *
@@ -215,7 +235,7 @@ void nvmet_tcp_accept_arm(nvmet_tcp_conn_t *c, int listener)
  *   0=送信完了、-1=フォーマット不正/送信失敗
  * コール元:
  *   nvmet_admin_job_step(), nvmet_io_job_step_impl()
- */
+ * ===============================================================*/
 int nvmet_tcp_send_icresp(nvmet_tcp_conn_t *c, const uint8_t icreq_buf[NVME_TCP_ICREQ_LEN])
 {
     uint8_t type = icreq_buf[0];
@@ -259,7 +279,7 @@ int nvmet_tcp_send_icresp(nvmet_tcp_conn_t *c, const uint8_t icreq_buf[NVME_TCP_
     return 0;
 }
 
-/*
+/*=================================================================
  * R2T PDU を送信して、ホストへ [r2to, r2to+r2tl) の H2CData を要求する。
  * 送りっぱなし(tcp_send_async)で、直後に受信フェーズへ進む。
  *
@@ -271,7 +291,7 @@ int nvmet_tcp_send_icresp(nvmet_tcp_conn_t *c, const uint8_t icreq_buf[NVME_TCP_
  *   0=送信成功、-1=失敗
  * コール元:
  *   nvmet_io_dispatch_cmd(), nvmet_io_dispatch_h2c()
- */
+ * ===============================================================*/
 int nvmet_tcp_send_r2t(nvmet_tcp_conn_t *c, uint16_t cid,
                         uint32_t r2to, uint32_t r2tl)
 {
@@ -348,7 +368,7 @@ int nvmet_tcp_send_resp(nvmet_tcp_conn_t *c, const nvme_cqe_t *cqe)
     return 0;
 }
 
-/*
+/*=================================================================
  * C2HData PDU を送信する(データ本体を C2H 用バッファへコピーしてから
  * 1 回の tcp_send() で送る同期版)。dlen が MDTS 以下なら常に単一 PDU で
  * 収まるため、チャンク境界で送信パイプラインを空にすることがない。
@@ -362,7 +382,7 @@ int nvmet_tcp_send_resp(nvmet_tcp_conn_t *c, const nvme_cqe_t *cqe)
  *   0=送信完了、-1=失敗
  * コール元:
  *   nvmet_io_dispatch_cmd(), nvmet_admin_dispatch()
- */
+ * ===============================================================*/
 int nvmet_tcp_send_c2h(nvmet_tcp_conn_t *c, uint16_t cid, const nvme_cqe_t *cqe,
                        const void *data, uint32_t dlen,
                        int data_success)
@@ -433,18 +453,19 @@ int nvmet_tcp_send_c2h(nvmet_tcp_conn_t *c, uint16_t cid, const nvme_cqe_t *cqe,
     return 0;
 }
 
-/*
+/*=================================================================
  * nvmet_tcp_send_c2h() の非同期・ゼロコピー版。data から直接 tcp_send_async()
- * へ渡し ACK を待たずに返る。ダイジェスト有効時は連続バッファが要るため
- * 使えない(呼び出し元が同期版へフォールバックする)。
+ * へ渡し ACK を待たずに返る。ダイジェストは送信元バッファから直接算出して
+ * 4 バイトだけ追加でキューするので、連続バッファへのコピーは要らない
+ * (以前は「計算に連続バッファが必要」として同期版へ退避していた)。
  *
  * 引数:
- *   c / cid / cqe / data / dlen - nvmet_tcp_send_c2h() と同じ
+ *   c / cid / data / dlen - nvmet_tcp_send_c2h() と同じ
  * 戻り値:
  *   0=キューイング成功、-1=失敗
  * コール元:
  *   nvmet_io_dispatch_cmd()
- */
+ * ===============================================================*/
 int nvmet_tcp_send_c2h_async(nvmet_tcp_conn_t *c, uint16_t cid,
                               const void *data, uint32_t dlen)
 {
@@ -454,19 +475,28 @@ int nvmet_tcp_send_c2h_async(nvmet_tcp_conn_t *c, uint16_t cid,
         return -1;
     }
 
-    uint8_t hdr[NVME_TCP_DATA_PDU_LEN];
+    /* ダイジェスト長を先に確定させ、flags/pdo/plen を最終値で書いてから
+     * append_hdgst() を呼ぶ(ヘッダを後から書き換えてはならない)。 */
+    uint32_t hd = c->hdgst ? 4u : 0u;
+    uint32_t dd = (c->ddgst && dlen > 0u) ? 4u : 0u;
+    uint32_t data_off = NVME_TCP_DATA_PDU_LEN + hd;
+
+    uint8_t hdr[NVME_TCP_DATA_PDU_LEN + 4u];
     hdr[0] = NVME_TCP_PDU_C2H_DATA;
-    hdr[1] = (uint8_t)(NVME_TCP_F_DATA_LAST | NVME_TCP_F_DATA_SUCCESS);
+    hdr[1] = (uint8_t)(NVME_TCP_F_DATA_LAST | NVME_TCP_F_DATA_SUCCESS |
+                       (c->hdgst ? NVME_TCP_F_HDGST : 0u) |
+                       (dd ? NVME_TCP_F_DDGST : 0u));
     hdr[2] = (uint8_t)NVME_TCP_DATA_PDU_LEN;
-    hdr[3] = (uint8_t)NVME_TCP_DATA_PDU_LEN;  /* pdo: データはこのPDU内の固定部直後 */
-    wr32le(&hdr[4], NVME_TCP_DATA_PDU_LEN + dlen);  /* plen */
+    hdr[3] = (uint8_t)data_off;  /* pdo: データはヘッダ(+hdgst)の直後 */
+    wr32le(&hdr[4], data_off + dlen + dd);  /* plen */
     wr16le(&hdr[8],  cid);
     wr16le(&hdr[10], 0);       /* ttag: C2HDataでは未使用 */
     wr32le(&hdr[12], 0);       /* datao: 単一PDU限定のため常に0 */
     wr32le(&hdr[16], dlen);    /* datal */
     wr32le(&hdr[20], 0);       /* reserved */
+    nvmet_tcp_append_hdgst(c, hdr, NVME_TCP_DATA_PDU_LEN);
 
-    if (tcp_send_async(&c->tcp, hdr, (uint16_t)NVME_TCP_DATA_PDU_LEN) < 0) {
+    if (tcp_send_async(&c->tcp, hdr, (uint16_t)(NVME_TCP_DATA_PDU_LEN + hd)) < 0) {
         uart_printf("[!] NVMe/TCP target: C2HDataヘッダ非同期送信失敗 (cid=%u)\n", cid);
         return -1;
     }
@@ -485,13 +515,22 @@ int nvmet_tcp_send_c2h_async(nvmet_tcp_conn_t *c, uint16_t cid,
         queued += (uint32_t)rc;
     }
 
+    if (dd) {
+        uint8_t d[4];
+        wr32le(d, ~crc32c(0xFFFFFFFFu, src, dlen));  /* 最終反転 */
+        if (tcp_send_async(&c->tcp, d, 4u) < 0) {
+            uart_printf("[!] NVMe/TCP target: C2HDataダイジェスト送信失敗 (cid=%u)\n", cid);
+            return -1;
+        }
+    }
+
     /* NSND(旧NC2H)。 */
     {
         volatile ts_nvme_pdu_t info = {0};
         info.pdu_type    = NVME_TCP_PDU_C2H_DATA;
         info.hlen        = (uint8_t)NVME_TCP_DATA_PDU_LEN;
-        info.pdo         = (uint8_t)NVME_TCP_DATA_PDU_LEN;
-        info.plen        = NVME_TCP_DATA_PDU_LEN + dlen;
+        info.pdo         = (uint8_t)data_off;
+        info.plen        = data_off + dlen + dd;
         info.cccid       = cid;
         info.data_offset = 0;
         info.data_length = dlen;
@@ -500,14 +539,14 @@ int nvmet_tcp_send_c2h_async(nvmet_tcp_conn_t *c, uint16_t cid,
     return 0;
 }
 
-/*
+/*=================================================================
  * NVMe/TCP コネクションの TCP を切断し、状態をクリアする。
  *
  * 引数:
  *   c - 対象コネクション
  * コール元:
  *   nvmet_admin_job_step(), nvmet_admin_job_setup_fail(), nvmet_io_job_end()
- */
+ * ===============================================================*/
 void nvmet_tcp_close(nvmet_tcp_conn_t *c)
 {
     tcp_close(&c->tcp);
