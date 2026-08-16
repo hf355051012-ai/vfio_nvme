@@ -79,6 +79,18 @@ static int mlx5_query_cq_state(mlx5_dev_t *dev, uint32_t cqn, uint8_t *out_statu
                                 uint32_t *out_consumer_counter, uint32_t *out_producer_counter);
 static void mlx5_monitor_dump_dev(mlx5_dev_t *dev, const char *label);
 
+/*
+ * Initialization Segment の initializing ビット(bit31)がクリアされる
+ * まで待つ。FW のブートが終わるまでコマンドを発行してはならない。
+ *
+ * 引数:
+ *   dev   - 対象 HCA
+ *   phase - ログ用のフェーズ名
+ * 戻り値:
+ *   0=クリアされた、-1=タイムアウト
+ * コール元:
+ *   mlx5_hca_bringup()
+ */
 static int mlx5_wait_fw_init(const mlx5_dev_t *dev, const char *phase) {
     uart_printf("mlx5: waiting for firmware %s...\n", phase);
     uint64_t start = timer_now();
@@ -97,6 +109,21 @@ static int mlx5_wait_fw_init(const mlx5_dev_t *dev, const char *phase) {
 
 int g_mlx5_skip_fte_experiment = 0;
 
+/*
+ * ConnectX を使える状態まで一気に立ち上げる。FW init 待ち -> cmdq 登録 ->
+ * ENABLE_HCA -> ISSI -> boot/init ページ供給 -> HCA cap 設定 -> INIT_HCA ->
+ * UAR/EQ/PD/MKey/CQ/TIS/RQ/TIR/SQ 作成 -> ポート admin UP と MTU 設定 ->
+ * フローステアリング(catch-all)まで。
+ *
+ * 引数:
+ *   dev          - 初期化する HCA(bar0_base と pf_index を設定済みのこと)
+ *   label        - ログ用の名前("PF0" 等)
+ *   monitor_only - 1=ENABLE_HCA と capability までで止める(モニタ用途)
+ * 戻り値:
+ *   0=成功、-1=いずれかの段階で失敗
+ * コール元:
+ *   bringup_pf()
+ */
 int mlx5_hca_bringup(mlx5_dev_t *dev, const char *label, int monitor_only) {
     uart_printf("mlx5: ===== bringing up %s (bar0_base=0x%08x%08x pf_index=%u) =====\n",
                 label, (uint32_t)(dev->bar0_base >> 32), (uint32_t)dev->bar0_base,
@@ -482,6 +509,15 @@ static mlx5_dev_t s_last_dev0;
 static mlx5_dev_t s_last_dev1;
 static int s_last_devs_valid = 0;
 
+/*
+ * モニタコマンドが再初期化なしで参照できるよう、bring-up 済みの PF0/PF1 を
+ * 保存する。
+ *
+ * 引数:
+ *   dev0, dev1 - 保存する HCA ハンドル
+ * コール元:
+ *   mlx5_net_register_dual()
+ */
 void mlx5_monitor_set_devs(const mlx5_dev_t *dev0, const mlx5_dev_t *dev1)
 {
     s_last_dev0 = *dev0;
@@ -526,6 +562,18 @@ _Static_assert(sizeof(mlx5_cmd_prot_block_t) == 576, "mlx5_cmd_prot_block_t must
 #define S_OUT_MBOX(dev, i) ((volatile mlx5_cmd_prot_block_t *)(uintptr_t)((dev)->out_mbox_cpu + (uint64_t)(i) * MLX5_CMD_MBOX_ALIGN))
 #define S_IN_MBOX(dev, i)  ((volatile mlx5_cmd_prot_block_t *)(uintptr_t)((dev)->in_mbox_cpu + (uint64_t)(i) * MLX5_CMD_MBOX_ALIGN))
 
+/*
+ * FW へ MANAGE_PAGES(GIVE)で譲渡するスクラッチページ(4KB 単位)の
+ * アドレスを返す。
+ *
+ * 引数:
+ *   dev - 対象 HCA
+ *   idx - ページ番号
+ * 戻り値:
+ *   そのページの先頭
+ * コール元:
+ *   mlx5_manage_pages_give_chunk()
+ */
 static inline volatile uint8_t *mlx5_fw_page(const mlx5_dev_t *dev, uint32_t idx) {
     /* Phase 2 段階4: DEVICE アリーナから確保した fw_pages 先頭 + idx*4096。 */
     return (volatile uint8_t *)(uintptr_t)((uint64_t)dev->fw_pages_cpu + (uint64_t)idx * MLX5_FW_PAGE_SIZE);
@@ -533,6 +581,18 @@ static inline volatile uint8_t *mlx5_fw_page(const mlx5_dev_t *dev, uint32_t idx
 
 #define MLX5_CMD_TIMEOUT_MS 2000u
 
+/*
+ * コマンドキューを FW へ登録する(Initialization Segment の
+ * CMDQ_ADDR_H/L へ物理アドレスを書く)。書き込み直後は FW が新しい cmdq を
+ * 取り込み切るまで少し待つ必要がある。
+ *
+ * 引数:
+ *   dev - 対象 HCA
+ * 戻り値:
+ *   0=成功、-1=タイムアウト
+ * コール元:
+ *   mlx5_hca_bringup()
+ */
 static int mlx5_cmdq_init(mlx5_dev_t *dev) {
     uint32_t cmd_l = mlx5_read32(dev, MLX5_ISEG_CMDQ_ADDR_L_SZ) & 0xffu;
     uint32_t log_sz = (cmd_l >> 4) & 0xfu;
@@ -689,6 +749,16 @@ static int mlx5_cmd_exec(mlx5_dev_t *dev, const uint8_t *in_buf, uint32_t in_len
 #define MLX5_CMD_OP_MANAGE_PAGES 0x108u
 #define MLX5_MANAGE_PAGES_OP_MOD_GIVE      0x1u
 
+/*
+ * ENABLE_HCA コマンドを発行する。
+ *
+ * 引数:
+ *   dev - 対象 HCA
+ * 戻り値:
+ *   0=成功、-1=コマンド失敗
+ * コール元:
+ *   mlx5_hca_bringup()
+ */
 static int mlx5_enable_hca(mlx5_dev_t *dev) {
     uint8_t in[16] = {0};
     in[0] = (uint8_t)(MLX5_CMD_OP_ENABLE_HCA >> 8);
@@ -710,6 +780,19 @@ static int mlx5_enable_hca(mlx5_dev_t *dev) {
     return 0;
 }
 
+/*
+ * QUERY_PAGES で、FW が要求するページ数(boot/init)を問い合わせる。
+ *
+ * 引数:
+ *   dev              - 対象 HCA
+ *   op_mod           - boot か init か
+ *   out_function_id  - 対象 function id の格納先
+ *   out_num_pages    - 要求ページ数の格納先
+ * 戻り値:
+ *   0=成功、-1=コマンド失敗
+ * コール元:
+ *   mlx5_hca_bringup()
+ */
 static int mlx5_query_pages(mlx5_dev_t *dev, uint32_t op_mod, uint16_t *out_function_id, int32_t *out_num_pages) {
     uint8_t in[16] = {0};
     in[0] = (uint8_t)(MLX5_CMD_OP_QUERY_PAGES >> 8);
@@ -746,6 +829,20 @@ static int mlx5_query_pages(mlx5_dev_t *dev, uint32_t op_mod, uint16_t *out_func
 _Static_assert(16u + MLX5_MANAGE_PAGES_MAX_PER_CALL * 8u <= MLX5_CMD_MAILBOX_MAX,
                "MLX5_MANAGE_PAGES_MAX_PER_CALL must fit in a single mailbox block");
 
+/*
+ * MANAGE_PAGES(GIVE)を 1 チャンク分(単一メールボックスに収まる最大
+ * ページ数まで)発行する。
+ *
+ * 引数:
+ *   dev            - 対象 HCA
+ *   function_id    - 対象 function
+ *   n              - このチャンクで渡すページ数
+ *   page_base_idx  - 渡すページの開始番号
+ * 戻り値:
+ *   0=成功、-1=コマンド失敗
+ * コール元:
+ *   mlx5_manage_pages_give()
+ */
 static int mlx5_manage_pages_give_chunk(mlx5_dev_t *dev, uint16_t function_id, uint32_t n, uint32_t page_base_idx) {
     uint8_t in[16 + MLX5_MANAGE_PAGES_MAX_PER_CALL * 8];
     for (unsigned i = 0; i < sizeof(in); i++) {
@@ -787,6 +884,19 @@ static int mlx5_manage_pages_give_chunk(mlx5_dev_t *dev, uint16_t function_id, u
     return 0;
 }
 
+/*
+ * npages 全体をチャンクに分けて MANAGE_PAGES(GIVE)を繰り返し発行する
+ * (init ページは数千ページになるため 1 回では送れない)。
+ *
+ * 引数:
+ *   dev         - 対象 HCA
+ *   function_id - 対象 function
+ *   npages      - 渡すページ総数
+ * 戻り値:
+ *   0=成功、-1=コマンド失敗
+ * コール元:
+ *   mlx5_hca_bringup()
+ */
 static int mlx5_manage_pages_give(mlx5_dev_t *dev, uint16_t function_id, int32_t npages) {
     if (npages <= 0) {
         return 0; // 要求無し、何もしなくてよい(pagealloc.cのmlx5_satisfy_startup_pages()と同じ)。
@@ -813,6 +923,18 @@ static int mlx5_manage_pages_give(mlx5_dev_t *dev, uint16_t function_id, int32_t
 #define MLX5_CMD_OP_QUERY_ISSI 0x10au
 #define MLX5_CMD_OP_SET_ISSI   0x10bu
 
+/*
+ * QUERY_ISSI で現在の ISSI と対応 ISSI のビットマップを読む。
+ *
+ * 引数:
+ *   dev                     - 対象 HCA
+ *   out_current_issi        - 現在値の格納先
+ *   out_supported_issi_dw0  - 対応ビットマップの格納先
+ * 戻り値:
+ *   0=成功、-1=コマンド失敗
+ * コール元:
+ *   mlx5_hca_bringup()
+ */
 static int mlx5_query_issi(mlx5_dev_t *dev, uint16_t *out_current_issi, uint32_t *out_supported_issi_dw0) {
     uint8_t in[16] = {0};
     in[0] = (uint8_t)(MLX5_CMD_OP_QUERY_ISSI >> 8);
@@ -845,6 +967,17 @@ static int mlx5_query_issi(mlx5_dev_t *dev, uint16_t *out_current_issi, uint32_t
     return 0;
 }
 
+/*
+ * SET_ISSI で使用する ISSI を設定する。
+ *
+ * 引数:
+ *   dev  - 対象 HCA
+ *   issi - 設定する ISSI(通常 1)
+ * 戻り値:
+ *   0=成功、-1=コマンド失敗
+ * コール元:
+ *   mlx5_hca_bringup()
+ */
 static int mlx5_set_issi(mlx5_dev_t *dev, uint16_t issi) {
     uint8_t in[16] = {0};
     in[0] = (uint8_t)(MLX5_CMD_OP_SET_ISSI >> 8);
@@ -881,6 +1014,17 @@ static int mlx5_set_issi(mlx5_dev_t *dev, uint16_t issi) {
 _Static_assert(16u + MLX5_HCA_CAP_BYTES <= MLX5_CMD_MAILBOX_MAX,
                "general HCA caps must fit in a single mailbox block");
 
+/*
+ * QUERY_HCA_CAP(general, current)で 256 バイトの general capability を読む。
+ *
+ * 引数:
+ *   dev     - 対象 HCA
+ *   cap_out - 256 バイトの格納先
+ * 戻り値:
+ *   0=成功、-1=コマンド失敗
+ * コール元:
+ *   mlx5_hca_bringup()
+ */
 static int mlx5_query_hca_cap_general(mlx5_dev_t *dev, uint8_t *cap_out) {
     uint8_t in[16] = {0};
     in[0] = (uint8_t)(MLX5_CMD_OP_QUERY_HCA_CAP >> 8);
@@ -910,6 +1054,17 @@ static int mlx5_query_hca_cap_general(mlx5_dev_t *dev, uint8_t *cap_out) {
     return 0;
 }
 
+/*
+ * QUERY_HCA_CAP(ETHERNET_OFFLOADS)を読み、LSO の最大バイト数を取り出す。
+ *
+ * 引数:
+ *   dev               - 対象 HCA
+ *   out_max_lso_bytes - LSO 上限の格納先(非対応なら 0)
+ * 戻り値:
+ *   0=成功、-1=コマンド失敗
+ * コール元:
+ *   mlx5_hca_bringup()
+ */
 static int mlx5_query_hca_cap_eth_offloads(mlx5_dev_t *dev, uint32_t *out_max_lso_bytes) {
     *out_max_lso_bytes = 0u;
 
@@ -944,6 +1099,18 @@ static int mlx5_query_hca_cap_eth_offloads(mlx5_dev_t *dev, uint32_t *out_max_ls
     return 0;
 }
 
+/*
+ * SET_HCA_CAP(general)で capability を設定する。QUERY_HCA_CAP で読んだ
+ * 現在値をそのまま送り返す最小実装。
+ *
+ * 引数:
+ *   dev    - 対象 HCA
+ *   cap_in - 送り返す 256 バイト
+ * 戻り値:
+ *   0=成功、-1=コマンド失敗
+ * コール元:
+ *   mlx5_hca_bringup()
+ */
 static int mlx5_set_hca_cap_general(mlx5_dev_t *dev, const uint8_t *cap_in) {
     uint8_t in[16 + MLX5_HCA_CAP_BYTES];
     for (unsigned i = 0; i < sizeof(in); i++) {
@@ -975,6 +1142,16 @@ static int mlx5_set_hca_cap_general(mlx5_dev_t *dev, const uint8_t *cap_in) {
     return 0;
 }
 
+/*
+ * INIT_HCA コマンドを発行し HCA を稼働状態にする。
+ *
+ * 引数:
+ *   dev - 対象 HCA
+ * 戻り値:
+ *   0=成功、-1=コマンド失敗
+ * コール元:
+ *   mlx5_hca_bringup()
+ */
 static int mlx5_init_hca(mlx5_dev_t *dev) {
     uint8_t in[32] = {0};
     in[0] = (uint8_t)(MLX5_CMD_OP_INIT_HCA >> 8);
@@ -999,6 +1176,17 @@ static int mlx5_init_hca(mlx5_dev_t *dev) {
 #define MLX5_CMD_OP_ALLOC_UAR 0x802u
 #define MLX5_CMD_OP_CREATE_EQ 0x301u
 
+/*
+ * ALLOC_UAR で UAR(ドアベル書き込み用の BAR 領域)を確保する。
+ *
+ * 引数:
+ *   dev      - 対象 HCA
+ *   out_uarn - UAR 番号の格納先
+ * 戻り値:
+ *   0=成功、-1=コマンド失敗
+ * コール元:
+ *   mlx5_hca_bringup(), mlx5_qp_create_rc(), mlx5_qp_create_ud_common()
+ */
 static int mlx5_alloc_uar(mlx5_dev_t *dev, uint32_t *out_uarn) {
     uint8_t in[16] = {0};
     in[0] = (uint8_t)(MLX5_CMD_OP_ALLOC_UAR >> 8);
@@ -1029,6 +1217,19 @@ static int mlx5_alloc_uar(mlx5_dev_t *dev, uint32_t *out_uarn) {
 #define MLX5_EQE_OWNER_INIT_VAL 1u // eq.cのinit_eq_buf()と同じ初期値
 _Static_assert(MLX5_EQ_NUM_ENTRIES == 64u, "MLX5_EQ_BUF_SIZE/MLX5_EQE_SIZE assumption changed");
 
+/*
+ * CREATE_EQ で Event Queue を作る。このドライバはポーリング専用で割り込みを
+ * 使わないため、CREATE_CQ が要求する eqn を満たすための最小限のダミー。
+ *
+ * 引数:
+ *   dev     - 対象 HCA
+ *   uarn    - 使用する UAR 番号
+ *   out_eqn - EQ 番号の格納先
+ * 戻り値:
+ *   0=成功、-1=コマンド失敗
+ * コール元:
+ *   mlx5_hca_bringup()
+ */
 static int mlx5_create_eq(mlx5_dev_t *dev, uint32_t uarn, uint32_t *out_eqn) {
     volatile uint8_t *eq_buf = (volatile uint8_t *)(uintptr_t)(uint64_t)dev->eq_buf_cpu;
     for (unsigned i = 0; i < MLX5_EQ_NUM_ENTRIES; i++) {
@@ -1079,6 +1280,17 @@ static int mlx5_create_eq(mlx5_dev_t *dev, uint32_t uarn, uint32_t *out_eqn) {
 #define MLX5_CMD_OP_ALLOC_PD    0x800u
 #define MLX5_CMD_OP_CREATE_MKEY 0x200u
 
+/*
+ * ALLOC_PD で Protection Domain を確保する。
+ *
+ * 引数:
+ *   dev     - 対象 HCA
+ *   out_pdn - PD 番号の格納先
+ * 戻り値:
+ *   0=成功、-1=コマンド失敗
+ * コール元:
+ *   mlx5_hca_bringup(), mlx5_qp_create_rc(), mlx5_qp_create_ud_common()
+ */
 static int mlx5_alloc_pd(mlx5_dev_t *dev, uint32_t *out_pdn) {
     uint8_t in[16] = {0};
     in[0] = (uint8_t)(MLX5_CMD_OP_ALLOC_PD >> 8);
@@ -1104,6 +1316,19 @@ static int mlx5_alloc_pd(mlx5_dev_t *dev, uint32_t *out_pdn) {
     return 0;
 }
 
+/*
+ * CREATE_MKEY で PA(物理アドレス)モードの MKey を作る。start_addr=0 /
+ * length64=1 で物理アドレス空間全体を対象にする最小実装。
+ *
+ * 引数:
+ *   dev      - 対象 HCA
+ *   pdn      - 所属 PD
+ *   out_mkey - mkey の格納先
+ * 戻り値:
+ *   0=成功、-1=コマンド失敗
+ * コール元:
+ *   mlx5_hca_bringup()
+ */
 static int mlx5_create_mkey_pa(mlx5_dev_t *dev, uint32_t pdn, uint32_t *out_mkey) {
     uint8_t in[272];
     for (unsigned i = 0; i < sizeof(in); i++) {
@@ -1156,6 +1381,21 @@ _Static_assert(272u + MLX5_CQ_NUM_PAGES * 8u <= 528u,
                "CREATE_CQ input must still fit in a single mailbox block");
 #define MLX5_CQE_INVALID 0xFu // cq.hのenum MLX5_CQE_INVALID -- op_own上位nibbleがこの値なら「まだHWが書いていない」
 
+/*
+ * CREATE_CQ で Completion Queue を作る。
+ *
+ * 引数:
+ *   dev      - 対象 HCA
+ *   uarn     - 使用する UAR 番号
+ *   eqn      - 紐付ける EQ 番号
+ *   buf_addr - CQ バッファ(1 ページ)
+ *   dbr_addr - ドアベルレコード
+ *   out_cqn  - CQ 番号の格納先
+ * 戻り値:
+ *   0=成功、-1=コマンド失敗
+ * コール元:
+ *   mlx5_hca_bringup(), mlx5_qp_create_rc(), mlx5_qp_create_ud_common()
+ */
 static int mlx5_create_cq(mlx5_dev_t *dev, uint32_t uarn, uint32_t eqn, uint64_t buf_addr, uint64_t dbr_addr, uint32_t *out_cqn) {
     volatile uint8_t *dbr = (volatile uint8_t *)(uintptr_t)dbr_addr;
     for (unsigned i = 0; i < MLX5_CQ_DBR_SIZE; i++) {
@@ -1225,6 +1465,17 @@ static int mlx5_create_cq(mlx5_dev_t *dev, uint32_t uarn, uint32_t eqn, uint64_t
 #define MLX5_CMD_OP_ALLOC_TRANSPORT_DOMAIN 0x816u
 #define MLX5_CMD_OP_CREATE_TIS             0x912u
 
+/*
+ * ALLOC_TRANSPORT_DOMAIN で transport domain を確保する。
+ *
+ * 引数:
+ *   dev     - 対象 HCA
+ *   out_tdn - TD 番号の格納先
+ * 戻り値:
+ *   0=成功、-1=コマンド失敗
+ * コール元:
+ *   mlx5_hca_bringup()
+ */
 static int mlx5_alloc_transport_domain(mlx5_dev_t *dev, uint32_t *out_tdn) {
     uint8_t in[16] = {0};
     in[0] = (uint8_t)(MLX5_CMD_OP_ALLOC_TRANSPORT_DOMAIN >> 8);
@@ -1251,6 +1502,18 @@ static int mlx5_alloc_transport_domain(mlx5_dev_t *dev, uint32_t *out_tdn) {
     return 0;
 }
 
+/*
+ * CREATE_TIS で送信側の Transport Interface Send を作る。
+ *
+ * 引数:
+ *   dev      - 対象 HCA
+ *   tdn      - 所属 transport domain
+ *   out_tisn - TIS 番号の格納先
+ * 戻り値:
+ *   0=成功、-1=コマンド失敗
+ * コール元:
+ *   mlx5_hca_bringup()
+ */
 static int mlx5_create_tis(mlx5_dev_t *dev, uint32_t tdn, uint32_t *out_tisn) {
     uint8_t in[192];
     for (unsigned i = 0; i < sizeof(in); i++) {
@@ -1292,6 +1555,24 @@ static int mlx5_create_tis(mlx5_dev_t *dev, uint32_t tdn, uint32_t *out_tisn) {
 #define MLX5_RQC_STATE_RST         0u
 #define MLX5_RQC_STATE_RDY         1u
 
+/*
+ * CREATE_RQ で受信キューを作る。単一の CYCLIC WQ で、各 WQE が専用の受信
+ * バッファを指す。作成直後に RQ ドアベルへ「投稿済み WQE 数」を書いて全
+ * エントリを一括で武装する(これを忘れると HW は受信を配送できない)。
+ *
+ * 引数:
+ *   dev      - 対象 HCA
+ *   rxq_idx  - この PF 内の受信キュー番号
+ *   cqn      - 完了を受け取る CQ
+ *   pdn      - 所属 PD
+ *   uarn     - 使用する UAR
+ *   mkey     - 受信バッファを参照する mkey
+ *   out_rqn  - RQ 番号の格納先
+ * 戻り値:
+ *   0=成功、-1=コマンド失敗
+ * コール元:
+ *   mlx5_hca_bringup()
+ */
 static int mlx5_create_rq(mlx5_dev_t *dev, unsigned rxq_idx, uint32_t cqn, uint32_t pdn, uint32_t uarn, uint32_t mkey, uint32_t *out_rqn) {
     volatile uint8_t *wqe_ring = (volatile uint8_t *)(uintptr_t)(uint64_t)dev->rxq[rxq_idx].wqe_cpu;
     for (unsigned i = 0; i < MLX5_RQ_NUM_WQES; i++) {
@@ -1374,6 +1655,17 @@ static int mlx5_create_rq(mlx5_dev_t *dev, unsigned rxq_idx, uint32_t cqn, uint3
     return 0;
 }
 
+/*
+ * MODIFY_RQ で RQ を RST から RDY へ遷移させる。
+ *
+ * 引数:
+ *   dev - 対象 HCA
+ *   rqn - 対象 RQ
+ * 戻り値:
+ *   0=成功、-1=コマンド失敗
+ * コール元:
+ *   mlx5_hca_bringup()
+ */
 static int mlx5_modify_rq_to_rdy(mlx5_dev_t *dev, uint32_t rqn) {
     uint8_t in[272];
     for (unsigned i = 0; i < sizeof(in); i++) {
@@ -1405,6 +1697,20 @@ static int mlx5_modify_rq_to_rdy(mlx5_dev_t *dev, uint32_t rqn) {
     return 0;
 }
 
+/*
+ * CREATE_TIR で受信側の Transport Interface Receive を作る。RSS は使わず
+ * DIRECT で単一 RQ へ固定ルーティングする最小実装。
+ *
+ * 引数:
+ *   dev      - 対象 HCA
+ *   rqn      - 転送先 RQ
+ *   tdn      - 所属 transport domain
+ *   out_tirn - TIR 番号の格納先
+ * 戻り値:
+ *   0=成功、-1=コマンド失敗
+ * コール元:
+ *   mlx5_hca_bringup()
+ */
 static int mlx5_create_tir(mlx5_dev_t *dev, uint32_t rqn, uint32_t tdn, uint32_t *out_tirn) {
     uint8_t in[272];
     for (unsigned i = 0; i < sizeof(in); i++) {
@@ -1446,6 +1752,23 @@ static int mlx5_create_tir(mlx5_dev_t *dev, uint32_t rqn, uint32_t tdn, uint32_t
 #define MLX5_SQC_STATE_RDY    1u
 #define MLX5_SQC_STATE_ERR    3u  // mlx5_monitor_dump_dev()のstate表示コメント参照
 
+/*
+ * CREATE_SQ で送信キューを作る。tis_lst_sz=1 と tis_num_0 の設定が必須で、
+ * これを忘れると CREATE_SQ/MODIFY_SQ は成功するのに WQE が一切フェッチ
+ * されず SQ が黙って ERR へ落ちる。
+ *
+ * 引数:
+ *   dev      - 対象 HCA
+ *   cqn      - 完了を受け取る CQ
+ *   pdn      - 所属 PD
+ *   uarn     - 使用する UAR
+ *   tisn     - 送信に使う TIS
+ *   out_sqn  - SQ 番号の格納先
+ * 戻り値:
+ *   0=成功、-1=コマンド失敗
+ * コール元:
+ *   mlx5_hca_bringup()
+ */
 static int mlx5_create_sq(mlx5_dev_t *dev, uint32_t cqn, uint32_t pdn, uint32_t uarn, uint32_t tisn, uint32_t *out_sqn) {
     volatile uint8_t *dbr = (volatile uint8_t *)(uintptr_t)(uint64_t)dev->sq_dbr_cpu;
     for (unsigned i = 0; i < MLX5_SQ_DBR_SIZE; i++) {
@@ -1511,6 +1834,19 @@ static int mlx5_create_sq(mlx5_dev_t *dev, uint32_t cqn, uint32_t pdn, uint32_t 
     return 0;
 }
 
+/*
+ * MODIFY_SQ で SQ の状態を遷移させる。
+ *
+ * 引数:
+ *   dev       - 対象 HCA
+ *   sqn       - 対象 SQ
+ *   cur_state - 現在の状態
+ *   new_state - 遷移先の状態
+ * 戻り値:
+ *   0=成功、-1=コマンド失敗
+ * コール元:
+ *   mlx5_modify_sq_to_rdy(), mlx5_recover_sq()
+ */
 static int mlx5_modify_sq_state(mlx5_dev_t *dev, uint32_t sqn, uint8_t cur_state, uint8_t new_state) {
     uint8_t in[272];
     for (unsigned i = 0; i < sizeof(in); i++) {
@@ -1543,12 +1879,34 @@ static int mlx5_modify_sq_state(mlx5_dev_t *dev, uint32_t sqn, uint8_t cur_state
     return 0;
 }
 
+/*
+ * SQ を RST から RDY へ遷移させる薄いラッパ。
+ *
+ * 引数:
+ *   dev - 対象 HCA
+ *   sqn - 対象 SQ
+ * 戻り値:
+ *   0=成功、-1=コマンド失敗
+ * コール元:
+ *   mlx5_hca_bringup()
+ */
 static int mlx5_modify_sq_to_rdy(mlx5_dev_t *dev, uint32_t sqn) {
     return mlx5_modify_sq_state(dev, sqn, MLX5_SQC_STATE_RST, MLX5_SQC_STATE_RDY);
 }
 
 #define MLX5_CMD_OP_ACCESS_REG 0x805u
 #define MLX5_REG_PAOS          0x5006u
+/*
+ * ACCESS_REG(PAOS)でポートの admin 状態を UP にする。これを呼ばないと
+ * ポートは論理的に無効のままで、フレームが一切流れない。
+ *
+ * 引数:
+ *   dev - 対象 HCA
+ * 戻り値:
+ *   0=成功、-1=コマンド失敗
+ * コール元:
+ *   mlx5_hca_bringup()
+ */
 static int mlx5_set_port_admin_status_up(mlx5_dev_t *dev) {
     uint8_t in[16 + 16];
     for (unsigned i = 0; i < sizeof(in); i++) {
@@ -1582,6 +1940,18 @@ static int mlx5_set_port_admin_status_up(mlx5_dev_t *dev) {
     return 0;
 }
 
+/*
+ * PAOS の oper_status(PHY のオートネゴシエーション完了を要する実際の
+ * リンク状態、admin_status とは別)を読む。
+ *
+ * 引数:
+ *   dev             - 対象 HCA
+ *   out_oper_status - 格納先(1=UP)
+ * 戻り値:
+ *   0=成功、-1=コマンド失敗
+ * コール元:
+ *   mlx5_hca_bringup()
+ */
 static int mlx5_query_port_oper_status(mlx5_dev_t *dev, uint8_t *out_oper_status) {
     uint8_t in[16 + 16];
     for (unsigned i = 0; i < sizeof(in); i++) {
@@ -1608,6 +1978,17 @@ static int mlx5_query_port_oper_status(mlx5_dev_t *dev, uint8_t *out_oper_status
 
 #define MLX5_REG_PMTU 0x5003u
 
+/*
+ * PMTU の max_mtu(このポートが受け付ける最大フレーム長)を読む。
+ *
+ * 引数:
+ *   dev         - 対象 HCA
+ *   out_max_mtu - 格納先
+ * 戻り値:
+ *   0=成功、-1=コマンド失敗
+ * コール元:
+ *   mlx5_set_port_mtu()
+ */
 static int mlx5_query_port_max_mtu(mlx5_dev_t *dev, uint16_t *out_max_mtu) {
     uint8_t in[16 + 16];
     for (unsigned i = 0; i < sizeof(in); i++) {
@@ -1632,6 +2013,19 @@ static int mlx5_query_port_max_mtu(mlx5_dev_t *dev, uint16_t *out_max_mtu) {
     return 0;
 }
 
+/*
+ * PMTU の admin_mtu へ希望値を書く。先に max_mtu を読み、超える場合は
+ * 切り詰めてから書く(黙って拒否されるより安全側)。
+ *
+ * 引数:
+ *   dev              - 対象 HCA
+ *   desired_mtu      - 希望するワイヤ上の最大フレーム長
+ *   out_applied_mtu  - 実際に適用された値の格納先
+ * 戻り値:
+ *   0=成功、-1=コマンド失敗
+ * コール元:
+ *   mlx5_hca_bringup()
+ */
 static int mlx5_set_port_mtu(mlx5_dev_t *dev, uint16_t desired_mtu, uint16_t *out_applied_mtu) {
     uint16_t max_mtu = 0;
     if (mlx5_query_port_max_mtu(dev, &max_mtu) != 0) {
@@ -1683,6 +2077,15 @@ static int mlx5_set_port_mtu(mlx5_dev_t *dev, uint16_t desired_mtu, uint16_t *ou
 #define MLX5_ROCE_L3_TYPE_IPV4 0u
 #define MLX5_ROCE_VERSION_2    2u
 
+/*
+ * IPv4 から IPv4-mapped IPv6 形式の RoCEv2 GID(::ffff:a.b.c.d)を構築する。
+ *
+ * 引数:
+ *   ipv4_host_order - IPv4(ホストバイトオーダー)
+ *   out_gid         - 16 バイトの格納先
+ * コール元:
+ *   rdma_cm_fill_addr()
+ */
 void mlx5_build_roce_gid_v4(uint32_t ipv4_host_order, uint8_t out_gid[16]) {
     for (unsigned i = 0; i < 10; i++) {
         out_gid[i] = 0;
@@ -1695,6 +2098,20 @@ void mlx5_build_roce_gid_v4(uint32_t ipv4_host_order, uint8_t out_gid[16]) {
     out_gid[15] = (uint8_t)ipv4_host_order;
 }
 
+/*
+ * SET_ROCE_ADDRESS で GID テーブルへ自分の GID と MAC を登録する
+ * (RoCEv2 固定、L3 type は IPv4)。
+ *
+ * 引数:
+ *   dev   - 対象 HCA
+ *   index - GID テーブルのインデックス
+ *   gid   - 登録する GID(16 バイト)
+ *   mac   - 登録する MAC(6 バイト)
+ * 戻り値:
+ *   0=成功、-1=コマンド失敗
+ * コール元:
+ *   rdma_cm_setup_gsi()
+ */
 int mlx5_set_roce_address(mlx5_dev_t *dev, uint32_t index, const uint8_t gid[16], const uint8_t mac[6]) {
     uint8_t in[16 + 32] = {0};
     in[0] = (uint8_t)(MLX5_CMD_OP_SET_ROCE_ADDRESS >> 8);
@@ -1744,6 +2161,19 @@ int mlx5_set_roce_address(mlx5_dev_t *dev, uint32_t index, const uint8_t gid[16]
 
 #define MLX5_QPC_BYTES 232u // struct mlx5_ifc_qpc_bits全体、上記コメント参照
 
+/*
+ * QPC の primary_address_path(44 バイト)へ RoCEv2 のアドレス情報
+ * (相手 GID/MAC、UDP sport、hop limit、vhca_port_num)を書く。
+ *
+ * 引数:
+ *   ads             - qpc+24 を指すポインタ
+ *   remote_gid      - 相手 GID
+ *   remote_mac      - 相手 MAC
+ *   udp_sport       - 算出済み UDP 送信元ポート
+ *   set_ack_timeout - 1=ack_timeout も設定する(RTR2RTS 用)
+ * コール元:
+ *   mlx5_qp_modify_init2rtr(), mlx5_qp_modify_init2rtr_ud(), mlx5_qp_modify_rtr2rts()
+ */
 static void mlx5_ads_fill_roce(uint8_t *ads /* qpc+24を指す、44バイト */,
                                 const uint8_t remote_gid[16], const uint8_t remote_mac[6],
                                 uint16_t udp_sport, int full, int set_ack_timeout) {
@@ -1767,6 +2197,18 @@ static void mlx5_ads_fill_roce(uint8_t *ads /* qpc+24を指す、44バイト */,
     }
 }
 
+/*
+ * QPN の組から RoCEv2 の UDP 送信元ポートを算出する(Linux の
+ * rdma_calc_flow_label()/rdma_flow_label_to_udp_sport() と同じ式)。
+ *
+ * 引数:
+ *   lqpn - 自分の QPN
+ *   rqpn - 相手の QPN
+ * 戻り値:
+ *   UDP 送信元ポート
+ * コール元:
+ *   mlx5_qp_modify_init2rtr(), mlx5_qp_post_send_ud()
+ */
 uint16_t mlx5_calc_udp_sport(uint32_t lqpn, uint32_t rqpn) {
     uint64_t v = (uint64_t)lqpn * (uint64_t)rqpn;
     v ^= v >> 20;
@@ -1778,6 +2220,19 @@ uint16_t mlx5_calc_udp_sport(uint32_t lqpn, uint32_t rqpn) {
     return (uint16_t)(fl_low | 0xC000u);
 }
 
+/*
+ * リモートからの RDMA_WRITE/READ を許可した PA モード MKey を作る
+ * (rw/rr ビットを立てる)。RDMA データ転送にはこちらが要る。
+ *
+ * 引数:
+ *   dev      - 対象 HCA
+ *   pdn      - 所属 PD
+ *   out_mkey - mkey の格納先
+ * 戻り値:
+ *   0=成功、-1=コマンド失敗
+ * コール元:
+ *   mlx5_qp_create_rc(), mlx5_qp_create_ud_common()
+ */
 static int mlx5_create_mkey_pa_rw(mlx5_dev_t *dev, uint32_t pdn, uint32_t *out_mkey) {
     uint8_t in[272];
     for (unsigned i = 0; i < sizeof(in); i++) {
@@ -1814,6 +2269,18 @@ static int mlx5_create_mkey_pa_rw(mlx5_dev_t *dev, uint32_t pdn, uint32_t *out_m
     return 0;
 }
 
+/*
+ * MODIFY_NIC_VPORT_CONTEXT で roce_en=1 を立てる。これが無いと
+ * INIT2RTR_QP が BAD_OP_ERR で拒否される(RoCE アドレスパスを参照しない
+ * CREATE_QP/RST2INIT_QP は成功してしまうため気付きにくい)。
+ *
+ * 引数:
+ *   dev - 対象 HCA
+ * 戻り値:
+ *   0=成功、-1=コマンド失敗
+ * コール元:
+ *   mlx5_qp_create_rc(), mlx5_qp_create_ud_common()
+ */
 static int mlx5_nic_vport_enable_roce(mlx5_dev_t *dev) {
     uint8_t in[516];
     for (unsigned i = 0; i < sizeof(in); i++) {
@@ -1842,6 +2309,20 @@ static int mlx5_nic_vport_enable_roce(mlx5_dev_t *dev) {
     return 0;
 }
 
+/*
+ * RC QP を 1 本作る。必要な UAR/PD/MKey(rw+rr)/CQ もここでまとめて確保し、
+ * roce_en も立てる。WQE/CQ の DMA アドレスは qp_index で 1 本目/2 本目を
+ * 切り替える。
+ *
+ * 引数:
+ *   dev      - 対象 HCA
+ *   qp       - 初期化する QP ハンドル
+ *   qp_index - 0=admin 用、1=IO キュー用
+ * 戻り値:
+ *   0=成功、-1=コマンド失敗
+ * コール元:
+ *   rdma_cm_setup_rc()
+ */
 int mlx5_qp_create_rc(mlx5_dev_t *dev, mlx5_qp_t *qp, uint8_t qp_index) {
     if (mlx5_nic_vport_enable_roce(dev) != 0) {
         uart_printf("mlx5qp: MODIFY_NIC_VPORT_CONTEXT(roce_en) failed\n");
@@ -1944,6 +2425,18 @@ int mlx5_qp_create_rc(mlx5_dev_t *dev, mlx5_qp_t *qp, uint8_t qp_index) {
     return 0;
 }
 
+/*
+ * RC QP を RST から INIT へ遷移させる。この FW では pd と
+ * vhca_port_num だけを設定すること(rre/rwe/rae を含めると BAD_PARAM_ERR)。
+ *
+ * 引数:
+ *   dev - 対象 HCA
+ *   qp  - 対象 QP
+ * 戻り値:
+ *   0=成功、-1=コマンド失敗
+ * コール元:
+ *   rdma_cm_setup_rc()
+ */
 int mlx5_qp_modify_rst2init(mlx5_dev_t *dev, mlx5_qp_t *qp) {
     uint8_t in[24 + MLX5_QPC_BYTES + 16];
     for (unsigned i = 0; i < sizeof(in); i++) {
@@ -1980,6 +2473,24 @@ int mlx5_qp_modify_rst2init(mlx5_dev_t *dev, mlx5_qp_t *qp) {
     return 0;
 }
 
+/*
+ * RC QP を INIT から RTR へ遷移させる。相手 QPN・開始 PSN・path MTU と
+ * RoCEv2 アドレスパスを設定する。**開始 PSN の向きに注意** -- 自分が受信に
+ * 期待する PSN は自分が REQ/REP で宣言した値、送信に使う PSN は相手が
+ * 宣言した値。
+ *
+ * 引数:
+ *   dev              - 対象 HCA
+ *   qp               - 対象 QP
+ *   remote_qpn       - 相手の QPN
+ *   remote_start_psn - 相手が宣言した開始 PSN
+ *   remote_gid       - 相手 GID
+ *   remote_mac       - 相手 MAC
+ * 戻り値:
+ *   0=成功、-1=コマンド失敗
+ * コール元:
+ *   rdma_cm_job_step()
+ */
 int mlx5_qp_modify_init2rtr(mlx5_dev_t *dev, mlx5_qp_t *qp, uint32_t remote_qpn,
                              const uint8_t remote_gid[16], const uint8_t remote_mac[6],
                              uint32_t remote_start_psn) {
@@ -2042,6 +2553,17 @@ int mlx5_qp_modify_init2rtr(mlx5_dev_t *dev, mlx5_qp_t *qp, uint32_t remote_qpn,
     return 0;
 }
 
+/*
+ * この HCA が同時に受け付けられる RDMA_READ の数を返す(general cap の
+ * log_max_ra_req_qp / log_max_ra_res_qp の小さい方から求める)。実測では 1。
+ *
+ * 引数:
+ *   dev - 対象 HCA
+ * 戻り値:
+ *   同時 RDMA_READ 数
+ * コール元:
+ *   mlx5_qp_modify_rtr2rts(), nvmet_rdma_job_step()
+ */
 uint32_t mlx5_qp_max_concurrent_rdma_read(mlx5_dev_t *dev) {
     uint8_t log_v = dev->log_max_ra_req_qp;
     if (dev->log_max_ra_res_qp < log_v) log_v = dev->log_max_ra_res_qp;
@@ -2049,6 +2571,18 @@ uint32_t mlx5_qp_max_concurrent_rdma_read(mlx5_dev_t *dev) {
     return 1u << log_v;
 }
 
+/*
+ * RC QP を RTR から RTS へ遷移させる。rre/rwe(リモート RDMA アクセス許可)
+ * と log_rra_max はこの遷移で設定する -- INIT2RTR で書いても FW は保持しない。
+ *
+ * 引数:
+ *   dev - 対象 HCA
+ *   qp  - 対象 QP
+ * 戻り値:
+ *   0=成功、-1=コマンド失敗
+ * コール元:
+ *   rdma_cm_job_step()
+ */
 int mlx5_qp_modify_rtr2rts(mlx5_dev_t *dev, mlx5_qp_t *qp) {
     uint8_t in[24 + MLX5_QPC_BYTES + 16];
     for (unsigned i = 0; i < sizeof(in); i++) {
@@ -2101,6 +2635,20 @@ int mlx5_qp_modify_rtr2rts(mlx5_dev_t *dev, mlx5_qp_t *qp) {
     return 0;
 }
 
+/*
+ * QUERY_QP で QP の RQ/SQ が実際に何 WQE 処理したかを読む(HW 側と
+ * ソフトウェア側のカウンタを突き合わせ、詰まりの所在を切り分ける診断用)。
+ *
+ * 引数:
+ *   dev - 対象 HCA
+ *   qp  - 対象 QP
+ *   out_hw_rq / out_sw_rq - RQ の HW/SW カウンタ
+ *   out_hw_sq / out_sw_sq - SQ の HW/SW カウンタ
+ * 戻り値:
+ *   0=成功、-1=コマンド失敗
+ * コール元:
+ *   nvme_rdma_connect_job_step(), nvmet_rdma_job_step()
+ */
 int mlx5_qp_query_counters(mlx5_dev_t *dev, mlx5_qp_t *qp, uint32_t *out_hw_rq, uint32_t *out_sw_rq,
                             uint16_t *out_hw_sq, uint16_t *out_sw_sq) {
     uint8_t in[16] = {0};
@@ -2136,6 +2684,18 @@ int mlx5_qp_query_counters(mlx5_dev_t *dev, mlx5_qp_t *qp, uint32_t *out_hw_rq, 
     return 0;
 }
 
+/*
+ * DESTROY_QP で FW 側の QP オブジェクトを解放する。ジョブを止めるだけでは
+ * 解放されず、作り直しを繰り返すと FW のリソースが枯渇する。
+ *
+ * 引数:
+ *   dev - 対象 HCA
+ *   qp  - 解放する QP
+ * 戻り値:
+ *   0=成功、-1=コマンド失敗
+ * コール元:
+ *   nvmer_destroy_qp_if_valid(), nvmetr_destroy_qp_if_valid()
+ */
 int mlx5_qp_destroy(mlx5_dev_t *dev, mlx5_qp_t *qp) {
     uint8_t in[16] = {0};
     in[0] = (uint8_t)(MLX5_CMD_OP_DESTROY_QP >> 8);
@@ -2160,6 +2720,19 @@ int mlx5_qp_destroy(mlx5_dev_t *dev, mlx5_qp_t *qp) {
 #define MLX5_QP_ST_QP1 0x8u // 同、drivers/infiniband/hw/mlx5/qp.cの
 #define MLX5_QP1_QKEY  0x80010000u // include/rdma/ib_mad.hのIB_QP1_QKEY。
 
+/*
+ * UD / GSI QP を 1 本作る共通実装(service type だけが違う)。RC 同様に
+ * UAR/PD/MKey/CQ の確保と roce_en も行う。
+ *
+ * 引数:
+ *   dev - 対象 HCA
+ *   qp  - 初期化する QP ハンドル
+ *   st  - service type(UD か QP1)
+ * 戻り値:
+ *   0=成功、-1=コマンド失敗
+ * コール元:
+ *   mlx5_qp_create_gsi()
+ */
 static int mlx5_qp_create_ud_common(mlx5_dev_t *dev, mlx5_qp_t *qp, uint8_t st) {
     if (mlx5_nic_vport_enable_roce(dev) != 0) {
         uart_printf("mlx5qp: MODIFY_NIC_VPORT_CONTEXT(roce_en) failed\n");
@@ -2259,10 +2832,33 @@ static int mlx5_qp_create_ud_common(mlx5_dev_t *dev, mlx5_qp_t *qp, uint8_t st) 
     return 0;
 }
 
+/*
+ * GSI(QP1 相当)QP を作る薄いラッパ。
+ *
+ * 引数:
+ *   dev - 対象 HCA
+ *   qp  - 初期化する QP ハンドル
+ * 戻り値:
+ *   0=成功、-1=コマンド失敗
+ * コール元:
+ *   rdma_cm_setup_gsi()
+ */
 int mlx5_qp_create_gsi(mlx5_dev_t *dev, mlx5_qp_t *qp) {
     return mlx5_qp_create_ud_common(dev, qp, MLX5_QP_ST_QP1);
 }
 
+/*
+ * UD/GSI QP を RST から INIT へ遷移させる。
+ *
+ * 引数:
+ *   dev  - 対象 HCA
+ *   qp   - 対象 QP
+ *   qkey - このキューの Q_Key
+ * 戻り値:
+ *   0=成功、-1=コマンド失敗
+ * コール元:
+ *   rdma_cm_setup_gsi()
+ */
 int mlx5_qp_modify_rst2init_ud(mlx5_dev_t *dev, mlx5_qp_t *qp, uint32_t qkey) {
     qp->qkey = qkey;
     uint8_t in[24 + MLX5_QPC_BYTES + 16];
@@ -2303,6 +2899,18 @@ int mlx5_qp_modify_rst2init_ud(mlx5_dev_t *dev, mlx5_qp_t *qp, uint32_t qkey) {
     return 0;
 }
 
+/*
+ * UD/GSI QP を INIT から RTR へ遷移させる。UD は相手情報を QPC ではなく
+ * 送信 WQE の AV に載せるため、ここでは path 情報を設定しない。
+ *
+ * 引数:
+ *   dev - 対象 HCA
+ *   qp  - 対象 QP
+ * 戻り値:
+ *   0=成功、-1=コマンド失敗
+ * コール元:
+ *   rdma_cm_setup_gsi()
+ */
 int mlx5_qp_modify_init2rtr_ud(mlx5_dev_t *dev, mlx5_qp_t *qp) {
     uint8_t in[24 + MLX5_QPC_BYTES + 16];
     for (unsigned i = 0; i < sizeof(in); i++) {
@@ -2347,6 +2955,17 @@ int mlx5_qp_modify_init2rtr_ud(mlx5_dev_t *dev, mlx5_qp_t *qp) {
     return 0;
 }
 
+/*
+ * UD/GSI QP を RTR から RTS へ遷移させる。
+ *
+ * 引数:
+ *   dev - 対象 HCA
+ *   qp  - 対象 QP
+ * 戻り値:
+ *   0=成功、-1=コマンド失敗
+ * コール元:
+ *   rdma_cm_setup_gsi()
+ */
 int mlx5_qp_modify_rtr2rts_ud(mlx5_dev_t *dev, mlx5_qp_t *qp) {
     uint8_t in[24 + MLX5_QPC_BYTES + 16];
     for (unsigned i = 0; i < sizeof(in); i++) {
@@ -2390,6 +3009,17 @@ int mlx5_qp_modify_rtr2rts_ud(mlx5_dev_t *dev, mlx5_qp_t *qp) {
 #define MLX5_IFC_FLOW_DESTINATION_TYPE_TIR   2u
 #define MLX5_FLOW_CONTEXT_ACTION_FWD_DEST    0x4u
 
+/*
+ * CREATE_FLOW_TABLE で NIC RX のフローテーブルを作る。
+ *
+ * 引数:
+ *   dev          - 対象 HCA
+ *   out_table_id - テーブル ID の格納先
+ * 戻り値:
+ *   0=成功、-1=コマンド失敗
+ * コール元:
+ *   mlx5_hca_bringup()
+ */
 static int mlx5_create_flow_table_nic_rx(mlx5_dev_t *dev, uint32_t *out_table_id) {
     uint8_t in[64];
     for (unsigned i = 0; i < sizeof(in); i++) {
@@ -2420,6 +3050,17 @@ static int mlx5_create_flow_table_nic_rx(mlx5_dev_t *dev, uint32_t *out_table_id
     return 0;
 }
 
+/*
+ * SET_FLOW_TABLE_ROOT で作ったテーブルを NIC RX のルートに設定する。
+ *
+ * 引数:
+ *   dev      - 対象 HCA
+ *   table_id - ルートにするテーブル
+ * 戻り値:
+ *   0=成功、-1=コマンド失敗
+ * コール元:
+ *   mlx5_hca_bringup()
+ */
 static int mlx5_set_flow_table_root_nic_rx(mlx5_dev_t *dev, uint32_t table_id) {
     uint8_t in[64];
     for (unsigned i = 0; i < sizeof(in); i++) {
@@ -2449,6 +3090,19 @@ static int mlx5_set_flow_table_root_nic_rx(mlx5_dev_t *dev, uint32_t table_id) {
     return 0;
 }
 
+/*
+ * CREATE_FLOW_GROUP で match 条件を一切持たない catch-all グループを作る
+ * (1024 バイトの固定長コマンドでメールボックスチェインが要る)。
+ *
+ * 引数:
+ *   dev          - 対象 HCA
+ *   table_id     - 所属テーブル
+ *   out_group_id - グループ ID の格納先
+ * 戻り値:
+ *   0=成功、-1=コマンド失敗
+ * コール元:
+ *   mlx5_hca_bringup()
+ */
 static int mlx5_create_flow_group_catchall(mlx5_dev_t *dev, uint32_t table_id, uint32_t *out_group_id) {
     uint8_t in[1024];
     for (unsigned i = 0; i < sizeof(in); i++) {
@@ -2483,6 +3137,20 @@ static int mlx5_create_flow_group_catchall(mlx5_dev_t *dev, uint32_t table_id, u
     return 0;
 }
 
+/*
+ * SET_FLOW_TABLE_ENTRY で「全受信フレームを TIR へ転送する」ルールを 1 本
+ * 入れる。これが無いと HW はフレームを RQ へ届けない。
+ *
+ * 引数:
+ *   dev      - 対象 HCA
+ *   table_id - 対象テーブル
+ *   group_id - 対象グループ
+ *   tirn     - 転送先 TIR
+ * 戻り値:
+ *   0=成功、-1=コマンド失敗
+ * コール元:
+ *   mlx5_hca_bringup()
+ */
 static int mlx5_set_fte_fwd_tir(mlx5_dev_t *dev, uint32_t table_id, uint32_t group_id, uint32_t tirn) {
     uint8_t in[840];
     for (unsigned i = 0; i < sizeof(in); i++) {
@@ -2541,6 +3209,17 @@ static int mlx5_set_fte_fwd_tir(mlx5_dev_t *dev, uint32_t table_id, uint32_t gro
 #define MLX5_CMD_OP_QUERY_SQ 0x907u
 #define MLX5_CMD_OP_QUERY_CQ 0x402u
 
+/*
+ * PAOS から admin/oper 両方のポート状態を読む。
+ *
+ * 引数:
+ *   dev - 対象 HCA
+ *   out_admin_status / out_oper_status - 格納先
+ * 戻り値:
+ *   0=成功、-1=コマンド失敗
+ * コール元:
+ *   mlx5_monitor_dump_dev(), mlx5_monitor_summary3()
+ */
 static int mlx5_query_port_status(mlx5_dev_t *dev, uint8_t *out_admin_status, uint8_t *out_oper_status) {
     uint8_t in[16 + 16];
     for (unsigned i = 0; i < sizeof(in); i++) {
@@ -2570,6 +3249,19 @@ static int mlx5_query_port_status(mlx5_dev_t *dev, uint8_t *out_admin_status, ui
     return 0;
 }
 
+/*
+ * ACCESS_REG(PPCNT)で物理ポートの統計カウンタグループを読む。
+ *
+ * 引数:
+ *   dev     - 対象 HCA
+ *   grp     - カウンタグループ(0x0=IEEE802.3, 0x12=Physical Layer)
+ *   out     - 読んだレジスタの格納先
+ *   out_len - その容量
+ * 戻り値:
+ *   0=成功、-1=コマンド失敗
+ * コール元:
+ *   mlx5_dump_ieee802_3(), mlx5_dump_phys_layer(), mlx5_hw_error_flags()
+ */
 static int mlx5_ppcnt_query(mlx5_dev_t *dev, uint8_t grp, uint8_t *counter_set_out) {
     uint8_t in[16 + 8 + MLX5_PPCNT_COUNTER_SET_BYTES];
     for (unsigned i = 0; i < sizeof(in); i++) {
@@ -2613,11 +3305,31 @@ static void mlx5_print_ctr64(const char *name, const uint8_t *cs, unsigned byte_
     }
 }
 
+/*
+ * PPCNT レジスタから 32bit カウンタを取り出す。
+ *
+ * 引数:
+ *   reg - PPCNT レジスタ
+ *   off - バイトオフセット
+ * 戻り値:
+ *   カウンタ値
+ * コール元:
+ *   mlx5_dump_phys_layer(), mlx5_hw_error_flags()
+ */
 static uint32_t mlx5_ctr32(const uint8_t *cs, unsigned byte_off) {
     return ((uint32_t)cs[byte_off] << 24) | ((uint32_t)cs[byte_off + 1] << 16) |
            ((uint32_t)cs[byte_off + 2] << 8) | cs[byte_off + 3];
 }
 
+/*
+ * PPCNT の IEEE802.3 グループ(tx/rx frames_ok、fcs_err、align_err 等)を
+ * 表示する。MAC 層まで実際にフレームが届いているかの確認に使う。
+ *
+ * 引数:
+ *   dev - 対象 HCA
+ * コール元:
+ *   mlx5_monitor_dump_dev()
+ */
 static void mlx5_dump_ieee802_3(mlx5_dev_t *dev, const char *label) {
     uint8_t cs[MLX5_PPCNT_COUNTER_SET_BYTES];
     if (mlx5_ppcnt_query(dev, MLX5_PPCNT_GRP_IEEE_802_3, cs) != 0) {
@@ -2640,6 +3352,15 @@ static void mlx5_dump_ieee802_3(mlx5_dev_t *dev, const char *label) {
     uart_printf("\n");
 }
 
+/*
+ * PPCNT の Physical Layer グループ(symbol_errors、link_down_events 等)を
+ * 表示する。
+ *
+ * 引数:
+ *   dev - 対象 HCA
+ * コール元:
+ *   mlx5_monitor_dump_dev()
+ */
 static void mlx5_dump_phys_layer(mlx5_dev_t *dev, const char *label) {
     uint8_t cs[MLX5_PPCNT_COUNTER_SET_BYTES];
     if (mlx5_ppcnt_query(dev, MLX5_PPCNT_GRP_PHYSICAL_LAYER, cs) != 0) {
@@ -2652,6 +3373,17 @@ static void mlx5_dump_phys_layer(mlx5_dev_t *dev, const char *label) {
                 mlx5_ctr32(cs, 192), mlx5_ctr32(cs, 196));
 }
 
+/*
+ * ACCESS_REG(MTMP)でチップ温度を読む。
+ *
+ * 引数:
+ *   dev            - 対象 HCA
+ *   out_temp_c_x8  - 温度(1/8 度単位)の格納先
+ * 戻り値:
+ *   0=成功、-1=コマンド失敗
+ * コール元:
+ *   mlx5_monitor_summary3()
+ */
 static int mlx5_query_mtmp(mlx5_dev_t *dev, int16_t *out_temp, int16_t *out_max) {
     uint8_t in[16 + 32];
     for (unsigned i = 0; i < sizeof(in); i++) in[i] = 0;
@@ -2671,6 +3403,19 @@ static int mlx5_query_mtmp(mlx5_dev_t *dev, int16_t *out_temp, int16_t *out_max)
     return 0;
 }
 
+/*
+ * ACCESS_REG(MPCNT)で PCIe レイヤのエラーカウンタを読む。
+ *
+ * 引数:
+ *   dev     - 対象 HCA
+ *   grp     - カウンタグループ
+ *   out     - 読んだレジスタの格納先
+ *   out_len - その容量
+ * 戻り値:
+ *   0=成功、-1=コマンド失敗
+ * コール元:
+ *   mlx5_hw_error_flags()
+ */
 static int mlx5_mpcnt_query(mlx5_dev_t *dev, uint8_t grp, uint8_t *cs_out) {
     uint8_t in[16 + 8 + MLX5_PPCNT_COUNTER_SET_BYTES];
     for (unsigned i = 0; i < sizeof(in); i++) in[i] = 0;
@@ -2687,7 +3432,17 @@ static int mlx5_mpcnt_query(mlx5_dev_t *dev, uint8_t grp, uint8_t *cs_out) {
     return 0;
 }
 
-// PPCNT/MPCNT の64bitカウンタ(hi@off, lo@off+4)が非0か。
+/*
+ * PPCNT/MPCNT の 64bit カウンタが非ゼロかを調べる。
+ *
+ * 引数:
+ *   reg - レジスタ
+ *   off - バイトオフセット
+ * 戻り値:
+ *   1=非ゼロ、0=ゼロ
+ * コール元:
+ *   mlx5_hw_error_flags()
+ */
 static int mlx5_ctr64_nonzero(const uint8_t *cs, unsigned off) {
     for (unsigned i = 0; i < 8; i++) if (cs[off + i]) return 1;
     return 0;
@@ -2698,6 +3453,17 @@ static int mlx5_ctr64_nonzero(const uint8_t *cs, unsigned off) {
 #define MLX5_HWERR_ETH_FCS 0x04u
 #define MLX5_HWERR_ETH_ALN 0x08u
 #define MLX5_HWERR_ETH_SYM 0x10u
+/*
+ * PPCNT/MPCNT/health レジスタを走査し、ハードウェアエラーが 1 つでも
+ * 立っているかをフラグにまとめる。
+ *
+ * 引数:
+ *   dev - 対象 HCA
+ * 戻り値:
+ *   エラー種別のビットマスク(0=異常なし)
+ * コール元:
+ *   mlx5_monitor_summary3()
+ */
 static uint32_t mlx5_hw_error_flags(mlx5_dev_t *dev, uint16_t devsta) {
     uint32_t f = 0;
     // FW health synd(init-seg 相対 byte0x23d、mlx5_read32(0x23c)の bits23:16)
@@ -2720,6 +3486,17 @@ typedef struct {
     unsigned cur_spd, cur_w, max_spd, max_w, mps, mrrs;
     uint16_t devsta;
 } mlx5_pcie_info_t;
+/*
+ * PCI コンフィグ空間の PCIe Capability からリンク速度・幅・MPS・MRRS を
+ * 読み出す。
+ *
+ * 引数:
+ *   rd  - コンフィグ空間リード関数
+ *   ctx - rd へ渡すコンテキスト
+ *   o   - 読み取り結果の格納先
+ * コール元:
+ *   mlx5_monitor_summary3()
+ */
 static void mlx5_pcie_query_cfg(uint32_t (*rd)(void *, uint32_t), void *ctx, mlx5_pcie_info_t *o) {
     o->valid = 0;
     if (!((rd(ctx, 0x04u) >> 16) & 0x10u)) return;    // Status: capability list 無し
@@ -2743,6 +3520,17 @@ static void mlx5_pcie_query_cfg(uint32_t (*rd)(void *, uint32_t), void *ctx, mlx
     o->valid = 1;
 }
 
+/*
+ * シェルの `monitor`。PF0/PF1 について温度・health・PCIe リンク状態・
+ * MAC/PHY エラーカウンタ・ポート状態をまとめて表示する。
+ *
+ * 引数:
+ *   dev0, dev1 - 表示する HCA
+ *   rd         - コンフィグ空間リード関数
+ *   ctx0, ctx1 - rd へ渡すコンテキスト
+ * コール元:
+ *   shell_dispatch()
+ */
 void mlx5_monitor_summary3(mlx5_dev_t *d0, mlx5_dev_t *d1,
                            uint32_t (*rd)(void *, uint32_t), void *cx0, void *cx1) {
     mlx5_dev_t *dv[2] = { d0, d1 };
@@ -2787,6 +3575,20 @@ void mlx5_monitor_summary3(mlx5_dev_t *d0, mlx5_dev_t *d1,
                 128u << pi[0].mps, 128u << pi[0].mrrs);
 }
 
+/*
+ * QUERY_RQ / QUERY_SQ で WQ の状態(RST/RDY/ERR)と hw/sw カウンタを読む。
+ *
+ * 引数:
+ *   dev       - 対象 HCA
+ *   is_sq     - 1=SQ、0=RQ
+ *   wqn       - 対象 WQ 番号
+ *   out_state - 状態の格納先
+ *   out_hw / out_sw - カウンタの格納先
+ * 戻り値:
+ *   0=成功、-1=コマンド失敗
+ * コール元:
+ *   mlx5_monitor_dump_dev(), mlx5_recover_sq()
+ */
 static int mlx5_query_wq_state(mlx5_dev_t *dev, uint16_t opcode, uint32_t objn,
                                 uint8_t *out_state, uint32_t *out_hw_counter, uint32_t *out_sw_counter) {
     uint8_t in[16] = {0};
@@ -2822,6 +3624,18 @@ static int mlx5_query_wq_state(mlx5_dev_t *dev, uint16_t opcode, uint32_t objn,
     return 0;
 }
 
+/*
+ * ERR 状態に落ちた SQ を ERR->RST->RDY と遷移させて復帰させる。まず
+ * QUERY_SQ で本当に ERR かを確認してから行う。
+ *
+ * 引数:
+ *   dev - 対象 HCA
+ *   sqn - 対象 SQ
+ * 戻り値:
+ *   0=復帰した、-1=失敗
+ * コール元:
+ *   mlx5_net_try_recover()
+ */
 int mlx5_recover_sq(mlx5_dev_t *dev) {
     uint8_t state = 0xFFu;
     if (mlx5_query_wq_state(dev, MLX5_CMD_OP_QUERY_SQ, dev->sqn, &state, NULL, NULL) != 0) {
@@ -2847,6 +3661,20 @@ int mlx5_recover_sq(mlx5_dev_t *dev) {
     return 0;
 }
 
+/*
+ * QUERY_CQ で CQ の status と producer/consumer カウンタを読む
+ * (CQ オーバーフローの検出に使う)。
+ *
+ * 引数:
+ *   dev        - 対象 HCA
+ *   cqn        - 対象 CQ
+ *   out_status - status の格納先
+ *   out_pc / out_cc - カウンタの格納先
+ * 戻り値:
+ *   0=成功、-1=コマンド失敗
+ * コール元:
+ *   mlx5_monitor_dump_dev()
+ */
 static int mlx5_query_cq_state(mlx5_dev_t *dev, uint32_t cqn, uint8_t *out_status, uint8_t *out_st,
                                 uint32_t *out_consumer_counter, uint32_t *out_producer_counter) {
     uint8_t in[16] = {0};
@@ -2883,6 +3711,16 @@ static int mlx5_query_cq_state(mlx5_dev_t *dev, uint32_t cqn, uint8_t *out_statu
     return 0;
 }
 
+/*
+ * 1 つの HCA について、ポート状態・MAC/PHY カウンタ・RQ/SQ/CQ の状態を
+ * まとめて表示する。
+ *
+ * 引数:
+ *   dev   - 対象 HCA
+ *   label - ログ用の名前
+ * コール元:
+ *   mlx5_monitor_dump_saved()
+ */
 static void mlx5_monitor_dump_dev(mlx5_dev_t *dev, const char *label) {
     uint8_t admin = 0xFFu, oper = 0xFFu;
     if (mlx5_query_port_status(dev, &admin, &oper) == 0) {
@@ -2921,6 +3759,13 @@ static void mlx5_monitor_dump_dev(mlx5_dev_t *dev, const char *label) {
     }
 }
 
+/*
+ * mlx5_monitor_set_devs() で保存済みの PF0/PF1 について
+ * mlx5_monitor_dump_dev() を呼ぶ(SQ 復帰時などに再初期化なしで状態を残す)。
+ *
+ * コール元:
+ *   mlx5_net_try_recover()
+ */
 void mlx5_monitor_dump_saved(void) {
     if (!s_last_devs_valid) {
         uart_printf("mlx5: no saved HCA state -- run `mlx5` (bring-up) first\n");

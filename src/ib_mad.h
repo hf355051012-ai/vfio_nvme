@@ -64,6 +64,20 @@ static inline void wr32be_ib(volatile void *p, uint32_t v) {
     b[3] = (uint8_t)v;
 }
 
+/*
+ * IBTA MAD ヘッダ(24 バイト)を組み立てる。CM の REQ/REP/RTU/DREP は
+ * どれもこのヘッダの直後にペイロードを置く。
+ *
+ * 引数:
+ *   buf      - 書き込み先(24 バイト以上)
+ *   mgmt_cls - management class(CM は 0x07)
+ *   method   - メソッド(SEND=0x03)
+ *   attr_id  - attribute id(REQ=0x0010 / REP=0x0013 / RTU=0x0014 / DREP=0x0016)
+ *   tid      - トランザクション ID
+ * コール元:
+ *   rdma_cm_build_req(), rdma_cm_build_rep(), rdma_cm_build_rtu(),
+ *   nvmetr_build_drep()
+ */
 static inline void ib_mad_hdr_build(volatile uint8_t *buf, uint8_t mgmt_class, uint8_t class_version,
                                      uint8_t method, uint64_t tid, uint16_t attr_id, uint32_t attr_mod) {
     buf[0] = (uint8_t)IB_MGMT_BASE_VERSION;
