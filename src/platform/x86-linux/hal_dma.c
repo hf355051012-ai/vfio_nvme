@@ -1,24 +1,3 @@
-// platform/x86-linux/hal_dma.c
-//
-// DMA アロケータ(include/platform.h の dma_alloc/dma_free 契約)+ cpu->dev 変換
-// (mlx5_dma_addr、mlx5.h の x86 分岐)の x86-linux 実装(x86-vfio-port Phase 3-5、
-// ~/.claude/plans/x86-vfio-port.md §3-5 参照)。
-//
-// 【x86 の DMA モデル】RPi5 は全物理 RAM が DMA 可能(RC_BAR2 窓が全域を張る)ため
-// core は任意の static バッファを DMA ソースにできる。x86 は IOMMU があり、VFIO で
-// マップした領域だけが DMA 可能。core は任意の static/プールバッファを DMA に使うので、
-// **プロセスの rw メモリ領域(.bss/.data/heap/DMA プール)を VFIO でマップ**し、
-// `mlx5_dma_addr()` が cpu ポインタ -> IOVA を引けるようにする。
-//
-// **IOVA は identity(=vaddr)ではなく低位に連番割り当てする**: 実行体は PIE で
-// vaddr が高位(~0x7f..)になり、この IOMMU の IOVA 幅(実測でこの高位 vaddr を
-// そのまま IOVA にすると VFIO_IOMMU_MAP_DMA が全領域失敗する)を超える。低位
-// (0x1_0000_0000 起点)から連番で IOVA を割り当てて各領域をマップし、
-// mlx5_dma_addr() は vaddr が属する領域を引いて iova_base + (cpu - va_base) を返す。
-//
-// dma_alloc はプール(hugepage 優先)から bump 払い出しするだけ(kind 無視、x86 は
-// 全コヒーレント)。プールもマップ対象領域の一つなので dev はその IOVA。
-
 #include "platform.h"
 #include "vfio.h"
 #include "uart.h"
@@ -33,11 +12,6 @@
 uint64_t mlx5_dma_addr(const volatile void *cpu_ptr);
 
 /* プール総サイズ = 256MB = 128 × 2MB hugepage(§5、hugepages を 128 枚予約済み)。 */
-/* 512MB。内訳の大半は nvmet_rdma / nvme_rdma の RAM ディスク
- * (NVMET_RDMA_RAMDISK_SLOT_SIZE = 256MB)で、残りが cmdq/mailbox/RQ/SQ/CQ 等。
- * Linux 側と名前空間を 256MB で揃えるため 256MB から拡大した。
- * hugepage が不足すると匿名ページへフォールバックする(性能が落ちるので、
- * /proc/sys/vm/nr_hugepages を 256 枚以上にしておくこと)。 */
 #define DMA_POOL_SIZE   (512ull * 1024ull * 1024ull)
 
 /* IOVA 割り当て起点(低位、IOMMU の IOVA 幅に確実に収まる)。 */
@@ -62,9 +36,6 @@ static dma_region_map_t s_regions[DMA_MAX_REGIONS];
 static int              s_nregions = 0;
 static uint64_t         s_next_iova = DMA_IOVA_BASE;
 
-/* /proc/self/maps を読み、rw 領域を低位 IOVA へ連番マップする。ベストエフォート
- * (失敗はスキップ)。特殊カーネルマッピング([vvar]/[vdso]/[vsyscall])は除外。
- * VFIO 準備前に呼ばれたら何もしない。プール確保後に 1 度だけ呼ばれる想定。 */
 static void remap_process_memory(void)
 {
     if (s_maps_done || !vfio_is_ready()) {
@@ -138,8 +109,6 @@ static int pool_init_locked(void)
     s_next_off  = 0;
     memset(s_pool, 0, s_pool_size); /* 物理割り当てを確定(VFIO ピン留め前) */
 
-    /* プール確保後にプロセスメモリ全体をマップ(プール自身・.bss の static
-     * バッファ・heap を DMA 可能にする)。 */
     remap_process_memory();
     return 0;
 }
@@ -170,8 +139,6 @@ dma_region_t dma_alloc(uint64_t size, uint64_t align, dma_kind_t kind)
     return r;
 }
 
-/* core に残る唯一の cpu->dev 変換(mlx5.h の x86 分岐が宣言)。cpu ポインタが属する
- * マップ済み領域を引いて対応する IOVA を返す。 */
 uint64_t mlx5_dma_addr(const volatile void *cpu_ptr)
 {
     uintptr_t p = (uintptr_t)cpu_ptr;

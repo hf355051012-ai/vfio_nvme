@@ -1,14 +1,3 @@
-// platform/x86-linux/main.c
-//
-// x86-linux(Ubuntu + VFIO)ポートの POSIX エントリ(x86-vfio-port Phase 3、
-// ~/.claude/plans/x86-vfio-port.md §5 参照)。
-//
-// 【Phase 3 のゴール】「x86 ターゲットがリンク・起動し、コンソールが出る
-// ところまで」。実際の ConnectX bring-up(mlx5_hca_bringup 相当)は Phase 4。
-// ここでは自己完結する HAL プリミティブ(コンソール / タイマ / crc32c の
-// SSE4.2 バックエンド / spinlock / pthread ベースの smp)が x86 で動くことを
-// 実証する。RPi5 の src/main.c(EL2 ベアメタルエントリ)に相当する層。
-
 #include "uart.h"
 #include "timer.h"
 #include "smp.h"
@@ -34,9 +23,6 @@
 #include "timestamp.h" /* ts コマンド(ts_log ダンプ) */
 #include "tcp.h"       /* ackthresh コマンド(g_tcp_ack_threshold) */
 
-/* CRC32C の既知テストベクタ: CRC32C("123456789") = 0xE3069283(最終ダイジェスト、
- * init=0xFFFFFFFF・最終反転あり)。crc32c() は生の実行中 CRC を返す規約
- * (crc32c.h)なので、呼び出し側で ~ を取る。 */
 static int crc32c_selftest(void)
 {
     const char *v = "123456789";
@@ -84,11 +70,6 @@ static void smp_selftest(void)
                 (hb1 > hb0) ? "OK" : "NG");
 }
 
-/* Phase 4/5: VFIO で ConnectX(vfio-pci バインド済み)を掴み、BAR0 を mmap して
- * dev->bar0_base にセットし、RPi5 と同じ core の mlx5_hca_bringup() を x86 で
- * 通す。RPi5 は pcie1.c の bring-up 経由で bar0_base=PCIE1_OUTBOUND_CPU_BASE を
- * 得るが、x86 は PCIe 列挙/BAR 割り当てが Linux/VFIO 済みなので、その bring-up は
- * 呼ばず VFIO の BAR mmap を直接 bar0_base にする(§4-6)。 */
 static mlx5_dev_t s_dev0, s_dev1; /* 大きい構造体なので static */
 
 /* vfio スロット slot(vfio_init が返す)の PF を掴んで bring-up する。0=成功。 */
@@ -117,27 +98,12 @@ static int bringup_pf(int slot, mlx5_dev_t *dev, uint8_t pf_index, const char *l
     return rc;
 }
 
-/* RPi5 では command.c(シェル)が定義するグローバル。core(nvme.c/test.c)が
- * `extern nvme_ctx_t s_nvme_ctx`(nvme.h)で参照する共有の initiator コンテキスト。
- * x86 は command.c をリンクしないのでここで定義する。 */
 nvme_ctx_t s_nvme_ctx;
 
 static nvmet_ctx_t s_x86_nvmet; /* .bss(内蔵 RAM ディスク含む、TCP 経路は CPU 側) */
 
-/* NVMe/TCP 持続スループット(RPi5 の `test`=temp_test の post-bring-up 部分)。
- * target(nvmet)を pf1/core1、initiator(nvme)を pf0/core0 に立て、
- * nvme_write_pipelined_run/nvme_read_pipelined_run(qdepth=8 パイプライン)を
- * chunk サイズ別に 3 秒回してスループットを測る。net_ctx は既に登録済み
- * (run_bench が mlx5_net_register_dual 済み)の前提。 */
 static uint8_t s_nvmetcp_buf[262144] __attribute__((aligned(4096)));
 
-/* 【診断】NVMe/TCP 256K read の再送ストーム原因調査。single-core で 256K read を
- * 1 回走らせ、OOO(順序不正)の起点で ts リングを凍結し、core0 の直近イベントを
- * ダンプする。ストームで大量発生する uart 出力の前に凍結できるので、健全→異常の
- * 遷移が保存される。 */
-
-/* mlx5_pcie_decode_cfg() 用の config space 読み関数(x86=VFIO)。ctx=vfio
- * スロット番号。 */
 static uint32_t x86_cfg_rd(void *ctx, uint32_t off)
 {
     return vfio_cfg_read32((int)(intptr_t)ctx, off);
@@ -158,9 +124,6 @@ static uint32_t x86_cfg_rd(void *ctx, uint32_t off)
 static int s_shell_nvmet_started = 0;
 static int s_shell_tcp_connected = 0;
 
-/* NVMe/TCP 常駐セッション(target@core1 + initiator@core0)を1回だけ確立し、
- * 以後の tcpbench で再利用する。既に `nvmet` コマンドでターゲット常駐済み
- * ならそれを使う。戻り値: 0=確立済み、-1=失敗。 */
 static int shell_ensure_tcp_session(void)
 {
     if (s_shell_tcp_connected) return 0;
@@ -212,9 +175,6 @@ static unsigned shell_tokenize(char *s, char *tok[], unsigned n)
     return c;
 }
 
-/* args = "[chunkKB[,chunkKB...]] [r|w|rw] [qd]"。第1トークンはカンマ区切りで
- * 複数の転送長(KB)を指定できる(例 "8,64,256")。省略時は 8/64/256KB。
- * 2番目=read/write選択、3番目=qd(RDMAのみ、既定8)。 */
 static void bench_plan_parse(char *args, bench_plan_t *pl)
 {
     char *tok[3];
@@ -265,8 +225,6 @@ static void bench_summary(const char *tag, uint32_t qd, const bench_res_t *r, un
     }
 }
 
-/* NVMe/TCP 1 測定 -> スループット(mbps の100倍固定小数点)。qd は TCP では
- * 内部固定(NVME_IO_QDEPTH)のため参照しない。 */
 static uint32_t tcp_measure(uint32_t chunk, int is_read)
 {
     uint32_t nlb = chunk / s_nvme_ctx.lba_size;
@@ -277,8 +235,6 @@ static uint32_t tcp_measure(uint32_t chunk, int is_read)
     return (el > 0) ? (uint32_t)((by * 100000ull) / ((uint64_t)el * 1000000ull)) : 0u;
 }
 
-/* tcpbench [chunkKB] [r|w|rw] [qd] -- NVMe/TCP スループット。セッションは
- * 張りっぱなしで残す(再測定は再接続せず即実行)。末尾にサマリ表。 */
 static void shell_tcpbench(char *args)
 {
     if (shell_ensure_tcp_session() != 0) return;
@@ -304,13 +260,8 @@ static void shell_rdmabench(char *args)
     bench_summary("RDMA", pl.qd, res, nr);
 }
 
-/* ts [core N] [num N] [mask M V] | ts pause|resume -- ts_log() ダンプ
- * (rpi5 の `ts` コマンド互換のサブセット)。tag=File#|Func#|info、
- * mask で (tag&mask)==value 絞り込み。既定 core0・直近20件。 */
 static void shell_ts(char *args)
 {
-    /* `core N num N mask M V` は7トークン。tok は余裕を持って 8 にする
-     * (以前6にしていたため mask の value が落ち、フィルタが無視されていた)。 */
     char *tok[8];
     unsigned nt = shell_tokenize(args, tok, 8);
     unsigned core = 0, num = 20; uint32_t mask = 0, val = 0; int have_mask = 0; int pause = -1;
@@ -336,11 +287,6 @@ static void shell_ts(char *args)
     ts_log_dump_core(core, start, num, mask, val);
 }
 
-/* simdelay <core> <us> | simdelay show -- 指定コアのメインループ1周ごとに
- * <us> のビジーウェイトを注入して性能律速を切り分ける(rpi5 の simdelay 相当)。
- * 注入点は nvme.c の read/write パイプラインループ(core0=イニシエータ)と
- * hal_smp.c の worker_main(core1=ターゲット)に既にある。小さい遅延で
- * スループットが落ちるコアがソフトウェア律速。 */
 static void shell_simdelay(char *args)
 {
     char *tok[2];
@@ -357,9 +303,6 @@ static void shell_simdelay(char *args)
     uart_printf("simdelay: core%u = %uus\n", core, (unsigned)g_sim_delay_us[core]);
 }
 
-/* ackthresh [N] -- 遅延ACKの閾値(フルサイズin-orderセグメント何個に1回
- * ACKするか)。既定2。push受信ではウィンドウが常に最大なので上げてよい。
- * 引数なしで現在値を表示。read受信側(core0)のACK送信TX間引きの効果を測る。 */
 static void shell_ackthresh(char *args)
 {
     while (*args == ' ') args++;
@@ -501,8 +444,6 @@ static int shell_editor_byte(shell_editor_t *ed, unsigned char ch)
     return 0;
 }
 
-/* tty を raw(canonical/echo off)にして矢印キーと自前エコーを扱う。piped入力
- * (非tty)ならそのまま。exit 時に atexit で端末設定を元へ戻す。 */
 static struct termios s_orig_tio;
 static int s_raw_active = 0;
 static void shell_restore_tty(void) { if (s_raw_active) { tcsetattr(0, TCSANOW, &s_orig_tio); s_raw_active = 0; } }
@@ -526,9 +467,6 @@ static void run_shell(int s0, int s1)
     int fl = fcntl(0, F_GETFL, 0);
     if (fl != -1) (void)fcntl(0, F_SETFL, fl | O_NONBLOCK);
     shell_raw_mode();
-    /* raw モードでは端末エコーが無効なので自前で uart_putc() する。ただし
-     * stdout が行バッファだと '\n' まで表示されない(=入力が見えない)ため、
-     * 無バッファ化して1文字ずつ即座に画面へ出す。 */
     setvbuf(stdout, NULL, _IONBF, 0);
 
     uart_printf("\n==== x86 常駐シェル(bring-up 済み、再初期化なし、↑↓で履歴呼び出し) ====\n");

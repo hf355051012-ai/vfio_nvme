@@ -1,14 +1,3 @@
-// nvme_tcp.c
-//
-// NVMe/TCP (NVMe-oF TCPトランスポート) 接続・PDU送受信実装。
-// tcp.c(多重コネクション対応後のTCPクライアント)の上に、ICReq/ICResp
-// 交換・Command/Response Capsule・C2HData/R2T+H2CDataの送受信を組み立てる。
-// プロトコル(SQE/CQEの意味づけ)はここでは扱わない -- nvme.cの責務。
-//
-// 全ての多バイトフィールドアクセスはnet.hのrd16le/rd32le/wr16le/wr32le
-// (volatile経由のバイト単位アクセス)のみを使う(nvme_types.h/
-// nvme_tcp_pdu.hのコメント参照 -- NVMeはリトルエンディアン)。
-
 #include <stddef.h>
 #include "nvme_tcp.h"
 #include "nvme_tcp_pdu.h"
@@ -21,38 +10,11 @@
 #define NVME_TCP_ICRESP_TIMEOUT_MS 3000u
 #define NVME_TCP_RESP_TIMEOUT_MS   10000u
 
-/* H2CData 1PDUあたりの最大データ量(このファイル内の静的ステージング
- * バッファのサイズ)。R2Tが要求するr2tlがこれより大きい場合は複数の
- * H2CData PDUに分割して送る(nvme_tcp_send_h2c_data()参照)。
- *
- * target側(nvmet.cのNIO_ST_DISPATCH_H2C)は「1回のR2Tにつき1回の
- * H2CDataが返ってくる」設計(受信量がwrite_lenに満たなければ次の
- * R2Tを送る、というpending_writesの状態遷移)になっており、複数の
- * H2CData PDUへ分割された応答を想定していない -- 旧値(4096)のまま
- * R2T分割(8KiB超のwrite)を実機テストしたところ、target側が1回の
- * R2T(r2tl)に対して届いた2個目以降のH2CDataチャンクでpending_writes
- * エントリを「未知のcccid」として見失いdesyncする実機バグを踏んだ
- * (2026-08-08)。target側の実装を変更するのはリスクが高いため、
- * client側のチャンクサイズをtarget側が1回のR2Tで要求しうる最大値
- * (nvmet_tcp.cのNVMET_TCP_MAXH2CDATA_SCALED=262144、Window Scaling
- * 成立時)以上にし、常に「1R2T=1H2CData」の対応関係を保つ形で回避した。 */
 #define NVME_TCP_H2C_CHUNK_MAX 262144u
 
 int nvme_tcp_send_cmd(nvme_tcp_conn_t *c, const nvme_sqe_t *sqe,
                       const void *data, uint32_t dlen)
 {
-    /* in-capsule送信かR2T+H2CData分割送信かは、呼び出し元(nvme.cの
-     * nvme_build_write_sqe()等)がSQE自身に設定したSGL Descriptor Type
-     * (sqe->dptr[15]、nvme_types.hのNVME_SGL_TYPE_*)で判定する
-     * (2026-08-08、R2T分割実装 -- 以前はdlenの大小だけで無条件に
-     * in-capsuleへ倒し8KiB超をエラーにしていた)。SQE自身に意図を
-     * 持たせることで、SGL typeと実際のデータ送信有無が常に整合する --
-     * 以前実機で踏んだ「型はin-capsuleを示すのに実際にはデータを送らず
-     * pending_dataへ保留するだけ」という設計(target側がin-capsuleデータの
-     * 続きをTCPストリームから読もうとしてブロックし、こちらはR2Tを
-     * 待ってブロックする双方向デッドロック、nvme_types.hの
-     * NVME_SGL_TYPE_DATA_BLOCK_OFFSETコメント参照)を、型とデータ送信を
-     * 1箇所(呼び出し元のSQE構築)だけで決める構造にすることで再発させない。 */
     uint8_t sgl_type = sqe->dptr[15];
     int use_r2t = (data != NULL && dlen > 0 && sgl_type == (uint8_t)NVME_SGL_TYPE_TRANSPORT);
 
@@ -66,11 +28,6 @@ int nvme_tcp_send_cmd(nvme_tcp_conn_t *c, const nvme_sqe_t *sqe,
         __attribute__((aligned(64)));
 
     uint16_t cid = c->next_cid++;
-    /* use_r2t の場合はデータを一切このPDUへ付加しない -- target はSGL
-     * typeがTRANSPORTであることを見てR2Tを発行し、こちらはpending_data/
-     * pending_len(dlen全体)からnvme_tcp_send_h2c_data()経由で応答する
-     * (nvme_tcp_recv_resp()/nvme.cのnvme_exec_step()、いずれも既存の
-     * R2T受信ロジックがそのまま機能する)。 */
     int has_inline_data = (!use_r2t && data != NULL && dlen > 0);
 
     s_cmd_buf[0] = NVME_TCP_PDU_CMD;
@@ -81,9 +38,6 @@ int nvme_tcp_send_cmd(nvme_tcp_conn_t *c, const nvme_sqe_t *sqe,
 
     volatile_fast_copy((volatile uint8_t *)&s_cmd_buf[NVME_TCP_HDR_LEN],
                         (const volatile uint8_t *)sqe, NVME_SQE_LEN);
-    /* cidはコネクションごとに採番する(cdw0のbits[31:16]、SQE先頭からの
-     * オフセット2-3) -- 呼び出し元(nvme.c)はこのフィールドを0のまま
-     * sqeを渡してよい。ここでコピー後のバッファへ上書きする。 */
     wr16le(&s_cmd_buf[NVME_TCP_HDR_LEN + 2], cid);
 
     uint16_t total_len = (uint16_t)NVME_TCP_CMD_PDU_LEN;
@@ -104,26 +58,6 @@ int nvme_tcp_send_cmd(nvme_tcp_conn_t *c, const nvme_sqe_t *sqe,
     return 0;
 }
 
-/* nvme_tcp_send_cmd()の非同期版 -- Command Capsule PDU(NVME_TCP_CMD_PDU_LEN
- * =72バイト固定、in-capsuleデータ無し)をtcp_send_async()で送る。
- * 2026-08-09、NVMe/TCPコマンドパイプライン化(nvme.cの
- * nvme_write_pipelined_run()参照)向け -- 複数スロットのSQEを連続送信する
- * 際、ブロッキングtcp_send()(nvme_tcp_send_cmd())では1件ごとに相手の
- * ACKを待つ遅延(実機`ts`計測でバースト内の送信間隔が約110-120us)が
- * 積み重なっていたため、`tcp_send_async()`(TCP_ASYNC_MAX_LEN=128、
- * tcp.h参照)経由に変更した。
- *
- * in-capsuleデータを伴う書き込み・Fabrics Connect等には対応しない
- * (SQEはR2T経路[TRANSPORT SGL type]専用) -- 呼び出し元は
- * nvme_write_pipelined_run()のみを想定する。
- *
- * 呼び出し規則: 戻った直後、呼び出し元は該当コネクション上のasync送信が
- * 全て確認される(tcp_send_async_drain())まで、同じコネクションへ
- * ブロッキングtcp_send()を呼んではならない(tcp.hのtcp_send_async()
- * 呼び出し規則コメント参照 -- H2CData送信[nvme_tcp_send_h2c_data_ex()]は
- * ブロッキングtcp_send()を使うため、呼び出し元[nvme_pipeline_rx_tick()]
- * がR2T受信時に必ずtcp_send_async_drain()を先に呼ぶ)。
- * 戻り値: 0=キュー成功(*out_cidに採番値)、-1=失敗 */
 int nvme_tcp_send_cmd_async(nvme_tcp_conn_t *c, const nvme_sqe_t *sqe, uint16_t *out_cid)
 {
     static uint8_t s_cmd_async_buf[NVME_TCP_CMD_PDU_LEN] __attribute__((aligned(64)));
@@ -150,15 +84,6 @@ int nvme_tcp_send_cmd_async(nvme_tcp_conn_t *c, const nvme_sqe_t *sqe, uint16_t 
     return 0;
 }
 
-/* R2Tで要求された[r2to, r2to+r2tl)の範囲を、明示的に渡されたdata/
- * data_lenからH2CData PDU(1個以上、NVME_TCP_H2C_CHUNK_MAXごとに分割)
- * として送出する下位実装。cidも呼び出し元が明示する(c->pending_cidを
- * 暗黙参照しない) -- 2026-08-09、NVMe/TCPコマンドパイプライン化
- * (nvme.cのnvme_write_pipelined_run()参照)向けに、単一コネクション上で
- * 複数コマンドが同時に「保留中の書き込みデータ」を持てるようにする
- * ため、従来のconn単位の`pending_data/pending_len/pending_cid`から
- * 引数渡しへ切り出した(下記nvme_tcp_send_h2c_data()は互換ラッパとして
- * 従来通りconn->pending_*を渡すだけ、ロジックは完全に共有する)。 */
 int nvme_tcp_send_h2c_data_ex(nvme_tcp_conn_t *c, uint16_t cid, uint16_t ttag,
                                uint32_t r2to, uint32_t r2tl,
                                const void *data, uint32_t data_len)
@@ -169,11 +94,6 @@ int nvme_tcp_send_h2c_data_ex(nvme_tcp_conn_t *c, uint16_t cid, uint16_t ttag,
         return -1;
     }
 
-    /* tcp_send()に渡すバッファは64バイトアラインすること(tcp.hの
-     * tcp_send()ドキュメント参照)。ヘッダ(固定24バイト)+データチャンクを
-     * 1本のバッファへ組み立ててから送る(tcp_send_segment()が結局データを
-     * 内部バッファへコピーするため、ここでのアラインは必須要件では
-     * 無くなっているかもしれないが、指示されている規約として維持する)。 */
     static uint8_t s_h2c_buf[NVME_TCP_DATA_PDU_LEN + NVME_TCP_H2C_CHUNK_MAX]
         __attribute__((aligned(64)));
 
@@ -198,16 +118,6 @@ int nvme_tcp_send_h2c_data_ex(nvme_tcp_conn_t *c, uint16_t cid, uint16_t ttag,
         volatile_fast_copy((volatile uint8_t *)&s_h2c_buf[NVME_TCP_DATA_PDU_LEN],
                             (const volatile uint8_t *)(src + r2to + sent), chunk);
 
-        /* totalはuint32_t(2026-08-08、uint16_tから拡張): NVME_TCP_H2C_
-         * CHUNK_MAXを262144へ拡張した際、この変数がuint16_tのまま残って
-         * いたため、chunk(64KB以上)ではNVME_TCP_DATA_PDU_LEN(24)+chunkが
-         * 65535を超えてuint16_tでオーバーフローし、実際にはヘッダ24
-         * バイトだけを送ってペイロード本体を一切送らないまま「送信
-         * 成功」と判定してしまうバグを実機で踏んだ(32768+24=32792は
-         * 65535以下のため32KB以下のwriteでは問題化せず、64KB以上でのみ
-         * 顕在化 -- target側がH2CDataのデータ本体を永久に待ち続けて
-         * ハングする形で発現した)。tcp_send()のlen引数は既にuint32_t化
-         * 済み(tcp.h参照)なので、こちらの型を合わせるだけで直る。 */
         uint32_t total = NVME_TCP_DATA_PDU_LEN + chunk;
         if (tcp_send(&c->tcp, s_h2c_buf, total) != (int)total) {
             uart_printf("[!] NVMe/TCP: H2CData送信失敗 (offset=%u len=%u)\n", r2to + sent, chunk);
@@ -218,21 +128,11 @@ int nvme_tcp_send_h2c_data_ex(nvme_tcp_conn_t *c, uint16_t cid, uint16_t ttag,
     return 0;
 }
 
-/* 元はnvme_tcp_recv_resp()専用のstaticヘルパだったが、ジョブ化
- * (nvme.cのnvme_exec_step()、nvme_tcp.h冒頭コメント参照)が単発の
- * ブロッキング送信状態として直接呼べるようnon-staticへ変更した。
- * 2026-08-09、上記nvme_tcp_send_h2c_data_ex()への薄いラッパへ変更
- * (ロジック自体は無変更、conn->pending_*を明示引数として渡すだけ)。 */
 int nvme_tcp_send_h2c_data(nvme_tcp_conn_t *c, uint16_t ttag, uint32_t r2to, uint32_t r2tl)
 {
     return nvme_tcp_send_h2c_data_ex(c, c->pending_cid, ttag, r2to, r2tl,
                                       c->pending_data, c->pending_len);
 }
-
-/* ================================================================
- * NVMe/TCP制御のジョブ化(nvme.c)向け非ブロッキング・resumable
- * プリミティブの実装(nvme_tcp.h冒頭コメント参照)。
- * ================================================================ */
 
 void nvme_tcp_xfer_reset(nvme_tcp_xfer_t *x, void *buf, uint32_t want)
 {
@@ -247,15 +147,6 @@ int nvme_tcp_recv_poll(nvme_tcp_conn_t *c, nvme_tcp_xfer_t *x)
     if (x->got >= x->want) return 1;  /* want==0を含む */
 
     uint32_t remain = x->want - x->got;
-    /* 【2026-08-11、nvmet_tcp.cのnvmet_tcp_recv_poll()で発見・修正した
-     * のと同じ不要なuint16_t切り詰めバグ(そちら参照)をこちら[initiator
-     * 側、READのC2HData/RSP受信]にも適用。tcp_recv()のmaxlenはuint32_t
-     * なので、remainをそのまま渡して1回のポーリングでrx_bufに溜まって
-     * いる分を上限なく汲み出せるようにする -- 呼び出し回数(および
-     * それに伴うtcp_poll_once_ex()のオーバーヘッド)だけを削減する。 */
-    /* timeout_ms=0: tcp_recv_internal()(tcp.c)のdo-while構造により、
-     * tcp_poll_once()+受信チェックを1回だけ実行してから即座に返る --
-     * nvme_tcp.h冒頭コメント参照。 */
     uint32_t got_before = x->got;
     int n = tcp_recv(&c->tcp, x->buf + x->got, remain, 0u);
     if (n == 0) {
@@ -266,15 +157,6 @@ int nvme_tcp_recv_poll(nvme_tcp_conn_t *c, nvme_tcp_xfer_t *x)
         return 0;  /* この1tickでは何も届かなかっただけ */
     }
     if (got_before == 0) {
-        /* このxferで最初のバイトが届くまでにかかった時間(reset()からの
-         * 経過us)。nvme.cのnvme_exec_step()の各受信ステート(RECV_HDR,
-         * RECV_CQE, RECV_C2H_REST, RECV_C2H_DATA, RECV_R2T_REST)が
-         * どれも内部でこの関数を呼ぶだけなので、ここ1箇所の計装で
-         * 全ステートをカバーできる。
-         * 2026-08-09、コア0のSEND_H2C/RECV_CQE遅延解析向けにユーザー
-         * 指示で追加 -- 「相手からの応答そのものが遅い」のか「応答は
-         * 届いているのにこちらの受信処理が遅れて気づいた」のかを、
-         * NRDN(受信完了、reset()からの合計経過)との差分で切り分ける。 */
         ts_log(TS_MK(TS_FILE_NVME_TCP, TS_FUNC_nvme_tcp_recv_poll, 0), tcp_conn_arg(&c->tcp, (uint32_t)get_us_from(x->reset_tick)));
     }
     x->got += (uint32_t)n;
@@ -293,8 +175,6 @@ int nvme_tcp_send_icreq(nvme_tcp_conn_t *c)
     c->pending_len  = 0;
     c->pending_cid  = 0;
 
-    /* ICReq(128バイト固定)。tcp_send()に渡すバッファは64バイトアライン
-     * すること(tcp.hのtcp_send()ドキュメント参照)。 */
     static uint8_t s_icreq_buf[NVME_TCP_ICREQ_LEN] __attribute__((aligned(64)));
     for (uint32_t i = 0; i < NVME_TCP_ICREQ_LEN; i++) s_icreq_buf[i] = 0;
 

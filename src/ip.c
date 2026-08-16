@@ -1,13 +1,3 @@
-// ip.c
-//
-// IPv4ヘッダ処理 — フェーズ3
-// オプション無し(IHL=5)のIPv4パケットのみ対応。自機宛かつヘッダ
-// チェックサムが正しいパケットのみ上位プロトコル(ICMP等)へ委譲する。
-//
-// 全ての多バイトフィールドアクセスは net.h の rd16be/rd32be/wr16be/wr32be
-// (volatile経由のバイト単位アクセス)のみを使う。理由は net.h と arp.c の
-// コメントを参照(SCTLR_EL1.M=0環境でのAlignment fault対策)。
-
 #include <stddef.h>
 #include "ip.h"
 #include "icmp.h"
@@ -18,8 +8,6 @@
 #include "uart.h"
 #include "smp.h"
 
-/* ip_header_t 内のバイトオフセット (packed, 20バイト)。
- * offsetof はコンパイル時定数であり、メモリアクセスは発生しない。 */
 #define IP_OFF_VER_IHL     offsetof(ip_header_t, ver_ihl)
 #define IP_OFF_TOS         offsetof(ip_header_t, tos)
 #define IP_OFF_TOTAL_LEN   offsetof(ip_header_t, total_len)
@@ -33,10 +21,6 @@
 
 #define IP_DEFAULT_TTL 64u
 
-// マルチコア化 Phase 4(~/.claude/plans/wondrous-baking-gadget.md参照):
-// コアごとに独立したIP identificationカウンタにした -- 単一の共有カウンタ
-// のままだと、2コアが同時にip_build_header()を呼んだ際に更新が競合しうる
-// (実害は低い(単なる識別子)が、他のper-coreモジュールと同じ方針で揃えた)。
 static uint16_t s_ip_id[SMP_MAX_CORES];  /* IP identification: 単純増加カウンタ(固定値でも可) */
 
 void ip_init(void)
@@ -68,13 +52,6 @@ void ip_handle_frame(const uint8_t *payload, size_t len, const uint8_t *src_mac)
         return;
     }
 
-    /* ヘッダチェックサム検証: チェックサムフィールドを含めた20バイト全体の
-     * one's complement和を取ると、正常なパケットなら結果が0になる。
-     * 2026-08-09、ハードウェアチェックサムオフロード対応: このフレームが
-     * NIC(mlx5)のRXパイプラインで既にL3/L4検証済み(eth_rx_hw_csum_ok()、
-     * eth.hコメント参照)なら、このIPヘッダ20バイトのみの軽い検証すら
-     * 省略できる -- ソフトウェア検証を完全に信頼するHW検証で置き換える
-     * 設計(RP1[eth_rx_hw_csum_ok()==0]は従来通りソフトウェア検証)。 */
     if (!eth_rx_hw_csum_ok()) {
         uint16_t verify = inet_checksum(in, sizeof(ip_header_t));
         if (verify != 0) {
@@ -97,9 +74,6 @@ void ip_handle_frame(const uint8_t *payload, size_t len, const uint8_t *src_mac)
 
     uint32_t dst_ip = rd32be(in + IP_OFF_DST_IP);
     if (dst_ip != NET_SELF_IP) {
-        /* 自機宛でないIP(ブロードキャスト/他ホスト宛)は無視するだけで、
-         * ログには出さない -- arp.cのARP無視ログと同じ理由(LAN上で頻発、
-         * uart_printf()のブロッキングがRXポーリングを遅延させうる)。 */
         return;
     }
 
@@ -110,9 +84,6 @@ void ip_handle_frame(const uint8_t *payload, size_t len, const uint8_t *src_mac)
     src_ip[2] = in[IP_OFF_SRC_IP + 2];
     src_ip[3] = in[IP_OFF_SRC_IP + 3];
 
-    /* IPペイロード長: Ethernetフレームは最小長パディングされることがある
-     * (実データ長 len はパディング込みの場合がある)ため、IPヘッダの
-     * total_length を正としてペイロード長を決定する。 */
     size_t hdr_len = sizeof(ip_header_t);
     size_t ip_payload_len = (size_t)total_len - hdr_len;
     const uint8_t *ip_payload = payload + hdr_len;
@@ -135,8 +106,6 @@ void ip_build_header(uint8_t *buf, const uint8_t dst_ip[4], const uint8_t dst_ma
     uint8_t self_ip[4];
     ip_to_octets(NET_SELF_IP, self_ip);
 
-    /* 送信先MAC/IPは呼び出し元(icmp.c等)が別のnet_buf/ローカル配列から
-     * 渡してくる可能性があるため、念のためvolatile経由で統一する。 */
     const volatile uint8_t *vdst_mac = dst_mac;
     const volatile uint8_t *vdst_ip  = dst_ip;
 
@@ -147,9 +116,6 @@ void ip_build_header(uint8_t *buf, const uint8_t dst_ip[4], const uint8_t dst_ma
     for (int i = 0; i < ETH_ALEN; i++) out[ETH_ALEN + i] = self_mac[i];
     out[12] = 0x08; out[13] = 0x00;  /* EtherType: IPv4 */
 
-    /* IPv4ヘッダ。チェックサムはペイロードの内容に依存しないため、
-     * (呼び出し元がペイロードを別途どこかへ書く/書かないに関わらず)
-     * この時点で確定させてよい。 */
     volatile uint8_t *iph = out + ETH_HDR_LEN;
     uint16_t total_len = (uint16_t)(sizeof(ip_header_t) + payload_len);
 
@@ -203,8 +169,6 @@ int ip_send(const uint8_t dst_ip[4], const uint8_t dst_mac[6],
         return -1;
     }
 
-    /* 呼び出し元(icmp.c等)が別バッファから渡してくるペイロードなので
-     * volatile経由で統一する(ip_build_header()のvdst_mac等と同じ理由)。 */
     const volatile uint8_t *vpayload = payload;
     volatile uint8_t *body = nb->data + IP_PAYLOAD_OFFSET;
     for (uint16_t i = 0; i < payload_len; i++) body[i] = vpayload[i];

@@ -1,14 +1,3 @@
-// platform/x86-linux/console.c
-//
-// コンソール(uart.h 契約)の x86-linux 実装(x86-vfio-port Phase 3、
-// ~/.claude/plans/x86-vfio-port.md §3 参照)。RPi5 の PL011 UART(uart_shim.c)
-// に相当する層で、core(arp/ip/icmp/tcp/nvme*/mlx5* 等)が使う
-// uart_printf/uart_puts/uart_putc/uart_check_ctrl_c を stdout/stdin へ橋渡し
-// する。書式出力ロジック(pf_fmt_uint/pf_fmt_hex/pf_emit/uart_printf)は
-// uart_shim.c から移植(元コードは全て uart_putc を経由するので、uart_putc を
-// stdout へ差し替えるだけで動く)。RPi5 側の telnet リダイレクト/pl011_lock は
-// 持たない(x86 は当面単一プロセスのコンソール)。
-
 #include "uart.h"
 
 #include <stdint.h>
@@ -23,9 +12,6 @@
 
 void uart_putc(char c)
 {
-    /* stdout へ 1 バイト。低頻度なので都度 flush して、パニック/長待ちの
-     * 直前でもログが確実に見えるようにする(RPi5 の PL011 が同期出力なのと
-     * 同じ「出したら必ず見える」性質を保つ)。 */
     putchar((unsigned char)c);
     if (c == '\n') {
         fflush(stdout);
@@ -34,9 +20,6 @@ void uart_putc(char c)
 
 void uart_puts(const char *s)
 {
-    /* RPi5 の pl011_puts() は '\n' を '\r\n' に変換する。忠実に踏襲する
-     * (POSIX tty でも余分な CR は無害、Phase 4 で RPi5 ログと突き合わせる
-     * ときに出力が一致していると比較しやすい)。 */
     if (!s) return;
     for (const char *p = s; *p; p++) {
         if (*p == '\n') uart_putc('\r');
@@ -47,10 +30,6 @@ void uart_puts(const char *s)
 
 int uart_check_ctrl_c(void)
 {
-    /* 非ブロッキングで stdin から 1 バイト読み、Ctrl+C(0x03)なら 1。
-     * cooked tty では端末が Ctrl+C を SIGINT に変換してしまうため実際には
-     * 0x03 が届かないことが多いが、raw モードやパイプ入力では機能する。
-     * core(tcp_poll_once)の長時間待ちループ用の中断手段(uart.h 参照)。 */
     static int inited = 0;
     if (!inited) {
         int fl = fcntl(0, F_GETFL, 0);
@@ -102,11 +81,6 @@ static void pf_emit(char *buf, int n, char pad, int width, int left)
         for (int i = n; i < width; i++) uart_putc(' ');
 }
 
-/*
- * uart_printf — 書式出力(uart_shim.c と同一仕様)。
- * 対応指定子: %d %i %u %x %X %p %s %c %%、幅/ゼロパディング/左詰め、
- * %.N / %.* 精度、%l 修飾子読み飛ばし。
- */
 void uart_printf(const char *fmt, ...)
 {
     va_list ap;

@@ -1,15 +1,3 @@
-// platform/x86-linux/vfio.c
-//
-// VFIO による ConnectX(vfio-pci バインド済み)の掴み(x86-vfio-port Phase 3-5、
-// ~/.claude/plans/x86-vfio-port.md §4-6 参照)。標準 VFIO シーケンス:
-//   container(/dev/vfio/vfio) -> group(/dev/vfio/<N>) -> device -> BAR mmap /
-//   config region / VFIO_IOMMU_MAP_DMA。PCIe 列挙・BAR 割り当ては Linux/BIOS
-//   済みなので RPi5 の pcie1.c(PERST#/rescal/PLL/リンク訓練)は不要。
-//
-// **複数デバイス**: container/group は 1 度だけ開き(同一 IOMMU グループ前提)、
-// 各 BDF の device fd を配列で保持する。DMA マップは container 単位なので
-// 掴んだ全デバイスで共有される(dual-port PF0/PF1 ループバック用、§5)。
-
 #include "vfio.h"
 #include "uart.h"
 
@@ -62,9 +50,6 @@ static int read_iommu_group(const char *bdf)
 static int container_open_once(const char *bdf)
 {
     if (s_container >= 0) {
-        /* 既に開いている -- 同一グループであることを確認(異なると VFIO は
-         * 別 container を要するが、このプロジェクトは同一グループの ConnectX
-         * 2 ポートのみ想定)。 */
         int g = read_iommu_group(bdf);
         if (g != s_grpnum) {
             uart_printf("[vfio] %s は別 IOMMU グループ %d(既存 %d)-- 未対応\n",
@@ -227,8 +212,6 @@ void vfio_cfg_write32(int dev, uint32_t offset, uint32_t val)
 int vfio_enable_bus_master(int dev)
 {
     if (!dev_ok(dev)) return -1;
-    /* PCI Command(0x04)下位16bit: bit1=Memory Space Enable、bit2=Bus Master
-     * Enable。既存値に 0x06 を OR(CLAUDE.md「Command レジスタ有効化」教訓)。 */
     uint32_t cmd = vfio_cfg_read32(dev, 0x04);
     vfio_cfg_write32(dev, 0x04, cmd | 0x6u);
     return 0;

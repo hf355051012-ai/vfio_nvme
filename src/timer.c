@@ -1,13 +1,3 @@
-// timer.c
-//
-// ARMv8-Aジェネリックタイマー(timer_now()/timer_freq()、timer.hのstatic
-// inline)まわりの、ticks<->時間単位の変換ヘルパ。timer.h冒頭コメント参照。
-//
-// sec部と端数(rem)部に分けてから乗算することで、稼働時間がどれだけ
-// 伸びてもuint64_tの範囲を現実的に超えない(sec*1e9は約571年分のticksまで
-// 安全、rem(<freq)*1e9もfreq=54MHz程度なら安全)。stateprof.cで最初に
-// 導入した設計を汎用化してここへ移した。
-
 #include "timer.h"
 
 uint64_t ticks_to_ns(uint64_t ticks)

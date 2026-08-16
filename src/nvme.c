@@ -1,12 +1,3 @@
-// nvme.c
-//
-// NVMeプロトコル層 -- SQEの組み立てとCQEの解釈。PDU/TCPの詳細は
-// nvme_tcp.c(移植境界、CLAUDE.md参照)に委譲する。
-//
-// 全ての多バイトフィールドアクセスはnet.hのrd16le/rd32le/wr16le/wr32le/
-// wr64le(volatile経由のバイト単位アクセス)のみを使う(nvme_types.hの
-// コメント参照 -- NVMeはリトルエンディアン)。
-
 #include <stddef.h>
 #include "nvme.h"
 #include "net.h"
@@ -21,21 +12,11 @@
 #define NVME_ADMIN_CMD_TIMEOUT_MS 5000u
 #define NVME_IO_CMD_TIMEOUT_MS   10000u
 
-/* nvme_connect_job_step()(下記)がICResp受信を待つ締め切り。旧
- * nvme_tcp.cのNVME_TCP_ICRESP_TIMEOUT_MSと同じ値(ジョブ化に伴いnvme.c
- * 側で締め切り管理するようになったため、ここに複製した)。 */
 #define NVME_CONNECT_ICRESP_TIMEOUT_MS 3000u
 
-/* CC.EN=1書き込み後、CSTS.RDYになるまでのポーリング上限/間隔。
- * ramdiskバックエンドのtargetでは実質即座にRDYになるが、実ストレージ
- * バックエンドでは多少時間がかかることを見込んで余裕を持たせる。 */
 #define NVME_CTRL_READY_POLL_MAX     20u
 #define NVME_CTRL_READY_POLL_MS     100u
 
-/* このbare-metalクライアントは永続ストレージ(ディスク等)を持たないため、
- * RFC4122準拠の乱数UUIDではなく固定のホストIDを使う -- targetはhostnqn/
- * subsysnqnの組み合わせで十分にホストを識別できるため、hostidの一意性は
- * 本実装の用途(単一ホストからの検証)では問題にならない。 */
 static const uint8_t NVME_HOST_ID[16] = {
     0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7,
     0xA8, 0xA9, 0xAA, 0xAB, 0xAC, 0xAD, 0xAE, 0xAF,
@@ -44,10 +25,6 @@ static const uint8_t NVME_HOST_ID[16] = {
 
 #define NVME_CNTLID_DYNAMIC 0xFFFFu  /* Fabrics Connect(admin queue): controller ID割り当てをtargetに任せる */
 
-/* NVMe-oF Fabrics Connect コマンドのデータペイロード(1024バイト固定、
- * NVMe-oF仕様)。SQE自体には収まらず、nvme_tcp_send_cmd()のdata/dlenとして
- * 渡しin-capsule(Command Capsule PDUの固定部に続けて実データを送る)で
- * 転送する(nvme_types.hのNVME_SGL_TYPE_DATA_BLOCK_OFFSETコメント参照)。 */
 typedef struct __attribute__((packed)) {
     uint8_t  hostid[16];
     uint16_t cntlid;
@@ -57,23 +34,12 @@ typedef struct __attribute__((packed)) {
     uint8_t  reserved2[256];
 } nvmf_connect_data_t;
 
-/* volatile経由のバイト単位ゼロクリア -- 非volatileポインタへの逐次1
- * バイト代入だと、GCCが-O2でこれを1回のワイドストア(8/16バイト等)へ
- * 結合しうる(CLAUDE.md「ローカルスクラッチバッファへの逐次1バイト代入
- * も volatile が必須」節、timestamp.cで実機確認済みの既知パターン)。
- * このゼロクリアはpacked構造体(nvme_cqe_t等)のインスタンスにも使われ、
- * そのインスタンスは親構造体内で必ずしも4/8バイト境界に来ない
- * (実際にnvme_exec_ctx_t.cqe_outがoffset=106(非4アライン)に配置され
- * Alignment faultを起こした実例あり、上記nvme_exec_step()参照)ため、
- * ここも同じ理由でvolatileが必須。 */
 static void nvme_zero(void *p, size_t len)
 {
     volatile uint8_t *b = p;
     for (size_t i = 0; i < len; i++) b[i] = 0;
 }
 
-/* srcをdst(capacityバイト、NUL終端保証)へコピーする -- freestanding環境
- * (-nostdlib)のためstrncpy等の標準ライブラリ関数は使えない。 */
 static void nvme_copy_str(char *dst, size_t capacity, const char *src)
 {
     size_t i = 0;
@@ -84,13 +50,6 @@ static void nvme_copy_str(char *dst, size_t capacity, const char *src)
     dst[i] = '\0';
 }
 
-/* 読み出しコマンド(C2HDataで応答)、およびデータを伴わないコマンド
- * (Set Features/Property Set/Get等)用のSGL。addrはメモリアドレスとして
- * 使われないため常に0 -- Linuxのnvme_tcp_set_sg_host_data()/
- * nvme_tcp_set_sg_null()と同じ規約。書き込みコマンド(データをこちらから
- * 送る)には使わないこと -- nvme_set_sgl_inline()を使う
- * (nvme_types.hのNVME_SGL_TYPE_TRANSPORT/NVME_SGL_TYPE_DATA_BLOCK_OFFSET
- * のコメント参照)。 */
 static void nvme_set_sgl(nvme_sqe_t *sqe, uint32_t len)
 {
     wr64le(&sqe->dptr[0], 0);
@@ -101,9 +60,6 @@ static void nvme_set_sgl(nvme_sqe_t *sqe, uint32_t len)
     sqe->dptr[15] = (uint8_t)NVME_SGL_TYPE_TRANSPORT;
 }
 
-/* 書き込みコマンド(Fabrics Connect含む、データをこちらからin-capsule
- * 送信する)用のSGL -- nvme_tcp_send_cmd()がこの型と整合する形で実際に
- * データをCommand Capsule PDUへ付加する(nvme_types.hのコメント参照)。 */
 static void nvme_set_sgl_inline(nvme_sqe_t *sqe, uint32_t len)
 {
     wr64le(&sqe->dptr[0], 0);
@@ -114,12 +70,6 @@ static void nvme_set_sgl_inline(nvme_sqe_t *sqe, uint32_t len)
     sqe->dptr[15] = (uint8_t)NVME_SGL_TYPE_DATA_BLOCK_OFFSET;
 }
 
-/* ================================================================
- * NVMe/TCP制御のジョブ化(nvme.h冒頭コメント参照)向けの共有低レベル
- * ステートマシン。nvme_exec()(上記、ブロッキング)と同じロジックを
- * 状態遷移へ展開したもの -- 送信はnvme_tcp_send_cmd()を、R2T応答送信は
- * nvme_tcp_send_h2c_data()をそのまま呼ぶ(複製ではなく共有)。
- * ================================================================ */
 typedef enum {
     NVEXEC_ST_SEND = 0,
     NVEXEC_ST_RECV_HDR,
@@ -156,10 +106,6 @@ int nvme_exec_step(nvme_exec_ctx_t *ec)
             ec->state = NVEXEC_ST_DONE;
             return 1;
         }
-        /* NSND: CapsuleCmd送信。in-capsuleか(R2T経由の)transportかは
-         * nvme_tcp_send_cmd()(nvme_tcp.c)と同じ判定式(SGL descriptor
-         * type、sqe->dptr[15]=sqe先頭からoffset39)をここでも使い、
-         * 実際に送信されたhlen/pdo/plenを再現する。 */
         {
             const uint8_t *sqe_bytes = (const uint8_t *)ec->sqe;
             uint8_t  sgl_type = sqe_bytes[39];
@@ -211,14 +157,6 @@ int nvme_exec_step(nvme_exec_ctx_t *ec)
         if (r < 0) { ec->result = -1; ec->state = NVEXEC_ST_DONE; return 1; }
         if (r == 0) return 0;
 
-        /* nvme_cqe_tはpacked構造体 -- net.h冒頭の規約通り、直接の多バイト
-         * フィールドアクセス(読み書き両方)は禁止(親構造体nvme_exec_ctx_t
-         * 内でのオフセットが4バイト境界に来る保証が無く、実際に実機で
-         * その通りoffset=106(非4アライン)へ配置されコンパイラが生成した
-         * stur w1,[x19,#106]がAlignment fault(esr=0x96000061)を起こした
-         * -- ConnectXループバック検証中に発見)。wr32le/wr16le(書き込み)
-         * ・rd32le/rd16le(読み出し)を必ず使うこと -- ローカル変数へ一度
-         * 読んでから使う(cqe_out自体を後から読み返さない)。 */
         uint16_t cid    = rd16le(&ec->rest_buf[12]);
         uint16_t status = rd16le(&ec->rest_buf[14]);
         wr32le(&ec->cqe_out.dw0, rd32le(&ec->rest_buf[0]));
@@ -293,16 +231,12 @@ int nvme_exec_step(nvme_exec_ctx_t *ec)
             ts_log_nvme_tcp_pdu(TS_MK(TS_FILE_NVME, TS_FUNC_nvme_exec_step, 2), &info);
         }
         if (flags & NVME_TCP_F_DATA_SUCCESS) {
-            /* このC2HData自体が暗黙のcommand success応答を兼ねる --
-             * 別途CapsuleRespは来ない(target側の最適化)。 */
             nvme_zero(&ec->cqe_out, sizeof(ec->cqe_out));
             wr16le(&ec->cqe_out.cid, ec->conn->pending_cid);
             ec->result = 0;
             ec->state = NVEXEC_ST_DONE;
             return 1;
         }
-        /* DATA_LASTの有無に関わらずRECV_HDRへ戻り、続くC2HData
-         * (LASTでなければ)、またはCapsuleResp(LASTなら)を待つ。 */
         nvme_tcp_xfer_reset(&ec->xfer, ec->hdr_buf, NVME_TCP_HDR_LEN);
         ec->state = NVEXEC_ST_RECV_HDR;
         return 0;
@@ -361,9 +295,6 @@ int nvme_exec_step(nvme_exec_ctx_t *ec)
     }
 }
 
-/* Fabrics Property Set(fctype=0x00): CC等の4バイトプロパティに書き込む
- * (attrib=0固定 -- 本実装が書くのはCCのみで8バイトプロパティは扱わない)。
- * cdw10=attrib, cdw11=offset, cdw12/13=value(下位/上位32bit)。 */
 static void nvme_build_property_set_sqe(nvme_sqe_t *sqe, uint32_t offset, uint64_t value)
 {
     nvme_zero(sqe, sizeof(*sqe));
@@ -376,9 +307,6 @@ static void nvme_build_property_set_sqe(nvme_sqe_t *sqe, uint32_t offset, uint64
     wr32le(&sqe->cdw13, (uint32_t)(value >> 32));
 }
 
-/* Fabrics Property Get(fctype=0x04): CC/CSTS等の4バイトプロパティを読む
- * (attrib=0固定)。値はCQEのdw0(nvmet側がresult.u64の下位32bitとして
- * 返す、nvme_types.hのnvmet_execute_prop_get()コメント参照)に入る。 */
 static void nvme_build_property_get_sqe(nvme_sqe_t *sqe, uint32_t offset)
 {
     nvme_zero(sqe, sizeof(*sqe));
@@ -389,16 +317,6 @@ static void nvme_build_property_get_sqe(nvme_sqe_t *sqe, uint32_t offset)
     wr32le(&sqe->cdw11, offset);
 }
 
-/* admin queue(qid=0)へのFabrics Connect。成功するとctx->ctrlr_idに
- * targetが割り当てたController IDが入る(IO queue接続時にこれを使う)。
- * さらにController Configuration(CC)を有効化(EN=1)し、Controller
- * Status(CSTS)のRDYビットを待つ -- Fabrics Connect直後はCC.EN=0の
- * 状態でコントローラが生成され、Identify等の通常コマンドを一切受け
- * 付けない(nvme_types.hのNVME_REG_CC/NVME_CC_*コメント参照、実機の
- * nvmet-tcpとの相互接続検証で必須と判明した手順 -- 当初これを見落として
- * いた)。 */
-/* Fabrics Connectコマンドのデータペイロード(nvmf_connect_data_t)を
- * 組み立てる(admin/IO両queueで共通)。 */
 static void nvme_build_connect_data(nvmf_connect_data_t *data, uint16_t cntlid, const char *subnqn)
 {
     nvme_zero(data, sizeof(*data));
@@ -408,9 +326,6 @@ static void nvme_build_connect_data(nvmf_connect_data_t *data, uint16_t cntlid, 
     nvme_copy_str(data->hostnqn, sizeof(data->hostnqn), NVME_HOST_NQN);
 }
 
-/* Fabrics Connect(fctype=0x01)のSQEを組み立てる(admin(qid=0)/IO(qid=1)
- * 共通、qidだけが違う)。katoはadmin/IOいずれも0(Keep Alive未実装のため
- * 要求しない/IO queueでは予約)。 */
 static void nvme_build_fabrics_connect_sqe(nvme_sqe_t *sqe, uint16_t qid, uint32_t connect_data_len)
 {
     nvme_zero(sqe, sizeof(*sqe));
@@ -453,17 +368,6 @@ static void nvme_build_set_features_num_queues_sqe(nvme_sqe_t *sqe)
     wr32le(&sqe->cdw11, 0x00010001u);  /* NSQR=1, NCQR=1 (IO SQ/CQ各1本を要求) */
 }
 
-/* ================================================================
- * connect job(nvme.h冒頭コメント参照)。admin queue確立(TCP+ICReq/
- * ICResp+Fabrics Connect+CC有効化+CSTS.RDY待ち+Identify Controller/
- * Namespace+Set Features)→IO queue確立(TCP+ICReq/ICResp+Fabrics
- * Connect)という上記nvme_connect()と同じシーケンスを状態遷移へ展開
- * したもの。個々のFabrics/Property/Identify/Set Featuresコマンドは
- * 全てnvme_exec_begin()+nvme_exec_step()(共有ステートマシン、上記)
- * 経由で実行する -- ロジックは上記のブロッキング関数群
- * (nvme_connect_admin_queue()等)から複製せず、SQE組み立てヘルパ
- * (nvme_build_*_sqe())を両方から共有する。
- * ================================================================ */
 typedef enum {
     NCONN_ST_TCP_ADMIN_BEGIN = 0,
     NCONN_ST_TCP_ADMIN_WAIT,
@@ -487,8 +391,7 @@ typedef struct {
     uint32_t             ip;
     uint16_t              port;
     netif_t            *src_ctx;  /* spawn時点のg_active_ctx、下記コメント参照 */
-    uint64_t              wait_started_ticks;  /* 直近の待ち(ICResp受信/CSTS.RDYポーリング)を
-                                                 * 開始した時刻 -- timeout_ms()で判定する */
+    uint64_t              wait_started_ticks;
     nvme_tcp_xfer_t       xfer;
     uint8_t               icresp_buf[NVME_TCP_ICRESP_LEN];
     nvmf_connect_data_t   connect_data;
@@ -501,13 +404,6 @@ typedef struct {
 
 static nvme_connect_job_ctx_t s_nvme_connect_job_ctx;
 
-/* close_admin/close_io: 失敗した時点でそれぞれのTCP接続が既に
- * ESTABLISHEDに達していた(=tcp_close()が必要)ならtrue -- 上記
- * nvme_connect()/nvme_connect_admin_queue()/nvme_connect_io_queue()の
- * 各失敗分岐が呼ぶtcp_close()呼び出しの有無と同じ判断をジョブ側でも
- * 再現する(tcp_connect_poll()自身がTCP接続確立前の失敗では既に
- * 内部でs_conns[]を解放済みのため、その場合は追加のcloseは不要
- * かつ有害ではないが、元のコードの挙動に忠実に合わせる)。 */
 static job_result_t nvme_connect_job_fail(nvme_connect_job_ctx_t *jc, int close_admin, int close_io,
                                            const char *reason)
 {
@@ -528,16 +424,6 @@ static job_result_t nvme_connect_job_step(job_t *self)
     nvme_connect_job_ctx_t *jc  = (nvme_connect_job_ctx_t *)self->ctx;
     nvme_ctx_t              *ctx = jc->ctx;
 
-    /* `job stop <番号>`(job_request_cancel())対応。以前はこのジョブが
-     * cancel_requestedを一切見ておらず、`job stop`しても何も起きない
-     * (JOB_WAITINGを返し続け、ctx->busyもクリアされないまま)ため、
-     * スタックしたnvme connectを止める手段がreboot以外に無かった。
-     * 状態(self->state)がどこまで進んでいたかで、admin/io接続それぞれが
-     * 実際に確立済み(close対象)かを判定する -- 各状態が対応するTCP
-     * 接続待ち(NCONN_ST_TCP_ADMIN_WAIT/NCONN_ST_TCP_IO_WAIT)を通過した
-     * 後でなければ、その接続はまだ確立していない(nvme_connect_job_fail()
-     * の既存の呼び出しパターン、close_admin/close_ioの使い分けと同じ
-     * 判断基準)。 */
     if (self->cancel_requested) {
         int admin_open = (self->state > NCONN_ST_TCP_ADMIN_WAIT);
         int io_open    = (self->state > NCONN_ST_TCP_IO_WAIT);
@@ -559,9 +445,6 @@ static job_result_t nvme_connect_job_step(job_t *self)
         if (nvme_tcp_send_icreq(&ctx->admin) != 0) {
             return nvme_connect_job_fail(jc, 1, 0, "admin ICReq送信失敗");
         }
-        /* NSND: ICReq送信(admin queue)。nvme_tcp_send_icreq()(nvme_tcp.c)は
-         * 常に固定128バイト・pdo=0で送るため、実際に送信した値をここで
-         * そのまま渡せる。 */
         {
             volatile ts_nvme_pdu_t info = {0};
             info.pdu_type = NVME_TCP_PDU_ICREQ;
@@ -611,9 +494,6 @@ static job_result_t nvme_connect_job_step(job_t *self)
         ctx->ctrlr_id = (uint16_t)(rd32le(&jc->exec.cqe_out.dw0) & 0xFFFFu);
         uart_printf("[nvme] admin queue接続完了 (controller id=%u)\n", ctx->ctrlr_id);
 
-        /* コントローラ有効化(CC.EN=1)。IOSQES/IOCQESを規定値(64B/16B)に
-         * しないとtarget側がCSTS.CFSへ落ちる(nvme_types.hのNVME_CC_*
-         * コメント参照)。 */
         uint32_t cc = NVME_CC_EN | NVME_CC_CSS_NVM | NVME_CC_AMS_RR | NVME_CC_SHN_NONE |
                       NVME_CC_IOSQES | NVME_CC_IOCQES;
         nvme_build_property_set_sqe(&jc->sqe, NVME_REG_CC, cc);
@@ -768,24 +648,6 @@ int nvme_connect_job_start(nvme_ctx_t *ctx, uint32_t ip, uint16_t port, const ch
         uart_printf("[!] nvme: 前回の操作がまだ実行中です\n");
         return -1;
     }
-    /* 【実機で発見・修正】ctx->io_connectedのチェックが無いと、既に接続
-     * 済み(admin/io両queueがESTABLISHED)の状態でもう一度nvme connectを
-     * 呼べてしまい、tcp_connect_begin(&ctx->admin.tcp, ...)がESTABLISHED
-     * だったconn(ctx->admin.tcp、s_nvme_ctxの一部)を無条件に上書きして
-     * しまう(tcp_connect_begin()自身は「未使用のconnに新規接続を張る」
-     * 前提で、既存の生きた接続かどうかを一切確認しない設計)。この2回目の
-     * 接続試行自体が失敗(ARP解決失敗等)すると、nvme_connect_job_fail()の
-     * close_admin判定は「まだ接続していない」ものとして処理するため
-     * admin.tcpは一切closeされず、ESTABLISHED/CLOSE_WAITのどちらでも
-     * ない中途半端な状態のまま取り残される。この状態でnvme disconnect
-     * (tcp_close())を呼んでも、conn->stateがESTABLISHED/CLOSE_WAITの
-     * どちらでもないため`if`にヒットせずFINが一切送信されない
-     * ("nvme: 切断完了"とだけ表示されるが実際には何もclose
-     * していない)。サーバ側(nvmet)はFINを受け取れないので、前のセッション
-     * のまま(`jobs`のstateが固まって見える)取り残される -- という連鎖的
-     * な実害が実機で確認された。既に接続済みの状態で誤ってnvme connectを
-     * 呼んだ場合はここで即座に拒否し、`nvme disconnect`を先に呼ぶよう
-     * 促す(既存のctx->busyガードと同じスタイル)。 */
     if (ctx->io_connected) {
         uart_printf("[!] nvme: 既に接続済みです(先に`nvme disconnect`してください)\n");
         return -1;
@@ -804,22 +666,6 @@ int nvme_connect_job_start(nvme_ctx_t *ctx, uint32_t ip, uint16_t port, const ch
     s_nvme_connect_job_ctx.ctx     = ctx;
     s_nvme_connect_job_ctx.ip      = ip;
     s_nvme_connect_job_ctx.port    = port;
-    /* 送信元インターフェース(`net use`で選んだもの)をこの時点(コマンド
-     * 自身のdispatch()内、同期的)のg_active_ctxとして固定する。
-     * tcp_connect_begin()はNET_SELF_IP(=g_active_ctx由来)を読むが、この
-     * ジョブは複数tickにまたがって進行するため、admin/nvmet等の他ジョブの
-     * ポーリング・telnetの出力flush等がその間にg_active_ctxを一時的に
-     * 別インターフェースへ切り替えることがある(net_poll_all_and_
-     * dispatch()自身は呼び出し前の状態へ復元するが、tcp_send_segment()は
-     * 自分のconnのインターフェースへ切り替えたまま戻る設計のため、複数
-     * インターフェースが同時に活動していると、あるtickの終わりに
-     * g_active_ctxが「たまたま最後に何かを送信したインターフェース」に
-     * なる -- 実機でConnectX PF0<->PF1ループバック環境において、`net use
-     * mlx5-pf0`の直後に新しいtelnet接続を張り直すと、その接続受理処理の
-     * 過程でg_active_ctxがRP1へ固定されてしまい、`nvme connect`が誤って
-     * RP1からSYN/ARPを送出する事象を確認した)。呼び出し直後(まだ他の
-     * ジョブが割り込む前)に固定しておけば、以降の各tick開始時に明示的に
-     * 再アクティブ化するだけで、このレースの影響を受けなくなる。 */
     s_nvme_connect_job_ctx.src_ctx = g_active_ctx;
 
     job_t *connect_job = job_spawn(nvme_connect_job_step, &s_nvme_connect_job_ctx, "nvme-connect");
@@ -828,12 +674,6 @@ int nvme_connect_job_start(nvme_ctx_t *ctx, uint32_t ip, uint16_t port, const ch
         ctx->busy = 0;
         return -1;
     }
-    /* このジョブが実際に送受信を発行するインターフェース(src_ctx、上記
-     * コメント参照)へaffinity_key(job.h参照)を紐付ける -- src_ctx->
-     * owner_coreと異なるコアでこのジョブがclaimされる(=NICへ直接
-     * アクセスする)ことをjob.cの共有スケジューラレベルで防ぐ
-     * (マルチコア化 Phase 4-6準備、~/.claude/plans/wondrous-baking-
-     * gadget.md参照)。 */
     job_set_affinity(connect_job, s_nvme_connect_job_ctx.src_ctx);
     return 0;
 }
@@ -854,14 +694,6 @@ void nvme_build_write_sqe(nvme_sqe_t *sqe, uint32_t nsid, uint64_t slba, uint32_
     nvme_zero(sqe, sizeof(*sqe));
     wr32le(&sqe->cdw0, NVME_IO_CMD_WRITE | ((uint32_t)NVME_PSDT_SGL_MPTR_CONTIGUOUS << 8));
     wr32le(&sqe->nsid, nsid);
-    /* NVME_TCP_INLINE_DATA_MAX(8KiB)以下ならin-capsule、超えるならSGL
-     * typeをTRANSPORTにしてR2T+H2CData経由の分割送信にする(2026-08-08、
-     * R2T分割実装)。SQE自身にどちらの型で送るかを持たせることで、
-     * nvme_tcp_send_cmd()がSGL type(sqe->dptr[15])を見るだけでin-capsule
-     * データを実際に付加すべきか、それとも一切送らずpending_dataへ保留
-     * するだけにすべきかを判定できる -- 以前デッドロックを踏んだ
-     * (nvme_types.hのNVME_SGL_TYPE_TRANSPORTコメント参照)「型と実際の
-     * データ送信有無がずれる」設計を構造的に避けるための方針。 */
     if (total_len > NVME_TCP_INLINE_DATA_MAX) {
         nvme_set_sgl(sqe, total_len);
     } else {
@@ -872,53 +704,21 @@ void nvme_build_write_sqe(nvme_sqe_t *sqe, uint32_t nsid, uint64_t slba, uint32_
     wr32le(&sqe->cdw12, (uint32_t)(nlb - 1) & 0xFFFFu);
 }
 
-/* ================================================================
- * nvme_write_begin()/nvme_read_begin()/nvme_identify_ctrl_begin()/
- * nvme_identify_ns_begin() -- 非ブロッキング「開始」API群(job.h基盤)。
- *
- * SQE組み立て(nvme_build_*_sqe())は全てこのファイル内で完結させる --
- * 呼び出し元(command.c/test.c等)がnvme_sqe_tやCNS定数等のNVMeプロトコル
- * の詳細を直接扱うことはない。呼び出し元は「どのqueueを使うか
- * (admin/io)」「送信/受信バッファ」を意識する必要すら無く、意味のある
- * 引数(nsid/lba/buf/nlb等)だけを渡す。
- *
- * 全て同じ下位ヘルパnvme_io_begin()を共有する -- ctx->busyの管理
- * (nvme_connect_job_start()と同じ規約: 開始時に1、完了時に0)も含めて
- * ここに一本化することで、呼び出し元ごとの重複/実装漏れ(busyチェック
- * 忘れ等)を防ぐ。 */
-
 static volatile int    s_io_job_done = 0;
-
-/* ================================================================
- * ステート滞在時間プロファイラ(nvme.hコメント参照)へのアクセサ実装。
- * ================================================================ */
-
-/* ================================================================
- * NVMe/TCPコマンドパイプライン化(nvme.hのNVME_IO_QDEPTH/
- * nvme_write_pipelined_run()コメント参照)。
- * ================================================================ */
 
 typedef struct {
     int        in_use;   /* このスロットが現在1件のwriteを担当中か */
     int        sent;     /* SQEを送信済みか(R2T/RSP待ちの間だけ1) */
     int        done;     /* 完了(結果確定)したか -- in_useのままresultを取り出す猶予を与える */
     int        result;   /* 完了時のCQEステータス(0=success)、通信エラー等は-1 */
-    uint16_t   cid;       /* nvme_tcp_send_cmd_async()が採番したcid(out引数で直接受け取る、
-                           * 2026-08-09、tcp_send_async()化に伴いconn->pending_cid経由から変更) */
+    uint16_t   cid;
     nvme_sqe_t sqe;
-    const void *data;     /* このwriteが送るデータ(呼び出し元所有、複数スロットが同じ
-                           * バッファを読み取り専用で共有してもよい) */
+    const void *data;
     uint32_t   len;
 } nvme_pipeline_slot_t;
 
 static nvme_pipeline_slot_t s_pl_slots[NVME_IO_QDEPTH];
 
-/* 共有PDU受信ディスパッチャの状態 -- IO queue接続は1本のTCPストリーム
- * なので、複数スロットの応答(Response/R2T)は必ず順番に1つずつ届く。
- * ここでヘッダを読んでtype判定→本体を読んでcid/cccidでスロットへ
- * ルーティング、を繰り返す(nvme_exec_step()のRECV_HDR/RECV_CQE/
- * RECV_R2T_RESTと同じパターンだが、単一ecではなく複数スロットへ
- * ルーティングする点が異なる)。 */
 typedef enum {
     PL_RX_HDR = 0,
     PL_RX_RSP_REST,
@@ -930,10 +730,6 @@ static nvme_tcp_xfer_t          s_pl_xfer;
 static uint8_t                  s_pl_hdr_buf[NVME_TCP_HDR_LEN];
 static uint8_t                  s_pl_rest_buf[16];
 
-/* 送信済み(sent)かつ未完了(!done)のスロットからcidが一致するものを
- * 探す。C2HData(読み出し応答)はこのパイプラインが扱うwrite専用の
- * 用途では届かない想定のため対応しない(PL_RX_HDRのdefault分岐で
- * ログのみ出して読み捨てる、下記参照)。 */
 static int nvme_pipeline_find_slot(uint16_t cid)
 {
     for (unsigned i = 0; i < NVME_IO_QDEPTH; i++) {
@@ -945,24 +741,10 @@ static int nvme_pipeline_find_slot(uint16_t cid)
     return -1;
 }
 
-/* H2CData送信をパイプライン化するためのFIFOキュー(2026-08-09、ユーザー
- * 指示)。詳細な設計根拠はnvme_pipeline_h2c_pump()直前のコメント参照 --
- * ここでは前方参照を避けるため、nvme_pipeline_rx_tick()より先に
- * 宣言・定義する(rx_tick()のPL_RX_R2T_RESTケースがnvme_h2c_pending_push()
- * を呼ぶため)。 */
 typedef struct {
     int      valid;
     int      slot;
-    uint16_t cid;   /* 2026-08-10、実機で発見した本物のバグの修正
-                      * (下記nvme_pipeline_h2c_pump()コメント参照) --
-                      * 以前はslotだけを保持し、取り出す時点でs_pl_slots
-                      * [slot].cidを再読み込みしていたため、そのslotが
-                      * 取り出し前に別の新しいwriteへ再利用されると
-                      * (新しいcidに上書きされる)、古いpendingエントリが
-                      * 誤って新しいcidとして処理されてしまう実機バグ
-                      * (cid欠落+別cidの重複処理)を引き起こしていた。
-                      * push時点でcidをこの構造体自身に確定・保持する
-                      * ことで、以後slotが再利用されても影響を受けない。 */
+    uint16_t cid;
     uint16_t ttag;
     uint32_t r2to;
     uint32_t r2tl;
@@ -989,16 +771,10 @@ static int nvme_h2c_pending_push(int slot, uint16_t cid, uint16_t ttag, uint32_t
     return 0;
 }
 
-/* 到着済みのPDUを1ステップぶんだけ非ブロッキングで処理する
- * (nvme_tcp_recv_poll()自体が「1回だけ試す」非ブロッキング設計、
- * nvme_tcp.hコメント参照)。呼び出し元(nvme_write_pipelined_run())の
- * メインループから毎tick呼ばれる。 */
 static void nvme_pipeline_rx_tick(nvme_ctx_t *ctx)
 {
     int r = nvme_tcp_recv_poll(&ctx->io, &s_pl_xfer);
     if (r < 0) {
-        /* コネクションレベルの失敗(FIN/エラー) -- 送信済み・未完了の
-         * 全スロットを失敗として確定させる(これ以上応答は来ない)。 */
         for (unsigned i = 0; i < NVME_IO_QDEPTH; i++) {
             if (s_pl_slots[i].in_use && s_pl_slots[i].sent && !s_pl_slots[i].done) {
                 s_pl_slots[i].done   = 1;
@@ -1011,22 +787,12 @@ static void nvme_pipeline_rx_tick(nvme_ctx_t *ctx)
         return;  /* このPDUの受信途中、次tickへ */
     }
 
-    /* 計装専用(一時追加、原因特定後に削除すること) -- 状態遷移が
-     * 完了するたび(r==1で switch へ入る直前)に、現在の状態・
-     * ctx->io.tcp.rcv_seq(このPDU分を消費した直後の受信バイト
-     * ストリーム位置)・xferのgot/wantを記録する。nvmet_tcp.cの
-     * RSSQ(R2T送信時のsnd_seq)と突き合わせれば、TCP層でのバイト位置と
-     * アプリ層のPDU処理タイミングを直接対応付けられる。argは
-     * (state<<28)|(rcv_seq&0x0FFFFFFF)。 */
     ts_log(TS_MK(TS_FILE_NVME, TS_FUNC_nvme_pipeline_rx_tick, 0),
            ((uint32_t)s_pl_rx_state << 28) | (ctx->io.tcp.rcv_seq & 0x0FFFFFFFu));
 
     switch (s_pl_rx_state) {
     case PL_RX_HDR: {
         uint8_t type = s_pl_hdr_buf[0];
-        /* 計装専用(一時追加、原因特定後に削除すること) -- 読み取った
-         * 8バイトヘッダの生の型バイト+hlen/pdo+plenを丸ごと記録する。
-         * argの上位8bit=type、次の8bit=hlen、下位16bit=plen下位16bit。 */
         ts_log(TS_MK(TS_FILE_NVME, TS_FUNC_nvme_pipeline_rx_tick, 1),
                ((uint32_t)type << 24) | ((uint32_t)s_pl_hdr_buf[2] << 16) |
                ((uint32_t)rd32le(&s_pl_hdr_buf[4]) & 0xFFFFu));
@@ -1090,16 +856,6 @@ static void nvme_pipeline_rx_tick(nvme_ctx_t *ctx)
         }
         int slot = nvme_pipeline_find_slot(cccid);
         if (slot >= 0) {
-            /* 2026-08-09、ユーザー指示 -- 以前はここでブロッキング
-             * nvme_tcp_send_h2c_data_ex()(内部でtcp_send()、PDU全体を
-             * 送り切りACKを待つまで戻らない)を直接呼んでいたため、次の
-             * R2Tを読みに行くまでの間、実質1コマンドずつ完全に直列に
-             * なっていた(depth=8を用意してもR2T受信〜H2CData送信の部分は
-             * 並行化されていなかった、CLAUDE.md「NVMe/TCP writeの性能が
-             * 出ない要因」節参照)。ここでは(slot,ttag,r2to,r2tl)を小さい
-             * FIFOキューへ積んで即座に受信ループへ戻るだけにし、実際の
-             * 送信はnvme_pipeline_h2c_pump()(呼び出し元のメインループが
-             * 毎tick呼ぶ)がtcp_send_async()で非ブロッキングに進める。 */
             if (nvme_h2c_pending_push(slot, cccid, ttag, r2to, r2tl) != 0) {
                 uart_printf("[!] nvme pipeline: H2C送信キュー満杯 (cccid=%u)\n", cccid);
                 s_pl_slots[slot].done   = 1;
@@ -1114,32 +870,6 @@ static void nvme_pipeline_rx_tick(nvme_ctx_t *ctx)
     }
     }
 }
-
-/* ================================================================
- * H2CData送信のパイプライン化(2026-08-09、ユーザー指示)。
- *
- * 従来はR2T受信直後にブロッキングtcp_send()(nvme_tcp_send_h2c_data_ex()
- * 内部)を呼んでおり、PDU全体(ヘッダ24B+データ最大262144B)を送り切り、
- * さらにその末尾バイトのACK到達まで待ってから戻る設計だった。実機の
- * `ts`計測(SSLT/SFLT/TXAK/TACK相関)で、この「末尾ACK待ち」だけで
- * 1コマンドあたり約1msかかっており、depth=8で8回直列に積み重なって
- * 約16.8ms/バッチ(depth=4/8のどちらでもほぼ同じ)というスループット
- * 頭打ちの直接原因になっていることを特定した。
- *
- * 修正: R2T受信(nvme_pipeline_rx_tick())は(slot,ttag,r2to,r2tl)を
- * s_h2c_pending[]へ積むだけにし、実際の送信はここ(nvme_pipeline_h2c_pump()、
- * メインループから毎tick呼ぶ)がtcp_send_async()(MSS単位、ACK到達を
- * 待たず即座に返る、tcp_send_async_poll()が背後で確認・再送を担当)を
- * 繰り返し呼んで進める。1PDU分のバイト列(ヘッダ+データ)は必ず連続して
- * キューし切ってから次のPDUへ進む(NVMe/TCPフレーミング上、複数PDUを
- * バイト単位でインターリーブしてはならない -- ただし「確認[ACK]を
- * 待たない」ことと「連続してキューする」ことは両立する、両者は別の話)。
- * s_h2c_cursorが指す1件の送信は必ずnvme_pipeline_h2c_pump()の1回の
- * 呼び出し内で完結する(完了またはエラーで必ずactive=0に戻す)ため、
- * 呼び出し元のメインループ(SQE送信・R2T受信)が同じコネクションの
- * バイトストリームへ割り込む余地は無い(逐次実行のため自然に排他される)。
- * FIFOキュー本体(s_h2c_pending[]/nvme_h2c_pending_push())は前方参照を
- * 避けるためnvme_pipeline_rx_tick()より前で定義済み。 */
 
 typedef struct {
     int      active;
@@ -1173,13 +903,6 @@ static void nvme_pipeline_h2c_pump(nvme_ctx_t *ctx)
         nvme_h2c_pending_t *p = &s_h2c_pending[s_h2c_pending_head];
         s_h2c_cursor.active      = 1;
         s_h2c_cursor.slot        = p->slot;
-        /* 2026-08-10、実機で発見した本物のバグの修正: push時点で確定
-         * させたp->cid(nvme_h2c_pending_t.cidコメント参照)をそのまま
-         * 使う -- s_pl_slots[p->slot].cidを取り出す時点で再読み込みして
-         * いた旧実装は、slotが別のwriteへ再利用されタイミングによっては
-         * 誤ったcidを参照してしまい、あるcidのH2CDataが永久に送られない
-         * まま別のcidが重複して処理される実機バグ(`ts core 0 type NH2F`
-         * でcid欠落+重複を確認、CLAUDE.md参照)を引き起こしていた。 */
         s_h2c_cursor.cid         = p->cid;
         s_h2c_cursor.ttag        = p->ttag;
         s_h2c_cursor.r2to        = p->r2to;
@@ -1191,11 +914,6 @@ static void nvme_pipeline_h2c_pump(nvme_ctx_t *ctx)
         s_h2c_pending_count--;
     }
 
-    /* ヘッダ(24B、NVME_TCP_DATA_PDU_LEN)を最初に1回だけ送る -- r2tlは
-     * 常にNVMET_TCP_MAXH2CDATA_SCALED(262144)以下(target側の1回のR2T
-     * オファーの上限)であり、このパイプラインが対象とするwrite専用の
-     * 用途では1コマンド=1PDUで足りるため、複数PDUへの分割
-     * (NVME_TCP_H2C_CHUNK_MAX相当)は行わない -- 常にF_DATA_LASTを立てる。 */
     if (!s_h2c_cursor.header_sent) {
         uint8_t hdr[NVME_TCP_DATA_PDU_LEN];
         hdr[0] = NVME_TCP_PDU_H2C_DATA;
@@ -1208,10 +926,6 @@ static void nvme_pipeline_h2c_pump(nvme_ctx_t *ctx)
         wr32le(&hdr[12], s_h2c_cursor.r2to);
         wr32le(&hdr[16], s_h2c_cursor.r2tl);
         wr32le(&hdr[20], 0);  /* reserved */
-        /* NSND: H2CData送信(旧NMTX)。データ本体(TCP_ASYNC_MAX_LEN単位の
-         * 複数チャンク)は下のループでtcp_send_async()により追加でキュー
-         * されるが、PDUとしては1個(ヘッダ送信時点でplen/datao/datalが
-         * 確定済み)なのでここで1回だけ記録する。 */
         {
             volatile ts_nvme_pdu_t info = {0};
             info.pdu_type    = hdr[0];
@@ -1238,13 +952,6 @@ static void nvme_pipeline_h2c_pump(nvme_ctx_t *ctx)
     while (s_h2c_cursor.queued < s_h2c_cursor.r2tl) {
         uint32_t remaining = s_h2c_cursor.r2tl - s_h2c_cursor.queued;
         uint16_t chunk = (remaining > TCP_ASYNC_MAX_LEN) ? (uint16_t)TCP_ASYNC_MAX_LEN : (uint16_t)remaining;
-        /* 2026-08-10、LSO対応に伴いmssへの切り詰めを撤去した --
-         * tcp_send_async()自体が、接続先のLSOケーパビリティに応じて
-         * mss単位への分割/LSO単発送信を内部で使い分けるようになった
-         * (tcp.hのtcp_send_async()コメント参照)ため、ここは
-         * TCP_ASYNC_MAX_LEN単位のチャンクをそのまま渡すだけでよい。 */
-        /* 計装専用(上記NRSPコメント参照)。このPDUの最初のデータチャンクを
-         * キューする直前。使用後に削除すること。 */
         if (s_h2c_cursor.queued == 0) {
             ts_log(TS_MK(TS_FILE_NVME, TS_FUNC_nvme_pipeline_h2c_pump, 1), s_h2c_cursor.cid);
         }
@@ -1260,22 +967,12 @@ static void nvme_pipeline_h2c_pump(nvme_ctx_t *ctx)
         }
         s_h2c_cursor.queued += (uint32_t)rc;
     }
-    /* 計装専用(上記NRSPコメント参照)。このPDUの最後のデータチャンクを
-     * キューし終えた直後。使用後に削除すること。 */
     ts_log(TS_MK(TS_FILE_NVME, TS_FUNC_nvme_pipeline_h2c_pump, 2), s_h2c_cursor.cid);
 
     /* このPDUは完全にキューし終えた -- 次回の呼び出しで次のPDU(あれば)へ進む。 */
     s_h2c_cursor.active = 0;
 }
 
-/* ベンチのコマンドごとに開始 LBA を nlb ずつ進め、名前空間の終端を超えたら
- * 開始位置 base へ戻す(Linux の fio が --rw=write/read で行うシーケンシャル
- * アクセスと同じ挙動)。
- *
- * 以前はパイプラインの全コマンドが常に同じ LBA を指しており、ターゲット側が
- * 同一メモリだけを触り続けるためキャッシュに有利すぎる測定になっていた。
- * Linux 側(fio / SPDK perf)と条件を揃えるために導入した。
- * ctx->nsze が未取得(0)の場合は進めず base のままにする(退行しない側に倒す)。 */
 static uint64_t nvme_bench_next_lba(const nvme_ctx_t *ctx, uint64_t cur,
                                     uint64_t base, uint32_t nlb)
 {
@@ -1328,8 +1025,6 @@ int nvme_write_pipelined_run(nvme_ctx_t *ctx, uint32_t nsid, uint64_t lba,
                 s_pl_slots[i].in_use = 0;
             }
         }
-        /* 空いたスロットへ次のwriteを積む(常に同じlba/bufへ上書きする、
-         * 性能測定専用の設計 -- temp_test()の既存ループと同じ)。 */
         for (unsigned i = 0; i < NVME_IO_QDEPTH; i++) {
             if (!s_pl_slots[i].in_use) {
                 s_pl_slots[i].in_use = 1;
@@ -1342,15 +1037,6 @@ int nvme_write_pipelined_run(nvme_ctx_t *ctx, uint32_t nsid, uint64_t lba,
                 cur_lba = nvme_bench_next_lba(ctx, cur_lba, lba, nlb);
             }
         }
-        /* 未送信のスロットを送信する。2026-08-09、ユーザー指示で
-         * ブロッキングtcp_send()経由のnvme_tcp_send_cmd()から、
-         * tcp_send_async()経由のnvme_tcp_send_cmd_async()へ変更した
-         * (TCP_ASYNC_MAX_LENを128へ拡張、tcp.h参照) -- 実機の`ts`計測で
-         * 複数スロットを連続送信する際、1件ごとに相手のACKを待つ遅延
-         * (バースト内の送信間隔が約110-120us)が観測されたため。この
-         * 変更単独ではPDUの受信側処理(R2T待ち・H2CData転送・CQE受信、
-         * いずれもR2T往復のレイテンシが支配的)は変わらないが、SQE
-         * 送信自体を詰めることでバッチ内の実効並行度を上げる狙い。 */
         for (unsigned i = 0; i < NVME_IO_QDEPTH; i++) {
             if (s_pl_slots[i].in_use && !s_pl_slots[i].sent) {
                 uint16_t cid = 0;
@@ -1359,8 +1045,6 @@ int nvme_write_pipelined_run(nvme_ctx_t *ctx, uint32_t nsid, uint64_t lba,
                     s_pl_slots[i].result = -1;
                     continue;
                 }
-                /* NSND: CapsuleCmd送信(write、旧NMTX)。in-capsuleデータは
-                 * 使わない設計(常にR2T+H2CData)のためhlen=plen=72,pdo=0。 */
                 {
                     const uint8_t *sqe_bytes = (const uint8_t *)&s_pl_slots[i].sqe;
                     volatile ts_nvme_pdu_t info = {0};
@@ -1383,11 +1067,6 @@ int nvme_write_pipelined_run(nvme_ctx_t *ctx, uint32_t nsid, uint64_t lba,
         job_scheduler_tick();
     }
 
-    /* drain: 送信済みで未完了のスロットが残っていれば、その完了(または
-     * NVME_IO_CMD_TIMEOUT_MS超過)を待つ -- 新規の送信は行わない。
-     * ただしH2C送信キューに積まれたまま(R2Tは受けたがまだ送信していない)
-     * ものが残っている可能性があるため、ここでもnvme_pipeline_h2c_pump()を
-     * 呼び続けて確実に送り切る。 */
     {
         uint64_t drain_start = timer_now();
         while (!timeout_ms(drain_start, NVME_IO_CMD_TIMEOUT_MS)) {
@@ -1424,24 +1103,6 @@ int nvme_write_pipelined_run(nvme_ctx_t *ctx, uint32_t nsid, uint64_t lba,
     return 0;
 }
 
-/* ================================================================
- * NVMe/TCP READコマンドパイプライン化(2026-08-10、ユーザー指示)。
- *
- * 上記WRITE版(nvme_write_pipelined_run())と同じNVME_IO_QDEPTH並列設計
- * だが、応答経路が異なるため状態機械は独立させた: WRITEはSEND→R2T受信→
- * H2CData送信→RSP受信という往復を挟む(H2C送信キュー/pumpが必要)のに
- * 対し、READはSEND直後にtargetがC2HData(読み出しデータ本体)を送って
- * くるだけで、こちらから追加の送信は不要。CLAUDE.md「READ(C2HData送信)
- * の単一PDU化」節の通り、この実装のtarget(nvmet_tcp.c)は1コマンド分の
- * データ全体を単一のC2HData PDU(F_DATA_SUCCESS付き、別途RSPを送らない)
- * で返す設計になっているため、受信したデータをスロットの宛先バッファへ
- * コピーし、F_DATA_SUCCESSを見た時点で完了とするだけで済む。
- *
- * write版の受信ステートマシン/静的バッファは一切共用しない(read/write
- * パイプラインが同時に動くことは無い -- ctx->busyが単一ゲート -- が、
- * R2T往復とC2HData直送という異なるPDUフローを1つの状態機械に無理に
- * 詰め込むと条件分岐が増えて見通しが悪くなるため、素直に分けた)。 */
-
 typedef struct {
     int        in_use;
     int        sent;
@@ -1460,23 +1121,10 @@ typedef enum {
     PL_READ_RX_C2H_DATA,
 } nvme_pipeline_read_rx_state_t;
 
-/* 未知のcid/cccid宛のC2HData(本来起きないはずの防御的経路)を、ストリーム
- * 同期を保ったまま読み捨てるための破棄先バッファ。1PDUのデータ長は
- * target側のMDTS(NVMET_MAX_TRANSFER_BYTES=262144、nvmet.h)で頭打ちの
- * はずなのでこのサイズで足りる -- ただし万一これを超える場合は
- * datal全体を消費しきれずストリームがずれる(呼び出し元がslot探索に
- * 失敗する状況自体が想定外のため、この防御はベストエフォート)。 */
 static uint8_t s_pl_read_discard_buf[262144] __attribute__((aligned(64)));
 
 typedef enum { NRX_HDR, NRX_PSH, NRX_DATA } nvme_read_prx_phase_t;
 
-/* マルチコネクション対応(2026-08-15): read パイプライン状態を per-core 化。
- * 2 initiator コア(core0/core2)が別々の接続で並行して read を駆動するため、
- * 従来ファイルスコープ static だった状態を [SMP_MAX_CORES] 配列にし、
- * smp_core_index() で索引する(各関数先頭で rd = &s_rd[smp_core_index()])。
- * upcall(nvme_read_rx_upcall)は接続を所有するコアの tcp_input から呼ばれる
- * ため、smp_core_index() が正しい索引を返す。s_pl_read_discard_buf(破棄
- * シンク)だけは内容が意味を持たないため共有のまま。 */
 typedef struct {
     nvme_pipeline_read_slot_t     slots[NVME_IO_QDEPTH];
     nvme_pipeline_read_rx_state_t rx_state;
@@ -1513,15 +1161,6 @@ static int nvme_pipeline_read_find_slot(uint16_t cid)
     return -1;
 }
 
-/* ===== push型受信(inline upcall)による read RX。2026-08-15 =====
- * 従来の nvme_pipeline_read_rx_tick(pull型)は NIC→tcp rx_buf→スロット宛先の
- * 二重コピーを伴い、受信側(initiator=core0)の CPU コストが read スループットの
- * 律速になっていた(simdelay で実測: core0 に 5us 注入で read -12%)。target 側の
- * H2CData 受信(nvmet.c の nvmet_io_rx_upcall、CLAUDE.md「push型受信」節)と同じ手法で、
- * tcp_input() が in-order データを rx_buf へ積む代わりにこの upcall へ直接渡し、
- * C2HData 本体を宛先スロットバッファへ 1 コピーで配置する(rx_buf ステージング排除)。
- * パーサ状態は per-core 化した(上記 nvme_rd_state_t、マルチコネクションで
- * 2 initiator コアが並行 read するため)。 */
 static void nvme_read_rx_upcall(void *arg, const volatile uint8_t *data, uint16_t len)
 {
     (void)arg;
@@ -1574,8 +1213,6 @@ static void nvme_read_rx_upcall(void *arg, const volatile uint8_t *data, uint16_
                     rd->nrx_data_off = 0; rd->nrx_phase = NRX_DATA;
                 }
             } else if (rd->nrx_type == NVME_TCP_PDU_RSP) {
-                /* 通常はC2HData(F_DATA_SUCCESS)が暗黙完了を兼ねるため来ない想定だが、
-                 * targetがエラーを明示RSPで返す場合(範囲外read等)に備える。 */
                 uint16_t cid    = rd16le(&rd->nrx_psh[12]);
                 uint16_t status = rd16le(&rd->nrx_psh[14]);
                 int slot = nvme_pipeline_read_find_slot(cid);
@@ -1593,8 +1230,6 @@ static void nvme_read_rx_upcall(void *arg, const volatile uint8_t *data, uint16_
             uint32_t need  = rd->nrx_data_need - rd->nrx_data_off;
             uint32_t avail = (uint32_t)len - i;
             uint32_t take  = (need > avail) ? avail : need;
-            /* 唯一のコピー: RX(in-orderデータ)→宛先スロット直接配置。未知slot(-1)は
-             * コピーせず消費のみ(ストリーム同期維持)。 */
             if (rd->nrx_slot >= 0) {
                 volatile_fast_copy(rd->nrx_data_dst + rd->nrx_data_off, data + i, take);
             }
@@ -1616,8 +1251,6 @@ static void nvme_pipeline_read_rx_tick(nvme_ctx_t *ctx)
     nvme_rd_state_t *rd = &s_rd[smp_core_index()];
     int r = nvme_tcp_recv_poll(&ctx->io, &rd->xfer);
     if (r < 0) {
-        /* コネクションレベルの失敗(FIN/エラー) -- 送信済み・未完了の
-         * 全スロットを失敗として確定させる(write版と同じ考え方)。 */
         for (unsigned i = 0; i < NVME_IO_QDEPTH; i++) {
             if (rd->slots[i].in_use && rd->slots[i].sent && !rd->slots[i].done) {
                 rd->slots[i].done   = 1;
@@ -1648,9 +1281,6 @@ static void nvme_pipeline_read_rx_tick(nvme_ctx_t *ctx)
     }
 
     case PL_READ_RX_RSP_REST: {
-        /* 通常はC2HData(F_DATA_SUCCESS付き)が暗黙の完了応答を兼ねるため
-         * ここには来ない想定だが、targetがエラーを明示的なRSPで返す場合
-         * (例: 範囲外read)に備える。 */
         uint16_t cid    = rd16le(&rd->rest_buf[12]);
         uint16_t status = rd16le(&rd->rest_buf[14]);
         /* NRCV: Response Capsule(CQE)受信完了(read pipeline)。 */
@@ -1726,9 +1356,6 @@ static void nvme_pipeline_read_rx_tick(nvme_ctx_t *ctx)
             rd->slots[rd->cur_slot].done   = 1;
             rd->slots[rd->cur_slot].result = 0;
         }
-        /* F_DATA_SUCCESS無し(複数PDU分割)はこのtarget実装では起きない
-         * 想定だが、来た場合も状態を壊さないよう単純にRECV_HDRへ戻り
-         * 続くPDUを待つ(write版と同じ設計方針)。 */
         nvme_tcp_xfer_reset(&rd->xfer, rd->hdr_buf, NVME_TCP_HDR_LEN);
         rd->rx_state = PL_READ_RX_HDR;
         break;
@@ -1759,11 +1386,6 @@ int nvme_read_pipelined_run(nvme_ctx_t *ctx, uint32_t nsid, uint64_t lba,
     rd->rx_state = PL_READ_RX_HDR;
     rd->cur_slot = -1;
 
-    /* push型受信を有効化(nvme_read_rx_upcall)。以後 C2HData/RSP は tcp_input() から
-     * この upcall へ直接渡り、宛先スロットへ1コピーで配置される(rx_buf ステージング排除)。
-     * ループの nvme_pipeline_read_rx_tick() は tcp_poll_once() を回す poll ドライバとして
-     * 残る -- upcall 登録中は in-order データが rx_buf に積まれず recv_poll は 0 を返すため、
-     * pull 側の状態機械は空回り(no-op)し、実 RX は upcall が担う。 */
     rd->nrx_phase = NRX_HDR; rd->nrx_hdr_off = 0; rd->nrx_error = 0; rd->nrx_slot = -1;
     tcp_set_recv_upcall(&ctx->io.tcp, nvme_read_rx_upcall, NULL);
 
@@ -1787,20 +1409,6 @@ int nvme_read_pipelined_run(nvme_ctx_t *ctx, uint32_t nsid, uint64_t lba,
                 rd->slots[i].in_use = 0;
             }
         }
-        /* 空いたスロットへ次のreadを積む(常に同じlba/bufへ、性能測定
-         * 専用の設計 -- write版・temp_test()の既存ループと同じ)。
-         *
-         * 【2026-08-15、x86 VFIO ポートで発見・修正した zero-window
-         *  デッドロック】READ の in-flight(outstanding × total_len)が受信側の
-         *  TCP_RX_BUF_SIZE に達すると、相手が rx_buf を 100% 埋め尽くして WIN=0
-         *  になり、受信側は「処理中 PDU の残り」が届かず前進できず、送信側は
-         *  1.6 秒 RTO で空転する回復不能なデッドロックに陥る(256KB×qd8=2MB が
-         *  rx_buf 2MB と一致する条件。x86 の高速タイミングで顕在化。rpi5 は
-         *  広告受信ウィンドウが RX ring 容量で小さく抑えられ in-flight が
-         *  そもそもこの上限に達しないため問題化していなかった)。1 転送分の
-         *  headroom を常に残し、in-flight を rx_buf 未満に保つ。8KB 等の小さい
-         *  転送では max_inflight >> NVME_IO_QDEPTH となり従来通り全スロットを
-         *  使う(この cap は 256KB 級の大きい転送でのみ効く)。 */
         uint32_t rx_cap = tcp_rx_buf_size();
         unsigned max_inflight = NVME_IO_QDEPTH;
         if (total_len > 0u && rx_cap > total_len) {
@@ -1826,9 +1434,6 @@ int nvme_read_pipelined_run(nvme_ctx_t *ctx, uint32_t nsid, uint64_t lba,
                 cur_lba = nvme_bench_next_lba(ctx, cur_lba, lba, nlb);
             }
         }
-        /* 未送信のスロットを送信する(write版と同じくtcp_send_async()
-         * 経由のnvme_tcp_send_cmd_async()を使い、複数スロットのSQE送信
-         * 自体を詰める)。 */
         for (unsigned i = 0; i < NVME_IO_QDEPTH; i++) {
             if (rd->slots[i].in_use && !rd->slots[i].sent) {
                 uint16_t cid = 0;
@@ -1837,11 +1442,6 @@ int nvme_read_pipelined_run(nvme_ctx_t *ctx, uint32_t nsid, uint64_t lba,
                     rd->slots[i].result = -1;
                     continue;
                 }
-                /* NSND: CapsuleCmd送信(read、旧NMTX)。write版と同じ理由
-                 * (in-capsuleデータ無し)でhlen=plen=72,pdo=0。旧実装は
-                 * ここでopcode参照元をs_pl_slots(write用配列)と取り違えて
-                 * いた(cid自体は関数の戻り値経由のため無関係、表示のみの
-                 * バグ) -- 移行のついでにs_pl_read_slotsへ修正した。 */
                 {
                     const uint8_t *sqe_bytes = (const uint8_t *)&rd->slots[i].sqe;
                     volatile ts_nvme_pdu_t info = {0};
@@ -1863,8 +1463,6 @@ int nvme_read_pipelined_run(nvme_ctx_t *ctx, uint32_t nsid, uint64_t lba,
         job_scheduler_tick();
     }
 
-    /* drain: 送信済みで未完了のスロットが残っていれば、その完了(または
-     * NVME_IO_CMD_TIMEOUT_MS超過)を待つ -- 新規の送信は行わない。 */
     {
         uint64_t drain_start = timer_now();
         while (!timeout_ms(drain_start, NVME_IO_CMD_TIMEOUT_MS)) {

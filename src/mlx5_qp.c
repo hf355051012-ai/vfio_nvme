@@ -1,11 +1,3 @@
-// RC QP用WQE組み立て/ドアベル/CQEポーリング(FWコマンド不要、純粋なメモリ/
-// MMIO操作)。mlx5_net.c(Ethernet raw送受信のデータパス層)と同じ役割分担
-// -- FWコマンド(mlx5_cmd_exec()呼び出し)は全てmlx5.c側(mlx5_qp_create_rc()
-// 等)に置く、という既存アーキテクチャの境界を踏襲する。
-//
-// ConnectX RoCEv2 NVMe-oF実装計画(~/.claude/plans/peppy-wobbling-lamport.md)
-// フェーズ(b)。
-
 #include "mlx5_qp.h"
 #include "mmio.h"
 #include "timer.h"
@@ -16,15 +8,6 @@
 #include "ib_mad.h"
 #include "timestamp.h"
 
-// TS_TAG_MLX5_QPはmlx5_qp.hで定義済み(nvmet_rdma.cのNVMeコマンド受信
-// ログとも共有するため公開マクロへ昇格した、mlx5_qp.hのコメント参照)。
-
-// mlx5.cのmlx5_sq_send_test_frame()/mlx5_net.cのWQE組み立てと同じ定数
-// (MLX5_OPCODE_SEND/MLX5_WQE_CTRL_CQ_UPDATE/MLX5_SEND_WQE_BB/MLX5_BF_OFFSET)
-// はmlx5.hで共有済み。CQE関連定数はmlx5.c/mlx5_net.cそれぞれで private に
-// 定義されている(共有ヘッダに無い)ため、ここでも同じ値を独自に定義する
-// (mlx5.cのMLX5_CQE_SIZE/MLX5_CQE_INVALID、mlx5_net.cのMLX5_CQE_OFF_*と
-// 同値、実機で確認済みのstruct mlx5_cqe64レイアウト)。
 #define MLX5_QP_CQE_SIZE        64u
 #define MLX5_QP_CQ_NUM_ENTRIES  (MLX5_CQ_BUF_SIZE / MLX5_QP_CQE_SIZE) // 1024
 #define MLX5_QP_CQ_LOG_SIZE     10u
@@ -80,8 +63,6 @@ int mlx5_qp_post_send(mlx5_dev_t *dev, mlx5_qp_t *qp, const void *data, uint32_t
         wqe[24 + b] = (uint8_t)(data_pa >> (56 - 8 * b));
     }
 
-    // SQドアベル(MLX5_SND_DBR=1、include/linux/mlx5/qp.hで確認済み --
-    // 共有ドアベルレコード[8バイト]の後半4バイト)。
     volatile uint8_t *dbr = (volatile uint8_t *)(uintptr_t)mlx5_qp_dbr_addr(dev, qp);
     uint32_t new_pc = pc + 1u;
     dbr[4] = (uint8_t)(new_pc >> 24);
@@ -91,8 +72,6 @@ int mlx5_qp_post_send(mlx5_dev_t *dev, mlx5_qp_t *qp, const void *data, uint32_t
 
     dma_wmb();
 
-    // BlueFlame: ctrl_seg先頭8バイトをUARへ書く(mlx5.cのmlx5_sq_send_
-    // test_frame()/mlx5_net.cのmlx5_net_wqe_commit()と同じパターン)。
     uint32_t raw0 = (uint32_t)wqe[0] | ((uint32_t)wqe[1] << 8) |
                     ((uint32_t)wqe[2] << 16) | ((uint32_t)wqe[3] << 24);
     uint32_t raw1 = (uint32_t)wqe[4] | ((uint32_t)wqe[5] << 8) |
@@ -115,22 +94,6 @@ int mlx5_qp_post_send(mlx5_dev_t *dev, mlx5_qp_t *qp, const void *data, uint32_t
     return 0;
 }
 
-// フェーズ(d): UD/GSI QP経由でSEND WQEを1個投稿する。ctrl_seg(16B)+
-// datagram_seg(struct mlx5_av相当、48B=3DS、include/linux/mlx5/qp.hで
-// 実際に確認済み)+data_seg(16B)=ds_cnt5、80バイト=WQEBB0(64B)を完全に
-// 埋めた上でWQEBB1の先頭16バイトへ食い込む -- mlx5_net.cの「偶数アライン
-// 方式」(TCPゼロコピー2フラグメント送信、ds_cnt=5で全く同じサイズ)と
-// 構造的に同一で、既に実機で実績のあるパターンを踏襲する。GSI用のSQ
-// リング(log_sq_size=6、64 WQEBB)は「1論理送信=2 WQEBB固定」として
-// qp->sq_pcをWQEBB単位のカウンタのまま扱う(mlx5_net.cのような「論理WQE
-// 単位カウンタ+2倍換算」の二重管理はしない、GSIは低頻度・同期送信
-// [呼び出し元が完了を待ってから次を送る]前提のため不要な複雑さ)。
-// AVの各フィールドのバイトオフセット(struct mlx5_av、48バイト)は
-// drivers/infiniband/hw/mlx5/ah.cのcreate_ib_ah()を実際に取得し裏取り
-// 済み: qkey[0..3]/dqp_dct[8..11、下位24bit=宛先QPN]/stat_rate_sl[12]/
-// fl_mlid[13、RoCEでは0]/udp_sport[14..15 BE16]/rmac[20..25]/tclass[26]/
-// hop_limit[27]/grh_gid_fl[28..31 BE32、bit30=GRH存在ビット(RoCEでは
-// 常に1)|sgid_index<<20|flow_label]/rgid[32..47]。
 int mlx5_qp_post_send_ud(mlx5_dev_t *dev, mlx5_qp_t *qp, const void *data, uint32_t len,
                           uint32_t remote_qpn, uint32_t remote_qkey,
                           const uint8_t remote_gid[16], const uint8_t remote_mac[6]) {
@@ -166,25 +129,10 @@ int mlx5_qp_post_send_ud(mlx5_dev_t *dev, mlx5_qp_t *qp, const void *data, uint3
     wqe0[17] = (uint8_t)(remote_qkey >> 16);
     wqe0[18] = (uint8_t)(remote_qkey >> 8);
     wqe0[19] = (uint8_t)remote_qkey; // key.qkey
-    // wqe0[20..23] reserved = 0
-    //
-    // 実機で発見した本物のバグ(2026-08-12): dqp_dct(下位24bit=宛先QPN)の
-    // bit31に`MLX5_EXTENDED_UD_AV`(0x80000000、include/linux/mlx5/
-    // device.hで確認済み)を立て忘れていた -- drivers/infiniband/hw/mlx5/
-    // wr.cのset_datagram_seg()を実際に取得して確認したところ、
-    // `dseg->av.dqp_dct = cpu_to_be32(ud_wr(wr)->remote_qpn |
-    // MLX5_EXTENDED_UD_AV);`と、この帯域を必ずORしていた。このビットは
-    // 「このAVは48バイトのGRH拡張形式(struct mlx5_av全体)であり、16バイト
-    // の短縮形式(struct mlx5_base_av)ではない」ことをHWへ伝える -- 立てて
-    // いないとHWはAVを短縮形式(1DS)と解釈し、我々が宣言したds_cnt=5
-    // (ctrl+AV3DS+data)との不整合により、実機でLOCAL_LENGTH_ERR
-    // (syndrome=0x01)としてSQ自身のCQEに現れた。
     wqe0[24] = (uint8_t)((remote_qpn >> 24) | 0x80u); // bit31=MLX5_EXTENDED_UD_AV
     wqe0[25] = (uint8_t)(remote_qpn >> 16);
     wqe0[26] = (uint8_t)(remote_qpn >> 8);
     wqe0[27] = (uint8_t)remote_qpn; // dqp_dct(下位24bit=宛先QPN)
-    // wqe0[28] stat_rate_sl = 0
-    // wqe0[29] fl_mlid = 0(RoCEでは未使用)
     uint16_t udp_sport = mlx5_calc_udp_sport(qp->qpn, remote_qpn);
     wqe0[30] = (uint8_t)(udp_sport >> 8);
     wqe0[31] = (uint8_t)udp_sport;
@@ -249,14 +197,6 @@ int mlx5_qp_post_send_ud(mlx5_dev_t *dev, mlx5_qp_t *qp, const void *data, uint3
     return 0;
 }
 
-// フェーズ(c)、RDMA_WRITE/RDMA_READ共通のWQE組み立てヘルパ。ctrl_seg
-// (16B)+raddr_seg(16B、リモートアドレス+rkey)+data_seg(16B、ローカル
-// バッファ)=ds_cnt3、struct mlx5_wqe_raddr_seg(include/linux/mlx5/qp.h、
-// raddr[8B BE]+rkey[4B BE]+reserved[4B])のバイトオフセットを実際に
-// 取得して裏取り済み。opcodeだけがWRITE(0x08)/READ(0x10)で異なるため
-// 共通化する -- READはWQEのdata_seg(ローカル側)が「読み込んだデータの
-// 書き込み先」、raddr_segが「読み出し元」になる意味の違いだけで、WQEの
-// バイトレイアウト自体はWRITEと同一。
 static int mlx5_qp_post_rdma_common(mlx5_dev_t *dev, mlx5_qp_t *qp, uint32_t opcode,
                                      void *local_data, uint32_t len,
                                      uint64_t remote_addr, uint32_t remote_rkey) {
@@ -293,8 +233,6 @@ static int mlx5_qp_post_rdma_common(mlx5_dev_t *dev, mlx5_qp_t *qp, uint32_t opc
     wqe[26] = (uint8_t)(remote_rkey >> 8);
     wqe[27] = (uint8_t)remote_rkey;
 
-    // data_seg(wqe[32..47]): byte_count(4B)+lkey(4B)+addr(8B) -- ローカル側
-    // バッファ(WRITEなら送信元、READなら書き込み先)。
     uint32_t byte_count = len;
     wqe[32] = (uint8_t)(byte_count >> 24);
     wqe[33] = (uint8_t)(byte_count >> 16);
@@ -343,18 +281,12 @@ static int mlx5_qp_post_rdma_common(mlx5_dev_t *dev, mlx5_qp_t *qp, uint32_t opc
     return 0;
 }
 
-// RDMA_WRITE: local_data(len バイト)を相手のremote_addr(そのQPのrkeyで
-// アクセス可能な範囲)へ書き込む。CQEは送信元(このQP)にのみ生成され、
-// 相手側には一切通知されない(IBTA仕様通り、RDMA_WRITE with Immediateを
-// 使わない限り受信側は完了を検知できない)。
 int mlx5_qp_post_rdma_write(mlx5_dev_t *dev, mlx5_qp_t *qp, const void *local_data, uint32_t len,
                              uint64_t remote_addr, uint32_t remote_rkey) {
     return mlx5_qp_post_rdma_common(dev, qp, MLX5_OPCODE_RDMA_WRITE,
                                      (void *)(uintptr_t)local_data, len, remote_addr, remote_rkey);
 }
 
-// RDMA_READ: 相手のremote_addrからlenバイトを読み出し、local_bufへ
-// 書き込む。CQEは送信元(このQP、= 読み出しを要求した側)にのみ生成される。
 int mlx5_qp_post_rdma_read(mlx5_dev_t *dev, mlx5_qp_t *qp, void *local_buf, uint32_t len,
                             uint64_t remote_addr, uint32_t remote_rkey) {
     return mlx5_qp_post_rdma_common(dev, qp, MLX5_OPCODE_RDMA_READ,
@@ -381,10 +313,6 @@ int mlx5_qp_post_recv(mlx5_dev_t *dev, mlx5_qp_t *qp, void *buf, uint32_t buf_le
         wqe[8 + b] = (uint8_t)(buf_pa >> (56 - 8 * b));
     }
 
-    // RQドアベル(MLX5_RCV_DBR=0、共有ドアベルレコードの前半4バイト)。
-    // RQ投稿はSQと異なりBlueFlame/UARへの書き込みは不要(HWはドアベル
-    // レコードの更新をDMAで検知するだけで、SQのような即時処理起動の
-    // 仕組みを必要としない)。
     volatile uint8_t *dbr = (volatile uint8_t *)(uintptr_t)mlx5_qp_dbr_addr(dev, qp);
     uint32_t new_pc = pc + 1u;
     dbr[0] = (uint8_t)(new_pc >> 24);
@@ -473,11 +401,6 @@ int mlx5_qp_poll_cqe(mlx5_dev_t *dev, mlx5_qp_t *qp, int *out_is_send,
     return 1;
 }
 
-// 診断用(2026-08-12、パイプライン化調査): 直前にmlx5_qp_poll_cqe()が
-// 消費した(qp->cq_cc-1番目の)CQEのopcode(上位nibble)を読む -- REQ_ERR
-// (0xd、自分がREQUESTERだった操作=SQ側)かRESP_ERR(0xe、自分がRESPONDER
-// だった操作=RQ側)かでエラーの向きを切り分けるために使う。呼び出し元は
-// mlx5_qp_poll_cqe()の直後、cq_ccが変わる前に呼ぶこと。
 uint8_t mlx5_qp_last_cqe_opcode(mlx5_dev_t *dev, mlx5_qp_t *qp) {
     uint64_t cq_buf = mlx5_qp_cq_buf_addr(dev, qp);
     uint32_t ci = (qp->cq_cc - 1u) & (MLX5_QP_CQ_NUM_ENTRIES - 1u);
@@ -485,14 +408,6 @@ uint8_t mlx5_qp_last_cqe_opcode(mlx5_dev_t *dev, mlx5_qp_t *qp) {
     return (uint8_t)(cqe[MLX5_CQE_OFF_OP_OWN] >> 4);
 }
 
-// フェーズ(d): GSI/UD QPのRQへRECV WQEを1個投稿する。mlx5_qp_post_recv()
-// (RC QP専用、MLX5_QP_WQE_ADDR/MLX5_QP_DBR_ADDRをハードコード)と全く同じ
-// WQEフォーマット(data_seg 1個のみ)だが、GSI専用のDMA領域(MLX5_GSI_
-// WQE_ADDR/MLX5_GSI_DBR_ADDR)を参照する点だけが異なる -- 既存のRC専用
-// 関数を書き換えず並行する新関数として複製する(このプロジェクト一貫の
-// 「既存の動作確認済みコードに極力触れない」方針、pcie1.c/pcie.cの分離と
-// 同じ)。buf_lenには実ペイロード長+MLX5_GRH_BYTES(40)分の余裕を含める
-// こと(mlx5.hのMLX5_GRH_BYTESコメント参照)。
 int mlx5_qp_post_recv_gsi(mlx5_dev_t *dev, mlx5_qp_t *qp, void *buf, uint32_t buf_len) {
     uint32_t pc = qp->rq_pc;
     uint32_t idx = pc & 255u; // log_rq_size=8 -- 256エントリ
@@ -534,10 +449,6 @@ int mlx5_qp_post_recv_gsi(mlx5_dev_t *dev, mlx5_qp_t *qp, void *buf, uint32_t bu
     return 0;
 }
 
-// フェーズ(d): GSI/UD QPの共有CQを1件だけ非ブロッキングでポーリングする。
-// mlx5_qp_poll_cqe()(RC QP専用)と全く同じロジックだが、GSI専用のCQ
-// アドレス(MLX5_GSI_CQ_BUF_CACHE_ADDR/MLX5_GSI_CQ_DBR_CACHE_ADDR)を
-// 参照する。
 int mlx5_qp_poll_cqe_gsi(mlx5_dev_t *dev, mlx5_qp_t *qp, int *out_is_send,
                           uint32_t *out_recv_len, uint8_t *out_syndrome) {
     uint64_t cq_buf = (uint64_t)dev->gsi_cq_buf_cpu;

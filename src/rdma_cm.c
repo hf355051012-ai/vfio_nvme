@@ -1,16 +1,3 @@
-// ConnectX RoCEv2 NVMe-oF実装計画(~/.claude/plans/peppy-wobbling-lamport.md)
-// フェーズ(e): 標準IB CM(REQ/REP/RTU)によるRC QP自動確立。
-//
-// ワイヤフォーマットの根拠はrdma_cm.hコメント参照(torvalds/linuxの
-// drivers/infiniband/core/cm.c・cma.c・include/rdma/ibta_vol1_c12.h・
-// include/linux/nvme-rdma.hを本セッションで実際に取得し裏取り済み)。
-//
-// GSI/UD QPのWQE組み立て(mlx5_qp_post_send_ud()等)・「GSI宛は常に宛先
-// QPN=1固定」という規約は全てフェーズ(d)で確立・実機確認済みのものを
-// そのまま再利用する。RC QPのWQE組み立て(mlx5_qp_post_send()/
-// mlx5_qp_post_recv()/mlx5_qp_poll_cqe())はフェーズ(b)のものをそのまま
-// 再利用する。
-
 #include "rdma_cm.h"
 #include "mlx5.h"
 #include "ib_mad.h"
@@ -26,10 +13,6 @@
 #define CM_RTU_ATTR_ID 0x0014u
 #define IB_CM_CLASS_VERSION 2u // drivers/infiniband/core/cm_msgs.hで確認済み
 
-// rdma_get_service_id()相当(実際は(ps<<16)+port)のプレースホルダ。
-// フェーズ(e)はCM確立のみが目的でNVMe-oF Fabrics Connect自体は行わない
-// ため、両端が一致していれば値そのものに意味は無い -- 実NVMe-oFホストとの
-// 相互接続(フェーズi)までに正しい値を確認・実装すること。
 #define RDMA_CM_SERVICE_ID_PLACEHOLDER 0x0000000000000001ull
 
 #define RDMA_CM_REQ_RETRY_TIMEOUT_MS 2000u
@@ -43,8 +26,6 @@ uint16_t rdma_cm_recv_attr_id(const volatile uint8_t *recv_buf) {
     return rd16be_ib(&recv_buf[MLX5_GRH_BYTES + 16]);
 }
 
-// REQペイロード(24バイトMADヘッダの直後を先頭とする)の各フィールドの
-// バイトオフセットはinclude/rdma/ibta_vol1_c12.hのTable 106そのもの。
 static void rdma_cm_build_req(rdma_cm_ctx_t *ctx) {
     volatile uint8_t *buf = ctx->send_buf;
     for (unsigned i = 0; i < RDMA_CM_MAD_SIZE; i++) {
@@ -64,8 +45,6 @@ static void rdma_cm_build_req(rdma_cm_ctx_t *ctx) {
     p[35] = 4; // RESPONDER_RESOURCES(max_dest_rd_atomic、log_rra_max=2->4と揃える)
     p[39] = 4; // INITIATOR_DEPTH(log_sra_max=2->4)
     p[43] = (uint8_t)(20u << 3); // REMOTE_CM_RESPONSE_TIMEOUT(pos0-4)=20、
-                                  // TRANSPORT_SERVICE_TYPE(pos5-6)=0(RC)、
-                                  // END_TO_END_FLOW_CONTROL(pos7)=0
     p[44] = (uint8_t)(ctx->rc_qp.local_psn >> 16);
     p[45] = (uint8_t)(ctx->rc_qp.local_psn >> 8);
     p[46] = (uint8_t)ctx->rc_qp.local_psn; // STARTING_PSN(24bit)
@@ -75,8 +54,6 @@ static void rdma_cm_build_req(rdma_cm_ctx_t *ctx) {
     p[50] = (uint8_t)((3u << 4) | 7u); // PATH_PACKET_PAYLOAD_MTU(pos0-3)=IB_MTU_1024(3)、
                                         // RDC_EXISTS(pos4)=0、RNR_RETRY_COUNT(pos5-7)=7
     p[51] = (uint8_t)(3u << 4); // MAX_CM_RETRIES(pos0-3)=3、SRQ(pos4)=0、EXTENDED_TRANSPORT_TYPE(pos5-7)=0(RC)
-    // PRIMARY_LOCAL_PORT_LID/PRIMARY_REMOTE_PORT_LID(p[52..55]): RoCEでは
-    // LID概念自体が無いため0のまま(GID[p56..87]がRoCEv2の実アドレス)。
     for (unsigned i = 0; i < 16; i++) {
         p[56 + i] = ctx->own_gid[i]; // PRIMARY_LOCAL_PORT_GID
         p[72 + i] = ctx->peer_gid[i]; // PRIMARY_REMOTE_PORT_GID
@@ -94,8 +71,6 @@ static void rdma_cm_build_req(rdma_cm_ctx_t *ctx) {
     wr32be_ib(&priv[16], ctx->own_ip);
     // priv[20..35] = dst_addr(16B)。
     wr32be_ib(&priv[32], ctx->peer_ip);
-    // nvme_rdma_cm_req(priv[36..67]、32B、全フィールドLE -- include/linux/
-    // nvme-rdma.hのstruct nvme_rdma_cm_reqと同じ、net.hのwr16le流儀)。
     wr16le(&priv[36], 0); // recfmt = NVME_RDMA_CM_FMT_1_0
     wr16le(&priv[38], ctx->nvme_qid); // qid
     wr16le(&priv[40], 32); // hrqsize(プレースホルダ)
@@ -147,22 +122,11 @@ static void rdma_cm_build_rtu(rdma_cm_ctx_t *ctx) {
     wr32be_ib(&p[4], ctx->remote_comm_id);
 }
 
-// 受信したREQペイロードから、相手のRC QPN/開始PSN/comm_idを取り出す。
-// GID(PRIMARY_LOCAL_PORT_GID、REQ送信者自身のGID)も取り出して上書きする
-// -- 呼び出し元がpeer_gidを事前設定済みでも、ワイヤ上の実際の値を正とする
-// (実接続[フェーズi]で動的な相手を扱うことを見据えた設計)。MACはIBTA CM
-// メッセージに一切含まれないため、呼び出し元が事前設定した値をそのまま
-// 使う(このプロジェクトのフェーズ(b)/(c)/(d)診断コードと同じ、固定
-// トポロジのループバック検証という前提に基づく)。
 static void rdma_cm_parse_req(rdma_cm_ctx_t *ctx, const volatile uint8_t *recv_buf) {
     const volatile uint8_t *p = &recv_buf[MLX5_GRH_BYTES + IB_MAD_HDR_LEN];
     ctx->remote_comm_id = rd32be_ib(&p[0]);
     ctx->peer_rc_qpn = ((uint32_t)p[32] << 16) | ((uint32_t)p[33] << 8) | p[34];
     ctx->peer_starting_psn = ((uint32_t)p[44] << 16) | ((uint32_t)p[45] << 8) | p[46];
-    // PATH_PACKET_PAYLOAD_MTU: REQ byte50のbits[7:4](高nibble、IBTA
-    // pos0-3、この関数の送信側ビルドp[50]=(mtu<<4)|...と対称)。RC接続の
-    // 両端が同じpath MTUを使うため、passive側はこれをRC QPへ反映する
-    // (rdma_cm.cのPASSIVE_MODIFY_QP参照)。
     ctx->peer_path_mtu = (uint8_t)((p[50] >> 4) & 0x0Fu);
     for (unsigned i = 0; i < 16; i++) {
         ctx->peer_gid[i] = p[56 + i];
@@ -176,9 +140,6 @@ static void rdma_cm_parse_rep(rdma_cm_ctx_t *ctx, const volatile uint8_t *recv_b
     ctx->peer_starting_psn = ((uint32_t)p[20] << 16) | ((uint32_t)p[21] << 8) | p[22];
 }
 
-// GSI QPを1本作りRTSまで遷移させ、初回のRECV WQEを1個投稿する
-// (フェーズ(d)のmlx5_gsi_mad_test()と同じ手順)。共通のGID登録
-// (自分のGIDテーブルindex0、RC QP側もこれを共有する)もここで行う。
 static int rdma_cm_setup_gsi(rdma_cm_ctx_t *ctx) {
     if (mlx5_qp_create_gsi(ctx->dev, ctx->gsi_qp) != 0) {
         uart_printf("rdma_cm: FAILED (GSI CREATE_QP)\n");
@@ -203,12 +164,6 @@ static int rdma_cm_setup_gsi(rdma_cm_ctx_t *ctx) {
     return 0;
 }
 
-// フェーズ(i)続報(2026-08-13): GSIを新規作成せず、呼び出し元が事前に
-// ctx->gsi_qpへコピーした既存の(既にRTS状態の)GSI QPをそのまま使い
-// 回す -- 1PFにつきGSI/QP1相当は物理的に1つしか存在できないため
-// (rdma_cm.hのreuse_gsiコメント参照、フェーズdの「宛先QPN=1固定」規約)。
-// 次の受信に備えてRECV WQEを1個だけ再武装する(SET_ROCE_ADDRESS/状態
-// 遷移は不要 -- 既に確立済みのGSI QPをそのまま流用するだけ)。
 static int rdma_cm_setup_gsi_reused(rdma_cm_ctx_t *ctx) {
     if (mlx5_qp_post_recv_gsi(ctx->dev, ctx->gsi_qp, (void *)(uintptr_t)ctx->recv_buf,
                               sizeof(ctx->recv_buf)) != 0) {
@@ -218,9 +173,6 @@ static int rdma_cm_setup_gsi_reused(rdma_cm_ctx_t *ctx) {
     return 0;
 }
 
-// RC QPを1本作りRST->INITまで遷移させる(相手の情報はまだ無いためここまで)。
-// rc_qp_index(0=admin用、1=IOキュー用)はctxのフィールドをそのまま
-// mlx5_qp_create_rc()へ渡す(rdma_cm.hのコメント参照)。
 static int rdma_cm_setup_rc(rdma_cm_ctx_t *ctx) {
     if (mlx5_qp_create_rc(ctx->dev, &ctx->rc_qp, ctx->rc_qp_index) != 0) {
         uart_printf("rdma_cm: FAILED (RC CREATE_QP)\n");
@@ -237,13 +189,6 @@ static int rdma_cm_setup_rc(rdma_cm_ctx_t *ctx) {
 job_result_t rdma_cm_job_step(job_t *self) {
     rdma_cm_ctx_t *ctx = (rdma_cm_ctx_t *)self->ctx;
 
-    /* `job stop <番号>`(job_request_cancel())やRoCEv2一括停止
-     * (job_cancel_all_by_step()、pcie1 resetから)で停止要求が来たら、
-     * どのステートでも即座に自己終了する -- passive側のREQ無期限待ち等、
-     * 通常は自然にJOB_DONEへ到達しないステートでも確実に畳めるようにする
-     * ため(job.hのジョブテーブルは.bssにあり pcie1 reset では消えない)。
-     * 進行中のCMハンドシェイクを放棄しても、呼び出し元がこの直後に
-     * ConnectXをリセット/再初期化する想定のため実害はない。 */
     if (self->cancel_requested) {
         ctx->failed = 1;
         self->state = RDMA_CM_ST_DONE_FAIL;
@@ -252,9 +197,6 @@ job_result_t rdma_cm_job_step(job_t *self) {
 
     switch (self->state) {
 
-    // ------------------------------------------------------------------
-    // active(REQ送信側)
-    // ------------------------------------------------------------------
     case RDMA_CM_ST_ACTIVE_SETUP: {
         int gsi_rc = ctx->reuse_gsi ? rdma_cm_setup_gsi_reused(ctx) : rdma_cm_setup_gsi(ctx);
         if (gsi_rc != 0 || rdma_cm_setup_rc(ctx) != 0) {
@@ -351,8 +293,6 @@ job_result_t rdma_cm_job_step(job_t *self) {
         }
         uart_printf("rdma_cm: RTU sent -- RC QP established (active)\n");
         if (ctx->skip_ping) {
-            // フェーズ(g): 確立検証pingを省略し、確立済みrc_qpをそのまま
-            // 呼び出し元(nvme_rdma.c等)の実トラフィックへ引き渡す。
             self->state = RDMA_CM_ST_DONE_OK;
             return JOB_DONE;
         }
@@ -361,10 +301,6 @@ job_result_t rdma_cm_job_step(job_t *self) {
     }
 
     case RDMA_CM_ST_ACTIVE_PING_SEND: {
-        // 確立検証: CM経由で確立されたRC QP自体でSEND/RECVが成立するかを
-        // フェーズ(b)のmlx5_qp_post_send()/mlx5_qp_poll_cqe()そのままで
-        // 確認する(「手動QP確立をCM経由の自動確立へ置き換える」という
-        // フェーズ(e)完了条件の核心 -- RC QPのWQE/CQE層は一切変更しない)。
         if (mlx5_qp_post_send(ctx->dev, &ctx->rc_qp, RDMA_CM_PING_MSG, (uint32_t)sizeof(RDMA_CM_PING_MSG)) != 0) {
             uart_printf("rdma_cm: FAILED (RC QP post_send ping)\n");
             ctx->failed = 1;
@@ -401,9 +337,6 @@ job_result_t rdma_cm_job_step(job_t *self) {
         return JOB_WAITING;
     }
 
-    // ------------------------------------------------------------------
-    // passive(REQ待ち側)
-    // ------------------------------------------------------------------
     case RDMA_CM_ST_PASSIVE_SETUP: {
         int gsi_rc = ctx->reuse_gsi ? rdma_cm_setup_gsi_reused(ctx) : rdma_cm_setup_gsi(ctx);
         if (gsi_rc != 0 || rdma_cm_setup_rc(ctx) != 0) {
@@ -448,10 +381,6 @@ job_result_t rdma_cm_job_step(job_t *self) {
     }
 
     case RDMA_CM_ST_PASSIVE_MODIFY_QP: {
-        // RC接続の両端は同じpath MTUを使う(IBTA)。相手のCM REQが広告した
-        // MTUをRC QPへ反映してからINIT2RTRする -- 1024固定のままだとhostが
-        // jumbo(path MTU>1024)で接続してきた際にRDMA_WRITEが
-        // REMOTE_INVAL_REQ_ERRで拒否される(mlx5.hのmlx5_qp_t.path_mtu参照)。
         ctx->rc_qp.path_mtu = ctx->peer_path_mtu;
         if (mlx5_qp_modify_init2rtr(ctx->dev, &ctx->rc_qp, ctx->peer_rc_qpn, ctx->peer_gid,
                                      ctx->peer_mac, ctx->peer_starting_psn) != 0 ||
@@ -462,10 +391,6 @@ job_result_t rdma_cm_job_step(job_t *self) {
             return JOB_DONE;
         }
         ctx->established = 1;
-        // 確立検証用: activeがpingを送ってくる前にRECV WQEを構えておく
-        // (RC QPはTCPと違い自動バッファリングされないため必須)。
-        // フェーズ(g): skip_pingならこのRECV WQEを消費させない(呼び出し
-        // 元が確立後に自分のRECV WQEを投稿する、rdma_cm.hコメント参照)。
         if (!ctx->skip_ping) {
             if (mlx5_qp_post_recv(ctx->dev, &ctx->rc_qp, (void *)(uintptr_t)ctx->rc_recv_buf,
                                   sizeof(ctx->rc_recv_buf)) != 0) {
@@ -506,16 +431,6 @@ job_result_t rdma_cm_job_step(job_t *self) {
             if (rdma_cm_recv_attr_id(ctx->recv_buf) == CM_RTU_ATTR_ID) {
                 uart_printf("rdma_cm: RTU received (passive)\n");
                 if (ctx->skip_ping) {
-                    // 2026-08-13、切断検出のため: この"cm" jobはここで終了
-                    // する(既存動作を変えない)が、その前にGSIへもう1個
-                    // RECV WQEを構えておく -- これが無いと、job終了後は
-                    // 誰もGSIをポーリングしなくなり、ホストが後で送って
-                    // くる実際のCM DREQ(nvme disconnect時)を受け取る
-                    // バッファが存在しないことになる(CLAUDE.md
-                    // 「nvmet_rdma.cの切断検出」節参照)。nvmet_rdma.cの
-                    // DREQ監視はrtu_phase_done==1を確認してからしか
-                    // GSIをポーリングしないため、まだこの"cm" job自身が
-                    // 受信中のRTUを誤って横取りする競合は起きない。
                     mlx5_qp_post_recv_gsi(ctx->dev, ctx->gsi_qp, (void *)(uintptr_t)ctx->recv_buf,
                                           sizeof(ctx->recv_buf));
                     ctx->rtu_phase_done = 1;
@@ -590,21 +505,8 @@ void rdma_cm_fill_addr(rdma_cm_ctx_t *ctx, mlx5_dev_t *dev, const char *self_lab
     for (unsigned i = 0; i < sizeof(*ctx); i++) {
         ((uint8_t *)ctx)[i] = 0;
     }
-    // 実機で発見した本物のバグ(2026-08-12): 上のゼロクリアは`(uint8_t *)ctx`
-    // という非volatileキャスト経由の書き込みのため、recv_buf/rc_recv_buf
-    // (構造体内でvolatile宣言されているが、この書き込み自体はvolatile性を
-    // 失っている)へダーティなキャッシュラインを残す。dcache_invalidate_
-    // range()(cache.h)は`dc civac`(クリーン+無効化)を使うため、HWが
-    // 実際にDMA書き込みした直後にこれを呼ぶと、「クリーン」の部分が
-    // このダーティな(ゼロの)キャッシュラインをメインメモリへ書き戻し、
-    // HWが書いたばかりの実データを無言で上書きしてしまう -- 初回のRECV
-    // WQEを投稿する前に明示的にクリーンしておき、ダーティな状態を残さない。
     dcache_clean_range((const void *)ctx, sizeof(*ctx));
     ctx->dev = dev;
-    // 既定では自分自身のgsi_qp_storageを指す(通常の新規GSI作成ケース)。
-    // IOキュー用ctx(reuse_gsi=1)を作る呼び出し元は、この直後に
-    // admin側の実体を指すよう明示的に上書きすること(rdma_cm.hのgsi_qp
-    // コメント参照)。
     ctx->gsi_qp = &ctx->gsi_qp_storage;
 
     netif_t *self_nc = netif_find(self_label);
