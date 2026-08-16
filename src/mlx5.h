@@ -187,7 +187,9 @@ int mlx5_qp_modify_rtr2rts(mlx5_dev_t *dev, mlx5_qp_t *qp);
 int mlx5_qp_query_counters(mlx5_dev_t *dev, mlx5_qp_t *qp, uint32_t *out_hw_rq, uint32_t *out_sw_rq,
                             uint16_t *out_hw_sq, uint16_t *out_sw_sq);
 
-// DESTROY_QP。
+// QP と、その QP のために確保した UAR/PD/MKey/CQ をまとめて解放する
+// (DESTROY_QP -> DESTROY_MKEY -> DESTROY_CQ -> DEALLOC_PD -> DEALLOC_UAR)。
+// 呼んだ後 qp のハンドルはゼロクリアされる(二重解放しても無害)。
 int mlx5_qp_destroy(mlx5_dev_t *dev, mlx5_qp_t *qp);
 
 int mlx5_qp_create_gsi(mlx5_dev_t *dev, mlx5_qp_t *qp);

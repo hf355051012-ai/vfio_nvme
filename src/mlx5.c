@@ -2343,16 +2343,22 @@ int mlx5_qp_create_rc(mlx5_dev_t *dev, mlx5_qp_t *qp, uint8_t qp_index) {
     qp->qp_index = qp_index; // ゼロクリアの後で設定すること(前に設定すると消える)
     qp->local_psn = (uint32_t)(timer_now() & 0x00FFFFFFu); // 24bit PSN空間
 
+    /* 途中で失敗したら、そこまでに取れたぶんを mlx5_qp_destroy() で返す
+     * (qpn==0 でも残りを解放する実装になっている)。返さずに抜けると、
+     * 失敗するたびに UAR/PD/MKey/CQ が積み上がる。 */
     if (mlx5_alloc_uar(dev, &qp->uarn) != 0) {
         uart_printf("mlx5qp: ALLOC_UAR failed\n");
+        mlx5_qp_destroy(dev, qp);
         return -1;
     }
     if (mlx5_alloc_pd(dev, &qp->pdn) != 0) {
         uart_printf("mlx5qp: ALLOC_PD failed\n");
+        mlx5_qp_destroy(dev, qp);
         return -1;
     }
     if (mlx5_create_mkey_pa_rw(dev, qp->pdn, &qp->mkey) != 0) {
         uart_printf("mlx5qp: CREATE_MKEY(rw) failed\n");
+        mlx5_qp_destroy(dev, qp);
         return -1;
     }
 
@@ -2360,6 +2366,7 @@ int mlx5_qp_create_rc(mlx5_dev_t *dev, mlx5_qp_t *qp, uint8_t qp_index) {
     uint64_t cq_dbr = mlx5_qp_cq_dbr_addr(dev, qp);
     if (mlx5_create_cq(dev, qp->uarn, dev->eqn, cq_buf, cq_dbr, &qp->cqn) != 0) {
         uart_printf("mlx5qp: CREATE_CQ failed\n");
+        mlx5_qp_destroy(dev, qp);
         return -1;
     }
 
@@ -2417,6 +2424,7 @@ int mlx5_qp_create_rc(mlx5_dev_t *dev, mlx5_qp_t *qp, uint8_t qp_index) {
     int rc = mlx5_cmd_exec(dev, in, sizeof(in), out, sizeof(out));
     if (rc != 0) {
         uart_printf("mlx5qp: CREATE_QP: mlx5_cmd_exec failed rc=%d\n", rc);
+        mlx5_qp_destroy(dev, qp);
         return rc;
     }
     uint8_t status = out[0];
@@ -2424,6 +2432,7 @@ int mlx5_qp_create_rc(mlx5_dev_t *dev, mlx5_qp_t *qp, uint8_t qp_index) {
         uint32_t syndrome = ((uint32_t)out[4] << 24) | ((uint32_t)out[5] << 16) |
                              ((uint32_t)out[6] << 8) | out[7];
         uart_printf("mlx5qp: CREATE_QP: command status=0x%02x syndrome=0x%08x\n", status, syndrome);
+        mlx5_qp_destroy(dev, qp);
         return -1;
     }
     qp->qpn = ((uint32_t)out[9] << 16) | ((uint32_t)out[10] << 8) | out[11];
@@ -2704,36 +2713,121 @@ int mlx5_qp_query_counters(mlx5_dev_t *dev, mlx5_qp_t *qp, uint32_t *out_hw_rq, 
     return 0;
 }
 
+/* 解放系の opcode。値は include/linux/mlx5/mlx5_ifc.h の enum mlx5_cmd_opcode で
+ * 確認済み(推測ではない)。入力構造体もすべて 16 バイトで同じ形をしていて、
+ * byte9-11 に 24bit のオブジェクト ID を置く。 */
+#define MLX5_CMD_OP_DESTROY_MKEY 0x202u
+#define MLX5_CMD_OP_DESTROY_CQ   0x401u
+#define MLX5_CMD_OP_DEALLOC_PD   0x801u
+#define MLX5_CMD_OP_DEALLOC_UAR  0x803u
+
 /*=================================================================
- * DESTROY_QP で FW 側の QP オブジェクトを解放する。ジョブを止めるだけでは
- * 解放されず、作り直しを繰り返すと FW のリソースが枯渇する。
+ * 「16 バイト入力・byte9-11 に 24bit の ID」という共通の形をした解放コマンドを
+ * 実行する(DESTROY_MKEY / DESTROY_CQ / DEALLOC_PD / DEALLOC_UAR)。
+ *
+ * 失敗しても致命的にはしない。切断経路から呼ばれるので、ここでブロックしたり
+ * 中断したりすると「後始末でハングする」パターンになる。
+ *
+ * 引数:
+ *   dev    - 対象 HCA
+ *   opcode - コマンド opcode
+ *   id     - 解放するオブジェクトの 24bit ID
+ *   name   - ログ表示用の名前
+ * 戻り値:
+ *   0=成功、-1=失敗(ログは出す)
+ * コール元:
+ *   mlx5_qp_destroy()
+ * ===============================================================*/
+static int mlx5_destroy_obj24(mlx5_dev_t *dev, uint16_t opcode, uint32_t id, const char *name) {
+    uint8_t in[16] = {0};
+    in[0] = (uint8_t)(opcode >> 8);
+    in[1] = (uint8_t)(opcode & 0xffu);
+    in[9]  = (uint8_t)(id >> 16);
+    in[10] = (uint8_t)(id >> 8);
+    in[11] = (uint8_t)id;
+
+    uint8_t out[16];
+    int rc = mlx5_cmd_exec(dev, in, sizeof(in), out, sizeof(out));
+    if (rc != 0) {
+        uart_printf("mlx5: %s(id=%u): mlx5_cmd_exec failed rc=%d\n", name, id, rc);
+        return -1;
+    }
+    if (out[0] != 0) {
+        uint32_t syndrome = ((uint32_t)out[4] << 24) | ((uint32_t)out[5] << 16) |
+                             ((uint32_t)out[6] << 8) | out[7];
+        uart_printf("mlx5: %s(id=%u): status=0x%02x syndrome=0x%08x\n",
+                    name, id, out[0], syndrome);
+        return -1;
+    }
+    return 0;
+}
+
+/*=================================================================
+ * QP と、その QP のために確保した FW 側リソースをまとめて解放する。
+ *
+ * `mlx5_qp_create_rc()` / `mlx5_qp_create_ud_common()` は QP 1 本につき
+ * UAR / PD / MKey / CQ も確保する。以前は DESTROY_QP しか発行しておらず、
+ * **作り直すたびに 4 種類のリソースが積み上がっていた**(実測: qploop で
+ * 252 回まわすと cqn 19->286 / pdn 18->269 / uarn 17->268 と単調増加し、
+ * 再利用がゼロだった)。十分に繰り返せば確保が失敗する。
+ *
+ * 解放順は依存の逆順で QP -> MKey -> CQ -> PD -> UAR。MKey は PD に属し、
+ * CQ は UAR を参照するので、PD/UAR を先に返してはいけない。
+ *
+ * **`mlx5_hca_bringup()` が作る Ethernet 用の資源(EQ/PD/MKey/CQ/TIS/RQ/TIR/
+ * SQ/フローテーブル)は対象外。** あちらはプロセス生存中ずっと使う。
+ *
+ * 途中で失敗してもログを出して続行し、最後にハンドルをゼロクリアする
+ * (二重解放を防ぐ。呼び出し元は切断経路なので、ここで止まると後始末が
+ * ハングする)。
  *
  * 引数:
  *   dev - 対象 HCA
  *   qp  - 解放する QP
  * 戻り値:
- *   0=成功、-1=コマンド失敗
+ *   0=すべて成功、-1=どれかが失敗(QP 自体の解放失敗も含む)
  * コール元:
- *   nvmer_destroy_qp_if_valid(), nvmetr_destroy_qp_if_valid()
+ *   nvmer_destroy_qp_if_valid(), nvmetr_destroy_qp_if_valid(), shell_qploop()
  * ===============================================================*/
 int mlx5_qp_destroy(mlx5_dev_t *dev, mlx5_qp_t *qp) {
-    uint8_t in[16] = {0};
-    in[0] = (uint8_t)(MLX5_CMD_OP_DESTROY_QP >> 8);
-    in[1] = (uint8_t)(MLX5_CMD_OP_DESTROY_QP & 0xffu);
-    in[9] = (uint8_t)(qp->qpn >> 16);
-    in[10] = (uint8_t)(qp->qpn >> 8);
-    in[11] = (uint8_t)qp->qpn;
+    int failed = 0;
 
-    uint8_t out[16];
-    int rc = mlx5_cmd_exec(dev, in, sizeof(in), out, sizeof(out));
-    if (rc != 0) {
-        return rc;
+    if (qp->qpn != 0) {
+        if (mlx5_destroy_obj24(dev, MLX5_CMD_OP_DESTROY_QP, qp->qpn, "DESTROY_QP") != 0) {
+            failed = 1;
+        }
     }
-    if (out[0] != 0) {
-        return -1;
+    if (qp->mkey != 0) {
+        /* CREATE_MKEY は mkey_index を返し、mlx5_create_mkey_pa*() が
+         * `index << 8` を mkey として保持している。DESTROY_MKEY が取るのは
+         * インデックスの方なので 8bit 戻す。 */
+        if (mlx5_destroy_obj24(dev, MLX5_CMD_OP_DESTROY_MKEY, qp->mkey >> 8, "DESTROY_MKEY") != 0) {
+            failed = 1;
+        }
     }
+    if (qp->cqn != 0) {
+        if (mlx5_destroy_obj24(dev, MLX5_CMD_OP_DESTROY_CQ, qp->cqn, "DESTROY_CQ") != 0) {
+            failed = 1;
+        }
+    }
+    if (qp->pdn != 0) {
+        if (mlx5_destroy_obj24(dev, MLX5_CMD_OP_DEALLOC_PD, qp->pdn, "DEALLOC_PD") != 0) {
+            failed = 1;
+        }
+    }
+    if (qp->uarn != 0) {
+        if (mlx5_destroy_obj24(dev, MLX5_CMD_OP_DEALLOC_UAR, qp->uarn, "DEALLOC_UAR") != 0) {
+            failed = 1;
+        }
+    }
+
     qp->in_use = 0;
-    return 0;
+    qp->qpn  = 0;
+    qp->mkey = 0;
+    qp->cqn  = 0;
+    qp->pdn  = 0;
+    qp->uarn = 0;
+    return failed ? -1 : 0;
 }
 
 #define MLX5_QP_ST_UD  0x2u // include/linux/mlx5/qp.hのenumで確認済み
@@ -2765,16 +2859,20 @@ static int mlx5_qp_create_ud_common(mlx5_dev_t *dev, mlx5_qp_t *qp, uint8_t st) 
     qp->in_use = 1;
     qp->local_psn = (uint32_t)(timer_now() & 0x00FFFFFFu);
 
+    /* RC 側と同じく、途中で失敗したらそこまでに取れたぶんを返す。 */
     if (mlx5_alloc_uar(dev, &qp->uarn) != 0) {
         uart_printf("mlx5qp: ALLOC_UAR failed\n");
+        mlx5_qp_destroy(dev, qp);
         return -1;
     }
     if (mlx5_alloc_pd(dev, &qp->pdn) != 0) {
         uart_printf("mlx5qp: ALLOC_PD failed\n");
+        mlx5_qp_destroy(dev, qp);
         return -1;
     }
     if (mlx5_create_mkey_pa_rw(dev, qp->pdn, &qp->mkey) != 0) {
         uart_printf("mlx5qp: CREATE_MKEY(rw) failed\n");
+        mlx5_qp_destroy(dev, qp);
         return -1;
     }
 
@@ -2782,6 +2880,7 @@ static int mlx5_qp_create_ud_common(mlx5_dev_t *dev, mlx5_qp_t *qp, uint8_t st) 
     uint64_t cq_dbr = (uint64_t)dev->gsi_cq_dbr_cpu;
     if (mlx5_create_cq(dev, qp->uarn, dev->eqn, cq_buf, cq_dbr, &qp->cqn) != 0) {
         uart_printf("mlx5qp: CREATE_CQ failed\n");
+        mlx5_qp_destroy(dev, qp);
         return -1;
     }
 
@@ -2836,6 +2935,7 @@ static int mlx5_qp_create_ud_common(mlx5_dev_t *dev, mlx5_qp_t *qp, uint8_t st) 
     int rc = mlx5_cmd_exec(dev, in, sizeof(in), out, sizeof(out));
     if (rc != 0) {
         uart_printf("mlx5qp: CREATE_QP(st=0x%x): mlx5_cmd_exec failed rc=%d\n", st, rc);
+        mlx5_qp_destroy(dev, qp);
         return rc;
     }
     uint8_t status = out[0];
@@ -2844,6 +2944,7 @@ static int mlx5_qp_create_ud_common(mlx5_dev_t *dev, mlx5_qp_t *qp, uint8_t st) 
                              ((uint32_t)out[6] << 8) | out[7];
         uart_printf("mlx5qp: CREATE_QP(st=0x%x): command status=0x%02x syndrome=0x%08x\n",
                     st, status, syndrome);
+        mlx5_qp_destroy(dev, qp);
         return -1;
     }
     qp->qpn = ((uint32_t)out[9] << 16) | ((uint32_t)out[10] << 8) | out[11];

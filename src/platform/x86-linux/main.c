@@ -1149,8 +1149,58 @@ static void shell_txdrop(char *args)
 }
 
 /*=================================================================
+ * シェルの `qploop`。RC QP の作成と破棄を N 回繰り返し、FW 側リソースが
+ * 枯渇しないことを確認する。
+ *
+ * `mlx5_qp_create_rc()` は QP 1 本につき UAR / PD / MKey / CQ も確保する。
+ * これらを解放しないと作り直すたびに FW のリソースが溜まり、いずれ確保が
+ * 失敗する(過去に INIT2RTR_QP が BAD_RES_ERR=0x05 で落ちた実績がある)。
+ * **何回目で失敗するかを数値で出すのが目的**なので、失敗したらその回数を
+ * 報告して止める。
+ *
+ * 引数:
+ *   args - 繰り返し回数。省略時は 8(FW を一気に枯渇させると復旧が重いので
+ *          少しずつ増やして試すこと)
+ * コール元:
+ *   shell_dispatch()
+ * ===============================================================*/
+static void shell_qploop(char *args)
+{
+    while (*args == ' ') args++;
+    unsigned n = (*args >= '0' && *args <= '9') ? (unsigned)atoi(args) : 8u;
+    if (n == 0u) n = 1u;
+    if (n > 256u) n = 256u;  /* 一気に枯渇させない */
+
+    /* qp_index=0 は admin QP と DMA バッファを共有する。RDMA セッションが
+     * 生きている間に叩くとそれを壊すので、bench の後は使わないこと。 */
+    static mlx5_qp_t qp;
+    mlx5_dev_t *dev = &s_dev0;
+
+    uart_printf("qploop: RC QP の作成/破棄を %u 回繰り返します (PF0)\n", n);
+    unsigned done = 0;
+    for (unsigned i = 0; i < n; i++) {
+        if (mlx5_qp_create_rc(dev, &qp, 0) != 0) {
+            uart_printf("qploop: NG -- %u 回目の mlx5_qp_create_rc() が失敗 "
+                        "(FW リソース枯渇の疑い)\n", i + 1u);
+            return;
+        }
+        if (mlx5_qp_modify_rst2init(dev, &qp) != 0) {
+            uart_printf("qploop: NG -- %u 回目の RST2INIT_QP が失敗\n", i + 1u);
+            mlx5_qp_destroy(dev, &qp);
+            return;
+        }
+        if (mlx5_qp_destroy(dev, &qp) != 0) {
+            uart_printf("qploop: NG -- %u 回目の mlx5_qp_destroy() が失敗\n", i + 1u);
+            return;
+        }
+        done++;
+    }
+    uart_printf("qploop: PASS -- %u 回すべて成功\n", done);
+}
+
+/*=================================================================
  * 入力 1 行をコマンドとして解釈し実行する(monitor / nvmet / tcpbench /
- * bench / simdelay / ackthresh / txdrop / ts / jobs / help / quit)。
+ * bench / simdelay / ackthresh / txdrop / qploop / ts / jobs / help / quit)。
  *
  * 引数:
  *   line   - 入力行(破壊される)
@@ -1195,6 +1245,8 @@ static void shell_dispatch(char *line, int s0, int s1)
         shell_ackthresh(line + 9);
     } else if (strncmp(line, "txdrop", 6) == 0) {
         shell_txdrop(line + 6);
+    } else if (strncmp(line, "qploop", 6) == 0) {
+        shell_qploop(line + 6);
     } else if (strncmp(line, "ts", 2) == 0 && (line[2] == 0 || line[2] == ' ')) {
         shell_ts(line + 2);
     } else if (strncmp(line, "ping6", 5) == 0) {
@@ -1224,6 +1276,7 @@ static void shell_dispatch(char *line, int s0, int s1)
                     "  tcp6test                              対向PFとIPv6上でTCP確立+データ往復\n"
                     "  rsttest                               待ち受け無しポートへ接続しRSTで即失敗するか(v4/v6)\n"
                     "  txdrop [N]                            ロス注入(データN個に1個破棄、0=無効)+再送統計\n"
+                    "  qploop [N]                            RC QPの作成/破棄をN回繰り返しFWリソース枯渇を見る\n"
                     "  nvmet [port] | jobs | help | quit    (↑↓で履歴呼び出し)\n"
                     "  例: bench 8,64,256 rw 8 / tcpbench 64,256 w digest / ts core 1 num 40\n");
     } else if (strncmp(line, "quit", 4) == 0 || strncmp(line, "exit", 4) == 0) {

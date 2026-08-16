@@ -573,3 +573,44 @@ SACK(C3)を入れれば 1. と 2. の問題は根本的に消える。
 - ロス下の整合性確認は `txdrop 10` + `tcp6test`(64KB バイト一致)。ただし
   64KB=8 セグメントでは重複 ACK が 3 個溜まる前に終わるので、**高速再送そのものは
   発火せず RTO 経路が拾う**(これは正常。発火を見たいなら `tcpbench` を使う)。
+
+## QP に付随する FW リソースの解放(`PLAN_protocol_gaps.md` 段階 3 = E)
+
+`mlx5_qp_create_rc()` / `mlx5_qp_create_ud_common()` は QP 1 本につき
+**UAR / PD / MKey / CQ も確保する**。以前は `DESTROY_QP` しか発行しておらず、
+作り直すたびに 4 種類が積み上がっていた。`mlx5_qp_destroy()` を「付随する資源も
+まとめて返す」形へ拡張した(呼び出し元は変更不要)。
+
+解放順は依存の逆順で **QP → MKey → CQ → PD → UAR**。MKey は PD に属し CQ は
+UAR を参照するので、PD/UAR を先に返してはいけない。
+
+- **`DESTROY_MKEY` が取るのは mkey ではなくインデックス。**
+  `mlx5_create_mkey_pa*()` は `index << 8` を mkey として保持しているので、
+  8bit 戻して渡す。
+- **`mlx5_hca_bringup()` が作る Ethernet 用の資源(EQ/PD/MKey/CQ/TIS/RQ/TIR/SQ/
+  フローテーブル)は解放してはいけない。** プロセス生存中ずっと使う。
+  対象は QP ごとに確保するものだけ。
+- 解放が失敗しても致命的にしない(ログを出して続行し、最後にハンドルをゼロ
+  クリアする)。切断経路から呼ばれるので、ここで止まると「後始末でハングする」
+  パターンになる。
+- **作成の失敗パスにもロールバックが要る。** ALLOC_UAR は成功したが ALLOC_PD で
+  失敗、というときに漏れる。`mlx5_qp_destroy()` は `qpn==0` でも残りを解放する
+  ので、失敗時はそのまま呼べばよい。
+
+opcode(DEALLOC_UAR=0x803 / DEALLOC_PD=0x801 / DESTROY_MKEY=0x202 /
+DESTROY_CQ=0x401)と入力構造体は **OptiPlex の
+`/usr/src/linux-headers-*/include/linux/mlx5/mlx5_ifc.h` を実際に読んで確認した**。
+カーネルヘッダが入っているので clone は要らない。4 つとも 16 バイト入力・
+byte9-11 に 24bit ID という同じ形なので `mlx5_destroy_obj24()` にまとめてある。
+
+### 検証コマンド
+
+- `qploop [N]` — RC QP の作成 → RST2INIT → 破棄を N 回繰り返す。**枯渇させるより
+  「リソース番号が再利用されるか」を見るほうが安全で証拠として強い。**
+  実装前は 252 回で cqn 19→286 / pdn 18→269 / uarn 17→268 と単調増加、
+  実装後は 252 回すべて cqn=19 / pdn=18 / uarn=17 で一定になった。
+- **FW を一気に枯渇させないこと。** x86 VFIO 版には `pcie1 reset` 相当の手段が
+  無く、FW 状態が壊れたらプロセス終了 → bind し直し(それでも駄目ならホスト
+  電源断)になる。N は 4 → 8 → 16 → 32 … と段階的に増やす。
+- `qploop` は `qp_index=0`(admin QP)と DMA バッファを共有するので、
+  **RDMA セッションが生きている間に叩くとそれを壊す**。`bench` の後には使わない。
