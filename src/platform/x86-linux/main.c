@@ -15,9 +15,7 @@
 #include "crc32c.h"
 #include "vfio.h"
 #include "mlx5.h"
-#include "mlx5_qp.h"
 #include "nvme_rdma.h"
-#include "test.h"
 #include "net.h"
 #include "arp.h"
 #include "ip.h"
@@ -94,8 +92,7 @@ static void smp_selftest(void)
 static mlx5_dev_t s_dev0, s_dev1; /* 大きい構造体なので static */
 
 /* vfio スロット slot(vfio_init が返す)の PF を掴んで bring-up する。0=成功。 */
-static int bringup_pf(int slot, mlx5_dev_t *dev, uint8_t pf_index, const char *label,
-                      int monitor_only)
+static int bringup_pf(int slot, mlx5_dev_t *dev, uint8_t pf_index, const char *label)
 {
     if (slot < 0) {
         uart_printf("[main] %s: vfio_init 失敗 -- vfio-pci バインド / IOMMU を確認\n", label);
@@ -115,89 +112,17 @@ static int bringup_pf(int slot, mlx5_dev_t *dev, uint8_t pf_index, const char *l
     dev->bar0_base = (uint64_t)(uintptr_t)bar0;
     dev->pf_index  = pf_index;
 
-    int rc = mlx5_hca_bringup(dev, label, monitor_only);
+    int rc = mlx5_hca_bringup(dev, label, 0);
     uart_printf("[main] %s mlx5_hca_bringup -> %d (%s)\n", label, rc, rc == 0 ? "OK" : "FAILED");
     return rc;
 }
 
-/* 単一 PF: bring-up + 同一 PF 内 RC QP ループバック(RST2INIT->INIT2RTR->
- * RTR2RTS まで、RPi5 の `mlx5qp loop` と同じ。外部接続不要、RTS 到達で PASS)。 */
-static int run_single_pf(const char *bdf)
-{
-    uart_printf("\n========== single-PF bring-up + QP loopback: %s ==========\n", bdf);
-    int slot = vfio_init(bdf);
-    if (bringup_pf(slot, &s_dev0, 0u, "PF", 0) != 0) return -1;
-    uart_printf("\n========== Phase 5: RC QP loopback (same-PF, ->RTS) ==========\n");
-    mlx5_qp_loopback_test(&s_dev0, "x86-loopback");
-    return 0;
-}
-
-/* dual PF(PF0=bdf0, PF1=bdf1): 両方 bring-up し、mlx5_qp_rdma_test で PF0<->PF1
- * の RC QP を確立して RDMA_WRITE/READ のバイト完全一致を確認する(RPi5 の
- * `mlx5qp rdma` と同じ)。**RDMA データ疎通は 2 ポートが互いに直結(loopback)
- * している配線が前提** -- 両ポートが rpi5 側へ伸びている配線では RDMA_WRITE が
- * 相手に届かず CQE タイムアウトになる(bring-up と RTS 到達までは配線に依らず
- * 成功する)。 */
-/* NVMe/TCP over Ethernet ループバック(RPi5 の temp_test の post-bring-up 部分)。
- * PF は既に bring-up + net_ctx 登録 + arp/ip init 済みの前提。target(nvmet)を
- * pf1、initiator(nvme)を pf0 に立て、TCP で Fabrics Connect → CC → Identify →
- * write → read → byte 一致。nvmet_ctx_t は固定の NVMET_CTX_SLOT(x86 では未
- * マップ)ではなく static を渡す -- nvmet_job_start は任意の ctx ポインタを取る。 */
 /* RPi5 では command.c(シェル)が定義するグローバル。core(nvme.c/test.c)が
  * `extern nvme_ctx_t s_nvme_ctx`(nvme.h)で参照する共有の initiator コンテキスト。
  * x86 は command.c をリンクしないのでここで定義する。 */
 nvme_ctx_t s_nvme_ctx;
 
 static nvmet_ctx_t s_x86_nvmet; /* .bss(内蔵 RAM ディスク含む、TCP 経路は CPU 側) */
-static uint8_t s_nvme_wbuf[16384] __attribute__((aligned(4096)));
-static uint8_t s_nvme_rbuf[16384] __attribute__((aligned(4096)));
-
-static int run_nvme_tcp(void)
-{
-    net_ctx_t *ctx0 = net_ctx_find("mlx5-pf0");
-    net_ctx_t *ctx1 = net_ctx_find("mlx5-pf1");
-    if (!ctx0 || !ctx1) { uart_printf("[nvmetcp] net_ctx 未登録\n"); return -1; }
-
-    static char subnqn[128] = "nqn.2014-08.org.nvmexpress:uuid:deadbeef-cafe-babe-dead-beefcafebabe";
-    const uint16_t port = 4420u;
-
-    net_ctx_activate(ctx1);
-    if (nvmet_job_start(&s_x86_nvmet, port, ctx1, "manual") != 0) {
-        uart_printf("[nvmetcp] nvmet_job_start 失敗\n");
-        return -1;
-    }
-
-    net_ctx_activate(ctx0);
-    uint32_t dst = ip_from_octets(192, 168, 101, 11);
-    nvme_connect_job_start(&s_nvme_ctx, dst, port, subnqn);
-    uint64_t t = timer_now();
-    while (s_nvme_ctx.busy) {
-        job_delay_ms(50);
-        if (timeout_ms(t, 15000u)) { uart_printf("[nvmetcp] connect タイムアウト\n"); return -1; }
-    }
-    uart_printf("[nvmetcp] connect 完了 (lba_size=%u)\n", s_nvme_ctx.lba_size);
-    if (s_nvme_ctx.lba_size == 0u) { uart_printf("[nvmetcp] lba_size=0\n"); return -1; }
-
-    uint32_t nlb = (uint32_t)(sizeof(s_nvme_wbuf) / s_nvme_ctx.lba_size);
-    for (uint32_t i = 0; i < sizeof(s_nvme_wbuf); i++) s_nvme_wbuf[i] = (uint8_t)(0x5au ^ (i * 7u));
-
-    if (nvme_write_begin(&s_nvme_ctx, 1u, 0u, s_nvme_wbuf, nlb) != 0) { uart_printf("[nvmetcp] write_begin 失敗\n"); return -1; }
-    t = timer_now();
-    while (!nvme_io_job_done()) { job_delay_ms(10); if (timeout_ms(t, 15000u)) { uart_printf("[nvmetcp] write タイムアウト\n"); return -1; } }
-    if (nvme_io_job_result() != 0) { uart_printf("[nvmetcp] write 失敗 (status=%d)\n", nvme_io_job_result()); return -1; }
-    uart_printf("[nvmetcp] write 完了 (%u ブロック)\n", nlb);
-
-    memset(s_nvme_rbuf, 0, sizeof(s_nvme_rbuf));
-    if (nvme_read_begin(&s_nvme_ctx, 1u, 0u, s_nvme_rbuf, nlb) != 0) { uart_printf("[nvmetcp] read_begin 失敗\n"); return -1; }
-    t = timer_now();
-    while (!nvme_io_job_done()) { job_delay_ms(10); if (timeout_ms(t, 15000u)) { uart_printf("[nvmetcp] read タイムアウト\n"); return -1; } }
-    if (nvme_io_job_result() != 0) { uart_printf("[nvmetcp] read 失敗 (status=%d)\n", nvme_io_job_result()); return -1; }
-
-    int match = (memcmp(s_nvme_wbuf, s_nvme_rbuf, (size_t)nlb * s_nvme_ctx.lba_size) == 0);
-    uart_printf("[nvmetcp] read 完了、データ %s\n", match ? "完全一致 MATCH" : "MISMATCH");
-    nvme_disconnect(&s_nvme_ctx);
-    return match ? 0 : -1;
-}
 
 /* NVMe/TCP 持続スループット(RPi5 の `test`=temp_test の post-bring-up 部分)。
  * target(nvmet)を pf1/core1、initiator(nvme)を pf0/core0 に立て、
@@ -205,134 +130,17 @@ static int run_nvme_tcp(void)
  * chunk サイズ別に 3 秒回してスループットを測る。net_ctx は既に登録済み
  * (run_bench が mlx5_net_register_dual 済み)の前提。 */
 static uint8_t s_nvmetcp_buf[262144] __attribute__((aligned(4096)));
-static void run_nvme_tcp_bench(void)
-{
-    uart_printf("\n===== NVMe/TCP (nvmet@pf1/core1 <- nvme@pf0/core0, qdepth=8) =====\n");
-    arp_init();
-    ip_init();
-    mlx5_net_register_dual(&s_dev0, &s_dev1);
-    net_ctx_t *ctx0 = net_ctx_find("mlx5-pf0");
-    net_ctx_t *ctx1 = net_ctx_find("mlx5-pf1");
-    if (!ctx0 || !ctx1) { uart_printf("[nvmetcp-bench] net_ctx 未登録\n"); return; }
-
-    /* core-split: target(nvmet)を core1、initiator(nvme pipelined_run)を core0 へ。
-     * 2026-08-15: mlx5 SQ recovery の CQ desync を修正した(sq_cq_cc を SQ 占有量
-     * カウンタから分離、復帰時に flush CQE を drain してから sq_pc/sq_cc のみ 0 へ)。
-     * これで 64K 以上でも SQ ハング復帰後に継続できるはず -- 全サイズで core-split の
-     * レイテンシ削減効果(8K read は単一コア 380→694 を確認済み)が効く見込み。 */
-    static char subnqn[128] = "nqn.2014-08.org.nvmexpress:uuid:deadbeef-cafe-babe-dead-beefcafebabe";
-    const uint16_t port = 4421u;
-
-    int split = (smp_boot_core1() == 0);
-    if (split) net_ctx_set_owner_core(ctx1, 1u);
-    uart_printf("[nvmetcp-bench] core-split=%d (target=core%d)\n", split, split ? 1 : 0);
-
-    net_ctx_activate(ctx1);
-    if (nvmet_job_start(&s_x86_nvmet, port, ctx1, "manual") != 0) {
-        uart_printf("[nvmetcp-bench] nvmet_job_start 失敗\n"); return;
-    }
-    net_ctx_activate(ctx0);
-    nvme_connect_job_start(&s_nvme_ctx, ip_from_octets(192, 168, 101, 11), port, subnqn);
-    uint64_t t = timer_now();
-    while (s_nvme_ctx.busy) {
-        /* core-split では core0 が pf0 を継続 poll しないと、target(core1)が
-         * SYN|ACK 送信のために送る "who-has .10" ARP に応答できず connect が
-         * タイムアウトする(job_delay_ms は job_scheduler_tick のみで net_poll
-         * を回さない)。rpi5 のシェルループと同じく両方回す。 */
-        job_scheduler_tick();
-        net_poll_all_and_dispatch();
-        if (timeout_ms(t, 15000u)) { uart_printf("[nvmetcp-bench] connect タイムアウト\n"); return; }
-    }
-    if (s_nvme_ctx.lba_size == 0u) { uart_printf("[nvmetcp-bench] lba_size=0\n"); return; }
-    for (unsigned i = 0; i < sizeof(s_nvmetcp_buf); i++) s_nvmetcp_buf[i] = (uint8_t)(0x5au ^ (i * 7u));
-
-    /* push型受信(nvme.c の nvme_read_rx_upcall)の byte 正当性検証。パターンを lba0 へ
-     * 書き、別バッファへ pipelined-read(push 経路)して 1 バイト単位で比較する。ベンチ
-     * 本体は同一バッファで write/read するため read 側の破損を検出できないので、ここで
-     * 別バッファを使って明示的に確認する。 */
-    {
-        static uint8_t s_nvmetcp_vbuf[262144] __attribute__((aligned(4096)));
-        uint32_t vnlb = sizeof(s_nvmetcp_vbuf) / s_nvme_ctx.lba_size;
-        uint32_t vc = 0, ve = 0; uint64_t vb = 0;
-        nvme_write_pipelined_run(&s_nvme_ctx, 1u, 0u, s_nvmetcp_buf, vnlb, 300u, &vc, &vb, &ve);
-        for (unsigned i = 0; i < sizeof(s_nvmetcp_vbuf); i++) s_nvmetcp_vbuf[i] = 0;
-        nvme_read_pipelined_run(&s_nvme_ctx, 1u, 0u, s_nvmetcp_vbuf, vnlb, 300u, &vc, &vb, &ve);
-        int mism = -1;
-        for (unsigned i = 0; i < sizeof(s_nvmetcp_vbuf); i++) {
-            if (s_nvmetcp_vbuf[i] != s_nvmetcp_buf[i]) { mism = (int)i; break; }
-        }
-        uart_printf("[nvmetcp] push経路 byte検証: %s\n", (mism < 0) ? "完全一致 MATCH" : "MISMATCH");
-        if (mism >= 0) uart_printf("  最初の不一致 offset=%d (got=0x%02x want=0x%02x)\n",
-                                   mism, s_nvmetcp_vbuf[mism], s_nvmetcp_buf[mism]);
-    }
-
-    static const uint32_t chunks[] = { 8192u, 65536u, 262144u };
-    for (unsigned c = 0; c < sizeof(chunks) / sizeof(chunks[0]); c++) {
-        uint32_t nlb = chunks[c] / s_nvme_ctx.lba_size;
-        for (int rd = 0; rd < 2; rd++) {
-            uint32_t cnt = 0, el = 0; uint64_t by = 0;
-            if (rd) nvme_read_pipelined_run(&s_nvme_ctx, 1u, 0u, s_nvmetcp_buf, nlb, 3000u, &cnt, &by, &el);
-            else    nvme_write_pipelined_run(&s_nvme_ctx, 1u, 0u, s_nvmetcp_buf, nlb, 3000u, &cnt, &by, &el);
-            uint64_t mbps = (el > 0) ? (by * 1000ull) / el / 1000000ull : 0;
-            uart_printf("[nvmetcp] chunk=%u %s: 約%u MB/s (%u 回, %u ms)\n",
-                        chunks[c], rd ? "read " : "write", (unsigned)mbps, cnt, el);
-        }
-    }
-    nvme_disconnect(&s_nvme_ctx);
-}
 
 /* 【診断】NVMe/TCP 256K read の再送ストーム原因調査。single-core で 256K read を
  * 1 回走らせ、OOO(順序不正)の起点で ts リングを凍結し、core0 の直近イベントを
  * ダンプする。ストームで大量発生する uart 出力の前に凍結できるので、健全→異常の
  * 遷移が保存される。 */
-/* 性能測定(RPi5 の `nvmermabench` + `tcploopbench` 相当)。PF0<->PF1 直結
- * ループバック配線が前提。NVMe-oF RDMA(RC QP + パイプライン)と生 TCP の
- * 両方でスループットを測る。nvme_rdma_run_bench / tcp_loopback_bench は結果を
- * 自前で uart_printf(x86 では stdout)する。target ジョブは core1(hal_smp の
- * pthread)へ pin される。 */
-static void run_bench(void)
-{
-    uart_printf("\n########## 性能測定 (PF0<->PF1 25GbE loopback / PCIe Gen3 x8) ##########\n");
-    uart_printf("# 理論上限: 25GbE wire = 3.125 GB/s/方向, PCIe Gen3 x8 = 7.88 GB/s\n\n");
-
-    /* --- NVMe-oF RDMA スループット(chunk × read/write、qdepth=8) --- */
-    uart_printf("===== NVMe-oF RDMA (qdepth=8) =====\n");
-    static const uint32_t chunks[] = { 8192u, 65536u, 262144u };
-    for (unsigned c = 0; c < sizeof(chunks) / sizeof(chunks[0]); c++) {
-        uart_printf("--- chunk=%u write ---\n", chunks[c]);
-        nvme_rdma_run_bench(&s_dev0, &s_dev1, 3000u, 0 /*write*/, chunks[c], 8u, 0);
-        uart_printf("--- chunk=%u read ---\n", chunks[c]);
-        nvme_rdma_run_bench(&s_dev0, &s_dev1, 3000u, 1 /*read*/, chunks[c], 8u, 0);
-    }
-
-    /* --- 生 TCP スループット(mlx5_net Ethernet + TCP、片方向ストリーム) ---
-     * core_split=1(server を core1 pthread へ)が実力値。core_split=0 の単一
-     * スレッド ping-pong は「送信完了後にドレイン」を直列化するため遅延 ACK
-     * タイマ待ちでラウンドごとに ~31ms 停止する計測ハーネス由来の遅さになる
-     * (data-plane の限界ではない)。 */
-    uart_printf("\n===== 生 TCP loopback (mlx5-pf0 -> mlx5-pf1, server=core1) =====\n");
-    arp_init();
-    ip_init();
-    mlx5_net_register_dual(&s_dev0, &s_dev1);
-    uint32_t server_ip = ip_from_octets(192, 168, 101, 11);
-    uint32_t client_ip = ip_from_octets(192, 168, 101, 10);
-    tcp_loopback_bench(server_ip, client_ip, 5001u, 3000u, 0x1u /*CORE_SPLIT*/, 262144u);
-}
 
 /* mlx5_pcie_decode_cfg() 用の config space 読み関数(x86=VFIO)。ctx=vfio
  * スロット番号。 */
 static uint32_t x86_cfg_rd(void *ctx, uint32_t off)
 {
     return vfio_cfg_read32((int)(intptr_t)ctx, off);
-}
-
-/* ConnectX HW モニタ: 温度/health/PCIe HWエラー/リンク層エラー(BAR0経由)
- * + PCIeリンク速度・幅・MPS・MRRS(config space経由)を PF0/PF1 で表示。 */
-static void run_monitor(int s0, int s1)
-{
-    uart_printf("\n########## ConnectX HW モニタ ##########\n");
-    mlx5_monitor_summary3(&s_dev0, &s_dev1, x86_cfg_rd,
-                          (void *)(intptr_t)s0, (void *)(intptr_t)s1);
 }
 
 /* ====================================================================== */
@@ -744,65 +552,21 @@ static void run_shell(int s0, int s1)
     }
 }
 
-/* mode: 'r'=RC QP RDMA, 'n'=NVMe-oF RDMA, 't'=Ethernet/TCP loopback, 'i'=NVMe/TCP,
- * 'b'=性能測定(bench)、'm'=HWモニタ、's'=常駐シェル。 */
-static int run_dual_pf(const char *bdf0, const char *bdf1, char mode)
+/* PF0=bdf0 / PF1=bdf1 を両方 bring-up し、常駐シェルへ入る(戻らない)。 */
+static int run_dual_pf(const char *bdf0, const char *bdf1)
 {
     uart_printf("\n========== dual-PF bring-up: %s + %s ==========\n", bdf0, bdf1);
     int s0 = vfio_init(bdf0);
     int s1 = vfio_init(bdf1);
-    /* monitor('m')は INIT_HCA以降のデータパス資源作成が不要なので軽量
-     * ブリングアップ(ENABLE_HCA+capabilityまで)で済ませる。 */
-    int mon = (mode == 'm');
-    if (bringup_pf(s0, &s_dev0, 0u, "PF0", mon) != 0) return -1;
-    if (bringup_pf(s1, &s_dev1, 1u, "PF1", mon) != 0) return -1;
-    if (mode == 'b') { run_bench(); return 0; }
-    if (mode == 'j') { run_nvme_tcp_bench(); return 0; }
-    if (mode == 'm') { run_monitor(s0, s1); return 0; }
-    if (mode == 's') { run_shell(s0, s1); return 0; }  /* 常駐(戻らない) */
-    if (mode == 't' || mode == 'i') {
-        /* Ethernet/TCP 経路(RPi5 の `net init mlx5` + `tcplooptest`/`test` 相当):
-         * bring-up 済みの 2 PF を net_ctx(mlx5-pf0/pf1)として登録し、mlx5_net
-         * (Ethernet 送受信)+ TCP スタックで自己完結の疎通を確認する。 */
-        uart_printf("\n========== Phase 5: register net_ctx (mlx5-pf0/pf1) ==========\n");
-        /* EtherType ハンドラ登録(RPi5 は main.c が起動時に呼ぶ)。arp_init/
-         * ip_init は eth_register_handler するだけでハードウェア非依存。これが
-         * 無いと eth_dispatch が受信 ARP/IPv4 を捨てる(x86 で実際に踏んだ)。 */
-        arp_init();
-        ip_init();
-        mlx5_net_register_dual(&s_dev0, &s_dev1);
-        if (mode == 't') {
-            uart_printf("\n========== Phase 5: TCP loopback (mlx5-pf0 <-> mlx5-pf1) ==========\n");
-            uint32_t server_ip = ip_from_octets(192, 168, 101, 11);
-            uint32_t client_ip = ip_from_octets(192, 168, 101, 10);
-            tcp_loopback_test(server_ip, client_ip, 5000u, 8192u);
-        } else {
-            uart_printf("\n========== Phase 5: NVMe/TCP loopback (nvmet@pf1 <- nvme@pf0) ==========\n");
-            run_nvme_tcp();
-        }
-        return 0;
-    }
-    if (mode == 'n') {
-        /* NVMe-oF RDMA ループバック(RPi5 の `nvmerdmaconnect` 相当): 同一
-         * プログラム内で target(nvmet_rdma)と initiator(nvme_rdma)を PF0/PF1 に
-         * 立て、CM(rdma_cm REQ/REP/RTU)で RC QP を確立 → Fabrics Connect →
-         * CC 有効化 → Identify Controller/Namespace → write → read → byte 一致。
-         * target ジョブは core1 に pin される(hal_smp の core1 ワーカが
-         * job_scheduler_tick を回す)。 */
-        uart_printf("\n========== Phase 5: NVMe-oF RDMA loopback (PF0<->PF1) ==========\n");
-        nvme_rdma_run_connect_test(&s_dev0, &s_dev1);
-    } else {
-        uart_printf("\n========== Phase 5: RC QP RDMA_WRITE/READ (PF0<->PF1) ==========\n");
-        mlx5_qp_rdma_test(&s_dev0, &s_dev1);
-    }
+    if (bringup_pf(s0, &s_dev0, 0u, "PF0") != 0) return -1;
+    if (bringup_pf(s1, &s_dev1, 1u, "PF1") != 0) return -1;
+    run_shell(s0, s1);
     return 0;
 }
 
 int main(int argc, char **argv)
 {
-    uart_puts("\n");
-    uart_puts("rpi5-boot x86-linux port (VFIO) -- Phase 3: HAL up, console up\n");
-    uart_puts("(~/.claude/plans/x86-vfio-port.md)\n\n");
+    uart_puts("\nvfio_nvme -- ConnectX-4 / VFIO / NVMe-oF (RoCEv2 + TCP)\n\n");
 
     int rc = 0;
     rc |= crc32c_selftest();
@@ -810,35 +574,13 @@ int main(int argc, char **argv)
     spinlock_selftest();
     smp_selftest();
 
-    if (argc >= 4) {
-        /* 第3引数: "nvme"->NVMe-oF RDMA, "tcp"->Ethernet/TCP, "nvmetcp"->NVMe/TCP,
-         * それ以外->RC QP RDMA。 */
-        char mode;
-        if (strcmp(argv[3], "nvmetcp") == 0)      mode = 'i';
-        else if (strcmp(argv[3], "tcp") == 0)     mode = 't';
-        else if (strcmp(argv[3], "nvme") == 0)    mode = 'n';
-        else if (strcmp(argv[3], "bench") == 0)   mode = 'b';
-        else if (strcmp(argv[3], "nvmetcpbench") == 0) mode = 'j';
-        else if (strcmp(argv[3], "monitor") == 0) mode = 'm';
-        else if (strcmp(argv[3], "shell") == 0)   mode = 's';
-        else                                       mode = 'r';
-        return run_dual_pf(argv[1], argv[2], mode) ? 1 : 0;
-    }
-    if (argc == 3) {
-        return run_dual_pf(argv[1], argv[2], 'r') ? 1 : 0;
-    }
-    if (argc == 2) {
-        return run_single_pf(argv[1]) ? 1 : 0;
+    if (argc >= 3) {
+        return run_dual_pf(argv[1], argv[2]) ? 1 : 0;
     }
 
     uart_puts("\n使い方:\n"
-              "  sudo ./rpi5-x86 <BDF>                  単一 PF bring-up + QP ループバック(->RTS)\n"
-              "  sudo ./rpi5-x86 <BDF0> <BDF1>          dual PF + RC QP RDMA_WRITE/READ\n"
-              "  sudo ./rpi5-x86 <BDF0> <BDF1> nvme     dual PF + NVMe-oF RDMA(CM+Identify+write/read)\n"
-              "  sudo ./rpi5-x86 <BDF0> <BDF1> tcp      dual PF + Ethernet/TCP ループバック\n"
-              "  sudo ./rpi5-x86 <BDF0> <BDF1> nvmetcp  dual PF + NVMe/TCP(Fabrics+Identify+write/read)\n"
-              "  sudo ./rpi5-x86 <BDF0> <BDF1> bench    dual PF + 性能測定(NVMe-oF RDMA + 生TCP)\n"
-              "  例: sudo ./rpi5-x86 0000:01:00.0 0000:01:00.1 bench\n");
-    uart_printf("\nPhase 3 self-tests %s\n", (rc == 0) ? "PASSED" : "had FAILURES");
+              "  sudo ./vfio_nvme <BDF0> <BDF1>   dual PF bring-up + 常駐シェル\n"
+              "  例: sudo ./vfio_nvme 0000:01:00.0 0000:01:00.1\n");
+    uart_printf("\nself-tests %s\n", (rc == 0) ? "PASSED" : "had FAILURES");
     return rc ? 1 : 0;
 }
