@@ -34,6 +34,16 @@ _Static_assert(MLX5_SQ_WQE_COUNT <= ETH_TX_RING_SIZE,
 #define MLX5_ERR_CQE_OFF_VENDOR_SYND 54u
 #define MLX5_ERR_CQE_OFF_SYNDROME    55u
 
+/*
+ * CQE のエラー syndrome コードを表示用文字列へ変換する。
+ *
+ * 引数:
+ *   syndrome - MLX5_CQE_SYNDROME_* の値
+ * 戻り値:
+ *   syndrome 名。未知の値なら "?"
+ * コール元:
+ *   mlx5_net_sq_reap_one()
+ */
 static const char *mlx5_cqe_syndrome_str(uint8_t syndrome)
 {
     switch (syndrome) {
@@ -83,6 +93,17 @@ static int      s_recover_attempts[2];
 static uint64_t s_recover_window_start[2];
 static uint32_t s_recover_last_cq_cc[2];
 
+/*
+ * 状態構造体から PF 番号(0/1)を求める。ログ表示と per-PF 配列の添字に使う。
+ *
+ * 引数:
+ *   st - 対象インターフェースの mlx5_net 状態
+ * 戻り値:
+ *   PF 番号
+ * コール元:
+ *   mlx5_net_send_frags(), mlx5_net_send_frags_async(),
+ *   mlx5_net_send_lso_async(), mlx5_net_tx_wait_free_slot()
+ */
 static int mlx5_net_pf_index(const mlx5_net_state_t *st)
 {
     return (st == &s_state_pf0) ? 0 : 1;
@@ -90,6 +111,20 @@ static int mlx5_net_pf_index(const mlx5_net_state_t *st)
 
 static int mlx5_net_try_recover(int pf_index, mlx5_dev_t *dev, mlx5_net_state_t *st);
 
+/*
+ * CQ の cc 番目の CQE が HW によって書かれ済みかを判定し、書かれていれば
+ * その生ポインタを返す。owner bit(周回ごとに反転)と opcode!=INVALID の
+ * 両方を見る -- 初期化センチネルの owner が最初の周回とたまたま一致して
+ * しまうため、owner だけでは「未書き込み」と区別できない。
+ *
+ * 引数:
+ *   cq_buf_addr - CQ バッファ先頭
+ *   cc          - コンシューマカウンタ(累積値)
+ * 戻り値:
+ *   到着済み CQE のポインタ。まだなら NULL
+ * コール元:
+ *   mlx5_net_poll_recv(), mlx5_net_sq_reap_one(), mlx5_net_drain_sq_cq()
+ */
 static volatile uint8_t *mlx5_net_cqe_if_ready(uint64_t cq_buf_addr, uint32_t cc)
 {
     uint32_t ci = cc & (MLX5_NET_CQ_NUM_ENTRIES - 1u);
@@ -107,6 +142,16 @@ static volatile uint8_t *mlx5_net_cqe_if_ready(uint64_t cq_buf_addr, uint32_t cc
     return cqe;
 }
 
+/*
+ * CQE の HW タイムスタンプ(timestamp_h/l)を 64bit の生サイクル値へ復元する。
+ *
+ * 引数:
+ *   cqe - mlx5_net_cqe_if_ready() が返した CQE
+ * 戻り値:
+ *   生サイクル値
+ * コール元:
+ *   mlx5_net_poll_recv(), mlx5_net_sq_reap_one()
+ */
 static uint64_t mlx5_cqe_hw_ts_cycles(volatile uint8_t *cqe)
 {
     uint32_t hi = ((uint32_t)cqe[MLX5_CQE_OFF_TIMESTAMP_H] << 24) |
@@ -120,6 +165,19 @@ static uint64_t mlx5_cqe_hw_ts_cycles(volatile uint8_t *cqe)
     return ((uint64_t)hi << 32) | (uint64_t)lo;
 }
 
+/*
+ * 前回読んだ HW タイムスタンプとの差分を ns 換算して ts へ記録する。
+ * dev->clock_khz が未取得(0)なら憶測で換算せず何もしない。ソフトウェア側の
+ * 計測値と突き合わせて「HW 遅延かポーリング遅延か」を切り分けるための計装。
+ *
+ * 引数:
+ *   dev        - この CQ を持つ HCA(clock_khz を持つ)
+ *   cur_cycles - 今回の HW タイムスタンプ
+ *   last / has_last - 前回値とその有効フラグ(呼び出し元が保持)
+ *   tag        - ts に記録する識別子
+ * コール元:
+ *   mlx5_net_poll_recv(), mlx5_net_sq_reap_one()
+ */
 static void mlx5_net_log_hw_ts_delta(mlx5_dev_t *dev, uint64_t cur_cycles,
                                       uint64_t *last_cycles, uint8_t *has_last,
                                       uint32_t tag)
@@ -138,6 +196,18 @@ static void mlx5_net_log_hw_ts_delta(mlx5_dev_t *dev, uint64_t cur_cycles,
     *has_last = 1u;
 }
 
+/*
+ * 通常送信/LSO 送信で共通の「WQE 本体を書き終えた後」の処理。ドアベル
+ * レコード更新 -> バリア -> BlueFlame への 64bit アトミック書き込み -> sq_pc
+ * 更新、の順に行う。BlueFlame は必ず単一の 64bit ストアで書くこと
+ * (32bit×2 に分けると 2 コアの書き込みがワイヤ上でインターリーブしうる)。
+ *
+ * 引数:
+ *   dev / st - 対象 HCA と mlx5_net 状態
+ *   wqe      - 書き終えた WQE の先頭
+ * コール元:
+ *   mlx5_net_post_frame(), mlx5_net_post_lso_frame()
+ */
 static void mlx5_net_wqe_commit(mlx5_dev_t *dev, mlx5_net_state_t *st,
                                  uint32_t pc, volatile uint8_t *wqe)
 {
@@ -164,6 +234,21 @@ static void mlx5_net_wqe_commit(mlx5_dev_t *dev, mlx5_net_state_t *st,
     st->sq_pc = new_pc;
 }
 
+/*
+ * 通常送信の WQE を 1 個組み立ててポストする。frag_count==1 かつ 60 バイト
+ * 以上なら呼び出し元バッファを直接 data_seg で指すゼロコピー、それ以外
+ * (複数断片/最小フレーム長未満のパディングが要る場合)はスロット別
+ * ステージバッファへ連結してから送る。
+ *
+ * 引数:
+ *   st         - 対象インターフェースの mlx5_net 状態
+ *   frags      - 断片配列
+ *   frag_count - 断片数
+ * 戻り値:
+ *   0=ポスト成功、-1=引数不正
+ * コール元:
+ *   mlx5_net_send_frags(), mlx5_net_send_frags_async()
+ */
 static int mlx5_net_post_frame(mlx5_net_state_t *st, const eth_frag_t *frags, unsigned frag_count)
 {
     if (frag_count < 1u || frag_count > ETH_TX_MAX_FRAGS) {
@@ -290,6 +375,21 @@ static int mlx5_net_post_frame(mlx5_net_state_t *st, const eth_frag_t *frags, un
     return 0;
 }
 
+/*
+ * LSO 送信の WQE を 1 個組み立ててポストする。hdr(L2+L3+L4)を eth_seg の
+ * インラインヘッダとして載せ、payload を data_seg で指すと、HW が mss 単位に
+ * 分割して複数フレームとして送出する。
+ *
+ * 引数:
+ *   st                    - mlx5_net 状態
+ *   hdr / hdr_len         - ヘッダテンプレート
+ *   payload / payload_len - 分割対象のペイロード
+ *   mss                   - 分割単位
+ * 戻り値:
+ *   0=ポスト成功、-1=引数不正
+ * コール元:
+ *   mlx5_net_send_lso_async()
+ */
 static int mlx5_net_post_lso_frame(mlx5_net_state_t *st, const void *hdr, uint16_t hdr_len,
                                     const void *payload, uint32_t payload_len, uint16_t mss)
 {
@@ -377,6 +477,17 @@ static int mlx5_net_post_lso_frame(mlx5_net_state_t *st, const void *hdr, uint16
     return 0;
 }
 
+/*
+ * SQ 用 CQ から到着済みの完了を最大 1 件だけ非ブロッキングで刈り取る。
+ * エラー CQE なら syndrome を表示して復帰(mlx5_net_try_recover())を試みる。
+ *
+ * 引数:
+ *   pf_index / dev / st - 対象 PF、HCA、mlx5_net 状態
+ * 戻り値:
+ *   1=1 件処理した、0=まだ到着していない、-1=エラー完了
+ * コール元:
+ *   mlx5_net_sq_wait_room(), mlx5_net_send_frags()
+ */
 static int mlx5_net_sq_reap_one(int pf_index, mlx5_dev_t *dev, mlx5_net_state_t *st)
 {
     uint64_t cq_buf = (uint64_t)dev->sq_cq_buf_cpu;
@@ -430,6 +541,18 @@ static int mlx5_net_sq_reap_one(int pf_index, mlx5_dev_t *dev, mlx5_net_state_t 
     return 1;
 }
 
+/*
+ * 次の WQE をポストできるだけの空きが SQ リングにできるまで待つ。まず
+ * 到着済みの完了を刈り取り、それでも空かなければタイムアウトまで繰り返す。
+ *
+ * 引数:
+ *   pf_index / dev / st - 対象 PF、HCA、mlx5_net 状態
+ * 戻り値:
+ *   0=空きあり、-1=タイムアウト(復帰処理を実施済み)
+ * コール元:
+ *   mlx5_net_send_frags(), mlx5_net_send_frags_async(),
+ *   mlx5_net_send_lso_async(), mlx5_net_tx_wait_free_slot()
+ */
 static int mlx5_net_sq_wait_room(int pf_index, mlx5_dev_t *dev, mlx5_net_state_t *st)
 {
     for (;;) {
@@ -463,6 +586,19 @@ static int mlx5_net_sq_wait_room(int pf_index, mlx5_dev_t *dev, mlx5_net_state_t
     return 0;
 }
 
+/*
+ * nic_ops_t.send_frags_async() の実体。WQE をポストしたら送信完了(CQE)を
+ * 待たずに即座に返る。SQ リングに空きが無いときだけ待つ。
+ *
+ * 引数:
+ *   priv       - mlx5_net 状態(netif_t.nic_priv)
+ *   frags      - 断片配列
+ *   frag_count - 断片数
+ * 戻り値:
+ *   0=キューイング成功、-1=失敗
+ * コール元:
+ *   eth_send_frags_async() から nic_ops_t 経由
+ */
 static int mlx5_net_send_frags_async(void *priv, const eth_frag_t *frags, unsigned frag_count)
 {
     mlx5_net_state_t *st = (mlx5_net_state_t *)priv;
@@ -484,6 +620,18 @@ static int mlx5_net_send_frags_async(void *priv, const eth_frag_t *frags, unsign
     return mlx5_net_post_frame(st, frags, frag_count);
 }
 
+/*
+ * nic_ops_t.send_frags() の実体。WQE をポストし、自分がポストした WQE の
+ * 完了(CQE)まで待ってから返る(ARP/ICMP など送信成否をその場で確認したい
+ * 呼び出し元向け)。
+ *
+ * 引数:
+ *   priv / frags / frag_count - send_frags_async() と同じ
+ * 戻り値:
+ *   0=送信完了、-1=失敗/タイムアウト
+ * コール元:
+ *   eth_send_frags() から nic_ops_t 経由
+ */
 static int mlx5_net_send_frags(void *priv, const eth_frag_t *frags, unsigned frag_count)
 {
     mlx5_net_state_t *st = (mlx5_net_state_t *)priv;
@@ -530,6 +678,19 @@ static int mlx5_net_send_frags(void *priv, const eth_frag_t *frags, unsigned fra
     return 0;
 }
 
+/*
+ * nic_ops_t.send_lso() の実体。LSO WQE をポストして完了を待たずに返る。
+ *
+ * 引数:
+ *   priv                  - mlx5_net 状態
+ *   hdr / hdr_len         - ヘッダテンプレート
+ *   payload / payload_len - 分割対象のペイロード
+ *   mss                   - 分割単位
+ * 戻り値:
+ *   0=キューイング成功、-1=失敗
+ * コール元:
+ *   eth_send_lso_async() から nic_ops_t 経由
+ */
 static int mlx5_net_send_lso_async(void *priv, const void *hdr, uint16_t hdr_len,
                                     const void *payload, uint32_t payload_len, uint16_t mss)
 {
@@ -556,6 +717,15 @@ static int mlx5_net_send_lso_async(void *priv, const void *hdr, uint16_t hdr_len
     return mlx5_net_post_lso_frame(st, hdr, hdr_len, payload, payload_len, mss);
 }
 
+/*
+ * SQ の WQE リングと CQ の生内容を ts へダンプする(読み取り専用で HCA の
+ * コマンドインターフェースには触れないので、SQ が詰まった状態でも安全)。
+ *
+ * 引数:
+ *   pf_index - 対象 PF
+ * コール元:
+ *   mlx5_net_try_recover()
+ */
 void mlx5_net_dump_sq_debug(int pf_index)
 {
     mlx5_net_state_t *st = (pf_index == 0) ? &s_state_pf0 : &s_state_pf1;
@@ -605,6 +775,15 @@ void mlx5_net_dump_sq_debug(int pf_index)
     }
 }
 
+/*
+ * SQ 復帰後に、CQ へ残っている完了(flush CQE を含む)を全て読み捨てて
+ * sq_cq_cc をハードウェアと同期させる。
+ *
+ * 引数:
+ *   dev / st - 対象 HCA と mlx5_net 状態
+ * コール元:
+ *   mlx5_net_try_recover()
+ */
 static void mlx5_net_drain_sq_cq(mlx5_dev_t *dev, mlx5_net_state_t *st)
 {
     uint64_t cq_buf = (uint64_t)dev->sq_cq_buf_cpu;
@@ -628,6 +807,19 @@ static void mlx5_net_drain_sq_cq(mlx5_dev_t *dev, mlx5_net_state_t *st)
                 drained, st->sq_cq_cc);
 }
 
+/*
+ * SQ の TX タイムアウト/エラー CQE を検出したときの復帰処理。直近
+ * MLX5_NET_SQ_RECOVER_WINDOW_MS 内に MLX5_NET_SQ_RECOVER_MAX_ATTEMPTS 回
+ * までというサーキットブレーカー付きで、mlx5_recover_sq()(ERR->RST->RDY)
+ * を試み、成功したら CQ を drain してカウンタを同期させる。
+ *
+ * 引数:
+ *   pf_index / dev / st - 対象 PF、HCA、mlx5_net 状態
+ * 戻り値:
+ *   1=復帰成功(送信を再試行してよい)、0=復帰せず
+ * コール元:
+ *   mlx5_net_send_frags(), mlx5_net_sq_reap_one(), mlx5_net_sq_wait_room()
+ */
 static int mlx5_net_try_recover(int pf_index, mlx5_dev_t *dev, mlx5_net_state_t *st)
 {
     if (timeout_ms(s_recover_window_start[pf_index], MLX5_NET_SQ_RECOVER_WINDOW_MS)) {
@@ -681,6 +873,18 @@ static int mlx5_net_try_recover(int pf_index, mlx5_dev_t *dev, mlx5_net_state_t 
     return 0;
 }
 
+/*
+ * nic_ops_t.tx_wait_free_slot() の実体。ゼロコピー送信では呼び出し元の
+ * バッファをそのまま DMA ソースにするため、そのスロットの前回の WQE が
+ * 完了するまで待ってからスロット番号を返す。
+ *
+ * 引数:
+ *   priv - mlx5_net 状態
+ * 戻り値:
+ *   次に使う SQ スロット番号
+ * コール元:
+ *   eth_tx_wait_free_slot() から nic_ops_t 経由
+ */
 static unsigned mlx5_net_tx_wait_free_slot(void *priv)
 {
     mlx5_net_state_t *st = (mlx5_net_state_t *)priv;
@@ -693,6 +897,14 @@ static unsigned mlx5_net_tx_wait_free_slot(void *priv)
     return (unsigned)(st->sq_pc % MLX5_SQ_WQE_COUNT);
 }
 
+/*
+ * RQ ドアベルレコードへ「投稿済み WQE 数の累計」を書き込む。
+ *
+ * 引数:
+ *   dev / st - 対象 HCA と mlx5_net 状態
+ * コール元:
+ *   mlx5_net_rq_flush_rearm()
+ */
 static inline void mlx5_net_rq_write_dbr(mlx5_dev_t *dev, mlx5_net_state_t *st)
 {
     volatile uint8_t *rq_dbr = (volatile uint8_t *)(uintptr_t)(uint64_t)dev->rxq[0].dbr_cpu;
@@ -702,6 +914,16 @@ static inline void mlx5_net_rq_write_dbr(mlx5_dev_t *dev, mlx5_net_state_t *st)
     rq_dbr[3] = (uint8_t)st->rq_posted_ctr;
 }
 
+/*
+ * 受信ゼロコピーのため再武装を遅延していた RQ WQE を、まとめてドアベルへ
+ * 反映する。net_buf が RQ バッファを直接指すので、呼び出し元が dispatch+free
+ * を終えた次の poll_recv() 冒頭で 1 フレーム遅れて再武装する。
+ *
+ * 引数:
+ *   dev / st - 対象 HCA と mlx5_net 状態
+ * コール元:
+ *   mlx5_net_poll_recv()
+ */
 static inline void mlx5_net_rq_flush_rearm(mlx5_dev_t *dev, mlx5_net_state_t *st)
 {
     if (st->rq_rearm_pending == 0u) {
@@ -712,6 +934,18 @@ static inline void mlx5_net_rq_flush_rearm(mlx5_dev_t *dev, mlx5_net_state_t *st
     mlx5_net_rq_write_dbr(dev, st);
 }
 
+/*
+ * nic_ops_t.poll_recv() の実体。前回分の RQ 再武装を済ませてから RQ 用 CQ を
+ * 1 件ポーリングし、受信があれば net_buf の data を RQ バッファへ直接向けて
+ * (ゼロコピー)返す。CQE の L3/L4 チェックサム検証結果も net_buf へ載せる。
+ *
+ * 引数:
+ *   priv - mlx5_net 状態
+ * 戻り値:
+ *   受信フレームの net_buf。無ければ NULL
+ * コール元:
+ *   net_poll_all_and_dispatch() から nic_ops_t 経由
+ */
 static net_buf_t *mlx5_net_poll_recv(void *priv)
 {
     mlx5_net_state_t *st = (mlx5_net_state_t *)priv;
@@ -788,6 +1022,21 @@ static const nic_ops_t s_mlx5_net_ops = {
     .poll_recv         = mlx5_net_poll_recv,
 };
 
+/*
+ * bring-up 済みの HCA を 1 つのネットワークインターフェースとして構成する
+ * (名前・IP・MAC・nic_ops・MSS 上限・RX リング段数・HW オフロード能力)。
+ * MSS 上限はポートの実 MTU(PMTU で設定できた値)から逆算する。
+ *
+ * 引数:
+ *   ctx        - 構成する netif
+ *   st         - このインターフェース用の mlx5_net 状態
+ *   dev        - bring-up 済み HCA
+ *   name       - インターフェース名("mlx5-pf0" 等)
+ *   ip         - 自機 IPv4
+ *   mac_last   - MAC の末尾バイト(前半は固定のローカル管理アドレス)
+ * コール元:
+ *   mlx5_net_register_dual()
+ */
 static void mlx5_netif_setup(netif_t *ctx, mlx5_net_state_t *st, mlx5_dev_t *dev,
                                 const char *name, uint32_t ip, uint8_t mac_low_octet)
 {
@@ -828,6 +1077,17 @@ static void mlx5_netif_setup(netif_t *ctx, mlx5_net_state_t *st, mlx5_dev_t *dev
     }
 }
 
+/*
+ * bring-up 済みの 2 つの PF を "mlx5-pf0"/"mlx5-pf1" として netif 登録し、
+ * PF0 をアクティブにする。以後 arp/ip/tcp はこの 2 本を使う。
+ *
+ * 引数:
+ *   dev0, dev1 - bring-up 済みの PF0/PF1
+ * 戻り値:
+ *   0=成功
+ * コール元:
+ *   run_shell()
+ */
 int mlx5_net_register_dual(mlx5_dev_t *dev0, mlx5_dev_t *dev1)
 {
     mlx5_netif_setup(&s_ctx_pf0, &s_state_pf0, dev0, "mlx5-pf0",

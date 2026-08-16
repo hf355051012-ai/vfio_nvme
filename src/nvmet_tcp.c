@@ -12,6 +12,17 @@
 #define NVMET_TCP_MAXH2CDATA_UNSCALED 32768u
 #define NVMET_TCP_MAXH2CDATA_SCALED   262144u
 
+/*
+ * このコネクションで 1 回の H2CData PDU に載せてよい最大データ長を返す
+ * (ICResp で相手へ広告した MAXH2CDATA と同じ値)。
+ *
+ * 引数:
+ *   c - 対象コネクション
+ * 戻り値:
+ *   最大バイト数
+ * コール元:
+ *   nvmet_tcp_send_icresp(), nvmet_io_dispatch_cmd(), nvmet_io_dispatch_h2c()
+ */
 uint32_t nvmet_tcp_max_h2c_data(const nvmet_tcp_conn_t *c)
 {
     return tcp_window_scaling_enabled(&c->tcp)
@@ -19,6 +30,21 @@ uint32_t nvmet_tcp_max_h2c_data(const nvmet_tcp_conn_t *c)
         : NVMET_TCP_MAXH2CDATA_UNSCALED;
 }
 
+/*
+ * ヘッダダイジェストが有効なら buf[0..hlen) の CRC32C を buf[hlen..+4) へ
+ * 書く。**呼び出し元は先に flags/plen/pdo など hlen 範囲の全フィールドを
+ * 最終状態まで確定させておくこと**(実機で 2 度踏んだ、ダイジェスト計算後に
+ * ヘッダを書き換えると相手側の検証だけが静かに失敗する)。
+ *
+ * 引数:
+ *   c    - 対象コネクション(hdgst 有効判定に使う)
+ *   buf  - PDU ヘッダ先頭
+ *   hlen - ヘッダ長
+ * 戻り値:
+ *   付加したバイト数(0 か 4)
+ * コール元:
+ *   nvmet_tcp_send_r2t(), nvmet_tcp_send_resp(), nvmet_tcp_send_c2h()
+ */
 static uint32_t nvmet_tcp_append_hdgst(nvmet_tcp_conn_t *c, uint8_t *buf, uint32_t hlen)
 {
     if (!c->hdgst) return 0;
@@ -27,6 +53,20 @@ static uint32_t nvmet_tcp_append_hdgst(nvmet_tcp_conn_t *c, uint8_t *buf, uint32
     return 4u;
 }
 
+/*
+ * データダイジェストが有効かつ dlen>0 なら、データ本体の CRC32C を
+ * その直後へ書く。対象はデータのみでヘッダは範囲外。
+ *
+ * 引数:
+ *   c        - 対象コネクション
+ *   buf      - PDU 先頭
+ *   data_off - データ本体のオフセット
+ *   dlen     - データ長
+ * 戻り値:
+ *   付加したバイト数(0 か 4)
+ * コール元:
+ *   nvmet_tcp_send_c2h()
+ */
 static uint32_t nvmet_tcp_append_ddgst(nvmet_tcp_conn_t *c, uint8_t *buf,
                                         uint32_t data_off, uint32_t dlen)
 {
@@ -66,6 +106,18 @@ int nvmet_tcp_recv_poll(nvmet_tcp_conn_t *c, nvmet_tcp_xfer_t *x)
     return (x->got >= x->want) ? 1 : 0;
 }
 
+/*
+ * PDU ヘッダの plen/hlen とダイジェスト設定から、後続データ本体の長さを
+ * 求める(I/O を伴わない純粋な計算)。
+ *
+ * 引数:
+ *   c       - 対象コネクション(ダイジェスト有無で差し引く量が変わる)
+ *   hdr_buf - 受信済みの共通ヘッダ 8 バイト
+ * 戻り値:
+ *   データ本体のバイト数
+ * コール元:
+ *   nvmet_admin_job_step(), nvmet_io_job_step_impl()
+ */
 uint32_t nvmet_tcp_parse_cmd_dlen(const nvmet_tcp_conn_t *c, const uint8_t hdr_buf[NVME_TCP_HDR_LEN])
 {
     uint8_t  hlen = hdr_buf[2];
@@ -77,6 +129,19 @@ uint32_t nvmet_tcp_parse_cmd_dlen(const nvmet_tcp_conn_t *c, const uint8_t hdr_b
     return dlen;
 }
 
+/*
+ * 受信したヘッダダイジェストを検証する(I/O を伴わない純粋な計算)。
+ *
+ * 引数:
+ *   c        - 対象コネクション
+ *   hdr / hdr_len   - 共通ヘッダ部
+ *   rest / rest_len - 型固有部
+ *   dgst     - 受信した 4 バイトのダイジェスト
+ * 戻り値:
+ *   0=一致、-1=不一致
+ * コール元:
+ *   nvmet_admin_job_step(), nvmet_io_job_step_impl()
+ */
 int nvmet_tcp_verify_hdgst(const nvmet_tcp_conn_t *c,
                             const void *hdr1, uint32_t len1,
                             const void *hdr2, uint32_t len2,
@@ -96,6 +161,18 @@ int nvmet_tcp_verify_hdgst(const nvmet_tcp_conn_t *c,
     return 0;
 }
 
+/*
+ * 受信したデータダイジェストを検証する。
+ *
+ * 引数:
+ *   c    - 対象コネクション
+ *   data / dlen - データ本体
+ *   dgst - 受信した 4 バイトのダイジェスト
+ * 戻り値:
+ *   0=一致、-1=不一致
+ * コール元:
+ *   nvmet_admin_job_step(), nvmet_io_job_step_impl()
+ */
 int nvmet_tcp_verify_ddgst(const nvmet_tcp_conn_t *c,
                             const void *data, uint32_t len,
                             const uint8_t got[4])
@@ -112,11 +189,33 @@ int nvmet_tcp_verify_ddgst(const nvmet_tcp_conn_t *c,
     return 0;
 }
 
+/*
+ * ブロックせずに accept の受け皿だけを用意する。早着 SYN を取りこぼさない
+ * よう、実際に待ち始める前に呼んでおく。
+ *
+ * 引数:
+ *   c        - 受け皿にするコネクション
+ *   listener - リッスン中のソケット
+ * コール元:
+ *   nvmet_admin_job_step(), nvmet_io_job_step_impl()
+ */
 void nvmet_tcp_accept_arm(nvmet_tcp_conn_t *c, int listener)
 {
     tcp_accept_begin(listener, &c->tcp);
 }
 
+/*
+ * 受信した ICReq のダイジェスト設定をそのまま受理してコネクションへ記録し、
+ * ICResp を返す(MAXH2CDATA もここで広告する)。
+ *
+ * 引数:
+ *   c          - 対象コネクション
+ *   icreq_buf  - 受信した ICReq
+ * 戻り値:
+ *   0=送信完了、-1=フォーマット不正/送信失敗
+ * コール元:
+ *   nvmet_admin_job_step(), nvmet_io_job_step_impl()
+ */
 int nvmet_tcp_send_icresp(nvmet_tcp_conn_t *c, const uint8_t icreq_buf[NVME_TCP_ICREQ_LEN])
 {
     uint8_t type = icreq_buf[0];
@@ -160,6 +259,19 @@ int nvmet_tcp_send_icresp(nvmet_tcp_conn_t *c, const uint8_t icreq_buf[NVME_TCP_
     return 0;
 }
 
+/*
+ * R2T PDU を送信して、ホストへ [r2to, r2to+r2tl) の H2CData を要求する。
+ * 送りっぱなし(tcp_send_async)で、直後に受信フェーズへ進む。
+ *
+ * 引数:
+ *   c           - 対象コネクション
+ *   cid / ttag  - 対応するコマンド id と転送タグ
+ *   r2to / r2tl - 要求する範囲
+ * 戻り値:
+ *   0=送信成功、-1=失敗
+ * コール元:
+ *   nvmet_io_dispatch_cmd(), nvmet_io_dispatch_h2c()
+ */
 int nvmet_tcp_send_r2t(nvmet_tcp_conn_t *c, uint16_t cid,
                         uint32_t r2to, uint32_t r2tl)
 {
@@ -236,6 +348,21 @@ int nvmet_tcp_send_resp(nvmet_tcp_conn_t *c, const nvme_cqe_t *cqe)
     return 0;
 }
 
+/*
+ * C2HData PDU を送信する(データ本体を C2H 用バッファへコピーしてから
+ * 1 回の tcp_send() で送る同期版)。dlen が MDTS 以下なら常に単一 PDU で
+ * 収まるため、チャンク境界で送信パイプラインを空にすることがない。
+ *
+ * 引数:
+ *   c    - 対象コネクション
+ *   cid  - 対応するコマンド id
+ *   cqe  - DATA_SUCCESS で埋め込む CQE(別送しない)
+ *   data / dlen - 送るデータ
+ * 戻り値:
+ *   0=送信完了、-1=失敗
+ * コール元:
+ *   nvmet_io_dispatch_cmd(), nvmet_admin_dispatch()
+ */
 int nvmet_tcp_send_c2h(nvmet_tcp_conn_t *c, uint16_t cid, const nvme_cqe_t *cqe,
                        const void *data, uint32_t dlen,
                        int data_success)
@@ -306,6 +433,18 @@ int nvmet_tcp_send_c2h(nvmet_tcp_conn_t *c, uint16_t cid, const nvme_cqe_t *cqe,
     return 0;
 }
 
+/*
+ * nvmet_tcp_send_c2h() の非同期・ゼロコピー版。data から直接 tcp_send_async()
+ * へ渡し ACK を待たずに返る。ダイジェスト有効時は連続バッファが要るため
+ * 使えない(呼び出し元が同期版へフォールバックする)。
+ *
+ * 引数:
+ *   c / cid / cqe / data / dlen - nvmet_tcp_send_c2h() と同じ
+ * 戻り値:
+ *   0=キューイング成功、-1=失敗
+ * コール元:
+ *   nvmet_io_dispatch_cmd()
+ */
 int nvmet_tcp_send_c2h_async(nvmet_tcp_conn_t *c, uint16_t cid,
                               const void *data, uint32_t dlen)
 {
@@ -361,6 +500,14 @@ int nvmet_tcp_send_c2h_async(nvmet_tcp_conn_t *c, uint16_t cid,
     return 0;
 }
 
+/*
+ * NVMe/TCP コネクションの TCP を切断し、状態をクリアする。
+ *
+ * 引数:
+ *   c - 対象コネクション
+ * コール元:
+ *   nvmet_admin_job_step(), nvmet_admin_job_setup_fail(), nvmet_io_job_end()
+ */
 void nvmet_tcp_close(nvmet_tcp_conn_t *c)
 {
     tcp_close(&c->tcp);

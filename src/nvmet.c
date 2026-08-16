@@ -38,6 +38,15 @@ static void nvmet_copy_padded(volatile uint8_t *dst, const char *src, uint32_t f
     }
 }
 
+/*
+ * Identify Controller 応答(4096 バイト)を組み立てる。SN/MN/FR、MDTS、
+ * IOCCSZ/IORCSZ(in-capsule 上限)、MAXCMD、CAP 相当の値を設定する。
+ *
+ * 引数:
+ *   ctx - ターゲットコンテキスト
+ * コール元:
+ *   nvmet_job_start()
+ */
 static void nvmet_build_id_ctrl(nvmet_ctx_t *ctx)
 {
     nvmet_zero(ctx->id_ctrl, sizeof(ctx->id_ctrl));
@@ -74,6 +83,15 @@ static void nvmet_build_id_ctrl(nvmet_ctx_t *ctx)
     ctx->id_ctrl[1803] = 1;                      /* MSDBD = 1 */
 }
 
+/*
+ * Identify Namespace 応答(4096 バイト)を組み立てる。NSZE/NCAP/NUSE と
+ * LBA フォーマットを設定する。
+ *
+ * 引数:
+ *   ctx - ターゲットコンテキスト
+ * コール元:
+ *   nvmet_job_start()
+ */
 static void nvmet_build_id_ns(nvmet_ctx_t *ctx)
 {
     nvmet_zero(ctx->id_ns, sizeof(ctx->id_ns));
@@ -96,6 +114,19 @@ static void nvmet_build_cqe(nvme_cqe_t *cqe, uint16_t cid,
     wr16le(&cqe->status, status);
 }
 
+/*
+ * admin queue の 1 コマンド(受信済み SQE)を解釈して応答する。Fabrics
+ * Connect / Property Set / Property Get(CAP・CC・CSTS)/ Identify /
+ * Set Features / Keep Alive を扱う。
+ *
+ * 引数:
+ *   ctx - ターゲットコンテキスト
+ *   sqe - 受信した SQE
+ * 戻り値:
+ *   0=応答送信まで完了、-1=送信失敗
+ * コール元:
+ *   nvmet_admin_job_step()
+ */
 static int nvmet_admin_dispatch(nvmet_ctx_t *ctx, const nvme_sqe_t *sqe)
 {
     uint32_t   opcode = rd32le(&sqe->cdw0) & 0xFFu;
@@ -223,6 +254,19 @@ typedef struct {
 
 static nvmet_admin_job_ctx_t s_admin_job_pool[NVMET_MAX_INSTANCES];
 
+/*
+ * セッション確立段階(ICReq タイムアウト/受信失敗/ICResp 送信失敗)での
+ * 失敗処理。コネクションを閉じて accept 待ちの初期状態へ戻す(サーバ自体は
+ * 止めず、次のクライアントを待つ)。
+ *
+ * 引数:
+ *   self - このジョブ
+ *   ctx  - ターゲットコンテキスト
+ * 戻り値:
+ *   JOB_WAITING(常駐サーバとして継続)
+ * コール元:
+ *   nvmet_admin_job_step()
+ */
 static job_result_t nvmet_admin_job_setup_fail(job_t *self, nvmet_ctx_t *ctx)
 {
     nvmet_tcp_close(&ctx->admin);
@@ -230,6 +274,19 @@ static job_result_t nvmet_admin_job_setup_fail(job_t *self, nvmet_ctx_t *ctx)
     return JOB_WAITING;
 }
 
+/*
+ * admin queue のステートマシン 1 tick。accept 待ち -> ICReq 受信 -> ICResp
+ * 送信(この時点で IO キューの受け皿を arm する)-> 以後はコマンド受信と
+ * ディスパッチのループ。セッションが終わっても JOB_DONE にはせず、次の
+ * クライアントを待つ常駐サーバとして振る舞う。
+ *
+ * 引数:
+ *   self - このジョブ
+ * 戻り値:
+ *   JOB_WAITING=継続、JOB_DONE=アイドル中の Ctrl+C でサーバ停止
+ * コール元:
+ *   job_scheduler_tick() から関数ポインタ経由
+ */
 static job_result_t nvmet_admin_job_step(job_t *self)
 {
     nvmet_admin_job_ctx_t *jc  = (nvmet_admin_job_ctx_t *)self->ctx;
@@ -413,6 +470,16 @@ static job_result_t nvmet_admin_job_step(job_t *self)
     }
 }
 
+/*
+ * 進行中の write コマンド(R2T を出してデータ待ち)のスロットを 1 つ確保する。
+ *
+ * 引数:
+ *   ctx - ターゲットコンテキスト
+ * 戻り値:
+ *   スロット番号。空きが無ければ -1
+ * コール元:
+ *   nvmet_io_dispatch_cmd()
+ */
 static int nvmet_pending_write_alloc(nvmet_ctx_t *ctx)
 {
     for (unsigned i = 0; i < NVMET_MAX_PENDING_WRITES; i++) {
@@ -421,6 +488,18 @@ static int nvmet_pending_write_alloc(nvmet_ctx_t *ctx)
     return -1;
 }
 
+/*
+ * 進行中の write コマンドから cid が一致するスロットを探す(受信した
+ * H2CData をどのコマンドのものか対応付けるのに使う)。
+ *
+ * 引数:
+ *   ctx - ターゲットコンテキスト
+ *   cid - 探すコマンド id
+ * 戻り値:
+ *   スロット番号。見つからなければ -1
+ * コール元:
+ *   nvmet_io_job_h2c_validate(), nvmet_io_rx_upcall()
+ */
 static int nvmet_pending_write_find(nvmet_ctx_t *ctx, uint16_t cid)
 {
     for (unsigned i = 0; i < NVMET_MAX_PENDING_WRITES; i++) {
@@ -429,6 +508,16 @@ static int nvmet_pending_write_find(nvmet_ctx_t *ctx, uint16_t cid)
     return -1;
 }
 
+/*
+ * IO キューでストリーム desync らしき異常(想定外の PDU 種別、未知の cccid、
+ * datao 不一致など)を検出した際に、TCP 層の詳細状態を表示する診断ヘルパ。
+ *
+ * 引数:
+ *   ctx    - ターゲットコンテキスト
+ *   reason - 検出した異常の説明
+ * コール元:
+ *   nvmet_io_job_h2c_validate(), nvmet_io_job_step_impl()
+ */
 static void nvmet_io_debug_desync(nvmet_ctx_t *ctx, const char *reason)
 {
     uart_printf("\n[DEBUG] ==== IOキューdesync検出: %s ====\n", reason);
@@ -559,7 +648,18 @@ static job_result_t nvmet_io_job_end(job_t *self, nvmet_ctx_t *ctx, int close_io
     return JOB_WAITING;
 }
 
-/* 定常ループ中の受信エラー(r<0)を一元処理する。上記コメント参照。 */
+/*
+ * 定常ループ中の受信エラーを一元処理する。Ctrl+C 中断なら中断として、
+ * FIN/RST ならセッション終了として扱い、それ以外は次の PDU ヘッダから
+ * 仕切り直す。
+ *
+ * 引数:
+ *   self / jc / ctx - このジョブ、IO ジョブ状態、ターゲットコンテキスト
+ * 戻り値:
+ *   JOB_WAITING(常駐サーバとして継続)
+ * コール元:
+ *   nvmet_io_job_step_impl()
+ */
 static job_result_t nvmet_io_job_recv_fail(job_t *self, nvmet_io_job_ctx_t *jc, nvmet_ctx_t *ctx)
 {
     if (tcp_abort_requested()) {
@@ -575,6 +675,18 @@ static job_result_t nvmet_io_job_recv_fail(job_t *self, nvmet_io_job_ctx_t *jc, 
     return JOB_WAITING;
 }
 
+/*
+ * H2CData ヘッダを受信し終えた直後の検証。未知の cccid、datao の不一致、
+ * write_len 超過を、**データ本体を受信する前に**確認する(検証前に受信
+ * すると受信先バッファの安全な範囲が保証されない)。
+ *
+ * 引数:
+ *   self / jc / ctx - このジョブ、IO ジョブ状態、ターゲットコンテキスト
+ * 戻り値:
+ *   JOB_WAITING(検証を通れば受信状態へ、失敗ならセッション終了)
+ * コール元:
+ *   nvmet_io_job_step_impl()
+ */
 static job_result_t nvmet_io_job_h2c_validate(job_t *self, nvmet_io_job_ctx_t *jc, nvmet_ctx_t *ctx)
 {
     int slot = nvmet_pending_write_find(ctx, jc->cccid);
@@ -603,6 +715,21 @@ static job_result_t nvmet_io_job_h2c_validate(job_t *self, nvmet_io_job_ctx_t *j
     return JOB_WAITING;
 }
 
+/*
+ * IO キューの 1 コマンド(Command Capsule)を処理して応答する。read は
+ * C2HData で返し、write は in-capsule なら即コミット、超過分は R2T を出して
+ * H2CData を待つ。
+ *
+ * 引数:
+ *   ctx      - ターゲットコンテキスト
+ *   hdr_buf  - 受信した共通ヘッダ
+ *   sqe      - 受信した SQE
+ *   cid      - コマンド id
+ *   dlen     - in-capsule データ長
+ *   incap_committed - in-capsule データを既に RAM ディスクへ書き込み済みか
+ * コール元:
+ *   nvmet_io_job_step_impl()
+ */
 static void nvmet_io_dispatch_cmd(nvmet_ctx_t *ctx, const uint8_t *hdr_buf,
                                    const uint8_t *sqe_buf, uint16_t cid,
                                    uint32_t dlen, int incap_committed)
@@ -727,6 +854,18 @@ static void nvmet_io_dispatch_cmd(nvmet_ctx_t *ctx, const uint8_t *hdr_buf,
     }
 }
 
+/*
+ * 受信し終えた H2CData を処理する。要求範囲を満たしたら CQE を返し、まだ
+ * 残りがあれば次の R2T を出す。
+ *
+ * 引数:
+ *   ctx      - ターゲットコンテキスト
+ *   h2c_slot - 対応する write スロット
+ *   hdr_buf  - 受信した共通ヘッダ
+ *   cccid / ttag / datao / datal - H2CData ヘッダのフィールド
+ * コール元:
+ *   nvmet_io_job_step_impl()
+ */
 static void nvmet_io_dispatch_h2c(nvmet_ctx_t *ctx, int h2c_slot,
                                    const uint8_t *hdr_buf, uint16_t cccid,
                                    uint16_t ttag, uint32_t datao, uint32_t datal)
@@ -766,6 +905,15 @@ static void nvmet_io_dispatch_h2c(nvmet_ctx_t *ctx, int h2c_slot,
     }
 }
 
+/*
+ * 受信 upcall 側から、完成した 1 コマンドを ready-ring へ積む。リングが
+ * 満杯(dispatch が追いつかない)なら prx_error を立てる。
+ *
+ * 引数:
+ *   jc - IO ジョブ状態
+ * コール元:
+ *   nvmet_io_rx_upcall()
+ */
 static void nvmet_ready_push_cmd(nvmet_io_job_ctx_t *jc)
 {
     if (jc->ready_head - jc->ready_tail >= NVMET_READY_RING) { jc->prx_error = 1; return; }
@@ -780,6 +928,14 @@ static void nvmet_ready_push_cmd(nvmet_io_job_ctx_t *jc)
     jc->ready_head++;
 }
 
+/*
+ * 受信 upcall 側から、完成した 1 件の H2CData を ready-ring へ積む。
+ *
+ * 引数:
+ *   jc - IO ジョブ状態
+ * コール元:
+ *   nvmet_io_rx_upcall()
+ */
 static void nvmet_ready_push_h2c(nvmet_io_job_ctx_t *jc)
 {
     if (jc->ready_head - jc->ready_tail >= NVMET_READY_RING) { jc->prx_error = 1; return; }
@@ -795,6 +951,19 @@ static void nvmet_ready_push_h2c(nvmet_io_job_ctx_t *jc)
     jc->ready_head++;
 }
 
+/*
+ * IO キューの push 型受信ハンドラ。tcp_input() から in-order データをその場
+ * で受け取り、PDU をストリーム解析する(ヘッダ -> 型固有部 -> データ)。
+ * in-capsule write データは rx_buf を経由せず RAM ディスクへ直接配置し、
+ * 完成したコマンドは ready-ring へ積む(送信はここでは一切行わない)。
+ *
+ * 引数:
+ *   arg  - IO ジョブ状態
+ *   data - 到着した in-order バイト列
+ *   len  - そのバイト数
+ * コール元:
+ *   tcp_input() から tcp_recv_upcall として
+ */
 static void nvmet_io_rx_upcall(void *arg, const volatile uint8_t *data, uint16_t len)
 {
     nvmet_io_job_ctx_t *jc  = (nvmet_io_job_ctx_t *)arg;
@@ -924,6 +1093,19 @@ static void nvmet_io_rx_upcall(void *arg, const volatile uint8_t *data, uint16_t
     }
 }
 
+/*
+ * IO キューのステートマシン本体 1 tick。admin の準備完了を待って accept ->
+ * ICReq/ICResp -> 以後はコマンド受信とディスパッチ。非 digest 接続では
+ * push 型受信を登録し、ready-ring に積まれたコマンドをここで dispatch する
+ * (送信は受信コンテキストの外で行う)。
+ *
+ * 引数:
+ *   self - このジョブ
+ * 戻り値:
+ *   JOB_WAITING=継続
+ * コール元:
+ *   nvmet_io_job_step()
+ */
 static job_result_t nvmet_io_job_step_impl(job_t *self)
 {
     nvmet_io_job_ctx_t *jc  = (nvmet_io_job_ctx_t *)self->ctx;
@@ -1250,11 +1432,37 @@ static job_result_t nvmet_io_job_step_impl(job_t *self)
     }
 }
 
+/*
+ * IO キュージョブのエントリ。停止要求を確認してから
+ * nvmet_io_job_step_impl() へ委譲する。
+ *
+ * 引数:
+ *   self - このジョブ
+ * 戻り値:
+ *   JOB_WAITING=継続、JOB_DONE=停止要求
+ * コール元:
+ *   job_scheduler_tick() から関数ポインタ経由
+ */
 static job_result_t nvmet_io_job_step(job_t *self)
 {
     return nvmet_io_job_step_impl(self);
 }
 
+/*
+ * NVMe/TCP ターゲットを常駐起動する。指定インターフェースで port を
+ * リッスンし、admin/IO の 2 本のジョブを spawn して即座に返る。同じ
+ * インターフェースで既に別インスタンスが稼働していれば起動を拒否する。
+ *
+ * 引数:
+ *   ctx       - ターゲットコンテキスト(RAM ディスクを含む)
+ *   port      - リッスンポート
+ *   bound_ctx - 使用するネットワークインターフェース
+ *   label     - ログ用の名前
+ * 戻り値:
+ *   0=起動した、-1=稼働中/リッスン失敗/ジョブテーブル満杯
+ * コール元:
+ *   shell_dispatch(), shell_ensure_tcp_session()
+ */
 int nvmet_job_start(nvmet_ctx_t *ctx, uint16_t port, netif_t *bound_ctx, const char *label)
 {
     if (ctx->session_active) {

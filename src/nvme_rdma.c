@@ -9,6 +9,15 @@
 #include "smp.h"
 #include "platform.h"
 
+/*
+ * ループバック検証用 RAM ディスク(インスタンス 1)を COHERENT DMA アリーナ
+ * から初回だけ確保して返す。
+ *
+ * 戻り値:
+ *   RAM ディスク先頭
+ * コール元:
+ *   nvme_rdma_run_bench()
+ */
 static volatile uint8_t *nvmer_ramdisk_slot1(void)
 {
     static volatile uint8_t *s_rd1 = 0;
@@ -44,6 +53,19 @@ static void nvmer_copy_str_v(volatile uint8_t *dst, uint32_t field_len, const ch
     }
 }
 
+/*
+ * Keyed SGL Data Block descriptor(16 バイト)を SQE の dptr へ書く。
+ * addr/length/key/type=0x40 の順で、length は 3 バイト LE。
+ *
+ * 引数:
+ *   dptr - 書き込み先(SQE 内 offset 24)
+ *   addr - ローカルバッファの IOVA
+ *   len  - 転送バイト数
+ *   key  - 自分の mkey(相手がこれを使って RDMA する)
+ * コール元:
+ *   nvmer_build_connect(), nvmer_build_prop_set/get(),
+ *   nvmer_build_identify(), nvmer_build_io_ex()
+ */
 static void nvmer_set_ksgl(volatile uint8_t *dptr, uint64_t addr, uint32_t len, uint32_t key)
 {
     wr64le(&dptr[0], addr);
@@ -57,6 +79,19 @@ static void nvmer_set_ksgl(volatile uint8_t *dptr, uint64_t addr, uint32_t len, 
     dptr[15] = (uint8_t)NVME_SGL_TYPE_KEYED_DATA_BLOCK;
 }
 
+/*
+ * Fabrics Connect capsule を組み立てる(SQE 64B + connect data 1024B の
+ * in-capsule 送信)。
+ *
+ * 引数:
+ *   ctx   - 送信バッファを持つ initiator コンテキスト
+ *   qid   - キュー ID(0=admin、1=IO)
+ *   subnqn- 接続先サブシステム NQN
+ * 戻り値:
+ *   送信すべき合計バイト数(1088)
+ * コール元:
+ *   nvme_rdma_connect_job_step()
+ */
 static uint32_t nvmer_build_connect(nvme_rdma_ctx_t *ctx, uint16_t qid, const char *subnqn)
 {
     volatile uint8_t *b = ctx->send_buf;
@@ -78,6 +113,18 @@ static uint32_t nvmer_build_connect(nvme_rdma_ctx_t *ctx, uint16_t qid, const ch
     return 64u + 1024u;
 }
 
+/*
+ * Fabrics Property Set capsule を組み立てる(CC レジスタ書き込み用)。
+ *
+ * 引数:
+ *   ctx    - initiator コンテキスト
+ *   offset - プロパティのオフセット(CC=0x14 等)
+ *   value  - 書き込む値
+ * 戻り値:
+ *   送信すべきバイト数
+ * コール元:
+ *   nvme_rdma_connect_job_step()
+ */
 static uint32_t nvmer_build_prop_set(nvme_rdma_ctx_t *ctx, uint32_t offset, uint64_t value)
 {
     volatile uint8_t *b = ctx->send_buf;
@@ -93,6 +140,17 @@ static uint32_t nvmer_build_prop_set(nvme_rdma_ctx_t *ctx, uint32_t offset, uint
     return 64u;
 }
 
+/*
+ * Fabrics Property Get capsule を組み立てる(CSTS レジスタ読み出し用)。
+ *
+ * 引数:
+ *   ctx    - initiator コンテキスト
+ *   offset - プロパティのオフセット(CSTS=0x1c 等)
+ * 戻り値:
+ *   送信すべきバイト数
+ * コール元:
+ *   nvme_rdma_connect_job_step()
+ */
 static uint32_t nvmer_build_prop_get(nvme_rdma_ctx_t *ctx, uint32_t offset)
 {
     volatile uint8_t *b = ctx->send_buf;
@@ -106,6 +164,20 @@ static uint32_t nvmer_build_prop_get(nvme_rdma_ctx_t *ctx, uint32_t offset)
     return 64u;
 }
 
+/*
+ * Identify コマンドを組み立てる。応答データはターゲットが RDMA_WRITE で
+ * 書き込むので、Keyed SGL で受信先バッファを相手へ開示する。
+ *
+ * 引数:
+ *   ctx  - initiator コンテキスト
+ *   cns  - Identify の CNS 値(1=Controller、0=Namespace)
+ *   nsid - 名前空間 ID
+ *   buf / buf_len - 応答の受信先
+ * 戻り値:
+ *   送信すべきバイト数
+ * コール元:
+ *   nvme_rdma_connect_job_step()
+ */
 static uint32_t nvmer_build_identify(nvme_rdma_ctx_t *ctx, uint8_t cns, uint32_t nsid,
                                      volatile uint8_t *dest, uint32_t dest_len)
 {
@@ -119,6 +191,23 @@ static uint32_t nvmer_build_identify(nvme_rdma_ctx_t *ctx, uint8_t cns, uint32_t
     return 64u;
 }
 
+/*
+ * Read/Write コマンドを、出力先バッファと cid を明示して組み立てる。
+ * パイプライン化では複数コマンドが同時に in-flight になるため、
+ * コンテキスト共有の単一バッファではなくスロット別バッファを使う。
+ *
+ * 引数:
+ *   ctx    - initiator コンテキスト
+ *   out    - この SQE を書き込む先
+ *   cid    - このコマンドの id
+ *   opcode - 0x01=write / 0x02=read
+ *   nsid / slba / nlb - 対象名前空間と LBA 範囲
+ *   data   - データバッファ(Keyed SGL で相手へ開示する)
+ * 戻り値:
+ *   送信すべきバイト数
+ * コール元:
+ *   nvmer_build_io(), nvme_rdma_connect_job_step()
+ */
 static uint32_t nvmer_build_io_ex(nvme_rdma_ctx_t *ctx, volatile uint8_t *out, uint16_t cid,
                                   uint8_t opcode, uint32_t nsid, uint64_t slba,
                                   uint32_t nlb, volatile uint8_t *buf, uint32_t total_len)
@@ -135,6 +224,18 @@ static uint32_t nvmer_build_io_ex(nvme_rdma_ctx_t *ctx, volatile uint8_t *out, u
     return 64u;
 }
 
+/*
+ * ベンチのコマンドごとに開始 LBA を nlb ずつ進め、名前空間の終端でラップ
+ * する(fio のシーケンシャルアクセスと条件を揃えるため)。
+ *
+ * 引数:
+ *   ctx - initiator コンテキスト(現在位置を保持)
+ *   nlb - 1 コマンドのブロック数
+ * 戻り値:
+ *   このコマンドで使う開始 LBA
+ * コール元:
+ *   nvme_rdma_connect_job_step()
+ */
 static uint64_t nvmer_next_lba(nvme_rdma_ctx_t *ctx, uint32_t nlb)
 {
     uint64_t lba = ctx->bench_cur_lba;
@@ -146,18 +247,48 @@ static uint64_t nvmer_next_lba(nvme_rdma_ctx_t *ctx, uint32_t nlb)
     return lba;
 }
 
+/*
+ * nvmer_build_io_ex() をコンテキスト既定のバッファ/cid で呼ぶ薄いラッパ
+ * (単発コマンド用)。
+ *
+ * 引数:
+ *   ctx / opcode / nsid / slba / nlb - nvmer_build_io_ex() と同じ
+ * 戻り値:
+ *   送信すべきバイト数
+ * コール元:
+ *   nvme_rdma_connect_job_step()
+ */
 static uint32_t nvmer_build_io(nvme_rdma_ctx_t *ctx, uint8_t opcode, uint32_t nsid, uint64_t slba,
                                uint32_t nlb, volatile uint8_t *buf, uint32_t total_len)
 {
     return nvmer_build_io_ex(ctx, ctx->send_buf, ctx->cur_cid, opcode, nsid, slba, nlb, buf, total_len);
 }
 
+/*
+ * 応答 capsule 受信用の RECV WQE を 1 個投稿する。
+ *
+ * 引数:
+ *   ctx - initiator コンテキスト
+ * 戻り値:
+ *   0=成功、-1=失敗
+ * コール元:
+ *   nvme_rdma_connect_job_step()
+ */
 static int nvmer_post_recv(nvme_rdma_ctx_t *ctx)
 {
     return mlx5_qp_post_recv(ctx->cm.dev, &ctx->cm.rc_qp, (void *)(uintptr_t)ctx->recv_buf,
                              sizeof(ctx->recv_buf));
 }
 
+/*
+ * 組み立て済みの capsule を SEND WQE として投稿する。
+ *
+ * 引数:
+ *   ctx - initiator コンテキスト
+ *   len - 送信バイト数
+ * コール元:
+ *   nvme_rdma_connect_job_step()
+ */
 static void nvmer_post_send(nvme_rdma_ctx_t *ctx, uint32_t len)
 {
     dcache_clean_range((const void *)(uintptr_t)ctx->send_buf, len);
@@ -167,6 +298,17 @@ static void nvmer_post_send(nvme_rdma_ctx_t *ctx, uint32_t len)
     ctx->cmd_deadline = timer_now();
 }
 
+/*
+ * 送信完了(SQ CQE)と応答 capsule 到着(RQ CQE)の両方を待つ。1 tick 分だけ
+ * ポーリングして状態を進める。
+ *
+ * 引数:
+ *   ctx - initiator コンテキスト
+ * 戻り値:
+ *   1=両方完了(recv_buf に応答 CQE)、0=継続中、-1=エラー/タイムアウト
+ * コール元:
+ *   nvme_rdma_connect_job_step()
+ */
 static int nvmer_wait_exec(nvme_rdma_ctx_t *ctx)
 {
     if (!ctx->send_done || !ctx->recv_done) {
@@ -216,6 +358,17 @@ static volatile uint8_t s_pl_recv_bufs[NVME_RDMA_PL_QDEPTH_MAX][64] __attribute_
 static unsigned s_pl_rq_order[NVME_RDMA_PL_QDEPTH_MAX];
 static unsigned s_pl_rq_head, s_pl_rq_tail;
 
+/*
+ * パイプライン用スロットの応答受信バッファへ RECV WQE を投稿する。
+ *
+ * 引数:
+ *   ctx  - initiator コンテキスト
+ *   slot - スロット番号
+ * 戻り値:
+ *   0=成功、-1=失敗
+ * コール元:
+ *   nvme_rdma_connect_job_step()
+ */
 static int nvmer_pl_post_recv_slot(nvme_rdma_ctx_t *ctx, unsigned slot)
 {
     if (mlx5_qp_post_recv(ctx->cm.dev, &ctx->cm.rc_qp, (void *)(uintptr_t)s_pl_recv_bufs[slot],
@@ -227,6 +380,17 @@ static int nvmer_pl_post_recv_slot(nvme_rdma_ctx_t *ctx, unsigned slot)
     return 0;
 }
 
+/*
+ * Identify Namespace 完了直後に次のステートを決める。ベンチ指定があれば
+ * 直接 read/write ループへ、無ければ単発検証シーケンスへ進む。
+ *
+ * 引数:
+ *   ctx - initiator コンテキスト
+ * 戻り値:
+ *   次のステート
+ * コール元:
+ *   nvme_rdma_connect_job_step(), nvme_rdma_run_bench()
+ */
 static nvme_rdma_state_t nvmer_resume_state_after_identify(nvme_rdma_ctx_t *ctx)
 {
     if (ctx->bench_enabled && ctx->bench_qdepth > 1u) {
@@ -240,6 +404,19 @@ static nvme_rdma_state_t nvmer_resume_state_after_identify(nvme_rdma_ctx_t *ctx)
     return NVMER_ST_SEND_WRITE;
 }
 
+/*
+ * NVMe-oF RDMA initiator のステートマシン 1 tick。CM 確立 -> Fabrics Connect
+ * -> Property Set(CC.EN) -> Property Get(CSTS.RDY) -> Identify
+ * Controller/Namespace と進み、そのままベンチ(write/read の
+ * パイプライン発行と完了回収)まで回す。
+ *
+ * 引数:
+ *   self - このジョブ(self->state が initiator のステート)
+ * 戻り値:
+ *   JOB_WAITING=継続、JOB_DONE=完了/失敗で終了
+ * コール元:
+ *   job_scheduler_tick() から関数ポインタ経由
+ */
 job_result_t nvme_rdma_connect_job_step(job_t *self)
 {
     nvme_rdma_ctx_t *ctx = (nvme_rdma_ctx_t *)self->ctx;
@@ -598,12 +775,35 @@ static nvmet_rdma_ctrl_t s_target_ctrl;
 static int s_target_resident;
 static uint32_t s_target_resident_generation;
 
+/*
+ * 前回の接続(CM 確立〜Identify 完了済み)をそのまま再利用できるかを判定
+ * する。HCA の bring-up 世代が変わっていれば古い QP ハンドルは無効。
+ *
+ * 引数:
+ *   ctx - initiator コンテキスト
+ *   dev - 現在の HCA
+ * 戻り値:
+ *   1=再利用可、0=作り直しが必要
+ * コール元:
+ *   nvme_rdma_run_bench()
+ */
 static int nvmer_conn_reusable(nvme_rdma_ctx_t *ctx, mlx5_dev_t *dev)
 {
     return ctx->reusable && !ctx->failed &&
            ctx->established_generation == dev->bringup_generation;
 }
 
+/*
+ * QP が作成済みなら DESTROY_QP で FW 側のオブジェクトを解放する。ジョブを
+ * 止めるだけでは FW のリソースは解放されず、作り直しを繰り返すと
+ * INIT2RTR_QP が BAD_RES_ERR で失敗するようになるため、再作成の前に必ず呼ぶ。
+ *
+ * 引数:
+ *   dev - この QP を持つ HCA
+ *   qp  - 解放する QP(qpn==0 なら何もしない)
+ * コール元:
+ *   nvme_rdma_run_bench()
+ */
 static void nvmer_destroy_qp_if_valid(mlx5_dev_t *dev, mlx5_qp_t *qp)
 {
     if (dev != 0 && qp->qpn != 0) {
@@ -611,6 +811,16 @@ static void nvmer_destroy_qp_if_valid(mlx5_dev_t *dev, mlx5_qp_t *qp)
     }
 }
 
+/*
+ * ターゲット側ジョブを core1 へ pin する(core1 が未起動なら起動する)。
+ * initiator=core0 / target=core1 に分けることでレイテンシが下がる。
+ * 起動に失敗した場合は core0 のままフォールバックする。
+ *
+ * 引数:
+ *   target_job - pin するターゲットジョブ
+ * コール元:
+ *   nvme_rdma_run_bench()
+ */
 static void nvmer_pin_target_to_core1(job_t *target_job)
 {
     if (smp_boot_core1() == 0) {
@@ -620,6 +830,21 @@ static void nvmer_pin_target_to_core1(job_t *target_job)
     }
 }
 
+/*
+ * NVMe-oF RDMA のスループットを測る。target/initiator を同一プロセスに立て
+ * (接続を再利用できるならそのまま使い)、指定 chunk・queue depth で
+ * duration_ms のあいだ read か write を回し続ける。
+ *
+ * 引数:
+ *   dev0, dev1  - initiator 側(PF0)と target 側(PF1)の HCA
+ *   duration_ms - 測定時間
+ *   is_read     - 1=read、0=write
+ *   chunk_bytes - 1 コマンドの転送バイト数
+ *   qdepth      - 同時 outstanding コマンド数
+ *   out_mbps_x100 - MB/s の 100 倍固定小数点値の格納先(不要なら NULL)
+ * コール元:
+ *   shell_rdmabench()
+ */
 void nvme_rdma_run_bench(mlx5_dev_t *dev0, mlx5_dev_t *dev1, uint32_t duration_ms,
                          int is_read, uint32_t chunk_bytes, uint32_t qdepth,
                          uint32_t *out_mbps_x100)
