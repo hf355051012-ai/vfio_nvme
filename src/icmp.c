@@ -12,7 +12,7 @@
 #include <stddef.h>
 #include "icmp.h"
 #include "ip.h"
-#include "eth.h"
+#include "netctx.h"
 #include "arp.h"
 #include "net_buf.h"
 #include "net.h"

@@ -6,6 +6,8 @@
 #include "netctx.h"
 #include <stddef.h>
 #include "timestamp.h"   /* 同上 */
+#include "cache.h"
+#include "uart.h"
 
 // マルチコア化 Phase 4(~/.claude/plans/wondrous-baking-gadget.md参照):
 // 「現在アクティブなコンテキスト」(g_active_ctxマクロの実体)はコアごとに
@@ -28,6 +30,129 @@ static smp_spinlock_t  s_registered_lock;
 void net_ctx_activate(net_ctx_t *ctx)
 {
     g_active_ctx = ctx;
+}
+
+/* ------------------------------------------------------------------ */
+/* Ethernet フレーム層(旧 eth.c の共通ディスパッチ部)                  */
+/* ------------------------------------------------------------------ */
+
+#define HANDLER_MAX 8
+
+static struct {
+    uint16_t      ethertype;
+    eth_handler_t handler;
+    int           used;
+} g_handlers[HANDLER_MAX];
+
+void eth_register_handler(uint16_t ethertype, eth_handler_t handler)
+{
+    for (int i = 0; i < HANDLER_MAX; i++) {
+        if (g_handlers[i].used && g_handlers[i].ethertype == ethertype) {
+            g_handlers[i].handler = handler;
+            if (!handler) g_handlers[i].used = 0;
+            return;
+        }
+    }
+    if (handler) {
+        for (int i = 0; i < HANDLER_MAX; i++) {
+            if (!g_handlers[i].used) {
+                g_handlers[i].ethertype = ethertype;
+                g_handlers[i].handler   = handler;
+                g_handlers[i].used      = 1;
+                return;
+            }
+        }
+        uart_printf("[eth] handler table full\n");
+    }
+}
+
+/* eth_dispatch() 呼び出しのネストは無い前提の per-core スカラー。 */
+static int s_rx_hw_csum_ok[SMP_MAX_CORES];
+
+int eth_rx_hw_csum_ok(void)
+{
+    return s_rx_hw_csum_ok[smp_core_index()];
+}
+
+void eth_dispatch(net_buf_t *nb)
+{
+    if (!nb || nb->len < ETH_HDR_LEN) return;
+    uint16_t etype = (uint16_t)((nb->data[12] << 8) | nb->data[13]);
+    const uint8_t *src_mac = &nb->data[6];
+    const uint8_t *payload = &nb->data[ETH_HDR_LEN];
+    size_t plen = nb->len - ETH_HDR_LEN;
+
+    unsigned core = smp_core_index();
+    s_rx_hw_csum_ok[core] = nb->hw_csum_ok;
+
+    for (int i = 0; i < HANDLER_MAX; i++) {
+        if (g_handlers[i].used && g_handlers[i].ethertype == etype) {
+            g_handlers[i].handler(payload, plen, src_mac); // -> arp_handle_frame / ip_handle_frame
+            break;
+        }
+    }
+    s_rx_hw_csum_ok[core] = 0;
+}
+
+void eth_get_mac(uint8_t mac[ETH_ALEN])
+{
+    for (int i = 0; i < ETH_ALEN; i++) {
+        mac[i] = g_active_ctx ? g_active_ctx->mac[i] : 0u;
+    }
+}
+
+/* 以下は g_active_ctx->nic 経由の間接呼び出し。実体は mlx5_net.c の
+ * s_mlx5_net_ops(定義は netctx.h の nic_ops_t 参照)。 */
+int eth_send_frags(const eth_frag_t *frags, unsigned frag_count)
+{
+    if (!g_active_ctx) {
+        uart_printf("[eth] eth_send_frags: アクティブなインターフェースが無い\n");
+        return -1;
+    }
+    return g_active_ctx->nic->send_frags(g_active_ctx->nic_priv, frags, frag_count); // -> mlx5_net_send_frags
+}
+
+int eth_send_frags_async(const eth_frag_t *frags, unsigned frag_count)
+{
+    if (!g_active_ctx) return -1;
+    return g_active_ctx->nic->send_frags_async(g_active_ctx->nic_priv, frags, frag_count); // -> mlx5_net_send_frags_async
+}
+
+int eth_send_lso_async(const void *hdr, uint16_t hdr_len,
+                       const void *payload, uint32_t payload_len, uint16_t mss)
+{
+    if (!g_active_ctx || !g_active_ctx->nic->send_lso) return -1;
+    return g_active_ctx->nic->send_lso(g_active_ctx->nic_priv, hdr, hdr_len, payload, payload_len, mss); // -> mlx5_net_send_lso_async
+}
+
+unsigned eth_tx_wait_free_slot(void)
+{
+    if (!g_active_ctx) return 0;
+    return g_active_ctx->nic->tx_wait_free_slot(g_active_ctx->nic_priv); // -> mlx5_net_tx_wait_free_slot
+}
+
+net_buf_t *eth_poll_recv(void)
+{
+    if (!g_active_ctx) return NULL;
+    return g_active_ctx->nic->poll_recv(g_active_ctx->nic_priv); // -> mlx5_net_poll_recv
+}
+
+/* nb は net_buf.c の一般プール由来で Normal cacheable。そのまま NIC の
+ * DMA ソースになるため、CPU の書き込みを Point of Coherency までクリーン
+ * してから渡す(cache.h のコメント参照)。 */
+int eth_send(net_buf_t *nb)
+{
+    if (!nb) return -1;
+    if (nb->len < ETH_HDR_LEN || nb->len > NET_BUF_SIZE) {
+        uart_printf("[eth] eth_send: 不正なフレーム長 (%u)\n", (unsigned)nb->len);
+        net_buf_free(nb);
+        return -1;
+    }
+    dcache_clean_range(nb->data, nb->len);
+    eth_frag_t frag = { nb->data, nb->len };
+    int ret = eth_send_frags(&frag, 1);
+    net_buf_free(nb);
+    return ret;
 }
 
 void net_ctx_register(net_ctx_t *ctx)

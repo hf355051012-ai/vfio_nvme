@@ -2,9 +2,84 @@
 #define NETCTX_H
 
 #include <stdint.h>
-#include "eth.h"
+#include <stddef.h>
 #include "net_buf.h"
 #include "smp.h"
+
+/* ================================================================
+ * Ethernet フレーム層(旧 eth.h)。実際の送受信は nic_ops_t 経由で
+ * バックエンド(mlx5_net.c)へ委譲し、ここは EtherType ディスパッチと
+ * アクティブインターフェースへの振り分けだけを持つ。
+ * ================================================================ */
+
+#define ETH_ALEN            6
+#define ETH_HDR_LEN         14      /* dst(6) + src(6) + ethertype(2) */
+#define ETH_JUMBO_MAX_LEN   10240u  /* ジャンボフレームの最大長(ヘッダ+ペイロード+FCS) */
+
+/* 送信フレームを構成する1個の断片(スキャッタ・ギャザー送信用)。 */
+typedef struct {
+    const void *data;
+    uint16_t    len;
+} eth_frag_t;
+
+/* 1回の送信で使える最大断片数。TCP のゼロコピー送信(ヘッダ用の小さな
+ * バッファ + 呼び出し元のデータバッファの2断片)を想定した値。 */
+#define ETH_TX_MAX_FRAGS 2
+
+/* RX/TX リング段数の既定値。バックエンドが net_ctx_t.rx_ring_size を
+ * 設定しない場合の受信ウィンドウ計算のフォールバック(ETH_RX_RING_SIZE)と、
+ * tcp.c がスロット別送信バッファを確保する個数(ETH_TX_RING_SIZE)に使う。 */
+#define ETH_RX_RING_SIZE 128
+#define ETH_TX_RING_SIZE 256
+
+/* 自機の MAC アドレス(アクティブインターフェースのもの)を取得する。 */
+void eth_get_mac(uint8_t mac[ETH_ALEN]);
+
+/* Ethernet フレーム(dst+src+ethertype+payload、FCS 抜き)を1つ送信する。
+ * nb の所有権は本関数に渡り、成否によらず内部で net_buf_free() される。
+ * 戻り値: 0=送信完了, -1=引数エラー/送信失敗 */
+int eth_send(net_buf_t *nb);
+
+/* frags[0..frag_count) を連結した1つのフレームとして送信し、ハードウェアの
+ * 送信完了まで待つ(戻った時点で全断片のメモリを再利用してよい)。
+ * frag_count は 1 以上 ETH_TX_MAX_FRAGS 以下。戻り値: 0=完了, -1=失敗 */
+int eth_send_frags(const eth_frag_t *frags, unsigned frag_count);
+
+/* eth_send_frags() と同じキューイングを行うが送信完了を待たずに返る。
+ * 信頼性は呼び出し元(TCP の ACK ベース再送)が担保する前提。
+ * 戻り値: 0=キューイング成功, -1=失敗 */
+int eth_send_frags_async(const eth_frag_t *frags, unsigned frag_count);
+
+/* LSO(TCP Segmentation Offload)送信。hdr(L2+L3+L4)をテンプレートに
+ * payload を HW が mss 単位で分割送出する。非対応バックエンドでは常に -1
+ * (net_active_lso_max_bytes() で事前に確認すること)。
+ * 戻り値: 0=キューイング成功, -1=非対応/失敗 */
+int eth_send_lso_async(const void *hdr, uint16_t hdr_len,
+                       const void *payload, uint32_t payload_len, uint16_t mss);
+
+/* 次に eth_send_frags_async()(frag_count=1)が使う TX スロット番号を返す。
+ * そのスロットの前回のフレームが未完了なら完了までブロックする。呼び出し元は
+ * 戻ってから初めて、そのスロット専用の送信バッファへ書き込んでよい。 */
+unsigned eth_tx_wait_free_slot(void);
+
+/* 受信を1回ポーリングする(ブロックしない)。フレームがあれば net_buf を
+ * 確保して返す(呼び出し側が net_buf_free() する)。無ければ NULL。 */
+net_buf_t *eth_poll_recv(void);
+
+/* EtherType 別ハンドラ。登録される具体関数:
+ *   0x0806(ARP)  -> arp_handle_frame(arp.c、arp_init() で登録)
+ *   0x0800(IPv4) -> ip_handle_frame(ip.c、ip_init() で登録) */
+typedef void (*eth_handler_t)(const uint8_t *payload, size_t len, const uint8_t *src_mac);
+
+/* EtherType に対するハンドラを登録する(再登録は上書き、NULL で解除)。 */
+void eth_register_handler(uint16_t ethertype, eth_handler_t handler);
+
+/* nb の EtherType に応じて登録済みハンドラを呼ぶ。nb の解放は呼び出し側の責任。 */
+void eth_dispatch(net_buf_t *nb);
+
+/* 「今 eth_dispatch() が処理中のフレームは HW で L3/L4 チェックサム検証済みか」。
+ * ip.c/tcp.c がソフトウェア再検証をスキップしてよいかの判定に使う。 */
+int eth_rx_hw_csum_ok(void);
 
 /* ================================================================
  * netctx.h — 複数NIC/複数ネットワークインターフェースの並行運用抽象化

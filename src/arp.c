@@ -13,7 +13,7 @@
 
 #include <stddef.h>
 #include "arp.h"
-#include "eth.h"
+#include "netctx.h"
 #include "net_buf.h"
 #include "net.h"
 #include "netctx.h"
