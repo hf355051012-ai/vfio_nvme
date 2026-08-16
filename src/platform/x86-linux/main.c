@@ -608,6 +608,102 @@ static void shell_tcp6test(void)
     netif_activate(self);
 }
 
+/*=================================================================
+ * 待ち受けの無いポートへ接続を試み、RST で即座に失敗することを確認する
+ * (rsttest の v4/v6 共通部)。
+ *
+ * RST が返らない実装では SYN が 500ms から倍々で 5 回再送されるまで
+ * (合計 15 秒以上)失敗が確定しないので、経過時間そのものが判定になる。
+ *
+ * 引数:
+ *   label  - 表示用のラベル("IPv4" / "IPv6")
+ *   dst    - 接続先(対向 PF)
+ *   port   - 待ち受けの無いポート
+ * 戻り値:
+ *   1=期待どおり即座に失敗、0=失敗しなかった/遅すぎた
+ * コール元:
+ *   shell_rsttest()
+ * ===============================================================*/
+static int shell_rsttest_one(const char *label, const netaddr_t *dst, uint16_t port)
+{
+    /* SYN 1 回ぶんの RTO(TCP_INITIAL_RTO_MS=500ms)より十分短ければ RST 由来と
+     * 言える。ARP/NDP の解決が初回に入るので、その往復(実測 150〜200us)ぶんの
+     * 余裕は見ておく。 */
+    const uint64_t rst_deadline_us = 200000u;
+    static tcp_conn_t s_conn;
+
+    s_conn.state = TCP_CLOSED;
+    tcp_connect_begin_to(&s_conn, dst, port);
+
+    uint64_t t0 = timer_now();
+    int r = 0;
+    while (!timeout_ms(t0, 3000u)) {
+        r = tcp_connect_poll(&s_conn);
+        net_poll_all_and_dispatch();
+        if (r != 0) break;
+    }
+    uint64_t elapsed_us = get_us_from(t0);
+
+    if (r > 0) {
+        uart_printf("rsttest: NG(%s) -- 待ち受けが無いはずのポート %u へ接続できてしまいました\n",
+                    label, (unsigned)port);
+        tcp_close(&s_conn);
+        return 0;
+    }
+    if (r == 0) {
+        uart_printf("rsttest: NG(%s) -- 3 秒たっても接続失敗が確定しませんでした\n", label);
+        return 0;
+    }
+    if (elapsed_us > rst_deadline_us) {
+        uart_printf("rsttest: NG(%s) -- 失敗まで %uus かかりました(RST ではなく SYN 再送の"
+                    "タイムアウト待ちの疑い、期待 <%uus)\n",
+                    label, (unsigned)elapsed_us, (unsigned)rst_deadline_us);
+        return 0;
+    }
+    uart_printf("rsttest: PASS(%s) -- %uus で接続失敗が確定(RST 受信)\n",
+                label, (unsigned)elapsed_us);
+    return 1;
+}
+
+/*=================================================================
+ * シェルの `rsttest`。対向 PF の「誰も待ち受けていないポート」へ v4/v6 の
+ * 両方で接続し、RST が返って即座に失敗することを確認する。
+ *
+ * 2 ポートとも同一プロセスの自作ドライバが握っているので、RST を返すのも
+ * 自分自身(対向インターフェースの受信経路)になる。
+ *
+ * コール元:
+ *   shell_dispatch()
+ * ===============================================================*/
+static void shell_rsttest(void)
+{
+    /* nvmet(4421)や tcp6test(6000)と衝突しない、誰も listen しない番号。 */
+    const uint16_t dead_port = 6001u;
+
+    uint8_t peer_ll[16];
+    netif_t *peer = shell_peer_ll6(peer_ll);
+    netif_t *self = g_active_ctx;
+    if (!peer || !self) {
+        uart_printf("rsttest: 対向インターフェースが見つかりません(net init mlx5 が必要)\n");
+        return;
+    }
+
+    uint32_t peer_ip = (net_active_ip() == 0xC0A8650Au) ? 0xC0A8650Bu : 0xC0A8650Au;
+    netaddr_t dst4 = netaddr_v4(peer_ip);
+    netaddr_t dst6 = netaddr_v6(peer_ll);
+
+    uart_printf("rsttest: client=%s server=%s port=%u(待ち受け無し)\n",
+                self->name, peer->name, (unsigned)dead_port);
+
+    netif_activate(self);
+    int ok4 = shell_rsttest_one("IPv4", &dst4, dead_port);
+    netif_activate(self);
+    int ok6 = shell_rsttest_one("IPv6", &dst6, dead_port);
+    netif_activate(self);
+
+    uart_printf("rsttest: %s\n", (ok4 && ok6) ? "PASS" : "NG");
+}
+
 /* ---- ベンチ引数パース + サマリ表示(bench/tcpbench 共通) ---- */
 #define BENCH_MAX_CHUNKS 8u
 typedef struct {
@@ -1062,6 +1158,8 @@ static void shell_dispatch(char *line, int s0, int s1)
         shell_udptest();
     } else if (strncmp(line, "tcp6test", 8) == 0) {
         shell_tcp6test();
+    } else if (strncmp(line, "rsttest", 7) == 0) {
+        shell_rsttest();
     } else if (strncmp(line, "jobs", 4) == 0) {
         job_list_dump();
     } else if (strncmp(line, "help", 4) == 0) {
@@ -1077,6 +1175,7 @@ static void shell_dispatch(char *line, int s0, int s1)
                     "  ping6                                 対向PFへICMPv6 Echo(IPv6疎通確認)\n"
                     "  udptest | udptest6                    対向PFへUDP往復(v4はPort Unreachableも確認)\n"
                     "  tcp6test                              対向PFとIPv6上でTCP確立+データ往復\n"
+                    "  rsttest                               待ち受け無しポートへ接続しRSTで即失敗するか(v4/v6)\n"
                     "  nvmet [port] | jobs | help | quit    (↑↓で履歴呼び出し)\n"
                     "  例: bench 8,64,256 rw 8 / tcpbench 64,256 w digest / ts core 1 num 40\n");
     } else if (strncmp(line, "quit", 4) == 0 || strncmp(line, "exit", 4) == 0) {

@@ -820,17 +820,20 @@ static int tcp_send_segment_lso(tcp_conn_t *conn, tcp_priv_t *priv,
 
 /*=================================================================
  * 登録済みコネクションを持たない相手(既にスロットから外れた TIME_WAIT の
- * 相手など)へ、単発の ACK だけを送る tcp_send_segment() の最小構成版。
+ * 相手、閉じたポートを叩いてきた相手など)へ、データを持たない単発の
+ * セグメントを送る tcp_send_segment() の最小構成版。flags を引数に取るので
+ * ACK / RST / RST|ACK のいずれも同じ経路で送れる。
  *
  * 引数:
  *   local_ip / local_port / remote_ip / remote_port - 4-tuple
+ *   flags     - 送出するフラグ(TCP_FLAG_ACK / TCP_FLAG_RST 等)
  *   seq / ack - 送出する シーケンス/確認応答番号
  * コール元:
- *   tcp_input()
+ *   tcp_send_bare_ack(), tcp_send_bare_rst()
  * ===============================================================*/
-static void tcp_send_bare_ack(const netaddr_t *local_ip, uint16_t local_port,
-                               const netaddr_t *remote_ip, uint16_t remote_port,
-                               uint32_t seq, uint32_t ack)
+static void tcp_send_bare(const netaddr_t *local_ip, uint16_t local_port,
+                           const netaddr_t *remote_ip, uint16_t remote_port,
+                           uint8_t flags, uint32_t seq, uint32_t ack)
 {
     unsigned core = smp_core_index();
 
@@ -856,7 +859,7 @@ static void tcp_send_bare_ack(const netaddr_t *local_ip, uint16_t local_port,
     wr32be(tcph + TCP_OFF_SEQ, seq);
     wr32be(tcph + TCP_OFF_ACK, ack);
     tcph[TCP_OFF_DATA_OFFSET] = (uint8_t)((TCP_HDR_LEN / 4u) << 4);
-    tcph[TCP_OFF_FLAGS] = TCP_FLAG_ACK;
+    tcph[TCP_OFF_FLAGS] = flags;
     wr16be(tcph + TCP_OFF_WINDOW, 0);
     wr16be(tcph + TCP_OFF_CHECKSUM, 0);
     wr16be(tcph + TCP_OFF_URGENT, 0);
@@ -870,6 +873,112 @@ static void tcp_send_bare_ack(const netaddr_t *local_ip, uint16_t local_port,
 
     dcache_clean_range(seg_buf, frag.len);
     eth_send_frags_async(&frag, 1u);
+}
+
+/*=================================================================
+ * TIME_WAIT の相手からの再送へ返す単発 ACK。
+ *
+ * 引数:
+ *   local_ip / local_port / remote_ip / remote_port - 4-tuple
+ *   seq / ack - 送出する シーケンス/確認応答番号
+ * コール元:
+ *   tcp_input_addr()
+ * ===============================================================*/
+static void tcp_send_bare_ack(const netaddr_t *local_ip, uint16_t local_port,
+                               const netaddr_t *remote_ip, uint16_t remote_port,
+                               uint32_t seq, uint32_t ack)
+{
+    tcp_send_bare(local_ip, local_port, remote_ip, remote_port,
+                   TCP_FLAG_ACK, seq, ack);
+}
+
+/*=================================================================
+ * どのコネクションにもリスナにも一致しないセグメントへ RST を返す
+ * (RFC 793 "SEGMENT ARRIVES / CLOSED STATE")。これが無いと相手は接続失敗を
+ * 即座に知れず、SYN 再送のタイムアウト(数秒〜十数秒)まで待たされる。
+ *
+ * 引数:
+ *   local_ip / local_port / remote_ip / remote_port - 応答する 4-tuple
+ *                                                     (受信の src/dst を入れ替えたもの)
+ *   seg_flags - 受信セグメントのフラグ
+ *   seg_seq / seg_ack - 受信セグメントのシーケンス/確認応答番号
+ *   seg_len   - 受信セグメントのペイロード長(SYN/FIN 分は含まない)
+ * コール元:
+ *   tcp_input_addr()
+ * ===============================================================*/
+static void tcp_send_bare_rst(const netaddr_t *local_ip, uint16_t local_port,
+                               const netaddr_t *remote_ip, uint16_t remote_port,
+                               uint8_t seg_flags, uint32_t seg_seq, uint32_t seg_ack,
+                               uint16_t seg_len)
+{
+    if (seg_flags & TCP_FLAG_ACK) {
+        /* 相手が ACK を持っている -- その番号を自分の seq にして裸の RST を返す。 */
+        tcp_send_bare(local_ip, local_port, remote_ip, remote_port,
+                       TCP_FLAG_RST, seg_ack, 0u);
+    } else {
+        /* ACK が無い -- seq=0 で、受信分を確認応答する RST|ACK を返す。
+         * SYN と FIN はそれぞれ 1 バイト分のシーケンス番号を消費する。 */
+        uint32_t ack = seg_seq + seg_len;
+        if (seg_flags & TCP_FLAG_SYN) ack++;
+        if (seg_flags & TCP_FLAG_FIN) ack++;
+        tcp_send_bare(local_ip, local_port, remote_ip, remote_port,
+                       TCP_FLAG_RST | TCP_FLAG_ACK, 0u, ack);
+    }
+}
+
+/*=================================================================
+ * 指定ポートで待ち受けているリスナが 1 つでもあるか。
+ *
+ * 受動 open のマッチ条件(accept_conn が用意済みで CLOSED)より緩く、
+ * 「ポートが開いているか」だけを見る。armed でないリスナへ届いた SYN に
+ * RST を返してしまうと、accept を張り直す一瞬の隙間(nvmet が admin キュー
+ * 確立後に IO キューの accept を arm するまでの間など)で相手の接続が即座に
+ * 失敗する。Linux が accept キュー溢れで黙って捨てるのと同じ扱いにして、
+ * 相手の SYN 再送に任せる。
+ *
+ * 引数:
+ *   port - 宛先ポート
+ * 戻り値:
+ *   1=リスナあり、0=無し
+ * コール元:
+ *   tcp_input_addr()
+ * ===============================================================*/
+static int tcp_port_has_listener(uint16_t port)
+{
+    for (unsigned li = 0; li < TCP_LISTENER_TOTAL; li++) {
+        if (s_listeners[li].in_use && s_listeners[li].port == port) return 1;
+    }
+    return 0;
+}
+
+/*=================================================================
+ * 全コアのコネクションスロットから 4-tuple が一致するものを探す。
+ *
+ * 受信ホットパスの照合は自コアぶんしか見ない(他コアのコネクション宛
+ * パケットは届かない前提)。RST を返す直前だけは、その前提が崩れていた場合に
+ * 自分のコネクションを自分で撃つことになるので、冷たい経路で全コアを確認する。
+ *
+ * 引数:
+ *   src / src_port / dst_port - 探す 4-tuple
+ * 戻り値:
+ *   1=どこかのコアに存在する、0=無し
+ * コール元:
+ *   tcp_input_addr()
+ * ===============================================================*/
+static int tcp_conn_exists_any_core(const netaddr_t *src, uint16_t src_port, uint16_t dst_port)
+{
+    for (unsigned c = 0; c < SMP_MAX_CORES; c++) {
+        for (unsigned i = 0; i < TCP_MAX_CONNS; i++) {
+            tcp_conn_t *cn = s_conns[c][i];
+            if (cn != NULL &&
+                src_port == cn->remote_port &&
+                dst_port == cn->local_port &&
+                netaddr_eq(src, (const netaddr_t *)&cn->remote_ip)) {
+                return 1;
+            }
+        }
+    }
+    return 0;
 }
 
 static volatile int s_abort_requested;
@@ -2424,9 +2533,13 @@ void tcp_input_addr(const uint8_t *pkt, uint16_t len,
         }
     }
     if (!conn) {
-        if (in[TCP_OFF_FLAGS] & TCP_FLAG_FIN) {
-            tcp_timewait_t *tw = tcp_timewait_find(src, src_port, dst_port);
-            if (tw) {
+        uint8_t nm_flags = in[TCP_OFF_FLAGS];
+        /* TIME_WAIT は 4-tuple 一致だけで先に判定する(FIN のときだけ引くのでは
+         * なく)。閉じた直後の相手から届く遅延セグメントを「閉じたポート宛」と
+         * 誤判定して RST を返すと、相手の TIME_WAIT を勝手に潰すことになる。 */
+        tcp_timewait_t *tw = tcp_timewait_find(src, src_port, dst_port);
+        if (tw) {
+            if (nm_flags & TCP_FLAG_FIN) {
                 uint8_t fin_hdr_len = (uint8_t)(((in[TCP_OFF_DATA_OFFSET] >> 4) & 0x0Fu) * 4u);
                 if (fin_hdr_len >= TCP_HDR_LEN && fin_hdr_len <= len) {
                     uint32_t fin_seq = rd32be(in + TCP_OFF_SEQ);
@@ -2436,8 +2549,32 @@ void tcp_input_addr(const uint8_t *pkt, uint16_t len,
                                        tw->local_seq, fin_seq + fin_payload_len + 1u);
                 }
             }
+            return;
         }
-        return;  /* どのアクティブコネクション宛でもない */
+        /* TIME_WAIT にも一致しない -- 閉じたポート宛。RFC 793 に従って RST を
+         * 返し、相手を SYN 再送のタイムアウトまで待たせない。
+         *
+         * RST を返さない条件(順に確認する):
+         *  - 受信が RST -- RST に RST を返すと無限ループになる(最重要)。
+         *  - 宛先がマルチキャスト -- 誰宛か特定できないものへ RST は返さない。
+         *  - そのポートにリスナが居る -- accept を張り直す隙間に届いた SYN。
+         *  - 他コアに 4-tuple 一致のコネクションが居る -- 自分のコネクションを
+         *    自分で撃たないための保険。 */
+        if (nm_flags & TCP_FLAG_RST) return;
+        if (dst && dst->family == NETADDR_V6 && dst->a[0] == 0xFFu) return;
+        if (tcp_port_has_listener(dst_port)) return;
+        if (tcp_conn_exists_any_core(src, src_port, dst_port)) return;
+
+        uint8_t nm_hdr_len = (uint8_t)(((in[TCP_OFF_DATA_OFFSET] >> 4) & 0x0Fu) * 4u);
+        if (nm_hdr_len < TCP_HDR_LEN || nm_hdr_len > len) return;
+
+        netaddr_t nm_local = dst ? *dst : netaddr_v4(NET_SELF_IP);
+        tcp_send_bare_rst(&nm_local, dst_port, src, src_port,
+                           nm_flags, rd32be(in + TCP_OFF_SEQ), rd32be(in + TCP_OFF_ACK),
+                           (uint16_t)(len - nm_hdr_len));
+        uart_printf("[TCP] 待ち受けの無いポート宛 (local_port=%u, remote_port=%u) へ RST を返しました\n",
+                    (unsigned)dst_port, (unsigned)src_port);
+        return;
     }
 
     int hw_ok = eth_rx_hw_csum_ok();
