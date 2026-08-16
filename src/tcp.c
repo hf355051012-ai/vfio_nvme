@@ -1,6 +1,7 @@
 #include <stddef.h>
 #include "tcp.h"
 #include "ip.h"
+#include "ipv6.h"
 #include "netif.h"
 #include "arp.h"
 #include "net_buf.h"
@@ -178,11 +179,11 @@ static tcp_priv_t  s_priv[SMP_MAX_CORES][TCP_MAX_CONNS];
 #define TCP_TIMEWAIT_MS  4000u  /* TCP_CLOSE_FIN_WAIT_MSより十分長い安全マージン */
 
 typedef struct {
-    int      in_use;
-    uint32_t local_ip;
-    uint16_t local_port;
-    uint32_t remote_ip;
-    uint16_t remote_port;
+    int       in_use;
+    netaddr_t local_ip;
+    uint16_t  local_port;
+    netaddr_t remote_ip;
+    uint16_t  remote_port;
     uint32_t local_seq;      /* 応答ACKのSEQフィールドに使う自分のFIN後のseq(不変) */
     uint64_t started_ticks;  /* TIME_WAIT開始時刻(TCP_TIMEWAIT_MS、timeout_ms()で判定) */
 } tcp_timewait_t;
@@ -202,12 +203,12 @@ static smp_spinlock_t s_timewait_lock;
  * コール元:
  *   tcp_input()
  * ===============================================================*/
-static tcp_timewait_t *tcp_timewait_find(uint32_t remote_ip, uint16_t remote_port, uint16_t local_port)
+static tcp_timewait_t *tcp_timewait_find(const netaddr_t *remote_ip, uint16_t remote_port, uint16_t local_port)
 {
     smp_spin_lock(&s_timewait_lock);
     for (unsigned i = 0; i < TCP_TIMEWAIT_TOTAL; i++) {
         if (s_timewait[i].in_use &&
-            s_timewait[i].remote_ip == remote_ip &&
+            netaddr_eq(&s_timewait[i].remote_ip, remote_ip) &&
             s_timewait[i].remote_port == remote_port &&
             s_timewait[i].local_port == local_port) {
             smp_spin_unlock(&s_timewait_lock);
@@ -228,8 +229,8 @@ static tcp_timewait_t *tcp_timewait_find(uint32_t remote_ip, uint16_t remote_por
  * コール元:
  *   tcp_close()
  * ===============================================================*/
-static void tcp_timewait_register(uint32_t local_ip, uint16_t local_port,
-                                   uint32_t remote_ip, uint16_t remote_port,
+static void tcp_timewait_register(const netaddr_t *local_ip, uint16_t local_port,
+                                   const netaddr_t *remote_ip, uint16_t remote_port,
                                    uint32_t local_seq)
 {
     smp_spin_lock(&s_timewait_lock);
@@ -239,9 +240,9 @@ static void tcp_timewait_register(uint32_t local_ip, uint16_t local_port,
     }
     if (slot < 0) slot = 0;  /* 空きが無ければ一番古い(先頭)のエントリを再利用する */
     s_timewait[slot].in_use       = 1;
-    s_timewait[slot].local_ip     = local_ip;
+    s_timewait[slot].local_ip     = *local_ip;
     s_timewait[slot].local_port   = local_port;
-    s_timewait[slot].remote_ip    = remote_ip;
+    s_timewait[slot].remote_ip    = *remote_ip;
     s_timewait[slot].remote_port  = remote_port;
     s_timewait[slot].local_seq    = local_seq;
     s_timewait[slot].started_ticks = timer_now();
@@ -480,29 +481,155 @@ static void tcp_rtt_update(tcp_priv_t *priv, uint64_t measured_ticks)
     priv->rto_ms = rto_ms;
 }
 
-static uint8_t s_seg_bufs[SMP_MAX_CORES][ETH_TX_RING_SIZE][IP_PAYLOAD_OFFSET + TCP_HDR_LEN + 8 + TCP_MSS_LOCAL]
+/* フレームは常に seg_buf の先頭から始まり、TCP ヘッダの位置だけが family で
+ * 変わる(IPv4=14+20=34、IPv6=14+40=54)。IPv4 のレイアウトを一切変えないため
+ * この形にしてある -- 一度「TCP ヘッダ位置を family 非依存にする」ために L3 を
+ * 右詰めしたところ、IPv4 のフレーム開始が 64 バイト境界から外れ、8KB の小さい
+ * I/O で TCP スループットが 6〜9% 落ちることを実測した。
+ * スロットサイズは 64 の倍数へ切り上げ、どのスロットも 64 バイト境界から
+ * 始まるようにする(NIC が読む先頭を揃える)。 */
+#define TCP_L4_OFFSET_V6 (ETH_HDR_LEN + IPV6_HDR_LEN)   /* 54 */
+#define TCP_SEG_BUF_RAW  (TCP_L4_OFFSET_V6 + TCP_HDR_LEN + 8 + TCP_MSS_LOCAL)
+#define TCP_SEG_BUF_SIZE (((TCP_SEG_BUF_RAW) + 63u) & ~63u)
+
+static uint8_t s_seg_bufs[SMP_MAX_CORES][ETH_TX_RING_SIZE][TCP_SEG_BUF_SIZE]
     __attribute__((aligned(64)));
+
+/*=================================================================
+ * seg_buf 内で TCP ヘッダが始まるオフセットを返す(L2+L3 ヘッダ長)。
+ *
+ * 引数:
+ *   a - コネクションのアドレス(family だけ見る)
+ * 戻り値:
+ *   IPv4=34、IPv6=54
+ * コール元:
+ *   tcp_send_segment(), tcp_send_segment_lso(), tcp_send_bare_ack()
+ * ===============================================================*/
+static inline unsigned tcp_l4_off(const netaddr_t *a)
+{
+    return (a->family == NETADDR_V6) ? TCP_L4_OFFSET_V6 : IP_PAYLOAD_OFFSET;
+}
+
+/*=================================================================
+ * 送信先 MAC を解決する。IPv4 は ARP、IPv6 は NDP。
+ *
+ * 引数:
+ *   remote  - 相手のアドレス
+ *   out_mac - 解決した MAC の格納先
+ * 戻り値:
+ *   0=解決できた、-1=失敗
+ * コール元:
+ *   tcp_send_segment(), tcp_send_segment_lso(), tcp_send_bare_ack()
+ * ===============================================================*/
+static inline uint16_t tcp_mss_cap_for(const netaddr_t *remote)
+{
+    uint16_t cap = net_active_mss_cap();
+    if (remote->family == NETADDR_V6) {
+        /* netif_t.mss_cap は IPv4(L3 ヘッダ 20 バイト)前提で決めてある。
+         * IPv6 は L3 が 40 バイトなので差分の 20 を引かないと、フルサイズ
+         * セグメントがリンク MTU を 20 バイト超え、NIC に無言で捨てられる
+         * (CLAUDE.md「境界値ぴったりのサイズだけが失敗する」の再来になる)。 */
+        cap = (cap > 20u) ? (uint16_t)(cap - 20u) : cap;
+    }
+    return cap;
+}
+
+static inline int tcp_resolve_mac(const netaddr_t *remote, uint8_t out_mac[ETH_ALEN])
+{
+    if (remote->family == NETADDR_V6) {
+        return ndp_resolve(remote->a, out_mac);
+    }
+    uint32_t ip = netaddr_v4_host(remote);
+    if (arp_cache_lookup(ip, out_mac) == 0) return 0;
+    return arp_resolve(ip, out_mac);
+}
+
+/*=================================================================
+ * コネクションのローカルアドレスから送信元インターフェースを引く。
+ *
+ * 引数:
+ *   local - 自分側のアドレス
+ * 戻り値:
+ *   見つかった netif_t、無ければ NULL
+ * コール元:
+ *   tcp_send_segment(), tcp_send_segment_lso(), tcp_send_bare_ack() 等
+ * ===============================================================*/
+static inline netif_t *tcp_netif_for(const netaddr_t *local)
+{
+    if (local->family == NETADDR_V6) return netif_find_by_ip6(local->a);
+    return netif_find_by_ip(netaddr_v4_host(local));
+}
+
+/*=================================================================
+ * seg_buf に Ethernet + L3 ヘッダを右詰めで組み立てる。
+ *
+ * 引数:
+ *   seg_buf  - セグメントバッファ先頭
+ *   conn     - アドレスを持つコネクション
+ *   dst_mac  - 宛先 MAC
+ *   seg_len  - TCP ヘッダ + データのバイト数(L3 ペイロード長)
+ * コール元:
+ *   tcp_send_segment(), tcp_send_bare_ack()
+ * ===============================================================*/
+static inline void tcp_build_l3(uint8_t *seg_buf, const netaddr_t *local, const netaddr_t *remote,
+                          const uint8_t dst_mac[ETH_ALEN], uint16_t seg_len)
+{
+    if (remote->family == NETADDR_V6) {
+        ipv6_build_header(seg_buf, local->a, remote->a, dst_mac, IP_PROTO_TCP, seg_len);
+    } else {
+        uint8_t dst_octets[4];
+        for (unsigned i = 0; i < 4; i++) dst_octets[i] = remote->a[i];
+        ip_build_header(seg_buf, dst_octets, dst_mac, IP_PROTO_TCP, seg_len);
+    }
+}
+
+/*=================================================================
+ * TCP チェックサムを計算する(疑似ヘッダは family ごとに形が違う)。
+ * hw_partial が真なら疑似ヘッダだけの部分和を返す(残りは NIC が完成させる)。
+ *
+ * 引数:
+ *   local / remote - 疑似ヘッダのアドレス
+ *   tcph / hdr_len - TCP ヘッダ(オプション込み)
+ *   data/data_len  - ペイロード(無ければ NULL/0)
+ *   hw_partial     - 1=疑似ヘッダのみ、0=全体を計算
+ * 戻り値:
+ *   チェックサム値
+ * コール元:
+ *   tcp_send_segment(), tcp_send_segment_lso(), tcp_send_bare_ack()
+ * ===============================================================*/
+static inline uint16_t tcp_checksum(const netaddr_t *local, const netaddr_t *remote,
+                              const volatile uint8_t *tcph, uint16_t hdr_len,
+                              const void *data, uint16_t data_len, int hw_partial)
+{
+    uint16_t seg_len = (uint16_t)(hdr_len + data_len);
+    if (remote->family == NETADDR_V6) {
+        if (hw_partial) {
+            return ipv6_pseudo_checksum_only(local->a, remote->a, IP_PROTO_TCP, seg_len);
+        }
+        return ipv6_pseudo_checksum2(local->a, remote->a, IP_PROTO_TCP,
+                                      tcph, hdr_len, data, data_len);
+    }
+    if (hw_partial) {
+        return pseudo_header_checksum_only(local->a, remote->a, IP_PROTO_TCP, seg_len);
+    }
+    return pseudo_header_checksum2(local->a, remote->a, IP_PROTO_TCP,
+                                    tcph, hdr_len, data, data_len);
+}
 
 static int tcp_send_segment(tcp_conn_t *conn, tcp_priv_t *priv, uint8_t flags,
                              const void *data, uint16_t data_len)
 {
     unsigned core = smp_core_index();
 
-    netif_t *conn_ctx = netif_find_by_ip(conn->local_ip);
+    netif_t *conn_ctx = tcp_netif_for((const netaddr_t *)&conn->local_ip);
     if (conn_ctx) {
         netif_activate(conn_ctx);
     }
 
     uint8_t dst_mac[ETH_ALEN];
-    if (arp_cache_lookup(conn->remote_ip, dst_mac) != 0) {
-        if (arp_resolve(conn->remote_ip, dst_mac) != 0) {
-            uart_printf("[!] TCP: %u.%u.%u.%u のARP解決失敗、送信中止\n",
-                        (unsigned)(conn->remote_ip >> 24) & 0xFFu,
-                        (unsigned)(conn->remote_ip >> 16) & 0xFFu,
-                        (unsigned)(conn->remote_ip >> 8) & 0xFFu,
-                        (unsigned)conn->remote_ip & 0xFFu);
-            return -1;
-        }
+    if (tcp_resolve_mac((const netaddr_t *)&conn->remote_ip, dst_mac) != 0) {
+        uart_printf("[!] TCP: 宛先MACの解決失敗、送信中止\n");
+        return -1;
     }
 
     int include_wscale = 0;
@@ -516,19 +643,16 @@ static int tcp_send_segment(tcp_conn_t *conn, tcp_priv_t *priv, uint8_t flags,
     uint16_t hdr_total = (uint16_t)(TCP_HDR_LEN + opt_len);  /* TCPヘッダ+オプション(データ抜き) */
     uint16_t seg_len = (uint16_t)(hdr_total + data_len);      /* IPペイロード全体(ヘッダ+データ) */
 
-    uint8_t src_ip_octets[4];
-    uint8_t dst_ip_octets[4];
-    ip_to_octets(conn->local_ip, src_ip_octets);
-    ip_to_octets(conn->remote_ip, dst_ip_octets);
-
     if(ts_log_mode()&TS_MODE_HOTPATH) ts_log(TS_MK(TS_FILE_TCP, TS_FUNC_tcp_send_segment, 0), tcp_conn_arg(conn, data_len));
     unsigned slot = eth_tx_wait_free_slot();
     if(ts_log_mode()&TS_MODE_HOTPATH) ts_log(TS_MK(TS_FILE_TCP, TS_FUNC_tcp_send_segment, 1), tcp_conn_arg(conn, data_len));
     uint8_t *seg_buf = s_seg_bufs[core][slot];
 
-    ip_build_header(seg_buf, dst_ip_octets, dst_mac, IP_PROTO_TCP, seg_len);
+    unsigned l4_off = tcp_l4_off((const netaddr_t *)&conn->remote_ip);
+    tcp_build_l3(seg_buf, (const netaddr_t *)&conn->local_ip,
+                  (const netaddr_t *)&conn->remote_ip, dst_mac, seg_len);
 
-    volatile uint8_t *tcph = seg_buf + IP_PAYLOAD_OFFSET;
+    volatile uint8_t *tcph = seg_buf + l4_off;
     wr16be(tcph + TCP_OFF_SRC_PORT, conn->local_port);
     wr16be(tcph + TCP_OFF_DST_PORT, conn->remote_port);
     wr32be(tcph + TCP_OFF_SEQ, conn->snd_seq);
@@ -554,7 +678,7 @@ static int tcp_send_segment(tcp_conn_t *conn, tcp_priv_t *priv, uint8_t flags,
     if (opt_len > 0) {
         tcph[TCP_HDR_LEN + 0] = TCP_OPT_KIND_MSS;
         tcph[TCP_HDR_LEN + 1] = 4;
-        wr16be(tcph + TCP_HDR_LEN + 2, net_active_mss_cap());
+        wr16be(tcph + TCP_HDR_LEN + 2, tcp_mss_cap_for((const netaddr_t *)&conn->remote_ip));
         if (include_wscale) {
             tcph[TCP_HDR_LEN + 4] = TCP_OPT_KIND_NOP;
             tcph[TCP_HDR_LEN + 5] = TCP_OPT_KIND_WSCALE;
@@ -563,28 +687,30 @@ static int tcp_send_segment(tcp_conn_t *conn, tcp_priv_t *priv, uint8_t flags,
         }
     }
 
-    uint16_t csum;
-    if (net_active_hw_csum_offload()) {
-        csum = pseudo_header_checksum_only(src_ip_octets, dst_ip_octets, IP_PROTO_TCP, seg_len);
-    } else {
-        csum = pseudo_header_checksum2(src_ip_octets, dst_ip_octets, IP_PROTO_TCP,
-                                        tcph, hdr_total, data, data_len);
-    }
+    /* HW チェックサムオフロードは IPv4 前提で組んである(mlx5 側の cs_flags は
+     * L3+L4 を無条件で立てる)。IPv6 では疑似ヘッダの形が違ううえ NIC 側の
+     * 設定を家族ごとに変える経路が無いので、v6 はソフトウェアで全計算する。 */
+    int hw_partial = net_active_hw_csum_offload() &&
+                     (conn->remote_ip.family != NETADDR_V6);
+    uint16_t csum = tcp_checksum((const netaddr_t *)&conn->local_ip,
+                                  (const netaddr_t *)&conn->remote_ip,
+                                  tcph, hdr_total, data, data_len, hw_partial);
     wr16be(tcph + TCP_OFF_CHECKSUM, csum);
 
     if(ts_log_mode()&TS_MODE_HOTPATH) ts_log(TS_MK(TS_FILE_TCP, TS_FUNC_tcp_send_segment, 2), tcp_conn_arg(conn, data_len));
 
-    uint16_t hdr_bytes = (uint16_t)(IP_PAYLOAD_OFFSET + hdr_total);
+    uint8_t *frame = seg_buf;
+    uint16_t hdr_bytes = (uint16_t)(l4_off + hdr_total);
 
     if (net_active_tx_zerocopy() && data_len >= 512u) {
         if(ts_log_mode()&TS_MODE_HOTPATH) ts_log(TS_MK(TS_FILE_TCP, TS_FUNC_tcp_send_segment, 3), tcp_conn_arg(conn, data_len)); // コピー無し(即座)
 
-        dcache_clean_range(seg_buf, hdr_bytes);
+        dcache_clean_range(frame, hdr_bytes);
         dcache_clean_range((const void *)data, data_len);
         if(ts_log_mode()&TS_MODE_HOTPATH) ts_log(TS_MK(TS_FILE_TCP, TS_FUNC_tcp_send_segment, 4), tcp_conn_arg(conn, data_len));
 
         eth_frag_t frags[2];
-        frags[0].data = seg_buf;
+        frags[0].data = frame;
         frags[0].len  = hdr_bytes;
         frags[1].data = data;
         frags[1].len  = data_len;
@@ -593,14 +719,14 @@ static int tcp_send_segment(tcp_conn_t *conn, tcp_priv_t *priv, uint8_t flags,
     }
 
     const volatile uint8_t *vdata = data;
-    volatile_fast_copy((volatile uint8_t *)(seg_buf + hdr_bytes), vdata, data_len);
+    volatile_fast_copy((volatile uint8_t *)(frame + hdr_bytes), vdata, data_len);
     if(ts_log_mode()&TS_MODE_HOTPATH) ts_log(TS_MK(TS_FILE_TCP, TS_FUNC_tcp_send_segment, 5), tcp_conn_arg(conn, data_len));
 
     eth_frag_t frag;
-    frag.data = seg_buf;
+    frag.data = frame;
     frag.len  = (uint16_t)(hdr_bytes + data_len);
 
-    dcache_clean_range(seg_buf, frag.len);
+    dcache_clean_range(frame, frag.len);
     if(ts_log_mode()&TS_MODE_HOTPATH) ts_log(TS_MK(TS_FILE_TCP, TS_FUNC_tcp_send_segment, 6), tcp_conn_arg(conn, data_len));
 
     return eth_send_frags_async(&frag, 1u);
@@ -627,21 +753,15 @@ static int tcp_send_segment_lso(tcp_conn_t *conn, tcp_priv_t *priv,
 {
     unsigned core = smp_core_index();
 
-    netif_t *conn_ctx = netif_find_by_ip(conn->local_ip);
+    netif_t *conn_ctx = tcp_netif_for((const netaddr_t *)&conn->local_ip);
     if (conn_ctx) {
         netif_activate(conn_ctx);
     }
 
     uint8_t dst_mac[ETH_ALEN];
-    if (arp_cache_lookup(conn->remote_ip, dst_mac) != 0) {
-        if (arp_resolve(conn->remote_ip, dst_mac) != 0) {
-            uart_printf("[!] TCP: %u.%u.%u.%u のARP解決失敗、送信中止(LSO)\n",
-                        (unsigned)(conn->remote_ip >> 24) & 0xFFu,
-                        (unsigned)(conn->remote_ip >> 16) & 0xFFu,
-                        (unsigned)(conn->remote_ip >> 8) & 0xFFu,
-                        (unsigned)conn->remote_ip & 0xFFu);
-            return -1;
-        }
+    if (tcp_resolve_mac((const netaddr_t *)&conn->remote_ip, dst_mac) != 0) {
+        uart_printf("[!] TCP: 宛先MACの解決失敗、送信中止(LSO)\n");
+        return -1;
     }
 
     uint32_t seg_len32 = (uint32_t)TCP_HDR_LEN + data_len;
@@ -651,18 +771,15 @@ static int tcp_send_segment_lso(tcp_conn_t *conn, tcp_priv_t *priv,
     }
     uint16_t seg_len = (uint16_t)seg_len32;
 
-    uint8_t src_ip_octets[4];
-    uint8_t dst_ip_octets[4];
-    ip_to_octets(conn->local_ip, src_ip_octets);
-    ip_to_octets(conn->remote_ip, dst_ip_octets);
-
     /* tcp_send_segment()と同じスロット確保規約(コメント参照)。 */
     unsigned slot = eth_tx_wait_free_slot();
     uint8_t *seg_buf = s_seg_bufs[core][slot];
 
-    ip_build_header(seg_buf, dst_ip_octets, dst_mac, IP_PROTO_TCP, seg_len);
+    unsigned l4_off = tcp_l4_off((const netaddr_t *)&conn->remote_ip);
+    tcp_build_l3(seg_buf, (const netaddr_t *)&conn->local_ip,
+                  (const netaddr_t *)&conn->remote_ip, dst_mac, seg_len);
 
-    volatile uint8_t *tcph = seg_buf + IP_PAYLOAD_OFFSET;
+    volatile uint8_t *tcph = seg_buf + l4_off;
     wr16be(tcph + TCP_OFF_SRC_PORT, conn->local_port);
     wr16be(tcph + TCP_OFF_DST_PORT, conn->remote_port);
     wr32be(tcph + TCP_OFF_SEQ, conn->snd_seq);
@@ -684,15 +801,21 @@ static int tcp_send_segment_lso(tcp_conn_t *conn, tcp_priv_t *priv,
     wr16be(tcph + TCP_OFF_WINDOW, wire_window);
     wr16be(tcph + TCP_OFF_URGENT, 0);
 
-    uint16_t csum = pseudo_header_checksum_only(src_ip_octets, dst_ip_octets, IP_PROTO_TCP, seg_len);
+    /* LSO は NIC が IPv4 ヘッダの total_length/ID を書き換える前提の機能で、
+     * 現在の実装は IPv4 でしか使わない(v6 の呼び出し元は tcp_can_use_lso()
+     * で弾いている)。ここでは疑似ヘッダ部分和を種として渡す。 */
+    uint16_t csum = tcp_checksum((const netaddr_t *)&conn->local_ip,
+                                  (const netaddr_t *)&conn->remote_ip,
+                                  tcph, TCP_HDR_LEN, data, (uint16_t)data_len, 1);
     wr16be(tcph + TCP_OFF_CHECKSUM, csum);
 
-    uint16_t hdr_bytes = (uint16_t)(IP_PAYLOAD_OFFSET + TCP_HDR_LEN);
+    uint8_t *frame = seg_buf;
+    uint16_t hdr_bytes = (uint16_t)(l4_off + TCP_HDR_LEN);
 
-    dcache_clean_range(seg_buf, hdr_bytes);
+    dcache_clean_range(frame, hdr_bytes);
     dcache_clean_range((const void *)data, data_len);
 
-    return eth_send_lso_async(seg_buf, hdr_bytes, data, data_len, conn->snd_mss);
+    return eth_send_lso_async(frame, hdr_bytes, data, data_len, conn->snd_mss);
 }
 
 /*=================================================================
@@ -705,34 +828,29 @@ static int tcp_send_segment_lso(tcp_conn_t *conn, tcp_priv_t *priv,
  * コール元:
  *   tcp_input()
  * ===============================================================*/
-static void tcp_send_bare_ack(uint32_t local_ip, uint16_t local_port,
-                               uint32_t remote_ip, uint16_t remote_port,
+static void tcp_send_bare_ack(const netaddr_t *local_ip, uint16_t local_port,
+                               const netaddr_t *remote_ip, uint16_t remote_port,
                                uint32_t seq, uint32_t ack)
 {
     unsigned core = smp_core_index();
 
-    netif_t *conn_ctx = netif_find_by_ip(local_ip);
+    netif_t *conn_ctx = tcp_netif_for(local_ip);
     if (conn_ctx) {
         netif_activate(conn_ctx);
     }
 
     uint8_t dst_mac[ETH_ALEN];
-    if (arp_cache_lookup(remote_ip, dst_mac) != 0) {
-        if (arp_resolve(remote_ip, dst_mac) != 0) {
-            return;
-        }
+    if (tcp_resolve_mac(remote_ip, dst_mac) != 0) {
+        return;
     }
-
-    uint8_t src_ip_octets[4], dst_ip_octets[4];
-    ip_to_octets(local_ip, src_ip_octets);
-    ip_to_octets(remote_ip, dst_ip_octets);
 
     unsigned slot = eth_tx_wait_free_slot();
     uint8_t *seg_buf = s_seg_bufs[core][slot];
 
-    ip_build_header(seg_buf, dst_ip_octets, dst_mac, IP_PROTO_TCP, TCP_HDR_LEN);
+    unsigned l4_off = tcp_l4_off(remote_ip);
+    tcp_build_l3(seg_buf, local_ip, remote_ip, dst_mac, TCP_HDR_LEN);
 
-    volatile uint8_t *tcph = seg_buf + IP_PAYLOAD_OFFSET;
+    volatile uint8_t *tcph = seg_buf + l4_off;
     wr16be(tcph + TCP_OFF_SRC_PORT, local_port);
     wr16be(tcph + TCP_OFF_DST_PORT, remote_port);
     wr32be(tcph + TCP_OFF_SEQ, seq);
@@ -743,13 +861,12 @@ static void tcp_send_bare_ack(uint32_t local_ip, uint16_t local_port,
     wr16be(tcph + TCP_OFF_CHECKSUM, 0);
     wr16be(tcph + TCP_OFF_URGENT, 0);
 
-    uint16_t csum = pseudo_header_checksum2(src_ip_octets, dst_ip_octets, IP_PROTO_TCP,
-                                             tcph, TCP_HDR_LEN, NULL, 0);
+    uint16_t csum = tcp_checksum(local_ip, remote_ip, tcph, TCP_HDR_LEN, NULL, 0, 0);
     wr16be(tcph + TCP_OFF_CHECKSUM, csum);
 
     eth_frag_t frag;
     frag.data = seg_buf;
-    frag.len  = (uint16_t)(IP_PAYLOAD_OFFSET + TCP_HDR_LEN);
+    frag.len  = (uint16_t)(l4_off + TCP_HDR_LEN);
 
     dcache_clean_range(seg_buf, frag.len);
     eth_send_frags_async(&frag, 1u);
@@ -1026,7 +1143,7 @@ static void tcp_parse_syn_options(tcp_conn_t *conn, tcp_priv_t *priv,
         }
         if (kind == TCP_OPT_KIND_MSS && opt_len == 4) {
             uint16_t peer_mss = rd16be(opts + i + 2);
-            uint16_t local_cap = net_active_mss_cap();
+            uint16_t local_cap = tcp_mss_cap_for((const netaddr_t *)&conn->remote_ip);
             if (peer_mss > local_cap) peer_mss = local_cap;
             conn->snd_mss = peer_mss;
             uart_printf("[TCP] 相手のMSSオプション受信: %u (採用値=%u)\n",
@@ -1117,13 +1234,14 @@ static tcp_async_slot_t *tcp_async_slot_at(tcp_priv_t *priv, unsigned core, unsi
  * 引数:
  *   priv     - コネクションのプライベート状態
  *   core     - 対象コア
- *   local_ip - 自機 IPv4(インターフェース判定に使う)
+ *   local_ip - 自機アドレス(インターフェース判定に使う)
  * コール元:
- *   tcp_connect_begin(), tcp_input()
+ *   tcp_connect_begin_addr(), tcp_input_addr()
  * ===============================================================*/
-static void tcp_priv_try_grant_mlx5_async_overflow(tcp_priv_t *priv, unsigned core, uint32_t local_ip)
+static void tcp_priv_try_grant_mlx5_async_overflow(tcp_priv_t *priv, unsigned core,
+                                                    const netaddr_t *local_ip)
 {
-    netif_t *ctx = netif_find_by_ip(local_ip);
+    netif_t *ctx = tcp_netif_for(local_ip);
     if (!ctx || !ctx->hw_csum_offload) {
         return;  /* RP1、または未解決 -- TCP_ASYNC_SLOTSのまま */
     }
@@ -1208,12 +1326,14 @@ static void tcp_cwnd_init(tcp_conn_t *conn, tcp_priv_t *priv)
  *
  * 引数:
  *   conn     - 初期化するコネクション
- *   dst_ip   - 接続先 IPv4(ホストバイトオーダー)
+ *   local_ip - 自分側のアドレス(family がそのままコネクションの family になる)
+ *   dst      - 接続先アドレス
  *   dst_port - 接続先ポート
  * コール元:
- *   nvme_connect_job_step()
+ *   tcp_connect_begin(), tcp_connect_begin6()
  * ===============================================================*/
-void tcp_connect_begin(tcp_conn_t *conn, uint32_t dst_ip, uint16_t dst_port)
+static void tcp_connect_begin_addr(tcp_conn_t *conn, const netaddr_t *local_ip,
+                                    const netaddr_t *dst, uint16_t dst_port)
 {
     unsigned core = smp_core_index();
     int slot = tcp_find_free_slot();
@@ -1225,8 +1345,8 @@ void tcp_connect_begin(tcp_conn_t *conn, uint32_t dst_ip, uint16_t dst_port)
     tcp_priv_t *priv = &s_priv[core][slot];
 
     conn->state       = TCP_CLOSED;
-    conn->local_ip    = NET_SELF_IP;
-    conn->remote_ip   = dst_ip;
+    conn->local_ip    = *local_ip;
+    conn->remote_ip   = *dst;
     conn->remote_port = dst_port;
     conn->snd_win     = 0;                     /* 相手の最初のACKで確定するまでは未知 */
     conn->snd_mss     = TCP_MSS_DEFAULT_RFC879; /* 相手がMSSオプションを付けなければこの既定値のまま */
@@ -1237,16 +1357,19 @@ void tcp_connect_begin(tcp_conn_t *conn, uint32_t dst_ip, uint16_t dst_port)
     conn->local_port = (uint16_t)(49152u + (isn & 0x3fffu));
 
     tcp_priv_init(priv, core);
-    tcp_priv_try_grant_mlx5_async_overflow(priv, core, conn->local_ip);
+    tcp_priv_try_grant_mlx5_async_overflow(priv, core, (const netaddr_t *)&conn->local_ip);
 
     conn->owner_core = core;
     s_conns[core][slot] = conn;
 
-    uint8_t dst_octets[4];
-    ip_to_octets(dst_ip, dst_octets);
-    uart_printf("[TCP] connect: %u.%u.%u.%u:%u へSYN送信 (local_port=%u, isn=%u, slot=%d)\n",
-                dst_octets[0], dst_octets[1], dst_octets[2], dst_octets[3],
-                dst_port, conn->local_port, isn, slot);
+    if (dst->family == NETADDR_V6) {
+        uart_printf("[TCP] connect: [IPv6]:%u へSYN送信 (local_port=%u, isn=%u, slot=%d)\n",
+                    dst_port, conn->local_port, isn, slot);
+    } else {
+        uart_printf("[TCP] connect: %u.%u.%u.%u:%u へSYN送信 (local_port=%u, isn=%u, slot=%d)\n",
+                    dst->a[0], dst->a[1], dst->a[2], dst->a[3],
+                    dst_port, conn->local_port, isn, slot);
+    }
 
     conn->state = TCP_SYN_SENT;
     priv->expected_ack    = isn + 1;
@@ -1260,6 +1383,38 @@ void tcp_connect_begin(tcp_conn_t *conn, uint32_t dst_ip, uint16_t dst_port)
         conn->state = TCP_CLOSED;
         s_conns[core][slot] = NULL;
     }
+}
+
+/*=================================================================
+ * 能動 open(IPv4)。自分側はアクティブなインターフェースの IPv4 を使う。
+ *
+ * 引数:
+ *   conn / dst_ip / dst_port - コネクションと接続先
+ * コール元:
+ *   nvme_connect_job_step()
+ * ===============================================================*/
+void tcp_connect_begin(tcp_conn_t *conn, uint32_t dst_ip, uint16_t dst_port)
+{
+    netaddr_t local = netaddr_v4(NET_SELF_IP);
+    netaddr_t dst   = netaddr_v4(dst_ip);
+    tcp_connect_begin_addr(conn, &local, &dst, dst_port);
+}
+
+/*=================================================================
+ * 能動 open(IPv6)。自分側はアクティブなインターフェースのリンクローカル。
+ *
+ * 引数:
+ *   conn / dst_ip / dst_port - コネクションと接続先(16 バイトアドレス)
+ * コール元:
+ *   shell_tcp6test()
+ * ===============================================================*/
+void tcp_connect_begin6(tcp_conn_t *conn, const uint8_t dst_ip[16], uint16_t dst_port)
+{
+    uint8_t ll[16];
+    ipv6_link_local_addr(ll);
+    netaddr_t local = netaddr_v6(ll);
+    netaddr_t dst   = netaddr_v6(dst_ip);
+    tcp_connect_begin_addr(conn, &local, &dst, dst_port);
 }
 
 /*=================================================================
@@ -1713,8 +1868,10 @@ static int tcp_send_async_ex(tcp_conn_t *conn, const void *buf, uint16_t len, in
         return tcp_send(conn, buf, len);
     }
 
-    netif_t *conn_ctx = netif_find_by_ip(conn->local_ip);
-    uint32_t lso_cap = conn_ctx ? conn_ctx->hw_lso_max_bytes : 0u;
+    netif_t *conn_ctx = tcp_netif_for((const netaddr_t *)&conn->local_ip);
+    /* LSO は NIC が IPv4 ヘッダを書き換える前提の機能なので v6 では使わない。 */
+    uint32_t lso_cap = (conn_ctx && conn->remote_ip.family != NETADDR_V6)
+                           ? conn_ctx->hw_lso_max_bytes : 0u;
     if (lso_cap > TCP_ASYNC_MAX_LEN) lso_cap = TCP_ASYNC_MAX_LEN;
 
     uint32_t sent_total = 0;
@@ -1943,8 +2100,8 @@ void tcp_close(tcp_conn_t *conn)
                     tcp_poll_once();
                 }
                 if (conn->state != TCP_TIME_WAIT && conn->state != TCP_CLOSED) {
-                    tcp_timewait_register(conn->local_ip, conn->local_port,
-                                           conn->remote_ip, conn->remote_port,
+                    tcp_timewait_register((const netaddr_t *)&conn->local_ip, conn->local_port,
+                                           (const netaddr_t *)&conn->remote_ip, conn->remote_port,
                                            conn->snd_seq);
                 }
             }
@@ -2151,11 +2308,16 @@ int tcp_accept_ready_poll(int listener)
  * 引数:
  *   pkt    - TCP ヘッダ先頭(IP ヘッダの直後)
  *   len    - そのバイト数
- *   src_ip - 送信元 IPv4(ホストバイトオーダー)
+ *   src - L3 ヘッダから取り出した送信元
+ *   dst - 同じく宛先。IPv4 で「アクティブなインターフェースの IPv4」と
+ *         分かっている場合は NULL を渡してよい(受信 1 パケットごとに
+ *         netaddr_t を組み立てる無駄を避けるため。実際に使うのは受動 open と
+ *         ソフトウェアチェックサム検証の 2 箇所だけ)
  * コール元:
- *   ip_handle_frame()
+ *   tcp_input(), ipv6_handle_frame()
  * ===============================================================*/
-void tcp_input(const uint8_t *pkt, uint16_t len, uint32_t src_ip)
+void tcp_input_addr(const uint8_t *pkt, uint16_t len,
+                    const netaddr_t *src, const netaddr_t *dst)
 {
     unsigned core = smp_core_index();
 
@@ -2199,9 +2361,9 @@ void tcp_input(const uint8_t *pkt, uint16_t len, uint32_t src_ip)
             uint32_t seg_seq  = rd32be(in + TCP_OFF_SEQ);
             uint8_t  hdr_len2 = (uint8_t)(((in[TCP_OFF_DATA_OFFSET] >> 4) & 0x0Fu) * 4u);
 
-            aconn->local_ip    = NET_SELF_IP;
-            tcp_priv_try_grant_mlx5_async_overflow(apriv, core, aconn->local_ip);
-            aconn->remote_ip   = src_ip;
+            aconn->local_ip    = dst ? *dst : netaddr_v4(NET_SELF_IP);
+            tcp_priv_try_grant_mlx5_async_overflow(apriv, core, (const netaddr_t *)&aconn->local_ip);
+            aconn->remote_ip   = *src;
             aconn->remote_port = src_port;
             aconn->local_port  = dst_port;
             aconn->state       = TCP_SYN_RCVD;
@@ -2232,10 +2394,14 @@ void tcp_input(const uint8_t *pkt, uint16_t len, uint32_t src_ip)
     tcp_conn_t *conn = NULL;
     tcp_priv_t *priv = NULL;
     for (unsigned i = 0; i < TCP_MAX_CONNS; i++) {
+        /* ポートを先に見る。ポートは構造体前半(スカラ側)にあり 2 バイトの
+         * 比較で済むうえ選択性が高いので、後半にある 17 バイトのアドレスへ
+         * 触る回数を最小化できる(アドレスを netaddr_t 化した直後、この順序
+         * が逆だったために 8KB read が 6% 落ちていた)。 */
         if (s_conns[core][i] != NULL &&
-            src_ip == s_conns[core][i]->remote_ip &&
             src_port == s_conns[core][i]->remote_port &&
-            dst_port == s_conns[core][i]->local_port) {
+            dst_port == s_conns[core][i]->local_port &&
+            netaddr_eq(src, (const netaddr_t *)&s_conns[core][i]->remote_ip)) {
             conn = s_conns[core][i];
             priv = &s_priv[core][i];
             break;
@@ -2243,13 +2409,14 @@ void tcp_input(const uint8_t *pkt, uint16_t len, uint32_t src_ip)
     }
     if (!conn) {
         if (in[TCP_OFF_FLAGS] & TCP_FLAG_FIN) {
-            tcp_timewait_t *tw = tcp_timewait_find(src_ip, src_port, dst_port);
+            tcp_timewait_t *tw = tcp_timewait_find(src, src_port, dst_port);
             if (tw) {
                 uint8_t fin_hdr_len = (uint8_t)(((in[TCP_OFF_DATA_OFFSET] >> 4) & 0x0Fu) * 4u);
                 if (fin_hdr_len >= TCP_HDR_LEN && fin_hdr_len <= len) {
                     uint32_t fin_seq = rd32be(in + TCP_OFF_SEQ);
                     uint16_t fin_payload_len = (uint16_t)(len - fin_hdr_len);
-                    tcp_send_bare_ack(tw->local_ip, tw->local_port, tw->remote_ip, tw->remote_port,
+                    tcp_send_bare_ack(&tw->local_ip, tw->local_port,
+                                       &tw->remote_ip, tw->remote_port,
                                        tw->local_seq, fin_seq + fin_payload_len + 1u);
                 }
             }
@@ -2260,12 +2427,14 @@ void tcp_input(const uint8_t *pkt, uint16_t len, uint32_t src_ip)
     int hw_ok = eth_rx_hw_csum_ok();
     if(ts_log_mode()&TS_MODE_HOTPATH) ts_log(TS_MK(TS_FILE_TCP, TS_FUNC_tcp_input, 0), tcp_conn_arg(conn, len));
     if (!hw_ok) {
-        uint8_t src_ip_octets[4];
-        uint8_t dst_ip_octets[4];
-        ip_to_octets(src_ip, src_ip_octets);
-        ip_to_octets(conn->local_ip, dst_ip_octets);
-        uint16_t csum_check = pseudo_header_checksum(src_ip_octets, dst_ip_octets,
-                                                      IP_PROTO_TCP, pkt, len);
+        uint16_t csum_check;
+        netaddr_t dst_v4;
+        if (!dst) { dst_v4 = netaddr_v4(NET_SELF_IP); dst = &dst_v4; }
+        if (src->family == NETADDR_V6) {
+            csum_check = ipv6_pseudo_checksum(src->a, dst->a, IP_PROTO_TCP, pkt, len);
+        } else {
+            csum_check = pseudo_header_checksum(src->a, dst->a, IP_PROTO_TCP, pkt, len);
+        }
         if (csum_check != 0) {
             if(ts_log_mode()&TS_MODE_HOTPATH) ts_log(TS_MK(TS_FILE_TCP, TS_FUNC_tcp_input, 1), tcp_conn_arg(conn, len));
             uart_printf("[TCP] チェックサム不正 (計算結果=0x%04X、0であるべき) セグメント破棄\n",
@@ -2482,4 +2651,23 @@ void tcp_input(const uint8_t *pkt, uint16_t len, uint32_t src_ip)
     default:
         break;
     }
+}
+
+/*=================================================================
+ * IPv4 用の受信入口。ip_handle_frame() から呼ばれ、アドレスを netaddr_t へ
+ * 包んで共通処理へ渡すだけ。宛先はアクティブなインターフェースの IPv4
+ * (ip.c が宛先一致を確認済みなのでそれと同じ値になる)。
+ *
+ * 引数:
+ *   pkt / len - TCP セグメント
+ *   src_ip    - 送信元 IPv4(ホストバイトオーダー)
+ * コール元:
+ *   ip_handle_frame()
+ * ===============================================================*/
+void tcp_input(const uint8_t *pkt, uint16_t len, uint32_t src_ip)
+{
+    netaddr_t src = netaddr_v4(src_ip);
+    /* 宛先は「アクティブなインターフェースの IPv4」なので、実際に必要になる
+     * 場面(受動 open / SW チェックサム)まで組み立てを遅らせる。 */
+    tcp_input_addr(pkt, len, &src, NULL);
 }

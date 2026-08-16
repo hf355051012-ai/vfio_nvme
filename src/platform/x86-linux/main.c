@@ -317,14 +317,19 @@ static volatile uint16_t s_udptest_len;
  *   udp_input()
  * ===============================================================*/
 static void shell_udptest_handler(const uint8_t *data, size_t len,
-                                   const uint8_t src_ip[4], uint16_t src_port,
+                                   const netaddr_t *src, uint16_t src_port,
                                    const uint8_t *src_mac)
 {
     (void)data; (void)src_mac;
     s_udptest_len = (uint16_t)len;
     s_udptest_rx++;
-    uart_printf("[udptest] 受信 %u バイト (from %u.%u.%u.%u:%u)\n",
-                (unsigned)len, src_ip[0], src_ip[1], src_ip[2], src_ip[3], src_port);
+    if (src->family == NETADDR_V6) {
+        uart_printf("[udptest] 受信 %u バイト (from IPv6 ...:%02x%02x:%u)\n",
+                    (unsigned)len, src->a[14], src->a[15], src_port);
+    } else {
+        uart_printf("[udptest] 受信 %u バイト (from %u.%u.%u.%u:%u)\n",
+                    (unsigned)len, src->a[0], src->a[1], src->a[2], src->a[3], src_port);
+    }
 }
 
 /*=================================================================
@@ -392,6 +397,194 @@ static void shell_udptest(void)
     }
 
     udp_unbind(port_ok);
+}
+
+/*=================================================================
+ * 対向 PF のリンクローカルアドレスを求める。2 ポートは同一プロセスから
+ * 駆動しているので、相手側インターフェースの MAC から EUI-64 を組み立てる
+ * (NDP で探すまでもなく確定できる)。
+ *
+ * 引数:
+ *   out - 16 バイトの格納先
+ * 戻り値:
+ *   対向の netif_t。見つからなければ NULL
+ * コール元:
+ *   shell_udptest6(), shell_tcp6test()
+ * ===============================================================*/
+static netif_t *shell_peer_ll6(uint8_t out[16])
+{
+    netif_t *a = netif_find("mlx5-pf0");
+    netif_t *b = netif_find("mlx5-pf1");
+    netif_t *peer = (g_active_ctx == a) ? b : a;
+    if (!peer) return NULL;
+
+    const uint8_t *mac = peer->mac;
+    for (unsigned i = 0; i < 16; i++) out[i] = 0;
+    out[0] = 0xFE; out[1] = 0x80;
+    out[8]  = (uint8_t)(mac[0] ^ 0x02u);
+    out[9]  = mac[1];
+    out[10] = mac[2];
+    out[11] = 0xFF;
+    out[12] = 0xFE;
+    out[13] = mac[3];
+    out[14] = mac[4];
+    out[15] = mac[5];
+    return peer;
+}
+
+/*=================================================================
+ * シェルの `udptest6`。対向 PF のリンクローカル宛に UDP over IPv6 を 1 発
+ * 送り、受信ハンドラが呼ばれることを確認する。宛先 MAC は NDP(Neighbor
+ * Solicitation/Advertisement)で解決する。
+ *
+ * コール元:
+ *   shell_dispatch()
+ * ===============================================================*/
+static void shell_udptest6(void)
+{
+    const uint16_t port = 7777u;
+
+    uint8_t peer_ll[16];
+    if (!shell_peer_ll6(peer_ll)) {
+        uart_printf("udptest6: 対向インターフェースが見つかりません(net init mlx5 が必要)\n");
+        return;
+    }
+
+    if (udp_bind(port, shell_udptest_handler) != 0) {
+        uart_printf("udptest6: udp_bind 失敗\n");
+        return;
+    }
+
+    uint8_t peer_mac[6];
+    if (ndp_resolve(peer_ll, peer_mac) != 0) {
+        uart_printf("udptest6: NDP 解決失敗\n");
+        udp_unbind(port);
+        return;
+    }
+    uart_printf("udptest6: NDP 解決 OK (%02x:%02x:%02x:%02x:%02x:%02x)\n",
+                peer_mac[0], peer_mac[1], peer_mac[2],
+                peer_mac[3], peer_mac[4], peer_mac[5]);
+
+    static uint8_t body[64];
+    for (unsigned i = 0; i < sizeof(body); i++) body[i] = (uint8_t)(0x50u + i);
+
+    uint32_t before = s_udptest_rx;
+    if (udp_send6(peer_ll, peer_mac, port, port, body, (uint16_t)sizeof(body)) != 0) {
+        uart_printf("udptest6: udp_send6 失敗\n");
+        udp_unbind(port);
+        return;
+    }
+    uart_printf("udptest6: %u バイトを対向のリンクローカル:%u へ送信\n",
+                (unsigned)sizeof(body), port);
+
+    uint64_t t0 = timer_now();
+    while (!timeout_ms(t0, 1000u)) {
+        net_poll_all_and_dispatch();
+        job_scheduler_tick();
+        if (s_udptest_rx != before) break;
+    }
+    if (s_udptest_rx != before) {
+        uart_printf("udptest6: OK -- 受信ハンドラが %u バイトで呼ばれました\n",
+                    (unsigned)s_udptest_len);
+    } else {
+        uart_printf("udptest6: NG -- 受信ハンドラが呼ばれませんでした\n");
+    }
+    udp_unbind(port);
+}
+
+/*=================================================================
+ * シェルの `tcp6test`。同一プロセス内の 2 つのインターフェースを
+ * サーバ役/クライアント役にして、IPv6 上で TCP を確立しデータを 1 往復
+ * させる。ポーリング専用・単一スレッドなので、接続待ちは
+ * tcp_accept_begin()(ブロックしない受け皿準備)で用意しておき、
+ * tcp_connect_poll() が内部で回すポーリングにサーバ側の処理も乗せる。
+ *
+ * コール元:
+ *   shell_dispatch()
+ * ===============================================================*/
+static void shell_tcp6test(void)
+{
+    const uint16_t port = 6000u;
+    static tcp_conn_t s_srv, s_cli;
+
+    uint8_t peer_ll[16];
+    netif_t *peer = shell_peer_ll6(peer_ll);
+    netif_t *self = g_active_ctx;
+    if (!peer || !self) {
+        uart_printf("tcp6test: 対向インターフェースが見つかりません(net init mlx5 が必要)\n");
+        return;
+    }
+    uart_printf("tcp6test: client=%s server=%s port=%u\n", self->name, peer->name, port);
+
+    /* サーバ役の受け皿を先に用意する(対向インターフェース宛に束縛)。 */
+    int listener = tcp_listen(port, peer);
+    if (listener < 0) {
+        uart_printf("tcp6test: tcp_listen 失敗\n");
+        return;
+    }
+    s_srv.state = TCP_CLOSED;
+    tcp_accept_begin(listener, &s_srv);
+
+    netif_activate(self);
+    tcp_connect_begin6(&s_cli, peer_ll, port);
+
+    uint64_t t0 = timer_now();
+    int established = 0;
+    while (!timeout_ms(t0, 3000u)) {
+        netif_activate(self);
+        int r = tcp_connect_poll(&s_cli);
+        net_poll_all_and_dispatch();
+        if (r == 1) { established = 1; break; }
+        if (r < 0) break;
+    }
+    if (!established) {
+        uart_printf("tcp6test: NG -- 接続確立できず (client state=%d server state=%d)\n",
+                    (int)s_cli.state, (int)s_srv.state);
+        tcp_unlisten(listener);
+        return;
+    }
+    uart_printf("tcp6test: 接続確立 (MSS=%u)\n", (unsigned)s_cli.snd_mss);
+
+    /* フルサイズ(MSS)セグメントを何本も流す大きさにしておく。小さいままだと
+     * 1 セグメントに収まってしまい、L3 ヘッダ 20 バイト増による MTU 超過
+     * (NIC が無言で捨てる)を踏まずに PASS してしまう。 */
+    static uint8_t tx[65536];
+    static uint8_t rx[65536];
+    for (unsigned i = 0; i < sizeof(tx); i++) tx[i] = (uint8_t)(i * 7u + 3u);
+
+    netif_activate(self);
+    /* tcp_send() は送信できたバイト数を返す(失敗/中断で -1)。 */
+    if (tcp_send(&s_cli, tx, sizeof(tx)) != (int)sizeof(tx)) {
+        uart_printf("tcp6test: NG -- 送信失敗\n");
+        tcp_close(&s_cli);
+        tcp_unlisten(listener);
+        return;
+    }
+
+    uint32_t got = 0;
+    t0 = timer_now();
+    while (got < sizeof(tx) && !timeout_ms(t0, 3000u)) {
+        netif_activate(peer);
+        int n = tcp_recv(&s_srv, rx + got, (uint32_t)sizeof(rx) - got, 20u);
+        if (n > 0) got += (uint32_t)n;
+        else if (n < 0) break;
+        net_poll_all_and_dispatch();
+    }
+
+    int match = (got == sizeof(tx));
+    for (uint32_t i = 0; match && i < got; i++) {
+        if (rx[i] != tx[i]) match = 0;
+    }
+    uart_printf("tcp6test: 受信 %u/%u バイト -- %s\n",
+                (unsigned)got, (unsigned)sizeof(tx),
+                match ? "PASS(内容一致)" : "NG(内容不一致または不足)");
+
+    netif_activate(self);
+    tcp_close(&s_cli);
+    netif_activate(peer);
+    tcp_close(&s_srv);
+    tcp_unlisten(listener);
+    netif_activate(self);
 }
 
 /* ---- ベンチ引数パース + サマリ表示(bench/tcpbench 共通) ---- */
@@ -839,8 +1032,12 @@ static void shell_dispatch(char *line, int s0, int s1)
         shell_ts(line + 2);
     } else if (strncmp(line, "ping6", 5) == 0) {
         shell_ping6();
+    } else if (strncmp(line, "udptest6", 8) == 0) {
+        shell_udptest6();
     } else if (strncmp(line, "udptest", 7) == 0) {
         shell_udptest();
+    } else if (strncmp(line, "tcp6test", 8) == 0) {
+        shell_tcp6test();
     } else if (strncmp(line, "jobs", 4) == 0) {
         job_list_dump();
     } else if (strncmp(line, "help", 4) == 0) {
@@ -854,7 +1051,8 @@ static void shell_dispatch(char *line, int s0, int s1)
                     "  ts [core N] [num N] [mask M V] | ts pause|resume   ts_log ダンプ\n"
                     "  simdelay <core> <us> | simdelay show   律速切り分け(遅延注入)\n"
                     "  ping6                                 対向PFへICMPv6 Echo(IPv6疎通確認)\n"
-                    "  udptest                               対向PFへUDP往復 + Port Unreachable確認\n"
+                    "  udptest | udptest6                    対向PFへUDP往復(v4はPort Unreachableも確認)\n"
+                    "  tcp6test                              対向PFとIPv6上でTCP確立+データ往復\n"
                     "  nvmet [port] | jobs | help | quit    (↑↓で履歴呼び出し)\n"
                     "  例: bench 8,64,256 rw 8 / tcpbench 64,256 w digest / ts core 1 num 40\n");
     } else if (strncmp(line, "quit", 4) == 0 || strncmp(line, "exit", 4) == 0) {

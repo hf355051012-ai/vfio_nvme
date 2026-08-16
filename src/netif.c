@@ -312,6 +312,43 @@ netif_t *netif_find_by_ip(uint32_t ip)
 }
 
 /*=================================================================
+ * IPv6 リンクローカルアドレスから登録済みインターフェースを引く。IPv6 の
+ * アドレスは netif_t に持たず MAC から EUI-64 で毎回導出するので、ここでも
+ * 各インターフェースの MAC から組み立てて比較する。
+ *
+ * 引数:
+ *   addr - 探すリンクローカルアドレス(16 バイト)
+ * 戻り値:
+ *   見つかった netif_t、無ければ NULL
+ * コール元:
+ *   tcp_send_segment() 系(v6 コネクションの送信元インターフェース特定)
+ * ===============================================================*/
+netif_t *netif_find_by_ip6(const uint8_t addr[16])
+{
+    for (unsigned i = 0; i < s_registered_count; i++) {
+        const uint8_t *mac = s_registered[i]->mac;
+        uint8_t ll[16];
+        for (unsigned j = 0; j < 16; j++) ll[j] = 0;
+        ll[0] = 0xFE; ll[1] = 0x80;
+        ll[8]  = (uint8_t)(mac[0] ^ 0x02u);
+        ll[9]  = mac[1];
+        ll[10] = mac[2];
+        ll[11] = 0xFF;
+        ll[12] = 0xFE;
+        ll[13] = mac[3];
+        ll[14] = mac[4];
+        ll[15] = mac[5];
+
+        int same = 1;
+        for (unsigned j = 0; j < 16; j++) {
+            if (ll[j] != addr[j]) { same = 0; break; }
+        }
+        if (same) return s_registered[i];
+    }
+    return NULL;
+}
+
+/*=================================================================
  * 受信フレームの宛先 IP(ARP なら tpa、IPv4 なら dst_ip)を見て、同じ物理
  * NIC を共有する別名インターフェースの中にその IP を名乗るものがあれば
  * それを返す。無ければポーリング主体をそのまま返す。

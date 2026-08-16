@@ -5,6 +5,10 @@
 #include "net_buf.h"
 #include "uart.h"
 #include "smp.h"
+#include "timer.h"
+#include "netaddr.h"
+#include "tcp.h"
+#include "udp.h"
 
 #define ICMPV6_OFF_TYPE     0u
 #define ICMPV6_OFF_CODE     1u
@@ -18,6 +22,9 @@
 
 #define NDP_OPT_SRC_LLADDR 1u
 #define NDP_OPT_TGT_LLADDR 2u
+
+#define NDP_RESOLVE_TIMEOUT_MS  200u
+#define NDP_RESOLVE_MAX_ATTEMPTS 3u
 
 volatile uint32_t g_ipv6_echo_request_count[SMP_MAX_CORES];
 volatile uint32_t g_ipv6_echo_reply_count[SMP_MAX_CORES];
@@ -93,10 +100,11 @@ int ipv6_addr_is_ours(const uint8_t addr[IPV6_ADDR_LEN])
         }
         if (zero_mid && addr[15] == 0x01) return 1;
 
-        /* ff02::1:ffXX:XXXX (要請ノードマルチキャスト) -- 下位 24bit が一致 */
-        if (addr[11] == 0xFF && addr[12] == ll[13] &&
-            addr[13] == ll[14] && addr[14] == ll[15]) {
-            /* addr[12..14] がリンクローカル下位3バイトと一致すれば自分宛 */
+        /* ff02::1:ffXX:XXXX (要請ノードマルチキャスト)。バイト列では
+         * ff 02 00..00 01 ff XX XX XX なので、addr[11]=0x01 / addr[12]=0xFF で、
+         * addr[13..15] が自分のリンクローカル下位 3 バイトと一致する。 */
+        if (addr[11] == 0x01 && addr[12] == 0xFF &&
+            addr[13] == ll[13] && addr[14] == ll[14] && addr[15] == ll[15]) {
             return 1;
         }
     }
@@ -116,27 +124,92 @@ int ipv6_addr_is_ours(const uint8_t addr[IPV6_ADDR_LEN])
  * コール元:
  *   ipv6_handle_icmpv6(), ipv6_send_icmpv6()
  * ===============================================================*/
-static uint16_t ipv6_pseudo_checksum(const uint8_t src[IPV6_ADDR_LEN],
-                                      const uint8_t dst[IPV6_ADDR_LEN],
-                                      uint8_t next_hdr,
-                                      const volatile uint8_t *data, uint16_t len)
+static uint32_t ipv6_pseudo_sum(const uint8_t src[IPV6_ADDR_LEN],
+                                 const uint8_t dst[IPV6_ADDR_LEN],
+                                 uint8_t next_hdr, uint32_t len)
 {
     uint32_t sum = 0;
     for (unsigned i = 0; i < IPV6_ADDR_LEN; i += 2) {
         sum += ((uint32_t)src[i] << 8) | src[i + 1];
         sum += ((uint32_t)dst[i] << 8) | dst[i + 1];
     }
-    sum += (uint32_t)len;
+    /* IPv6 の疑似ヘッダは長さが 32bit、next header は 32bit フィールドの
+     * 最下位バイト。16bit ワードの和としてはどちらも下記で足りる。 */
+    sum += (len >> 16) & 0xFFFFu;
+    sum += len & 0xFFFFu;
     sum += (uint32_t)next_hdr;
+    return sum;
+}
 
-    uint16_t i = 0;
-    for (; (uint32_t)i + 1u < (uint32_t)len; i = (uint16_t)(i + 2)) {
-        sum += ((uint32_t)data[i] << 8) | data[i + 1];
-    }
-    if (i < len) sum += (uint32_t)data[i] << 8;
-
+uint16_t ipv6_pseudo_checksum(const uint8_t src[IPV6_ADDR_LEN],
+                               const uint8_t dst[IPV6_ADDR_LEN],
+                               uint8_t next_hdr,
+                               const volatile uint8_t *data, uint16_t len)
+{
+    uint32_t sum = ipv6_pseudo_sum(src, dst, next_hdr, len);
+    sum = checksum_accumulate(sum, data, len);
     while (sum >> 16) sum = (sum & 0xFFFFu) + (sum >> 16);
-    return (uint16_t)(~sum);
+    return (uint16_t)(~sum & 0xFFFFu);
+}
+
+uint16_t ipv6_pseudo_checksum_only(const uint8_t src[IPV6_ADDR_LEN],
+                                    const uint8_t dst[IPV6_ADDR_LEN],
+                                    uint8_t next_hdr, uint16_t len)
+{
+    uint32_t sum = ipv6_pseudo_sum(src, dst, next_hdr, len);
+    while (sum >> 16) sum = (sum & 0xFFFFu) + (sum >> 16);
+    return (uint16_t)(~sum & 0xFFFFu);
+}
+
+uint16_t ipv6_pseudo_checksum2(const uint8_t src[IPV6_ADDR_LEN],
+                                const uint8_t dst[IPV6_ADDR_LEN], uint8_t next_hdr,
+                                const volatile uint8_t *hdr, uint16_t hdr_len,
+                                const void *data, uint16_t data_len)
+{
+    uint32_t sum = ipv6_pseudo_sum(src, dst, next_hdr,
+                                    (uint32_t)hdr_len + (uint32_t)data_len);
+    sum = checksum_accumulate(sum, hdr, hdr_len);
+    sum = checksum_accumulate(sum, data, data_len);
+    while (sum >> 16) sum = (sum & 0xFFFFu) + (sum >> 16);
+    return (uint16_t)(~sum & 0xFFFFu);
+}
+
+/*=================================================================
+ * Ethernet + IPv6 ヘッダを buf の先頭へ組み立てる(ip_build_header の IPv6 版)。
+ * IPv6 ヘッダにチェックサムは無いので、ここで計算するものは無い。
+ *
+ * 引数:
+ *   buf         - 書き込み先(ETH_HDR_LEN + IPV6_HDR_LEN 以上の余裕が必要)
+ *   src / dst   - 送信元・宛先 IPv6 アドレス
+ *   dst_mac     - 宛先 MAC
+ *   next_header - 上位プロトコル番号
+ *   payload_len - 上位プロトコルのバイト数
+ * コール元:
+ *   tcp_send_segment() 系、udp_send6()
+ * ===============================================================*/
+void ipv6_build_header(uint8_t *buf, const uint8_t src[IPV6_ADDR_LEN],
+                        const uint8_t dst[IPV6_ADDR_LEN], const uint8_t dst_mac[6],
+                        uint8_t next_header, uint16_t payload_len)
+{
+    uint8_t self_mac[ETH_ALEN];
+    eth_get_mac(self_mac);
+
+    const volatile uint8_t *vdst_mac = dst_mac;
+    volatile uint8_t *out = buf;
+
+    for (int i = 0; i < ETH_ALEN; i++) out[i]            = vdst_mac[i];
+    for (int i = 0; i < ETH_ALEN; i++) out[ETH_ALEN + i] = self_mac[i];
+    out[12] = 0x86; out[13] = 0xDD;  /* EtherType: IPv6 */
+
+    volatile uint8_t *h = out + ETH_HDR_LEN;
+    h[0] = 0x60; h[1] = 0; h[2] = 0; h[3] = 0;   /* version=6, TC=0, flow label=0 */
+    wr16be(h + offsetof(ipv6_header_t, payload_len), payload_len);
+    h[offsetof(ipv6_header_t, next_header)] = next_header;
+    h[offsetof(ipv6_header_t, hop_limit)]   = 64u;
+    for (unsigned i = 0; i < IPV6_ADDR_LEN; i++) {
+        h[offsetof(ipv6_header_t, src) + i] = src[i];
+        h[offsetof(ipv6_header_t, dst) + i] = dst[i];
+    }
 }
 
 /*=================================================================
@@ -162,6 +235,141 @@ static int ipv6_send_icmpv6(const uint8_t dst[IPV6_ADDR_LEN], const uint8_t dst_
     wr16be(msg + ICMPV6_OFF_CHECKSUM, csum);
 
     return ipv6_send(dst, dst_mac, IPV6_NH_ICMPV6, msg, msg_len);
+}
+
+/*=================================================================
+ * 近隣キャッシュへ 1 件登録する(既存エントリがあれば MAC を更新)。空きが
+ * 無ければ先頭を潰す。ARP キャッシュと同じく、アクティブなインターフェースの
+ * キャッシュに入れる。
+ *
+ * 引数:
+ *   addr - 相手の IPv6 アドレス
+ *   mac  - 対応する MAC
+ * コール元:
+ *   ipv6_handle_icmpv6()
+ * ===============================================================*/
+void ndp_cache_insert(const uint8_t addr[IPV6_ADDR_LEN], const uint8_t mac[ETH_ALEN])
+{
+    ndp_cache_entry_t *cache = g_active_ctx->ndp_cache;
+    unsigned free_slot = NDP_CACHE_SIZE;
+
+    for (unsigned i = 0; i < NDP_CACHE_SIZE; i++) {
+        if (!cache[i].valid) {
+            if (free_slot == NDP_CACHE_SIZE) free_slot = i;
+            continue;
+        }
+        int same = 1;
+        for (unsigned j = 0; j < IPV6_ADDR_LEN; j++) {
+            if (cache[i].addr[j] != addr[j]) { same = 0; break; }
+        }
+        if (same) {
+            for (unsigned j = 0; j < ETH_ALEN; j++) cache[i].mac[j] = mac[j];
+            return;
+        }
+    }
+
+    unsigned slot = (free_slot < NDP_CACHE_SIZE) ? free_slot : 0u;
+    for (unsigned j = 0; j < IPV6_ADDR_LEN; j++) cache[slot].addr[j] = addr[j];
+    for (unsigned j = 0; j < ETH_ALEN; j++) cache[slot].mac[j] = mac[j];
+    cache[slot].valid = 1;
+}
+
+/*=================================================================
+ * 近隣キャッシュを引く。
+ *
+ * 引数:
+ *   addr    - 探す IPv6 アドレス
+ *   out_mac - 見つかった MAC の格納先
+ * 戻り値:
+ *   0=見つかった、-1=無い
+ * コール元:
+ *   ndp_resolve()
+ * ===============================================================*/
+int ndp_cache_lookup(const uint8_t addr[IPV6_ADDR_LEN], uint8_t out_mac[ETH_ALEN])
+{
+    const ndp_cache_entry_t *cache = g_active_ctx->ndp_cache;
+    for (unsigned i = 0; i < NDP_CACHE_SIZE; i++) {
+        if (!cache[i].valid) continue;
+        int same = 1;
+        for (unsigned j = 0; j < IPV6_ADDR_LEN; j++) {
+            if (cache[i].addr[j] != addr[j]) { same = 0; break; }
+        }
+        if (same) {
+            for (unsigned j = 0; j < ETH_ALEN; j++) out_mac[j] = cache[i].mac[j];
+            return 0;
+        }
+    }
+    return -1;
+}
+
+/*=================================================================
+ * Neighbor Solicitation を 1 個送る。宛先は target の要請ノードマルチキャスト
+ * (ff02::1:ffXX:XXXX)で、L2 は 33:33 + そのアドレス下位 4 バイト。Source
+ * Link-Layer Address オプションを付けて相手が NA を返せるようにする。
+ *
+ * 引数:
+ *   target - 解決したい相手の IPv6 アドレス
+ * 戻り値:
+ *   0=送信完了、-1=失敗
+ * コール元:
+ *   ndp_resolve()
+ * ===============================================================*/
+static int ndp_send_ns(const uint8_t target[IPV6_ADDR_LEN])
+{
+    unsigned core = smp_core_index();
+    if (core >= SMP_MAX_CORES) core = 0;
+    static uint8_t ns[SMP_MAX_CORES][8u + NDP_BODY_LEN + 8u];
+
+    uint8_t *m = ns[core];
+    for (unsigned i = 0; i < 8u + NDP_BODY_LEN + 8u; i++) m[i] = 0;
+    m[ICMPV6_OFF_TYPE] = ICMPV6_TYPE_NS;
+    m[ICMPV6_OFF_CODE] = 0;
+    for (unsigned i = 0; i < IPV6_ADDR_LEN; i++) m[8u + NDP_OFF_TARGET + i] = target[i];
+
+    uint8_t self_mac[ETH_ALEN];
+    eth_get_mac(self_mac);
+    m[8u + NDP_BODY_LEN + 0] = NDP_OPT_SRC_LLADDR;
+    m[8u + NDP_BODY_LEN + 1] = 1u;
+    for (unsigned i = 0; i < ETH_ALEN; i++) m[8u + NDP_BODY_LEN + 2u + i] = self_mac[i];
+
+    /* 要請ノードマルチキャスト ff02::1:ffXX:XXXX */
+    uint8_t sol[IPV6_ADDR_LEN];
+    for (unsigned i = 0; i < IPV6_ADDR_LEN; i++) sol[i] = 0;
+    sol[0] = 0xFF; sol[1] = 0x02; sol[11] = 0x01; sol[12] = 0xFF;
+    sol[13] = target[13]; sol[14] = target[14]; sol[15] = target[15];
+
+    const uint8_t dst_mac[ETH_ALEN] = { 0x33, 0x33, 0xFF,
+                                        target[13], target[14], target[15] };
+
+    return ipv6_send_icmpv6(sol, dst_mac, m, (uint16_t)(8u + NDP_BODY_LEN + 8u));
+}
+
+/*=================================================================
+ * IPv6 アドレスから MAC を得る。キャッシュに無ければ NS を送って NA を待つ。
+ * arp_resolve() と同じ「送って待つ」同期解決。
+ *
+ * 引数:
+ *   addr    - 解決したい相手の IPv6 アドレス
+ *   out_mac - 見つかった MAC の格納先
+ * 戻り値:
+ *   0=解決できた、-1=時間切れ
+ * コール元:
+ *   tcp_send_segment() 系、udp_send6()
+ * ===============================================================*/
+int ndp_resolve(const uint8_t addr[IPV6_ADDR_LEN], uint8_t out_mac[ETH_ALEN])
+{
+    if (ndp_cache_lookup(addr, out_mac) == 0) return 0;
+
+    for (unsigned attempt = 0; attempt < NDP_RESOLVE_MAX_ATTEMPTS; attempt++) {
+        if (ndp_send_ns(addr) != 0) return -1;
+
+        uint64_t start = timer_now();
+        do {
+            net_poll_all_and_dispatch();
+            if (ndp_cache_lookup(addr, out_mac) == 0) return 0;
+        } while (!timeout_ms(start, NDP_RESOLVE_TIMEOUT_MS));
+    }
+    return -1;
 }
 
 /*=================================================================
@@ -230,6 +438,22 @@ static void ipv6_handle_icmpv6(const uint8_t *msg, size_t len,
         }
         g_ipv6_ns_count[core]++;
 
+        /* 相手を近隣キャッシュへ入れておく。Source Link-Layer Address
+         * オプションがあればそれを使う(無ければ Ethernet の送信元 MAC)。
+         * これで「NS を受けた側」も相手の MAC を学習でき、以後の応答で
+         * こちらから NS を撃ち直さずに済む。 */
+        {
+            const uint8_t *learn_mac = src_mac;
+            if (len >= 8u + NDP_BODY_LEN + 8u && in[8u + NDP_BODY_LEN] == NDP_OPT_SRC_LLADDR) {
+                static uint8_t opt_mac[SMP_MAX_CORES][ETH_ALEN];
+                for (unsigned i = 0; i < ETH_ALEN; i++) {
+                    opt_mac[core][i] = in[8u + NDP_BODY_LEN + 2u + i];
+                }
+                learn_mac = opt_mac[core];
+            }
+            ndp_cache_insert(src, learn_mac);
+        }
+
         /* NA を組み立てる: flags に S(Solicited)|O(Override)、target は自分、
          * オプションに Target Link-Layer Address を付ける。 */
         uint8_t *na = out[core];
@@ -256,7 +480,23 @@ static void ipv6_handle_icmpv6(const uint8_t *msg, size_t len,
         return;
     }
     if (type == ICMPV6_TYPE_NA) {
-        return;  /* 近隣キャッシュを持たないので今は使わない */
+        if (len < 8u + NDP_BODY_LEN) return;
+        /* Target Link-Layer Address オプションがあればそれを、無ければ送信元 MAC を
+         * 近隣キャッシュへ入れる。target は本文中のアドレス(IPv6 ヘッダの src とは
+         * 別。プロキシ NA では両者が異なる)。 */
+        uint8_t target[IPV6_ADDR_LEN];
+        for (unsigned i = 0; i < IPV6_ADDR_LEN; i++) target[i] = in[8u + NDP_OFF_TARGET + i];
+
+        const uint8_t *mac = src_mac;
+        if (len >= 8u + NDP_BODY_LEN + 8u && in[8u + NDP_BODY_LEN] == NDP_OPT_TGT_LLADDR) {
+            static uint8_t opt_mac[SMP_MAX_CORES][ETH_ALEN];
+            for (unsigned i = 0; i < ETH_ALEN; i++) {
+                opt_mac[core][i] = in[8u + NDP_BODY_LEN + 2u + i];
+            }
+            mac = opt_mac[core];
+        }
+        ndp_cache_insert(target, mac);
+        return;
     }
     uart_printf("[IPv6] 未対応の ICMPv6 type=%u 無視\n", type);
 }
@@ -305,9 +545,18 @@ void ipv6_handle_frame(const uint8_t *payload, size_t len, const uint8_t *src_ma
     const uint8_t *body = payload + IPV6_HDR_LEN;
     if (nh == IPV6_NH_ICMPV6) {
         ipv6_handle_icmpv6(body, plen, src, dst, src_mac);
+    } else if (nh == IPV6_NH_TCP) {
+        netaddr_t s = netaddr_v6(src);
+        netaddr_t d = netaddr_v6(dst);
+        tcp_input_addr(body, plen, &s, &d);
+    } else if (nh == IPV6_NH_UDP) {
+        netaddr_t s = netaddr_v6(src);
+        netaddr_t d = netaddr_v6(dst);
+        udp_input_addr(body, plen, &s, &d, src_mac);
+        /* 待ち受けが無くても ICMPv6 Destination Unreachable は返さない
+         * (IPv4 側と違い、RoCEv2 の複製フレームのような自分宛の大量の
+         * 「宛先無し」がまだ観測されていないので、送る動機が無い)。 */
     } else {
-        /* TCP/UDP over IPv6 は未対応。スタック全体が 4 バイトアドレスを前提に
-         * しているため、対応にはアドレス幅の抽象化が要る(README 参照)。 */
         uart_printf("[IPv6] 未対応の next_header=%u 無視\n", nh);
     }
 }

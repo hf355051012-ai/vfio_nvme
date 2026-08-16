@@ -5,6 +5,7 @@
 #include <stddef.h>
 #include "netif.h"
 #include "smp.h"
+#include "netaddr.h"
 
 extern volatile uint32_t g_tcp_retransmit_count[SMP_MAX_CORES];
 extern volatile uint32_t g_tcp_ack_threshold;
@@ -48,10 +49,14 @@ typedef enum {
     TCP_SYN_RCVD,
 } tcp_state_t;
 
+/* 毎パケット触るスカラを前半へ固め、17 バイトのアドレスは後半へ置く
+ * (tcp_input() の 4-tuple 照合はポートを先に見るので、一致しないコネクション
+ * のアドレスまで読みに行かずに済む)。アドレスの netaddr_t 化でこの構造体は
+ * 36 -> 62 バイトに膨らんでおり、1 コマンドあたり約 180ns の固定コストとして
+ * 残っている(CLAUDE.md「IPv6 対応の代償」参照)。64 バイト境界への整列も
+ * 試したが実測で差が出なかったので付けていない。 */
 typedef struct {
     volatile tcp_state_t state;
-    volatile uint32_t    local_ip;
-    volatile uint32_t    remote_ip;
     volatile uint16_t    local_port;
     volatile uint16_t    remote_port;
     volatile uint32_t    snd_seq;   /* 次に送るシーケンス番号 */
@@ -59,11 +64,19 @@ typedef struct {
     volatile uint32_t    snd_win;
     volatile uint16_t    snd_mss;
     volatile unsigned    owner_core;
+    /* IPv4/IPv6 の両方をこの型で持つ。L3 ヘッダを組み立てる直前にだけ
+     * family を見て分岐する(tcp_send_segment 系)。 */
+    netaddr_t            local_ip;
+    netaddr_t            remote_ip;
 } tcp_conn_t;
 
 uint32_t tcp_conn_arg(const tcp_conn_t *conn, uint32_t value);
 
 void tcp_connect_begin(tcp_conn_t *conn, uint32_t dst_ip, uint16_t dst_port);
+
+/* IPv6 版。dst は 16 バイトのアドレス。ローカルアドレスはアクティブな
+ * インターフェースのリンクローカルを使う。 */
+void tcp_connect_begin6(tcp_conn_t *conn, const uint8_t dst_ip[16], uint16_t dst_port);
 
 int  tcp_connect_poll(tcp_conn_t *conn);
 
@@ -89,6 +102,13 @@ void tcp_copy_stats_get(uint64_t *c2_ns, uint64_t *c2_by,
 
 void tcp_close(tcp_conn_t *conn);
 
+/* src / dst は L3 ヘッダから取り出した送信元・宛先。IPv4 でも IPv6 でも
+ * 同じ入口を通る(4-tuple 照合は netaddr_t のまま行う)。dst は
+ * 「アクティブなインターフェースの IPv4」と分かっているなら NULL でよい。 */
+void tcp_input_addr(const uint8_t *pkt, uint16_t len,
+                    const netaddr_t *src, const netaddr_t *dst);
+
+/* IPv4 用の薄いラッパ(ip.c から呼ぶ)。 */
 void tcp_input(const uint8_t *pkt, uint16_t len, uint32_t src_ip);
 
 #define TCP_MAX_LISTENERS 8u

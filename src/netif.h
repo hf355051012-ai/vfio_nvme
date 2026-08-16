@@ -53,6 +53,16 @@ typedef struct {
     int      valid;
 } arp_cache_entry_t;
 
+/* IPv6 の近隣キャッシュ。ARP と役割は同じだが、解決手段が ARP ではなく
+ * ICMPv6 の Neighbor Solicitation/Advertisement(NDP)になる。 */
+#define NDP_CACHE_SIZE 8u
+
+typedef struct {
+    uint8_t addr[16];
+    uint8_t mac[ETH_ALEN];
+    int     valid;
+} ndp_cache_entry_t;
+
 typedef struct {
     int (*send_frags)(void *priv, const eth_frag_t *frags, unsigned frag_count);
     int (*send_frags_async)(void *priv, const eth_frag_t *frags, unsigned frag_count);
@@ -69,6 +79,7 @@ typedef struct netif {
     const nic_ops_t *nic;
     void       *nic_priv;
     arp_cache_entry_t arp_cache[ARP_CACHE_SIZE];
+    ndp_cache_entry_t ndp_cache[NDP_CACHE_SIZE];
     uint16_t    mss_cap;
     uint16_t    rx_ring_size;
     uint8_t     hw_csum_offload;
@@ -96,6 +107,8 @@ void netif_set_owner_core(netif_t *ctx, unsigned core);
 netif_t *netif_find(const char *name);
 
 netif_t *netif_find_by_ip(uint32_t ip);
+
+netif_t *netif_find_by_ip6(const uint8_t addr[16]);
 
 int net_poll_all_and_dispatch(void);
 
