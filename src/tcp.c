@@ -66,6 +66,10 @@ void tcp_copy_stats_get(uint64_t *c2_ns, uint64_t *c2_by,
 #define TCP_MAX_RTO_MS         8000u
 #define TCP_MAX_RETRIES            5
 
+/* RFC 5681 の Fast Retransmit は重複 ACK 3 個で発火する。3 未満にすると
+ * 単なる順序入れ替えを損失と誤検出して無駄な再送が増える。 */
+#define TCP_DUP_ACK_THRESHOLD      3u
+
 #define TCP_SEND_OVERALL_TIMEOUT_MS 30000u  /* tcp_send()全体(複数セグメント/再送込み)の上限 */
 #define TCP_CLOSE_FIN_WAIT_MS        2000u  /* 自分のFINがACKされた後、相手のFINを待つ時間 */
 
@@ -81,7 +85,49 @@ void tcp_copy_stats_get(uint64_t *c2_ns, uint64_t *c2_by,
 
 volatile uint32_t g_tcp_retransmit_count[SMP_MAX_CORES];
 
+/* 高速再送で実際に送り直したセグメント数。g_tcp_retransmit_count(全再送)の
+ * 内数なので、差が RTO 由来の再送になる。「RTO ではなく 3 dup ACK で再送された」
+ * ことを実機で確認するための計測点。再送を要求した回数ではなく**送った回数**を
+ * 数える(要求だけ立って未確認データが無く空振りした分を混ぜないため)。 */
+volatile uint32_t g_tcp_fast_retransmit_count[SMP_MAX_CORES];
+
+/* 受信した重複 ACK の総数。高速再送の発火数と突き合わせると、検出が
+ * 効きすぎていないか(1 回のロスに対し何回入り直しているか)が分かる。 */
+volatile uint32_t g_tcp_dup_ack_count[SMP_MAX_CORES];
+
 volatile uint32_t g_tcp_ack_threshold = 4u;
+
+/* 人為的な送信破棄(高速再送の検証用)。0=無効、N なら「データを持つセグメント」
+ * N 個に 1 個を、送ったことにして捨てる。DAC 直結ループバックではパケットロスが
+ * まず起きないので、ロス検出経路(3 dup ACK -> 高速再送)を実機で通すには
+ * これしか手が無い。シェルの `txdrop <N>` で切り替える。
+ *
+ * ホットパスに入るのは g_tcp_tx_drop_every のロードと分岐 1 つだけ(無効時は
+ * tcp_tx_should_drop() を呼びさえしない)。 */
+volatile uint32_t g_tcp_tx_drop_every;
+static uint32_t   s_tcp_tx_drop_counter[SMP_MAX_CORES];
+volatile uint32_t g_tcp_tx_dropped_count[SMP_MAX_CORES];
+
+/*=================================================================
+ * このデータセグメントを人為的に捨てるか判定する(g_tcp_tx_drop_every が
+ * 非 0 のときだけ呼ばれる)。
+ *
+ * 引数:
+ *   data_len - ペイロード長(0 なら捨てない。純 ACK は対象外)
+ * 戻り値:
+ *   1=捨てる、0=送る
+ * コール元:
+ *   tcp_send_segment(), tcp_send_segment_lso()
+ * ===============================================================*/
+static int tcp_tx_should_drop(uint32_t data_len)
+{
+    if (data_len == 0u) return 0;
+    unsigned c = smp_core_index();
+    s_tcp_tx_drop_counter[c]++;
+    if ((s_tcp_tx_drop_counter[c] % g_tcp_tx_drop_every) != 0u) return 0;
+    g_tcp_tx_dropped_count[c]++;
+    return 1;
+}
 
 /*=================================================================
  * 受信循環バッファの容量を返す(パイプライン受信の in-flight 上限計算用)。
@@ -137,6 +183,25 @@ typedef struct {
     uint32_t cwnd;
     uint32_t ssthresh;
 
+    /* 高速再送 / 高速回復(RFC 5681)。重複 ACK を数え、3 個目で RTO を待たずに
+     * 再送する。検出は tcp_input_addr() で行い、実際の再送は fast_retransmit を
+     * 拾った既存の再送経路(tcp_send() の Go-Back-N ループと tcp_async_poll())が
+     * 行う -- 再送機構を新しく作らない。 */
+    uint32_t          dup_ack_count;     /* 同一 ACK 番号の連続受信数 */
+    uint32_t          recover;           /* 回復の目標 seq。ここまで ACK されるまで次の回復を始めない */
+    uint32_t          dup_ack_suppress;  /* 自分の Go-Back-N が生む重複 ACK の予想数(この数だけ無視する) */
+    uint64_t          fr_last_at;        /* 直近に高速再送を要求した時刻(1 RTT に 1 回へ制限する) */
+    int               in_fast_recovery;
+
+    /* 高速再送の要求は「世代番号」で渡す。未確認データを持ちうる送信経路が
+     * 3 つ(tcp_send() の一括送信、async キュー、async short キュー)あり、
+     * 単純な 1 ビットのフラグだと最初に見た 1 つが消費してしまって残りが
+     * 再送しない。各経路が最後に処理した世代を覚え、世代が進んだら再送する。 */
+    volatile uint32_t fast_retransmit_gen;
+    uint32_t          fr_gen_bulk;
+    uint32_t          fr_gen_async;
+    uint32_t          fr_gen_short;
+
     uint8_t           rx_buf[TCP_RX_BUF_SIZE];
     volatile uint32_t rx_read;
     volatile uint32_t rx_count;
@@ -151,6 +216,11 @@ typedef struct {
     uint32_t          unacked_full_segments;
 
     uint32_t          unacked_consumed_bytes;
+
+    /* 直近に広告した (ACK 番号, ウィンドウ)。両方とも前回と同じウィンドウ更新
+     * ACK は相手に伝える情報がゼロなので送らない(tcp_recv_internal())。 */
+    uint32_t          last_ack_sent;
+    uint16_t          last_win_sent;
 
     tcp_ooo_slot_t ooo[TCP_OOO_SLOTS];
 
@@ -616,10 +686,40 @@ static inline uint16_t tcp_checksum(const netaddr_t *local, const netaddr_t *rem
                                     tcph, hdr_len, data, data_len);
 }
 
+/*=================================================================
+ * 広告する受信ウィンドウの「ワイヤ上の値」を計算する(Window Scale 適用後)。
+ *
+ * 引数:
+ *   conn / priv - 対象コネクションとプライベート状態
+ *   flags       - 送出するフラグ(SYN のときはスケールを掛けない)
+ * 戻り値:
+ *   TCP ヘッダの window フィールドに書く 16bit 値
+ * コール元:
+ *   tcp_send_segment(), tcp_recv_internal()
+ * ===============================================================*/
+static uint16_t tcp_wire_window(tcp_conn_t *conn, tcp_priv_t *priv, uint8_t flags)
+{
+    uint32_t ring_capacity_bytes = (uint32_t)net_active_rx_ring_size() * (uint32_t)conn->snd_mss;
+    uint32_t safe_window_cap = (ring_capacity_bytes >= TCP_RX_BUF_SIZE)
+                                   ? TCP_RX_BUF_SIZE
+                                   : (ring_capacity_bytes / 2u);
+    uint32_t actual_window = TCP_RX_BUF_SIZE - priv->rx_count;
+    if (actual_window > safe_window_cap) actual_window = safe_window_cap;
+    if ((flags & TCP_FLAG_SYN) || !priv->wscale_enabled) {
+        return (actual_window > 0xFFFFu) ? 0xFFFFu : (uint16_t)actual_window;
+    }
+    uint32_t scaled = actual_window >> TCP_RCV_WSCALE;
+    return (scaled > 0xFFFFu) ? 0xFFFFu : (uint16_t)scaled;
+}
+
 static int tcp_send_segment(tcp_conn_t *conn, tcp_priv_t *priv, uint8_t flags,
                              const void *data, uint16_t data_len)
 {
     unsigned core = smp_core_index();
+
+    if (g_tcp_tx_drop_every != 0u && tcp_tx_should_drop(data_len)) {
+        return 0;  /* 送ったことにして捨てる(ロス注入、txdrop) */
+    }
 
     netif_t *conn_ctx = tcp_netif_for((const netaddr_t *)&conn->local_ip);
     if (conn_ctx) {
@@ -659,20 +759,12 @@ static int tcp_send_segment(tcp_conn_t *conn, tcp_priv_t *priv, uint8_t flags,
     wr32be(tcph + TCP_OFF_ACK, (flags & TCP_FLAG_ACK) ? conn->rcv_seq : 0u);
     tcph[TCP_OFF_DATA_OFFSET] = (uint8_t)((hdr_total / 4u) << 4);
     tcph[TCP_OFF_FLAGS] = flags;
-    uint32_t ring_capacity_bytes = (uint32_t)net_active_rx_ring_size() * (uint32_t)conn->snd_mss;
-    uint32_t safe_window_cap = (ring_capacity_bytes >= TCP_RX_BUF_SIZE)
-                                   ? TCP_RX_BUF_SIZE
-                                   : (ring_capacity_bytes / 2u);
-    uint32_t actual_window = TCP_RX_BUF_SIZE - priv->rx_count;
-    if (actual_window > safe_window_cap) actual_window = safe_window_cap;
-    uint16_t wire_window;
-    if ((flags & TCP_FLAG_SYN) || !priv->wscale_enabled) {
-        wire_window = (actual_window > 0xFFFFu) ? 0xFFFFu : (uint16_t)actual_window;
-    } else {
-        uint32_t scaled = actual_window >> TCP_RCV_WSCALE;
-        wire_window = (scaled > 0xFFFFu) ? 0xFFFFu : (uint16_t)scaled;
-    }
+    uint16_t wire_window = tcp_wire_window(conn, priv, flags);
     wr16be(tcph + TCP_OFF_WINDOW, wire_window);
+    /* 直近に広告した (ack, window) を覚えておく。ウィンドウ更新目的の純 ACK が
+     * 「どちらも前回と同じ」なら送らずに済ませるため(tcp_recv_internal())。 */
+    priv->last_ack_sent = (flags & TCP_FLAG_ACK) ? conn->rcv_seq : 0u;
+    priv->last_win_sent = wire_window;
     wr16be(tcph + TCP_OFF_CHECKSUM, 0);  /* チェックサム計算前に0クリア */
     wr16be(tcph + TCP_OFF_URGENT, 0);
     if (opt_len > 0) {
@@ -752,6 +844,10 @@ static int tcp_send_segment_lso(tcp_conn_t *conn, tcp_priv_t *priv,
                                  const void *data, uint32_t data_len)
 {
     unsigned core = smp_core_index();
+
+    if (g_tcp_tx_drop_every != 0u && tcp_tx_should_drop(data_len)) {
+        return 0;  /* 送ったことにして捨てる(ロス注入、txdrop) */
+    }
 
     netif_t *conn_ctx = tcp_netif_for((const netaddr_t *)&conn->local_ip);
     if (conn_ctx) {
@@ -1032,6 +1128,37 @@ static void tcp_async_poll(tcp_conn_t *conn, tcp_priv_t *priv)
             continue;
         }
 
+        /* 高速再送。RTO 経路と同じ Go-Back-N で、キューに残っている未確認
+         * スロットを先頭から全部送り直す。RTO 由来ではないので retries と
+         * RTO の指数バックオフには触らない(ここで retries を進めると、
+         * ロスが続いたときに再送上限へ早く到達して接続を諦めてしまう)。 */
+        if (priv->fr_gen_async != priv->fast_retransmit_gen) {
+            priv->fr_gen_async = priv->fast_retransmit_gen;
+            g_tcp_retransmit_count[smp_core_index()]++;
+            g_tcp_fast_retransmit_count[smp_core_index()]++;
+            if(ts_log_mode()&0x1) ts_log(TS_MK(TS_FILE_TCP, TS_FUNC_tcp_async_poll, 3), tcp_conn_arg(conn, priv->async_count));
+            uint32_t fr_saved_snd_seq = conn->snd_seq;
+            uint64_t fr_now = timer_now();
+            for (unsigned k = 0; k < priv->async_count; k++) {
+                tcp_async_slot_t *rs = tcp_async_slot_at(priv, conn->owner_core,
+                                                          (priv->async_head + k) % priv->async_cap);
+                conn->snd_seq = rs->seq;
+                const uint8_t *fr_src = rs->ref ? rs->ref : rs->buf;
+                if (rs->len > conn->snd_mss) {
+                    if (tcp_send_segment_lso(conn, priv, fr_src, rs->len) != 0) break;
+                } else {
+                    if (tcp_send_segment(conn, priv, TCP_FLAG_PSH | TCP_FLAG_ACK,
+                                          fr_src, rs->len) != 0) break;
+                }
+                /* LSO スロットは HW が複数セグメントに分割するので、線上の
+                 * セグメント数で数える(相手はその数だけ ACK を返す)。 */
+                priv->dup_ack_suppress += ((uint32_t)rs->len + conn->snd_mss - 1u) / conn->snd_mss;
+                rs->sent_at = fr_now;
+            }
+            conn->snd_seq = fr_saved_snd_seq;
+            return;
+        }
+
         if (!timeout_ms(s->sent_at, s->rto_ms)) {
             return;  /* まだRTO未満、様子見(呼び出し元はブロックしていない) */
         }
@@ -1058,6 +1185,7 @@ static void tcp_async_poll(tcp_conn_t *conn, tcp_priv_t *priv)
         } else {
             tcp_send_segment(conn, priv, TCP_FLAG_PSH | TCP_FLAG_ACK, rsrc, s->len);
         }
+        priv->dup_ack_suppress += ((uint32_t)s->len + conn->snd_mss - 1u) / conn->snd_mss;
         conn->snd_seq = saved_snd_seq;
 
         s->sent_at = timer_now();
@@ -1088,6 +1216,27 @@ static void tcp_async_short_poll(tcp_conn_t *conn, tcp_priv_t *priv)
             continue;
         }
 
+        /* 高速再送(tcp_async_poll() と同じ扱い)。 */
+        if (priv->fr_gen_short != priv->fast_retransmit_gen) {
+            priv->fr_gen_short = priv->fast_retransmit_gen;
+            g_tcp_retransmit_count[smp_core_index()]++;
+            g_tcp_fast_retransmit_count[smp_core_index()]++;
+            if(ts_log_mode()&0x1) ts_log(TS_MK(TS_FILE_TCP, TS_FUNC_tcp_async_short_poll, 2), tcp_conn_arg(conn, priv->async_short_count));
+            uint32_t fr_saved_snd_seq = conn->snd_seq;
+            uint64_t fr_now = timer_now();
+            for (unsigned k = 0; k < priv->async_short_count; k++) {
+                tcp_async_short_slot_t *rs =
+                    &priv->async_short_slots[(priv->async_short_head + k) % TCP_ASYNC_SHORT_SLOTS];
+                conn->snd_seq = rs->seq;
+                if (tcp_send_segment(conn, priv, TCP_FLAG_PSH | TCP_FLAG_ACK,
+                                      rs->buf, rs->len) != 0) break;
+                priv->dup_ack_suppress++;  /* short スロットは常に 1 セグメント */
+                rs->sent_at = fr_now;
+            }
+            conn->snd_seq = fr_saved_snd_seq;
+            return;
+        }
+
         if (!timeout_ms(s->sent_at, s->rto_ms)) {
             return;
         }
@@ -1109,6 +1258,7 @@ static void tcp_async_short_poll(tcp_conn_t *conn, tcp_priv_t *priv)
         uint32_t saved_snd_seq = conn->snd_seq;
         conn->snd_seq = s->seq;
         tcp_send_segment(conn, priv, TCP_FLAG_PSH | TCP_FLAG_ACK, s->buf, s->len);
+        priv->dup_ack_suppress++;
         conn->snd_seq = saved_snd_seq;
 
         s->sent_at = timer_now();
@@ -1389,6 +1539,15 @@ static void tcp_priv_init(tcp_priv_t *priv, unsigned core)
     priv->rto_ms        = TCP_INITIAL_RTO_MS;
     priv->cwnd          = 0;
     priv->ssthresh      = 0xFFFFFFFFu;
+    priv->dup_ack_count       = 0;
+    priv->recover             = 0;
+    priv->dup_ack_suppress    = 0;
+    priv->fr_last_at          = 0;
+    priv->in_fast_recovery    = 0;
+    priv->fast_retransmit_gen = 0;
+    priv->fr_gen_bulk         = 0;
+    priv->fr_gen_async        = 0;
+    priv->fr_gen_short        = 0;
     priv->rx_read       = 0;
     priv->rx_count      = 0;
     priv->fin_received  = 0;
@@ -1398,6 +1557,8 @@ static void tcp_priv_init(tcp_priv_t *priv, unsigned core)
     priv->snd_wscale     = 0;
     priv->unacked_full_segments = 0;
     priv->unacked_consumed_bytes = 0;
+    priv->last_ack_sent = 0;
+    priv->last_win_sent = 0;
     for (unsigned i = 0; i < TCP_OOO_SLOTS; i++) {
         priv->ooo[i].valid = 0;
     }
@@ -1630,8 +1791,39 @@ int tcp_connect_poll(tcp_conn_t *conn)
  * コール元:
  *   tcp_send(), tcp_async_poll()
  * ===============================================================*/
+/*=================================================================
+ * 受信バッファを読み出した後のウィンドウ更新 ACK。ACK 番号もウィンドウも
+ * 前回広告した値と同じなら**送らない**。
+ *
+ * 相手に伝える新しい情報がゼロなので純粋な無駄、というだけでなく、
+ * **相手から見ると重複 ACK そのものに見える**のが問題だった。この受信
+ * ウィンドウは safe_window_cap で頭打ちされているため、バッファがどれだけ
+ * 空こうがワイヤ上の値は動かない。つまり「ack 据え置き・データ無し・
+ * ウィンドウ不変」となり、RFC 5681 の重複 ACK の定義に完全に一致してしまう。
+ * 高速再送(C2)を入れた直後、**ロスが 1 つも無いのに重複 ACK を 419 万個
+ * 検出し、高速再送が 10 万回空振りしていた**のはこれが原因。
+ *
+ * 引数:
+ *   conn / priv - 対象コネクションとプライベート状態
+ * コール元:
+ *   tcp_recv_internal()
+ * ===============================================================*/
+static void tcp_send_window_update(tcp_conn_t *conn, tcp_priv_t *priv)
+{
+    uint16_t win = tcp_wire_window(conn, priv, TCP_FLAG_ACK);
+    if (conn->rcv_seq == priv->last_ack_sent && win == priv->last_win_sent) {
+        return;  /* 前回と同じ -- 送っても情報が増えない */
+    }
+    tcp_send_segment(conn, priv, TCP_FLAG_ACK, NULL, 0);
+}
+
 static void tcp_cwnd_grow_on_ack(tcp_priv_t *priv, uint16_t mss)
 {
+    if (priv->in_fast_recovery) {
+        /* Fast Recovery 中は cwnd を dup ACK ごとに膨らませる(tcp_on_dup_ack())。
+         * 通常の成長を重ねると二重に増える。 */
+        return;
+    }
     if (priv->cwnd < priv->ssthresh) {
         priv->cwnd += mss;
     } else {
@@ -1639,6 +1831,121 @@ static void tcp_cwnd_grow_on_ack(tcp_priv_t *priv, uint16_t mss)
         if (inc == 0) inc = 1u;
         priv->cwnd += inc;
     }
+}
+
+/*=================================================================
+ * 重複 ACK を 1 個数える。3 個目で高速再送(RFC 5681 の Fast Retransmit)を
+ * 要求するフラグを立て、以後は Fast Recovery のウィンドウ膨張を行う。
+ *
+ * 実際の再送はここでは行わない。送信側の既存の再送経路(tcp_send() の
+ * Go-Back-N ループ / tcp_async_poll() / tcp_async_short_poll())が
+ * priv->fast_retransmit を拾って送る。受信ハンドラの中から送信ループを
+ * 呼ぶと再入するため。
+ *
+ * 引数:
+ *   conn / priv - 対象コネクションとプライベート状態
+ * コール元:
+ *   tcp_input_addr()
+ * ===============================================================*/
+static void tcp_on_dup_ack(tcp_conn_t *conn, tcp_priv_t *priv)
+{
+    uint16_t mss = conn->snd_mss;
+
+    g_tcp_dup_ack_count[smp_core_index()]++;
+
+    /* **自分の Go-Back-N が生んだ重複 ACK を差し引く。これが無いと発散する。**
+     * 高速再送は RTO 経路と同じ Go-Back-N で未確認ウィンドウ全体(K セグメント)を
+     * 送り直す。その大半は相手が既に受け取っている分で、この受信側は
+     * 「in-order で受理できなかったセグメント」に即座に ACK を返す規約なので、
+     * **K 個送り直せばほぼ K 個の重複 ACK が返ってくる**。K >= 3 ならそれだけで
+     * 次の高速再送の条件を満たしてしまい、再送 -> 重複 ACK -> 再送 の正の
+     * フィードバックになる(実測で破棄 1318 個に対し再送 517527 回)。
+     * 送り直したセグメント数を数えておき、その分の重複 ACK は損失の証拠として
+     * 数えない。本当に穴が残っていれば相手はそれ以上の重複 ACK を出すので、
+     * 検出は遅れるだけで失われない。 */
+    if (priv->dup_ack_suppress > 0u) {
+        priv->dup_ack_suppress--;
+        priv->dup_ack_count = 0;
+        return;
+    }
+
+    if (priv->in_fast_recovery) {
+        /* 追加の dup ACK = 1 セグメントがネットワークから抜けた証拠なので、
+         * その分だけ送信を許す(RFC 5681 のウィンドウ膨張)。 */
+        priv->cwnd += mss;
+        return;
+    }
+
+    /* **recover ガード(RFC 6582)。これが無いと発散する。**
+     * 高速再送は RTO 経路と同じ Go-Back-N で未確認ウィンドウ全体を送り直す。
+     * 送り直した中には相手が既に受け取っている分も含まれ、この受信側は
+     * 「in-order で受理できなかったセグメント」に即座に ACK を返すので、
+     * **再送 1 回につき大量の重複 ACK が返ってくる**。それをそのまま次の
+     * 高速再送の根拠にすると、再送 -> 重複 ACK -> 再送 の正のフィードバックに
+     * なる。実測では破棄 1331 個に対して再送 533935 回まで膨れた。
+     * 直前の回復で送り直した範囲(recover)が ACK されきるまでは、重複 ACK が
+     * 来ても新しい回復を始めない。 */
+    if (tcp_seq_lt(priv->snd_una, priv->recover)) {
+        priv->dup_ack_count = 0;
+        return;
+    }
+
+    priv->dup_ack_count++;
+    if (priv->dup_ack_count != TCP_DUP_ACK_THRESHOLD) {
+        return;  /* 1〜2 個目は順序入れ替えかもしれないので何もしない */
+    }
+
+    /* 高速再送は 1 RTT に 1 回まで。dup_ack_suppress で自分が生む重複 ACK を
+     * 差し引いてもなお、見積もりの誤差(受信側は full-size セグメントを
+     * g_tcp_ack_threshold 個に 1 回しか ACK しない等)で漏れた分が次の再送を
+     * 呼ぶ。送り直したウィンドウの結果が返ってくるまでは、何度要求されても
+     * 1 回しか送り直さない -- 標準的な TCP 実装の "at most once per RTT" と
+     * 同じ考え方で、これを入れると再送回数が実測で 274542 -> 大幅に減る。 */
+    uint64_t min_gap_us = priv->srtt_us ? priv->srtt_us : 200u;
+    if (priv->fr_last_at != 0 && get_us_from(priv->fr_last_at) < min_gap_us) {
+        priv->dup_ack_count = 0;
+        return;
+    }
+    priv->fr_last_at = timer_now();
+
+    /* flight は「未確認バイト数」。conn->snd_seq は楽観的に進めてあるので
+     * これがそのまま snd_nxt 相当になる。 */
+    uint32_t flight = conn->snd_seq - priv->snd_una;
+    uint32_t half   = flight / 2u;
+    uint32_t floor_val = 2u * (uint32_t)mss;
+    priv->ssthresh = (half > floor_val) ? half : floor_val;
+    priv->cwnd     = priv->ssthresh + 3u * (uint32_t)mss;
+    priv->recover  = conn->snd_seq;
+    priv->in_fast_recovery = 1;
+    priv->fast_retransmit_gen++;
+
+    if(ts_log_mode()&0x1) ts_log(TS_MK(TS_FILE_TCP, TS_FUNC_tcp_input, 10), tcp_conn_arg(conn, priv->snd_una));
+}
+
+/*=================================================================
+ * 新しい ACK が届いたときの Fast Recovery の後始末。送り直した範囲
+ * (recover)まで累積 ACK が進んだら回復を終え、cwnd を ssthresh へ落として
+ * 通常の輻輳回避へ戻る。
+ *
+ * **partial ACK ごとに次のセグメントを再送する NewReno 本来の動作は入れて
+ * いない。** 一度実装して撤回した -- このスタックの高速再送は 1 セグメントでは
+ * なくウィンドウ全体の Go-Back-N なので、partial ACK のたびに再送を重ねると
+ * 再送回数が爆発する(実測で破棄 71 個に対し再送 3184 回)。穴が 2 つ以上
+ * あるときは、recover を追い越した後の次の 3 dup ACK か RTO が拾う。
+ *
+ * 引数:
+ *   priv / ack - コネクションのプライベート状態と受信した ACK 番号
+ * コール元:
+ *   tcp_input_addr()
+ * ===============================================================*/
+static void tcp_on_new_ack(tcp_priv_t *priv, uint32_t ack)
+{
+    priv->dup_ack_count = 0;
+    if (!priv->in_fast_recovery) return;
+    if (tcp_seq_lt(ack, priv->recover)) return;  /* まだ送り直した範囲の途中 */
+
+    priv->cwnd = priv->ssthresh;
+    priv->in_fast_recovery = 0;
 }
 
 /*=================================================================
@@ -1681,6 +1988,9 @@ int tcp_send(tcp_conn_t *conn, const void *buf, uint32_t len)
 
     priv->snd_una = base_seq;
     priv->ack_advanced = 0;
+    /* 前の転送で誰にも回収されずに残った要求を持ち越さない(持ち越すと
+     * 今回の先頭セグメントをいきなり無駄に送り直す)。 */
+    priv->fr_gen_bulk = priv->fast_retransmit_gen;
 
     priv->in_bulk_send = 1;
 
@@ -1781,6 +2091,36 @@ int tcp_send(tcp_conn_t *conn, const void *buf, uint32_t len)
             rto_ms = priv->rto_ms;
         }
 
+        if (priv->fr_gen_bulk != priv->fast_retransmit_gen) {
+            /* 3 個の重複 ACK で tcp_on_dup_ack() が要求した高速再送。RTO を
+             * 待たずに、RTO 経路と**同じ Go-Back-N** で未確認ウィンドウ全体を
+             * 送り直す。cwnd/ssthresh は要求側で調整済みなのでここでは触らない。 */
+            priv->fr_gen_bulk = priv->fast_retransmit_gen;
+            if (tcp_seq_lt(priv->snd_una, snd_nxt)) {
+                uint32_t resend_seq = priv->snd_una;
+                uint32_t resent = 0;
+                while (tcp_seq_lt(resend_seq, snd_nxt)) {
+                    uint32_t remain = snd_nxt - resend_seq;
+                    uint16_t rchunk = (uint16_t)((remain > conn->snd_mss) ? conn->snd_mss : remain);
+                    conn->snd_seq = resend_seq;
+                    if (tcp_send_segment(conn, priv, TCP_FLAG_PSH | TCP_FLAG_ACK,
+                                          data + (resend_seq - base_seq), rchunk) != 0) {
+                        break;
+                    }
+                    resend_seq += rchunk;
+                    resent     += rchunk;
+                    priv->dup_ack_suppress++;  /* 1 チャンク = 1 セグメント */
+                }
+                g_tcp_retransmit_count[smp_core_index()]++;
+                g_tcp_fast_retransmit_count[smp_core_index()]++;
+                if(ts_log_mode()&0x1) ts_log(TS_MK(TS_FILE_TCP, TS_FUNC_tcp_send, 6), tcp_conn_arg(conn, resent));
+                /* RTO タイマを張り直し、この往復では RTT を測らない(Karn)。 */
+                window_sent_at = timer_now();
+                window_retransmitted = 1;
+                rto_active = 1;
+            }
+        }
+
         if (rto_active && timeout_ms(window_sent_at, rto_ms)) {
             retransmit_attempts++;
             if (retransmit_attempts > TCP_MAX_RETRIES) {
@@ -1797,6 +2137,12 @@ int tcp_send(tcp_conn_t *conn, const void *buf, uint32_t len)
             uint32_t half = flight / 2u;
             priv->ssthresh = (half > 2u * conn->snd_mss) ? half : 2u * conn->snd_mss;
             priv->cwnd = conn->snd_mss;
+            /* RTO はウィンドウ全体を失ったということなので、Fast Recovery は
+             * 打ち切ってスロースタートからやり直す(RFC 5681)。 */
+            priv->in_fast_recovery = 0;
+            priv->dup_ack_count    = 0;
+            priv->recover          = priv->snd_una;  /* recover ガードを解除 */
+            priv->fr_gen_bulk      = priv->fast_retransmit_gen;
 
             rto_ms *= 2;
             if (rto_ms > TCP_MAX_RTO_MS) rto_ms = TCP_MAX_RTO_MS;
@@ -1813,6 +2159,7 @@ int tcp_send(tcp_conn_t *conn, const void *buf, uint32_t len)
                 /* TCP層の性能分析用: Go-Back-Nで実際に再送されたバイト数。 */
                 if(ts_log_mode()&0x1) ts_log(TS_MK(TS_FILE_TCP, TS_FUNC_tcp_send, 5), tcp_conn_arg(conn, rchunk));
                 resend_seq += rchunk;
+                priv->dup_ack_suppress++;  /* 高速再送と同じ理由(自分が生む重複ACKを差し引く) */
             }
             window_sent_at = timer_now();
             window_retransmitted = 1;
@@ -2133,14 +2480,14 @@ static int tcp_recv_internal(tcp_conn_t *conn, void *buf, uint32_t maxlen, uint3
             priv->rx_count = priv->rx_count - n;
 
             if (send_ack && (conn->state == TCP_ESTABLISHED || conn->state == TCP_CLOSE_WAIT)) {
-                tcp_send_segment(conn, priv, TCP_FLAG_ACK, NULL, 0);
+                tcp_send_window_update(conn, priv);
             } else if (!send_ack && (conn->state == TCP_ESTABLISHED || conn->state == TCP_CLOSE_WAIT)) {
                 priv->unacked_consumed_bytes += n;
                 uint32_t threshold = (uint32_t)conn->snd_mss * TCP_RECV_NOACK_ACK_THRESHOLD_MSS;
                 if (threshold == 0) threshold = TCP_RECV_NOACK_ACK_THRESHOLD_MSS * 536u;
                 if (priv->unacked_consumed_bytes >= threshold) {
                     TS_HOT(TS_MK(TS_FILE_TCP, TS_FUNC_tcp_recv_internal, 2), tcp_conn_arg(conn, priv->unacked_consumed_bytes));
-                    tcp_send_segment(conn, priv, TCP_FLAG_ACK, NULL, 0);
+                    tcp_send_window_update(conn, priv);
                     priv->unacked_consumed_bytes = 0;
                 }
             }
@@ -2623,6 +2970,7 @@ void tcp_input_addr(const uint8_t *pkt, uint16_t len,
         return;
     }
 
+    uint32_t prev_snd_win = conn->snd_win;  /* dup ACK 判定に要る(更新前の値) */
     if (priv->wscale_enabled) {
         conn->snd_win = (uint32_t)rd16be(in + TCP_OFF_WINDOW) << priv->snd_wscale;
     } else {
@@ -2666,6 +3014,25 @@ void tcp_input_addr(const uint8_t *pkt, uint16_t len,
             if (tcp_seq_gt(ack, priv->snd_una)) {
                 priv->snd_una = ack;     /* パイプライン送信(tcp_send())向け、累積ACKで進める */
                 priv->ack_advanced = 1;
+                tcp_on_new_ack(priv, ack);
+            } else if (ack == priv->snd_una &&
+                       payload_len == 0 &&
+                       (flags & (TCP_FLAG_SYN | TCP_FLAG_FIN)) == 0 &&
+                       conn->snd_win == prev_snd_win &&
+                       tcp_seq_gt(conn->snd_seq, priv->snd_una)) {
+                /* RFC 5681 の重複 ACK の定義: 累積 ACK が進まず、データを運ばず、
+                 * SYN/FIN も無く、広告ウィンドウも変わっておらず、**未確認データが
+                 * 存在する**もの。
+                 *
+                 * 最後の条件(RFC 5681 の condition 1)を落とすと、このスタックでは
+                 * 誤検出が壊滅的になる。`tcp_recv_internal()` はアプリが受信バッファ
+                 * から読み出すたびにウィンドウ更新の純 ACK を送るが(tcp.c の
+                 * send_ack 経路)、広告ウィンドウは safe_window_cap で頭打ちなので
+                 * **ワイヤ上の値が変わらない** -- つまり「ack 据え置き・データ無し・
+                 * ウィンドウ不変」となり、条件 5 では弾けない。
+                 * 実測では、ロスがゼロのときでも重複 ACK を 419 万個・高速再送を
+                 * 10 万回誤検出していた。 */
+                tcp_on_dup_ack(conn, priv);
             }
             if(ts_log_mode()&TS_MODE_HOTPATH) ts_log_tcp_ack(TS_MK(TS_FILE_TCP, TS_FUNC_tcp_input, 3), (uint8_t)tcp_conn_slot(conn),
                            seq, ack, conn->snd_win, flags);
@@ -2725,10 +3092,13 @@ void tcp_input_addr(const uint8_t *pkt, uint16_t len,
                             priv->ooo[i].seq = seq;
                             priv->ooo[i].len = payload_len;
                             priv->ooo[i].valid = 1;
+                            /* ここは ts_log だけにしてある。以前は 1 セグメントごとに
+                             * uart_printf していたが、高速再送(C2)を入れて順序不正の
+                             * 到着が「異常」ではなく通常の回復過程になると、受信ホット
+                             * パスでコンソール出力が延々と走る。実測でロス注入時の
+                             * スループットがこの出力に支配され、さらに RX リングが
+                             * 溢れて二次的なロスを生んでいた。 */
                             if(ts_log_mode()&TS_MODE_HOTPATH) ts_log(TS_MK(TS_FILE_TCP, TS_FUNC_tcp_input, 7), tcp_conn_arg(conn, payload_len));
-                            uart_printf("[TCP] 順序不正セグメントを先読みバッファに保持 "
-                                        "(seq=%u rcv_seq=%u len=%u slot=%u)\n",
-                                        seq, conn->rcv_seq, payload_len, i);
                             stored = 1;
                             break;
                         }

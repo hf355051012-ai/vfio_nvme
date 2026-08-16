@@ -1104,8 +1104,53 @@ static void shell_ackthresh(char *args)
 }
 
 /*=================================================================
+ * シェルの `txdrop`。TCP のデータセグメントを人為的に N 個に 1 個捨てる
+ * ロス注入を設定/表示する(0=無効)。
+ *
+ * DAC 直結ループバックではパケットロスがまず起きないので、高速再送
+ * (3 dup ACK)の経路を実機で通すにはこれが要る。引数なしで現在値と
+ * これまでに捨てた数、再送の内訳を表示する。
+ *
+ * 引数:
+ *   args - N。省略時は現在値と統計を表示
+ * コール元:
+ *   shell_dispatch()
+ * ===============================================================*/
+static void shell_txdrop(char *args)
+{
+    while (*args == ' ') args++;
+    if (*args >= '0' && *args <= '9') {
+        g_tcp_tx_drop_every = (uint32_t)atoi(args);
+        /* 切り替えのたびに統計を 0 に戻す(前回の測定と混ざらないように)。 */
+        for (unsigned c = 0; c < SMP_MAX_CORES; c++) {
+            g_tcp_tx_dropped_count[c]      = 0;
+            g_tcp_retransmit_count[c]      = 0;
+            g_tcp_fast_retransmit_count[c] = 0;
+            g_tcp_dup_ack_count[c]         = 0;
+        }
+    }
+
+    uint32_t dropped = 0, retx = 0, fastretx = 0, dupack = 0;
+    for (unsigned c = 0; c < SMP_MAX_CORES; c++) {
+        dropped   += g_tcp_tx_dropped_count[c];
+        retx      += g_tcp_retransmit_count[c];
+        fastretx  += g_tcp_fast_retransmit_count[c];
+        dupack    += g_tcp_dup_ack_count[c];
+    }
+    if (g_tcp_tx_drop_every == 0u) {
+        uart_printf("txdrop: 無効\n");
+    } else {
+        uart_printf("txdrop: データセグメント %u 個に 1 個を破棄\n",
+                    (unsigned)g_tcp_tx_drop_every);
+    }
+    uart_printf("txdrop: 破棄=%u 重複ACK=%u 再送=%u (うち高速再送=%u、残りはRTO由来=%u)\n",
+                (unsigned)dropped, (unsigned)dupack, (unsigned)retx,
+                (unsigned)fastretx, (unsigned)(retx - fastretx));
+}
+
+/*=================================================================
  * 入力 1 行をコマンドとして解釈し実行する(monitor / nvmet / tcpbench /
- * bench / simdelay / ackthresh / ts / jobs / help / quit)。
+ * bench / simdelay / ackthresh / txdrop / ts / jobs / help / quit)。
  *
  * 引数:
  *   line   - 入力行(破壊される)
@@ -1148,6 +1193,8 @@ static void shell_dispatch(char *line, int s0, int s1)
         shell_simdelay(line + 8);
     } else if (strncmp(line, "ackthresh", 9) == 0) {
         shell_ackthresh(line + 9);
+    } else if (strncmp(line, "txdrop", 6) == 0) {
+        shell_txdrop(line + 6);
     } else if (strncmp(line, "ts", 2) == 0 && (line[2] == 0 || line[2] == ' ')) {
         shell_ts(line + 2);
     } else if (strncmp(line, "ping6", 5) == 0) {
@@ -1176,6 +1223,7 @@ static void shell_dispatch(char *line, int s0, int s1)
                     "  udptest | udptest6                    対向PFへUDP往復(v4はPort Unreachableも確認)\n"
                     "  tcp6test                              対向PFとIPv6上でTCP確立+データ往復\n"
                     "  rsttest                               待ち受け無しポートへ接続しRSTで即失敗するか(v4/v6)\n"
+                    "  txdrop [N]                            ロス注入(データN個に1個破棄、0=無効)+再送統計\n"
                     "  nvmet [port] | jobs | help | quit    (↑↓で履歴呼び出し)\n"
                     "  例: bench 8,64,256 rw 8 / tcpbench 64,256 w digest / ts core 1 num 40\n");
     } else if (strncmp(line, "quit", 4) == 0 || strncmp(line, "exit", 4) == 0) {

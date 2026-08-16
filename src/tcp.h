@@ -8,7 +8,14 @@
 #include "netaddr.h"
 
 extern volatile uint32_t g_tcp_retransmit_count[SMP_MAX_CORES];
+extern volatile uint32_t g_tcp_fast_retransmit_count[SMP_MAX_CORES];
+extern volatile uint32_t g_tcp_dup_ack_count[SMP_MAX_CORES];
 extern volatile uint32_t g_tcp_ack_threshold;
+
+/* ロス注入(シェルの `txdrop <N>`)。0=無効、N ならデータセグメント N 個に 1 個を
+ * 送らずに捨てる。ループバックではロスが起きないため、高速再送の検証に要る。 */
+extern volatile uint32_t g_tcp_tx_drop_every;
+extern volatile uint32_t g_tcp_tx_dropped_count[SMP_MAX_CORES];
 
 uint32_t tcp_rx_buf_size(void);
 
