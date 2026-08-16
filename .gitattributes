@@ -1,0 +1,4 @@
+# 作業は Windows、ビルド・実機テストは Linux(OptiPlex)。
+# rsync でそのまま Linux へ渡るため、チェックアウトは常に LF に固定する
+# (CRLF が混ざるとシェルスクリプトの shebang が壊れる)。
+* text=auto eol=lf
