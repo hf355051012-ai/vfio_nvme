@@ -16,14 +16,11 @@
 #include "timestamp.h"
 #include "job.h"
 #include "tcp.h"
-#include "rxcopy.h"
 
 /* push vs pull の同一(非digest)トラフィックA/B比較用の試験トグル
  * (検証後に撤去)。1なら非digest接続でも従来のpull型RX(copy2+copy3の
  * 二重コピー)を使う。command.cの`nvmetpull <0|1>`で切替、次の接続から。 */
 int g_nvmet_force_pull = 0;
-void nvmet_set_force_pull(int on) { g_nvmet_force_pull = on ? 1 : 0; }
-int  nvmet_get_force_pull(void)   { return g_nvmet_force_pull; }
 
 /* セッション確立(accept待ち・ICReq受信)の許容時間。ジョブ化(job.h、
  * CLAUDE.md「NVMe/TCP制御のステートマシン化」節参照)後もこの段階だけは
@@ -443,13 +440,6 @@ typedef enum {
     NADM_ST_DISPATCH,
 } nvmet_admin_state_t;
 
-/* stateprof.h向けの人間可読なステート名(nvmet_admin_state_tと同じ
- * 並び順)。 */
-static const char *const NADM_STATE_NAMES[] = {
-    "ARM", "ACCEPT_WAIT", "ICREQ_RECV", "ICRESP_SEND",
-    "RECV_HDR", "RECV_SQE", "RECV_HDGST", "RECV_DATA",
-    "RECV_DDGST", "DISPATCH",
-};
 #define NADM_STATE_NAME_COUNT (sizeof(NADM_STATE_NAMES) / sizeof(NADM_STATE_NAMES[0]))
 
 typedef struct {
@@ -501,10 +491,6 @@ static job_result_t nvmet_admin_job_step(job_t *self)
 {
     nvmet_admin_job_ctx_t *jc  = (nvmet_admin_job_ctx_t *)self->ctx;
     nvmet_ctx_t            *ctx = jc->ctx;
-
-    /* stateprof.h -- このステートに何回・合計どれだけ滞在したかを記録
-     * する(呼ばれるたびに毎回、switchより前で)。 */
-    state_prof_mark(&ctx->admin_prof, self->state);
 
     switch ((nvmet_admin_state_t)self->state) {
 
@@ -845,13 +831,6 @@ typedef enum {
     NIO_ST_PUSH_RUN,
 } nvmet_io_state_t;
 
-/* stateprof.h向けの人間可読なステート名(nvmet_io_state_tと同じ並び順)。 */
-static const char *const NIO_STATE_NAMES[] = {
-    "WAIT_ADMIN_READY", "ARM", "ACCEPT_WAIT", "ICREQ_RECV", "ICRESP_SEND",
-    "RECV_PDU_HDR", "RECV_CMD_SQE", "RECV_CMD_HDGST", "RECV_CMD_DATA",
-    "RECV_CMD_DDGST", "DISPATCH_CMD", "RECV_H2C_REST", "RECV_H2C_HDGST",
-    "RECV_H2C_DATA", "RECV_H2C_DDGST", "DISPATCH_H2C", "PUSH_RUN",
-};
 #define NIO_STATE_NAME_COUNT (sizeof(NIO_STATE_NAMES) / sizeof(NIO_STATE_NAMES[0]))
 
 /* push型受信のパーサ相(nvmet_io_rx_upcall()、2026-08-13)。 */
@@ -876,9 +855,6 @@ typedef struct {
     uint16_t  ttag;
     uint32_t  datao;
     uint32_t  datal;
-    uint32_t  copy_wm;   /* RXコピーオフロード時: このコマンドの全データコピーが
-                          * 完了する rxcopy submitted seq。dispatch(CQE)は
-                          * rxcopy_done()がこれに達してから(rxcopy.h参照)。 */
 } nvmet_ready_t;
 
 typedef struct {
@@ -936,7 +912,6 @@ typedef struct {
     uint32_t          prx_copy_ns;           /* このPDUの1コピー累積時間(DBGT 0x40、検証後に撤去) */
     uint64_t          pull_copy_base_ns;     /* pull型コピー計測の基準(DBGT 0x41、検証後に撤去) */
     uint64_t          prx_start_tick;        /* このPDUの受信開始tick(DBGT 0x43=受信+処理span、検証後に撤去) */
-    uint32_t          prx_copy_wm;           /* RXコピーオフロード時: このPDUのデータコピーの最新 rxcopy submitted seq */
     volatile int      prx_error;             /* パース致命エラー(ring溢れ/未知PDU等) */
     nvmet_ready_t     ready[NVMET_READY_RING];
     volatile uint32_t ready_head;            /* upcallが積む(生産) */
@@ -1270,7 +1245,6 @@ static void nvmet_ready_push_cmd(nvmet_io_job_ctx_t *jc)
     rd->cid             = jc->prx_cid;
     rd->dlen            = jc->prx_data_need;
     rd->incap_committed = jc->prx_incap_committed;
-    rd->copy_wm         = jc->prx_copy_wm;
     __asm__ volatile("" ::: "memory");
     jc->ready_head++;
 }
@@ -1286,7 +1260,6 @@ static void nvmet_ready_push_h2c(nvmet_io_job_ctx_t *jc)
     rd->ttag     = jc->prx_ttag;
     rd->datao    = jc->prx_datao;
     rd->datal    = jc->prx_datal;
-    rd->copy_wm  = jc->prx_copy_wm;
     __asm__ volatile("" ::: "memory");
     jc->ready_head++;
 }
@@ -1323,7 +1296,6 @@ static void nvmet_io_rx_upcall(void *arg, const volatile uint8_t *data, uint16_t
                 jc->prx_psh_off = 0;
                 jc->prx_phase   = PRX_PSH;
                 jc->prx_copy_ns = 0;   /* このPDUの1コピー累積時間を計測開始 */
-                jc->prx_copy_wm = rxcopy_submitted();  /* データ無しPDUでも有効な watermark(以後submitで更新) */
             }
             break;
         }
@@ -1418,11 +1390,7 @@ static void nvmet_io_rx_upcall(void *arg, const volatile uint8_t *data, uint16_t
              * 省いてゼロコスト。 */
             int ts_rx_on = (ts_log_mode() & 0x2) != 0;
             uint64_t cpt0 = ts_rx_on ? timer_now() : 0;
-            if (rxcopy_enabled()) {
-                jc->prx_copy_wm = rxcopy_submit(data + i, jc->prx_data_dst + jc->prx_data_off, take);
-            } else {
-                volatile_fast_copy(jc->prx_data_dst + jc->prx_data_off, data + i, take);
-            }
+            volatile_fast_copy(jc->prx_data_dst + jc->prx_data_off, data + i, take);
             if (ts_rx_on) jc->prx_copy_ns += (uint32_t)get_ns_from(cpt0);
             jc->prx_data_off += take;
             i += take;
@@ -1451,10 +1419,6 @@ static job_result_t nvmet_io_job_step_impl(job_t *self)
 {
     nvmet_io_job_ctx_t *jc  = (nvmet_io_job_ctx_t *)self->ctx;
     nvmet_ctx_t         *ctx = jc->ctx;
-
-    /* stateprof.h -- このステートに何回・合計どれだけ滞在したかを記録
-     * する(呼ばれるたびに毎回、switchより前で)。 */
-    state_prof_mark(&ctx->io_prof, self->state);
 
     /* `job stop <番号>`(cancel_requested)対応の追加。以前はNIO_ST_WAIT_
      * ADMIN_READY(セッション未確立、次のadmin準備待ち)にしかこのチェックが
@@ -1609,13 +1573,6 @@ static job_result_t nvmet_io_job_step_impl(job_t *self)
          * 追加のupcall→ready_head前進を起こしても、tail!=headで拾い続ける。 */
         while (jc->ready_tail != jc->ready_head) {
             nvmet_ready_t *rd = &jc->ready[jc->ready_tail % NVMET_READY_RING];
-            /* RXコピーオフロード有効時: このコマンドの全データコピーが core1 で
-             * 完了する(rxcopy_done がこのコマンドの copy_wm に達する)まで
-             * dispatch(=CQE)しない。まだなら次tickへ回す(coreは他jobを回せる)。 */
-            if (rxcopy_enabled() &&
-                (int32_t)(rxcopy_done() - rd->copy_wm) < 0) {
-                break;
-            }
             /* DBGT 0x42(検証後に撤去): dispatch(CQE構築+応答送信 tcp_send_async)
              * 1回の所要時間。受信span(0x43)・コピー(0x40)と並べて内訳を見る。 */
             uint64_t dsp0 = timer_now();
@@ -1965,9 +1922,6 @@ int nvmet_job_start(nvmet_ctx_t *ctx, uint16_t port, netif_t *bound_ctx, const c
     ctx->write_incapsule_count = 0;
     ctx->write_h2c_count       = 0;
 
-    state_prof_reset(&ctx->admin_prof);
-    state_prof_reset(&ctx->io_prof);
-
     nvmet_build_id_ctrl(ctx);
     nvmet_build_id_ns(ctx);
 
@@ -2025,67 +1979,4 @@ int nvmet_job_start(nvmet_ctx_t *ctx, uint16_t port, netif_t *bound_ctx, const c
         job_pin_to_core(io_job, bound_ctx->owner_core);
     }
     return 0;
-}
-
-// pcie1 reset(command.cのcmd_pcie1)から呼ぶ: ConnectX(mlx5-pf0/pf1)へ
-// bindされているTCP nvmet常駐サーバだけを停止する(RP1 bindのものは残す)。
-// pcie1 resetでmlx5リンクが切れると、これらのadmin/ioジョブはNICが死んだ
-// まま宙に浮く -- `pcie1 reset`はRoCEv2(nvmet_rdma系)ジョブしか畳まないため
-// (nvmet_rdma_stop_all())、mlx5にbindしたNVMe/TCPのnvmetがそこから漏れる。
-// bound_ctxがmlx5-pf0/pf1のインスタンスだけを対象に、`job stop`と同じ
-// cancel_requested(job_cancel_by_ctx)+ctx->stop_requested(admin ACCEPT_WAIT
-// が見る)で自己終了させる(実際のテーブルからの除去は呼び出し元の
-// job_scheduler_tickドレインループ)。netif_find()がNULL(mlx5未初期化)
-// なら対象ゼロで何もしない。
-void nvmet_stop_connectx_instances(void)
-{
-    netif_t *pf0 = netif_find("mlx5-pf0");
-    netif_t *pf1 = netif_find("mlx5-pf1");
-    if (pf0 == NULL && pf1 == NULL) return;
-    for (unsigned slot = 0; slot < NVMET_MAX_INSTANCES; slot++) {
-        nvmet_ctx_t *ctx = s_instance_owner[slot];
-        if (ctx == NULL || !ctx->session_active) continue;
-        netif_t *b = ctx->bound_ctx;
-        if (b == NULL || (b != pf0 && b != pf1)) continue;  // ConnectX bindのみ対象
-        ctx->stop_requested = 1;                 // admin ACCEPT_WAIT(nvmet.c:546)が見る
-        job_cancel_by_ctx(&s_admin_job_pool[slot]);
-        job_cancel_by_ctx(&s_io_job_pool[slot]);
-        uart_printf("[nvmet:%s] ConnectXリセットに伴い停止します\n", ctx->label);
-    }
-}
-
-void nvmet_ctx_prof_reset(nvmet_ctx_t *ctx)
-{
-    state_prof_reset(&ctx->admin_prof);
-    state_prof_reset(&ctx->io_prof);
-}
-
-void nvmet_ctx_prof_dump(const nvmet_ctx_t *ctx)
-{
-    char label_admin[40];
-    char label_io[40];
-    const char *label = ctx->label ? ctx->label : "?";
-
-    /* uart_printf()の%sだけでラベルを組み立てられないため(可変長の
-     * 埋め込みが必要)、固定長バッファへ簡易連結する。ラベルは
-     * nvmet_job_start()が渡す短い静的文字列("rp1"/"mlx5-pf0"/
-     * "mlx5-pf1"/"manual")のみを想定しているため、これで十分。 */
-    unsigned i = 0;
-    const char *prefix1 = "nvmet-admin(";
-    while (*prefix1 && i < sizeof(label_admin) - 2) label_admin[i++] = *prefix1++;
-    const char *p = label;
-    while (*p && i < sizeof(label_admin) - 2) label_admin[i++] = *p++;
-    label_admin[i++] = ')';
-    label_admin[i] = '\0';
-
-    i = 0;
-    const char *prefix2 = "nvmet-io(";
-    while (*prefix2 && i < sizeof(label_io) - 2) label_io[i++] = *prefix2++;
-    p = label;
-    while (*p && i < sizeof(label_io) - 2) label_io[i++] = *p++;
-    label_io[i++] = ')';
-    label_io[i] = '\0';
-
-    state_prof_dump(&ctx->admin_prof, NADM_STATE_NAMES, (unsigned)NADM_STATE_NAME_COUNT, label_admin);
-    state_prof_dump(&ctx->io_prof, NIO_STATE_NAMES, (unsigned)NIO_STATE_NAME_COUNT, label_io);
 }

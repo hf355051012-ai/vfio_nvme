@@ -103,7 +103,6 @@ typedef struct {
 /* 1インスタンス分の RAM ディスク容量(dma_alloc で確保する、nvmet_rdma.c)。 */
 #define NVMET_RDMA_RAMDISK_SLOT_SIZE 0x10000000ULL  /* 256MB */
 
-
 /* コマンドパイプライン化(nvmet_rdma.cの「パイプライン化」節参照)で
  * 使う、1コマンド分の解析結果。単一コマンド逐次処理・パイプライン化の
  * 両方から参照する。 */
@@ -310,29 +309,5 @@ job_result_t nvmet_rdma_job_step(job_t *self);
  * peer_gidを事前設定済みでも、ワイヤ上の実際の値を正とする」コメント
  * 参照)。既に稼働中なら何もせず案内メッセージだけ出す(重複spawn防止、
  * nvmet.cのnvmet_job_start()と同じ考え方)。 */
-/* peer_mac(6バイト、NULL可)は、REQ受信より前にpassive側が送信する必要が
- * あるMAD(GSI宛のREP、RC QP確立後のRECV WQE構え自体はMAC不要)のAVで使う
- * フォールバック値。IBTA CMメッセージにはMACが一切含まれないため
- * (rdma_cm.cのコメント参照)、実ホストとの接続では呼び出し元が相手の
- * 実MACを別途知っている必要がある(NULLならゼロMACのまま、ループバック
- * 診断[mlx5-pf0等]と同じ挙動)。 */
-void nvmet_rdma_run_standalone(mlx5_dev_t *dev, const char *self_label, const uint8_t peer_mac[6]);
-
-/* nvmet_rdma_run_standalone()が保持するs_standalone_ctxのRC/GSI QP状態・
- * HW/SWカウンタをダンプする診断コマンド用(実Linuxホストとの接続確認で、
- * 相手が本当にRC QPへ届いているかをmlx5statとは別に切り分けるため --
- * mlx5statはmlx5_net.cのEthernet RQ/SQ[TCP/IPスタック統合バックエンド]
- * しか見えず、nvmet_rdma.cのRC QPは別の独立したFWオブジェクトのため)。 */
-void nvmet_rdma_run_standalone_dump(void);
-
-/* pcie1 reset(command.cのcmd_pcie1)から呼ぶ: ConnectXに紐づくRoCEv2系の
- * 全ジョブ(nvmet_rdma_job_step/rdma_cm_job_step/nvme_rdma_connect_job_step)
- * へ停止要求(cancel_requested)を出し、常駐フラグをリセットする。job.hの
- * ジョブテーブルは.bssにあり pcie1 reset(PERST#)/net init mlx5 では消え
- * ないため、ハードウェアをリセットする前にこれを呼んでジョブを畳まないと、
- * 再度nvmetrdmastart等を実行した際に古いジョブが残って重複する。実際の
- * テーブルからの除去は呼び出し元がこの後job_scheduler_tick()を回した時点
- * (nvmet_rdma.c参照)。 */
-void nvmet_rdma_stop_all(void);
 
 #endif /* NVMET_RDMA_H */

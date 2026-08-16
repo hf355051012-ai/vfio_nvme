@@ -4,7 +4,6 @@
 #include <stdint.h>
 #include "nvme_tcp.h"
 #include "nvme_types.h"
-#include "stateprof.h"
 
 /* ================================================================
  * nvme.h — NVMeプロトコル層。SQEの組み立てとCQEの解釈だけを担う
@@ -53,69 +52,6 @@ typedef struct {
  * バグを引き起こす(実機で確認・修正済み)。 */
 extern nvme_ctx_t s_nvme_ctx;
 
-/* admin queueを確立し(TCP+ICReq/ICResp+Fabrics Connect qid=0)、
- * Identify Controller/Identify Namespace(nsid=1)/Set Features(Number of
- * Queues)を行った上で、IO queue(qid=1、別TCPコネクション)まで接続する。
- * 戻り値: 0=成功、-1=いずれかの段階で失敗(ログ参照) */
-int nvme_connect(nvme_ctx_t *ctx, uint32_t ip, uint16_t port, const char *subnqn);
-
-/* Identify Controllerを実行し、応答4096バイトをbuf4096へ格納する。 */
-int nvme_identify_ctrl(nvme_ctx_t *ctx, void *buf4096);
-
-/* Identify Namespace(nsid)を実行し、応答4096バイトをbuf4096へ格納すると
- * 共に、そこからLBAサイズを読み取ってctx->lba_sizeを更新する
- * (以後のnvme_read()/nvme_write()はこの値を使う)。 */
-int nvme_identify_ns(nvme_ctx_t *ctx, uint32_t nsid, void *buf4096);
-
-/* IO queue経由でnlb個の論理ブロックをslbaから読み出し、bufへ格納する
- * (buf は少なくとも nlb*ctx->lba_size バイト)。
- * 戻り値: CQEのステータスコード(0=success)、通信エラー等は-1 */
-int nvme_read(nvme_ctx_t *ctx, uint32_t nsid, uint64_t slba, void *buf, uint32_t nlb);
-
-/* IO queue経由でbufの内容(nlb*ctx->lba_sizeバイト)をslbaから書き込む。 */
-int nvme_write(nvme_ctx_t *ctx, uint32_t nsid, uint64_t slba, const void *buf, uint32_t nlb);
-
-/* IO queue(接続していれば)とadmin queueを両方閉じる。 */
-void nvme_disconnect(nvme_ctx_t *ctx);
-
-/* nsid/lba(先頭ブロック番号)で指定した位置へ、buf(呼び出し側が用意する
- * データ、少なくともnlb*ctx->lba_sizeバイト)をnlbブロック分書き込む/
- * から読み出す(read版はnvme_read_begin()、bufは受け皿として使われる)。
- * SQE送信をキューイングし、本物のjob(job.h基盤、"nvme-write"/
- * "nvme-read")としてjob_spawn()した上で即座に戻る -- nvme_connect_
- * job_start()と同じ「開始だけして戻る」パターン。以後の進行はメイン
- * ループのjob_scheduler_tick()が自動的に処理するので、呼び出し側は
- * nvme_io_job_done()/nvme_io_job_result()で外から進行状況を監視する
- * だけでよく、応答を待つために自前でnvme_exec_step()やjob_scheduler_
- * tick()を呼ぶ必要は無い。
- *
- * ctx->busyは他のnvme_*_begin系(nvme_connect_job_start()等)と同じ規約で
- * 内部で管理する(開始時に1、完了時に0) -- command.c/test.c等、複数の
- * 呼び出し元がこの関数を共有して使うことを想定した統一設計であり、
- * busyチェック/クリアをここに一本化することで呼び出し元ごとの重複・
- * 実装漏れを防ぐ。
- *
- * bufは呼び出し側がジョブ完了(nvme_io_job_done()==1)まで有効なまま保持
- * し続けること(ポインタを保存するだけでコピーしない、nvme_exec_begin()
- * と同じ規約)。
- * 戻り値: 0=正常に開始、-1=未接続/busy/ジョブ生成失敗 */
-int nvme_write_begin(nvme_ctx_t *ctx, uint32_t nsid, uint64_t lba, const void *buf, uint32_t nlb);
-int nvme_read_begin(nvme_ctx_t *ctx, uint32_t nsid, uint64_t lba, void *buf, uint32_t nlb);
-
-/* Identify Controller/Identify Namespace(nsid)版。buf4096(呼び出し側が
- * 用意する、少なくとも4096バイト)へ応答が格納される。admin queueを
- * 使う点以外はnvme_write_begin()/nvme_read_begin()と全く同じ規約
- * (busy管理・生存期間の要件・nvme_io_job_done()/nvme_io_job_result()で
- * 監視する点も含めて)。 */
-int nvme_identify_ctrl_begin(nvme_ctx_t *ctx, void *buf4096);
-int nvme_identify_ns_begin(nvme_ctx_t *ctx, uint32_t nsid, void *buf4096);
-
-/* nvme_write_begin()/nvme_read_begin()の進行状況を、シェルコマンドや
- * ポーリングループを介さず外部の関数呼び出しから直接監視するための
- * アクセサ。どれも即座に現在値を返すだけ(待たない)。 */
-int nvme_io_job_done(void);    /* 0=進行中/未開始、1=完了(結果はnvme_io_job_result()参照) */
-int nvme_io_job_result(void);  /* 完了後のCQEステータス(0=success)。完了前は未規定 */
-
 /* ================================================================
  * NVMe/TCP制御のジョブ化(job.h基盤、CLAUDE.md「NVMe/TCP制御の
  * ステートマシン化」節参照)向けAPI。上記のブロッキング関数群
@@ -148,18 +84,6 @@ typedef struct {
     uint16_t          ttag;
     nvme_cqe_t        cqe_out;
     int               result;  /* 完了時: CQEステータス(0=success)、通信エラー等は-1 */
-
-    /* このサブステートマシン(NVEXEC_ST_*、nvme.c)の各ステート滞在時間
-     * プロファイラ(stateprof.h、~/.claude/plans/wondrous-baking-gadget.md
-     * 「次回セッションへの申し送り」節のマルチコア効果測定向け)。
-     * nvme_exec_begin()では意図的にリセットしない(1回のexec呼び出し
-     * 単位ではなく、複数回のnvme_exec_begin()/nvme_exec_step()呼び出し
-     * (例: `test`コマンドのwrite負荷ループ)にまたがって累積させ、
-     * 「read/write等のIOコマンドが実際にどのステートで時間を使って
-     * いるか」を見るのが目的のため -- 呼び出し側が明示的にリセットしたい
-     * 場合はnvme_io_exec_prof_reset()/nvme_connect_prof_reset()(nvme.h)
-     * を使うこと。 */
-    state_prof_t      prof;
 } nvme_exec_ctx_t;
 
 /* ecを初期状態にし、次のnvme_exec_step()呼び出しからSQE送信を開始する
@@ -282,23 +206,5 @@ int nvme_write_pipelined_run(nvme_ctx_t *ctx, uint32_t nsid, uint64_t lba,
 int nvme_read_pipelined_run(nvme_ctx_t *ctx, uint32_t nsid, uint64_t lba,
                              void *buf, uint32_t nlb, uint32_t duration_ms,
                              uint32_t *out_count, uint64_t *out_bytes, uint32_t *out_elapsed_ms);
-
-/* ================================================================
- * ステート滞在時間プロファイラ(stateprof.h、~/.claude/plans/
- * wondrous-baking-gadget.md「次回セッションへの申し送り」節の
- * マルチコア効果測定向け)へのアクセサ。2系統ある:
- *   connect: nvme_connect_job_start()が使うconnect job(NCONN_ST_*、
- *            接続シーケンス自体)と、そこに埋め込まれたexec sub-state
- *            machine(NVEXEC_ST_*、Fabrics Connect/Property Set/Get/
- *            Identify等、接続確立中に発行される個々のコマンド)。
- *   io_exec: nvme_write_begin()/nvme_read_begin()/nvme_identify_ctrl_
- *            begin()/nvme_identify_ns_begin()が共有する定常状態の
- *            exec sub-state machine(NVEXEC_ST_*) -- `test`コマンドの
- *            write負荷ループ等、実際のIOコマンド発行はほぼ全てこちらを
- *            通る。 */
-void nvme_connect_prof_reset(void);
-void nvme_connect_prof_dump(void);
-void nvme_io_exec_prof_reset(void);
-void nvme_io_exec_prof_dump(void);
 
 #endif /* NVME_H */

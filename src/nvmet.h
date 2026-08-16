@@ -4,7 +4,6 @@
 #include <stdint.h>
 #include "nvmet_tcp.h"
 #include "netif.h"
-#include "stateprof.h"
 
 /* ================================================================
  * nvmet.h — NVMe/TCPターゲット側プロトコル層。SQEの解釈とCQEの組み立て
@@ -222,8 +221,6 @@ typedef struct {
      * されうる)を異なるコアから読み書きしても、CLAUDE.md「MMUは有効」
      * 節のキャッシュコヒーレンシ設計によりロック無しで安全(jobs/
      * smpstat/ts coreと同じ前提)。 */
-    state_prof_t admin_prof;
-    state_prof_t io_prof;
 
     /* このインスタンス専用のNVMe名前空間バックエンド(RAMディスク・
      * Identify応答)。複数インスタンスを完全に独立させるため(各系統が
@@ -250,7 +247,6 @@ typedef struct {
     nvmet_pending_write_t pending_writes[NVMET_MAX_PENDING_WRITES];
 } nvmet_ctx_t;
 
-
 /* portでリッスンするNVMe/TCPターゲットセッションを開始する。admin/IO
  * キューをそれぞれ独立したjob_t(job.h)としてspawnし、即座に呼び出し元へ
  * 戻る -- 実際のaccept/ICReq/コマンド処理は以後job_scheduler_tick()が
@@ -268,16 +264,6 @@ typedef struct {
  * 戻り値: 0=spawn成功、-1=インスタンス上限/ジョブテーブル満杯等で失敗 */
 int nvmet_job_start(nvmet_ctx_t *ctx, uint16_t port, netif_t *bound_ctx, const char *label);
 
-/* pcie1 reset(command.c)から呼ぶ: ConnectX(mlx5-pf0/pf1)にbindされた
- * TCP nvmet常駐サーバだけを停止する(RP1 bindは残す)。pcie1 resetは
- * RoCEv2(nvmet_rdma)ジョブしか畳まないため、mlx5にbindしたNVMe/TCPの
- * nvmetがリンク断後も宙に浮くのを防ぐ。nvmet.c参照。 */
-void nvmet_stop_connectx_instances(void);
-
-/* push vs pull A/B比較用のpull強制トグル(検証後に撤去)。 */
-void nvmet_set_force_pull(int on);
-int  nvmet_get_force_pull(void);
-
 /* ================================================================
  * ステート滞在時間プロファイラ(stateprof.h、~/.claude/plans/
  * wondrous-baking-gadget.md「次回セッションへの申し送り」節の
@@ -286,13 +272,5 @@ int  nvmet_get_force_pull(void);
  * 呼んで更新し続けるので、これらは「今から計測を始める/今までの結果を
  * 見る」ための区切り操作にすぎない。
  * ================================================================ */
-
-/* admin/io両方の統計をゼロに戻す。性能分析したい区間(例: `test`
- * コマンドのwrite負荷テストループ)の直前に呼ぶこと。 */
-void nvmet_ctx_prof_reset(nvmet_ctx_t *ctx);
-
-/* admin/io両方の現在の統計をuart_printf経由で表示する(`nprof`コマンド、
- * command.c参照)。 */
-void nvmet_ctx_prof_dump(const nvmet_ctx_t *ctx);
 
 #endif /* NVMET_H */

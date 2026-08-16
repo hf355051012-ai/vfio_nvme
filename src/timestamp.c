@@ -157,11 +157,6 @@ void ts_log_tcp_ack(uint32_t tag, uint8_t conn_slot, uint32_t seq,
     s_ts_total[core]++;
 }
 
-uint64_t ts_log_total(void)
-{
-    return s_ts_total[smp_core_index()];
-}
-
 // tagの4バイト全てが印字可能ASCII(0x20-0x7e)ならout[0..3]+NULへ書き1を
 // 返す。そうでなければ0を返す(呼び出し側はASCII表示を省略すればよい)。
 // outはvolatile経由のバイト単位アクセスで書く -- 素のchar配列に対する
@@ -395,26 +390,6 @@ uint64_t ts_log_query_start_last_n(unsigned core, uint32_t count)
     return total - count;
 }
 
-uint64_t ts_log_query_start_after_tick(unsigned core, uint64_t tick)
-{
-    if (core >= SMP_MAX_CORES) core = 0;
-    uint64_t total = s_ts_total[core];
-    uint64_t first = ts_first_valid(total);
-
-    /* リングバッファはts_log()が常にtimer_now()の昇順で追記していく
-     * 設計(エントリ間でtickが逆転することはない)ため、保持範囲を先頭
-     * から線形に走査してtickを超えた最初のエントリを見つけるだけでよい
-     * (ts_log_query_start_last_n_matching()のような後方走査は不要)。 */
-    uint64_t n;
-    for (n = first; n < total; n++) {
-        uint32_t idx = (uint32_t)(n & (TS_LOG_COUNT - 1));
-        if (s_ts_buf[core][idx].ticks > tick) {
-            break;
-        }
-    }
-    return n;  // n==totalなら「該当なし」(ts_log_dump_core()に渡すと0件表示になる)
-}
-
 uint64_t ts_log_query_start_last_n_matching(unsigned core, uint32_t mask, uint32_t value, uint32_t count)
 {
     if (core >= SMP_MAX_CORES) core = 0;
@@ -521,65 +496,10 @@ void ts_log_freeze(void)
     s_ts_frozen_valid[core]   = 1;
 }
 
-// 2026-08-08、ユーザー指示(mlx5 core分離のタイムアウト根本原因調査)で
-// ts_log_dump_core()と同じパターンへリファクタ -- PF0(core0)/PF1(core1)
-// それぞれが自コアでts_log_freeze()した内容を、常にcore0から動く
-// シェル(command.c)側で両方とも読み比べられるようにする。
-void ts_log_dump_frozen_core(unsigned core, uint32_t count)
-{
-    if (!s_ts_frozen_valid[core] || s_ts_frozen_count[core] == 0) {
-        uart_printf("ts: core=%u フリーズ済みスナップショット無し"
-                    "(ts_log_freeze()が未実行、またはフリーズ時点で記録0件)\n", core);
-        return;
-    }
-    if (count > s_ts_frozen_count[core]) {
-        count = s_ts_frozen_count[core];
-    }
-    uint32_t start_i = s_ts_frozen_count[core] - count;
-
-    uart_printf("ts: core=%u フリーズ済みスナップショット 直近%u件/%u件 "
-                "(freeze時点の通し番号#%u〜#%u)\n",
-                core, count, s_ts_frozen_count[core],
-                (uint32_t)s_ts_frozen_start_n[core],
-                (uint32_t)(s_ts_frozen_start_n[core] + s_ts_frozen_count[core] - 1));
-
-    uint64_t prev_ticks = 0;
-    int      have_prev  = 0;
-    for (uint32_t i = start_i; i < s_ts_frozen_count[core]; i++) {
-        ts_entry_t e = s_ts_frozen[core][i];
-
-        uint32_t delta_us = 0;
-        if (have_prev) {
-            delta_us = (uint32_t)ticks_to_us(e.ticks - prev_ticks);
-        }
-
-        ts_print_entry(s_ts_frozen_start_n[core] + i, &e, delta_us);
-
-        prev_ticks = e.ticks;
-        have_prev  = 1;
-    }
-}
-
 void ts_log_set_paused_core(unsigned core, int paused)
 {
     if (core >= SMP_MAX_CORES) core = 0;
     s_ts_paused[core] = paused;
-}
-
-int ts_log_is_paused_core(unsigned core)
-{
-    if (core >= SMP_MAX_CORES) core = 0;
-    return s_ts_paused[core];
-}
-
-void ts_log_set_paused(int paused)
-{
-    ts_log_set_paused_core(smp_core_index(), paused);
-}
-
-int ts_log_is_paused(void)
-{
-    return ts_log_is_paused_core(smp_core_index());
 }
 
 /* ts_log_modeのビット割り当て(詳細は timestamp.h の TS_MODE_HOTPATH 節):

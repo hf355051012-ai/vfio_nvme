@@ -182,12 +182,6 @@ typedef struct {
  * fill_addr()相当は呼び出し元が行う、nvme_rdma_run_connect_test()参照)。 */
 job_result_t nvme_rdma_connect_job_step(job_t *self);
 
-/* `nvmerdmaconnect`シェルコマンド用。dev0(initiator)/dev1(target)で
- * nvme_rdma_connect_job_step()とnvmet_rdma_job_step()(nvmet_rdma.h)を
- * 協調動作させ、CM確立->Fabrics Connect->CC有効化->Identify Controller/
- * Namespace->write->readまで一気通貫で確認する。 */
-void nvme_rdma_run_connect_test(mlx5_dev_t *dev0, mlx5_dev_t *dev1);
-
 /* フェーズ(h): `nvmermabench`シェルコマンド用。dev0(initiator)/
  * dev1(target)でCM確立->Fabrics Connect->CC有効化->Identify Namespace
  * まではnvme_rdma_run_connect_test()と全く同じ手順を踏んだ上で、

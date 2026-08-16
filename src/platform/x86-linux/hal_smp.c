@@ -110,11 +110,7 @@ static void *worker_main(void *argp)
 
 /* PF ごとに 1 度だけ起動する(二重起動しても実害は無いが再起動しない)。 */
 static worker_arg_t s_core1_arg;
-static worker_arg_t s_core2_arg;
-static worker_arg_t s_core3_arg;
 static pthread_t    s_core1_thr;
-static pthread_t    s_core2_thr;
-static pthread_t    s_core3_thr;
 
 int smp_boot_core1(void)
 {
@@ -130,46 +126,6 @@ int smp_boot_core1(void)
     /* g_core1_alive が立つまで最大 2 秒待つ(RPi5 の smp_boot_core1 と同じ規約)。 */
     uint64_t start = timer_now();
     while (!g_core1_alive) {
-        if (timeout_sec(start, 2u)) {
-            return -1;
-        }
-    }
-    return 0;
-}
-
-int smp_boot_core2(void)
-{
-    if (g_core2_alive) {
-        return 0;
-    }
-    s_core2_arg.core_index = 2u;
-    s_core2_arg.hb    = &g_core2_heartbeat;
-    s_core2_arg.alive = &g_core2_alive;
-    if (pthread_create(&s_core2_thr, 0, worker_main, &s_core2_arg) != 0) {
-        return -1;
-    }
-    uint64_t start = timer_now();
-    while (!g_core2_alive) {
-        if (timeout_sec(start, 2u)) {
-            return -1;
-        }
-    }
-    return 0;
-}
-
-int smp_boot_core3(void)
-{
-    if (g_core3_alive) {
-        return 0;
-    }
-    s_core3_arg.core_index = 3u;
-    s_core3_arg.hb    = &g_core3_heartbeat;
-    s_core3_arg.alive = &g_core3_alive;
-    if (pthread_create(&s_core3_thr, 0, worker_main, &s_core3_arg) != 0) {
-        return -1;
-    }
-    uint64_t start = timer_now();
-    while (!g_core3_alive) {
         if (timeout_sec(start, 2u)) {
             return -1;
         }

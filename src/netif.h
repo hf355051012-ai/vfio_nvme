@@ -62,10 +62,6 @@ int eth_send_lso_async(const void *hdr, uint16_t hdr_len,
  * 戻ってから初めて、そのスロット専用の送信バッファへ書き込んでよい。 */
 unsigned eth_tx_wait_free_slot(void);
 
-/* 受信を1回ポーリングする(ブロックしない)。フレームがあれば net_buf を
- * 確保して返す(呼び出し側が net_buf_free() する)。無ければ NULL。 */
-net_buf_t *eth_poll_recv(void);
-
 /* EtherType 別ハンドラ。登録される具体関数:
  *   0x0806(ARP)  -> arp_handle_frame(arp.c、arp_init() で登録)
  *   0x0800(IPv4) -> ip_handle_frame(ip.c、ip_init() で登録) */
@@ -290,30 +286,6 @@ void netif_activate(netif_t *ctx);
  * 良い」ことを分離した設計、netif_t.owner_coreのコメント参照)。 */
 #define NETIF_MAX_REGISTERED 4u
 void netif_register(netif_t *ctx);
-
-/* 【2026-08-08追加】1つの物理NIC(RP1)を「論理的に」2つの識別子へ分ける
- * ための別名登録。telnetをコアごとに独立させる際、コア0向け/コア1向けの
- * 2つのtelnetセッションをそれぞれ別のIPアドレス(下1桁違い)で区別できる
- * ようにする目的で追加した -- 実ハードウェア(RXリング/TXリング)は
- * primaryが代表して1コアだけがポーリング/送信する(owner_coreの制約は
- * 従来通り)ため、真の意味で2コアが同時にNICへアクセスするわけではない
- * (このプロジェクトのNICドライバはコア間排他を持たないため、それ自体は
- * 今回も変更しない)。
- *
- * ctx: 呼び出し元が用意した別名用の netif_t(name/ip/mac/mss_capは
- *      呼び出し元が設定してから渡す -- macはprimaryと同じ値を使うのが
- *      通常、mss_capはprimaryと揃えるのが通常)。
- * primary: 実体を共有する代表ctx(既にnetif_register()済みであること)。
- *
- * 効果: ctx->nic/nic_priv/owner_coreをprimaryからコピーし、
- * ctx->is_poll_owner=0にしてから登録する。net_poll_all_and_dispatch()は
- * is_poll_owner==0のctxをポーリング対象から除外するが、受信フレームの
- * 宛先IPがこのctxのipと一致すれば、そのフレームの処理中だけこのctxを
- * activateする(netif.cのnetif_resolve_frame_owner()参照) -- IP
- * エイリアシング(1枚のNICに複数IPを持たせる一般的な手法)と同じ考え方。
- * netif_find()/netif_find_by_ip()からは通常のctxと同様に検索できる
- * ため、tcp_send_segment()等の既存コードは変更不要。 */
-void netif_register_alias(netif_t *ctx, const netif_t *primary);
 
 /* 【マルチコア化 Phase 6】netif_register()が記録したowner_coreを
  * 明示的に上書きする -- ConnectXブリングアップ自体は常にcore0が単独で

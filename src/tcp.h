@@ -150,18 +150,6 @@ uint32_t tcp_rx_buf_size(void);
 int  tcp_abort_requested(void);
 void tcp_clear_abort_request(void);
 
-/* tcp_poll_once()自身がuart_check_ctrl_c()でCtrl+Cを検出する経路とは
- * 別に、command.cのshell_line_poll()(ジョブ化されたシェルのメインループ
- * が毎tick呼ぶ、非ブロッキングの1行編集処理)もUARTのバイトを読み取る
- * ため、同じUART受信バイトをどちらが先に読むかで競合する -- job(nvmet
- * 等)がtcp_poll_once()経由でCtrl+Cを検出するより先にshell_line_poll()
- * がそのバイトを「制御文字」として読み捨ててしまうと、job側は永久に
- * Ctrl+Cを検知できない(実機で確認、CLAUDE.md「nvmet: 常駐サーバ化」
- * 節参照)。shell_line_poll()がCtrl+C(0x03)を読んだ際はこちらを呼び、
- * tcp_poll_once()が検出した場合と同じ効果(tcp_abort_requested()が
- * 真になる)を持たせること。 */
-void tcp_request_abort(void);
-
 #define TCP_HDR_LEN 20u
 
 /* フラグ(byteの下位6bit) */
@@ -270,13 +258,6 @@ typedef struct {
  * エンコーディングでadmin/IO queueを区別する必要があり、複製を避けて
  * ここで公開した。 */
 uint32_t tcp_conn_arg(const tcp_conn_t *conn, uint32_t value);
-
-/* dst_ip:dst_portへ3-way handshakeを行う。SYNは応答が無ければRTOベースで
- * 再送する(tcp_send_reliable()参照)。
- * conn: 呼び出し側が確保した接続状態(呼び出し中/接続中はtcp_input()の
- *       ディスパッチ先として内部でグローバル登録される)。
- * 戻り値: 0=ESTABLISHEDに到達, -1=送信失敗または再送上限到達 */
-int  tcp_connect(tcp_conn_t *conn, uint32_t dst_ip, uint16_t dst_port);
 
 /* tcp_connect()を「SYN送信(ブロックしない)」と「ESTABLISHEDになる/
  * 再送/タイムアウトを1tick分だけ進める」の2段に分けたもの
@@ -485,14 +466,6 @@ int  tcp_send_async(tcp_conn_t *conn, const void *buf, uint16_t len);
  * 変わりうるもの)は必ずコピー版tcp_send_async()を使うこと。 */
 int  tcp_send_async_ref(tcp_conn_t *conn, const void *buf, uint16_t len);
 
-/* connの未確認async送信キューが完全に空になるまでブロッキングで待つ。
- * 呼び出し規則(上記)により、いずれかのtcp_send_async()が未確認の間は
- * 同一connへtcp_send()を呼んではならないため、複数のasync送信をキューした
- * 直後に同じconnへブロッキングtcp_send()を呼ぶ必要がある場合(nvme.cの
- * nvme_write_pipelined_run()、SQE非同期送信後のH2CData一括送信前等)は
- * 必ずこれを先に呼ぶこと。 */
-void tcp_send_async_drain(tcp_conn_t *conn);
-
 /* データ受信、または相手からのFIN受信(半クローズ、CLOSE_WAITへの遷移)を
  * 最大timeout_msだけ待つ。
  * 戻り値: >0=受信したバイト数、
@@ -557,7 +530,6 @@ void tcp_clear_recv_upcall(tcp_conn_t *conn);
 /* pull型二重コピー時間計測(push vs pull 比較、検証後に撤去)。 */
 void tcp_copy_stats_get(uint64_t *c2_ns, uint64_t *c2_by,
                         uint64_t *c3_ns, uint64_t *c3_by);
-void tcp_copy_stats_reset(void);
 
 /* クローズシーケンスを開始する。conn->stateに応じて2通り:
  *   - ESTABLISHED(能動close): FINを送りFIN_WAIT_1へ。相手のACKとFINを
@@ -607,16 +579,6 @@ void tcp_input(const uint8_t *pkt, uint16_t len, uint32_t src_ip);
  *         へ渡す)、失敗時-1(TCP_MAX_LISTENERS個のスロットが全て使用中)。 */
 int tcp_listen(uint16_t port, netif_t *ctx);
 
-/* リッスン中のポートへの新規TCP接続(3-way handshake)を待つ。
- * listener: tcp_listen()が返したハンドル。
- * conn: 呼び出し側が確保したtcp_conn_t(tcp_connect()と同じ用法)。
- * リスナー自体はここでは解除しない(tcp_unlisten()呼び出しまで有効 --
- * 複数回tcp_accept()を呼べるようにするため、NVMe/TCPのadmin queue+IO
- * queueのように2本のコネクションを同じリスナーで順に受け付ける用途を
- * 想定)。
- * 戻り値: 0=ESTABLISHEDに到達, -1=タイムアウトまたは無効なlistener */
-int tcp_accept(int listener, tcp_conn_t *conn, uint32_t timeout_val_ms);
-
 /* tcp_accept()を「受け付け準備(ブロックしない)」と「ESTABLISHEDになる
  * のを待つ(ポーリングループ)」の2段に分けたもの。tcp_accept()は
  * 内部でtcp_accept_begin()に続けてtcp_accept_wait()を呼ぶだけ
@@ -636,7 +598,6 @@ int tcp_accept(int listener, tcp_conn_t *conn, uint32_t timeout_val_ms);
  * tcp_accept_wait()で実際にESTABLISHEDになるのを待つことで、この
  * 早着SYNを最初の到着で取りこぼさずに済む。 */
 void tcp_accept_begin(int listener, tcp_conn_t *conn);
-int  tcp_accept_wait(int listener, tcp_conn_t *conn, uint32_t timeout_val_ms);
 
 /* tcp_accept_wait()の非ブロッキング版(NVMe/TCP制御のジョブ化、CLAUDE.md
  * 「NVMe/TCP制御のステートマシン化」節参照)。tcp_accept_wait()はwhile

@@ -62,13 +62,6 @@ typedef struct net_buf {
     uint8_t  hw_csum_ok;
 } __attribute__((aligned(64))) net_buf_t;
 
-/* プール全体を空きに戻す。eth_init() から呼ばれる想定。
- * マルチコア化 Phase 3(net_buf.c参照)によりコアごとに独立したプールを
- * 持つため、呼び出したコア自身のプールだけを初期化する -- 複数コアが
- * それぞれ自分のeth_init()を呼ぶ設計(Phase 6以降)になった場合、
- * 各コアがこの関数を1回ずつ呼ぶ想定。 */
-void net_buf_pool_init(void);
-
 /* 空きバッファを1個確保する。呼び出したコア自身のプールから確保する
  * (net_buf.c参照)。戻り値: NULL=プール枯渇 */
 net_buf_t *net_buf_alloc(void);

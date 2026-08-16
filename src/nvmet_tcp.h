@@ -56,16 +56,6 @@ typedef struct {
                             * digestバイトbit1から確定(上記hdgstと同じ扱い)。 */
 } nvmet_tcp_conn_t;
 
-/* portをリッスンし(ctx=NULL、インターフェースを問わない単発利用向け)、
- * TCP接続を1本受け付けてICReq/ICResp交換まで完了する。内部でtcp_listen()
- * /tcp_unlisten()を自前で完結させる -- 複数インターフェースにまたがる
- * 常駐サーバ(nvmet.c)は、代わりにnvmet_tcp_accept_arm()/accept_wait()を
- * 呼び出し元が管理するリスナーハンドル(tcp_listen()で1インスタンスに
- * つき1回だけ確保、admin/IO両方のaccept段階で使い回す)と組み合わせて
- * 直接使うこと。
- * 戻り値: 0=成功, -1=失敗 */
-int nvmet_tcp_accept(nvmet_tcp_conn_t *c, uint16_t port, uint32_t timeout_ms);
-
 /* nvmet_tcp_accept()を「受け付け準備(ブロックしない)」と「実際に
  * ESTABLISHED+ICReq/ICResp交換まで待つ」の2段に分けたもの。
  * nvmet_tcp_accept()は内部でtcp_listen()してこの2つを呼ぶだけ(実装は同じ)。
@@ -83,66 +73,6 @@ int nvmet_tcp_accept(nvmet_tcp_conn_t *c, uint16_t port, uint32_t timeout_ms);
  * ではこの遅延が全体のキュー確立タイムアウトに食い込んで接続ごと
  * 中断される事象を確認した。 */
 void nvmet_tcp_accept_arm(nvmet_tcp_conn_t *c, int listener);
-int  nvmet_tcp_accept_wait(nvmet_tcp_conn_t *c, int listener, uint32_t timeout_ms);
-
-/* 次のCommand Capsule PDUを受信する(1コマンド分をまとめて読む、
- * ブロッキング)。adminキュー専用 -- adminはコマンドをパイプライン発行
- * されない前提なので、これで十分(ファイル冒頭コメント参照)。IOキューは
- * 下記nvmet_tcp_recv_pdu_type()系を使うこと。
- * sqe_out: 受信したSQE(64バイト)
- * data_buf/data_buf_max: in-capsuleデータの格納先と容量
- * dlen_out: 受信したin-capsuleデータ長(in-capsuleなし = 0)
- * 戻り値: 0=成功, -1=タイムアウトまたは接続断 */
-int nvmet_tcp_recv_cmd(nvmet_tcp_conn_t *c,
-                       nvme_sqe_t *sqe_out,
-                       void *data_buf, uint32_t data_buf_max,
-                       uint32_t *dlen_out,
-                       uint32_t timeout_ms);
-
-/* IOキュー用。次に来るPDUのヘッダ8バイトだけを読み、種別を返す --
- * IOキューはCMD PDU(新規コマンド)とH2CData PDU(先行するR2Tへの応答)が
- * 任意の順序でインターリーブして届きうる(ホストが複数コマンドをR2T
- * 往復の完了を待たずパイプライン発行するため、ファイル冒頭コメント
- * 参照)ため、「次は必ずCMDのはず」と決め打ちできない -- 呼び出し元は
- * *type_outを見て、CMD/H2C_DATAそれぞれの続きを読む関数(下記)を呼ぶこと。
- * hdr_buf_outには読んだ生の8バイトをそのまま返す(続きの関数へそのまま
- * 渡す)。
- * 戻り値: 0=成功, -1=タイムアウトまたは接続断 */
-int nvmet_tcp_recv_pdu_type(nvmet_tcp_conn_t *c, uint8_t *type_out,
-                             uint8_t hdr_buf_out[NVME_TCP_HDR_LEN],
-                             uint32_t timeout_ms);
-
-/* nvmet_tcp_recv_pdu_type()でtype==NVME_TCP_PDU_CMDと分かった後、続き
- * (SQE+in-capsuleデータ)を読む。hdr_bufはnvmet_tcp_recv_pdu_type()が
- * 返したものをそのまま渡すこと。cid_outにSQEのCIDを返す(nvmet.c側が
- * 複数コマンドを同時追跡するために必須 -- last_cidは使わない)。
- * 戻り値: 0=成功, -1=タイムアウト・接続断・in-capsuleデータ過大 */
-int nvmet_tcp_recv_cmd_body(nvmet_tcp_conn_t *c,
-                             const uint8_t hdr_buf[NVME_TCP_HDR_LEN],
-                             nvme_sqe_t *sqe_out, uint16_t *cid_out,
-                             void *data_buf, uint32_t data_buf_max,
-                             uint32_t *dlen_out, uint32_t timeout_ms);
-
-/* nvmet_tcp_recv_pdu_type()でtype==NVME_TCP_PDU_H2C_DATAと分かった後、
- * 続きの16バイト(cccid/ttag/datao/datal)を読む。cccidで呼び出し元が
- * どのoutstandingな書き込みコマンドへのデータか判別する。
- * hdr_bufはnvmet_tcp_recv_pdu_type()が返した最初の8バイトをそのまま渡す
- * こと(2026-07-25、ヘッダダイジェスト検証がPDUヘッダ全体(共通8バイト+
- * この16バイト=hlen分)のCRC32Cを必要とするため -- nvmet_tcp_recv_cmd_body()
- * と同じ理由)。
- * 戻り値: 0=成功, -1=タイムアウト・接続断・ヘッダダイジェスト不一致 */
-int nvmet_tcp_recv_h2c_hdr(nvmet_tcp_conn_t *c,
-                            const uint8_t hdr_buf[NVME_TCP_HDR_LEN],
-                            uint16_t *cccid_out, uint16_t *ttag_out,
-                            uint32_t *datao_out, uint32_t *datal_out,
-                            uint32_t timeout_ms);
-
-/* nvmet_tcp_recv_h2c_hdr()の後、実データ本体(lenバイト)をbufへ読む。
- * データダイジェストが有効なコネクションでは、続けて4バイトのCRC32Cを
- * 読んで検証する(不一致なら-1、2026-07-25追加)。
- * 戻り値: 0=成功, -1=タイムアウト・接続断・データダイジェスト不一致 */
-int nvmet_tcp_recv_h2c_data(nvmet_tcp_conn_t *c, void *buf, uint32_t len,
-                             uint32_t timeout_ms);
 
 /* R2T PDUを1件送りっぱなしで送信する(応答を待たずすぐ戻る)。cidは
  * 対象コマンドのCID(ワイヤのcccidフィールドに使う)、r2to/r2tlは

@@ -72,45 +72,6 @@ void job_pin_to_core(job_t *job, unsigned core)
     smp_spin_unlock(&s_job_lock);
 }
 
-int job_request_cancel(unsigned index)
-{
-    smp_spin_lock(&s_job_lock);
-    int ok = (index < JOB_MAX) && s_jobs[index].in_use;
-    if (ok) {
-        s_jobs[index].cancel_requested = 1;
-    }
-    smp_spin_unlock(&s_job_lock);
-    return ok ? 0 : -1;
-}
-
-unsigned job_cancel_all_by_step(job_step_fn step)
-{
-    smp_spin_lock(&s_job_lock);
-    unsigned n = 0;
-    for (unsigned i = 0; i < JOB_MAX; i++) {
-        if (s_jobs[i].in_use && s_jobs[i].step == step) {
-            s_jobs[i].cancel_requested = 1;
-            n++;
-        }
-    }
-    smp_spin_unlock(&s_job_lock);
-    return n;
-}
-
-unsigned job_cancel_by_ctx(void *ctx)
-{
-    smp_spin_lock(&s_job_lock);
-    unsigned n = 0;
-    for (unsigned i = 0; i < JOB_MAX; i++) {
-        if (s_jobs[i].in_use && s_jobs[i].ctx == ctx) {
-            s_jobs[i].cancel_requested = 1;
-            n++;
-        }
-    }
-    smp_spin_unlock(&s_job_lock);
-    return n;
-}
-
 /* 再入ガード(コアごと)。tcp.cのtcp_recv_internal()が(旧来のブロッキング
  * nvme_exec()経由の待ちのように、job_scheduler_tick()を長時間呼ばない
  * トップレベルシェルコマンドから使われる場合に)自分の内部待ちループから
@@ -210,38 +171,12 @@ void job_scheduler_tick(void)
     s_ticking[core] = 0;
 }
 
-void job_delay_ms(uint32_t ms)
-{
-    uint64_t start = timer_now();
-    do {
-        job_scheduler_tick();
-    } while (!timeout_ms(start, ms));
-}
-
 unsigned job_active_count(void)
 {
     smp_spin_lock(&s_job_lock);
     unsigned n = 0;
     for (unsigned i = 0; i < JOB_MAX; i++) {
         if (s_jobs[i].in_use) n++;
-    }
-    smp_spin_unlock(&s_job_lock);
-    return n;
-}
-
-static int job_name_eq(const char *a, const char *b)
-{
-    unsigned i = 0;
-    while (a[i] != '\0' && b[i] != '\0' && a[i] == b[i]) i++;
-    return a[i] == '\0' && b[i] == '\0';
-}
-
-unsigned job_active_count_excluding(const char *name)
-{
-    smp_spin_lock(&s_job_lock);
-    unsigned n = 0;
-    for (unsigned i = 0; i < JOB_MAX; i++) {
-        if (s_jobs[i].in_use && !job_name_eq(s_jobs[i].name, name)) n++;
     }
     smp_spin_unlock(&s_job_lock);
     return n;

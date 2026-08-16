@@ -58,22 +58,10 @@ extern volatile int g_core1_alive;
  * -1=CPU_ON自体が失敗、またはタイムアウトしてもg_core1_aliveにならなかった。 */
 int smp_boot_core1(void);
 
-/* 3コア化(RXコピーオフロード専任のcore2)。core1(target本体)とは独立に
- * PSCI CPU_ONで起動する(target_cpu Aff1=2)。core2はsecondary_main()の
- * core2分岐に入り、rxcopy_worker_drain()だけを回すコピー専任ループになる
- * -- per-core配列(SMP_MAX_CORES=2のまま)には一切触れないため、SMP_MAX_
- * CORESを増やす必要はなく、大きな状態も持たない(必要なのは専用Cスタック
- * __stack3_topだけ)。rxcopy_set_enabled()から呼ばれる。
- * 戻り値はsmp_boot_core1()と同じ意味。 */
-int smp_boot_core2(void);
-
 /* core2用。g_core1_*と同じ規約(単一ライタ=core2、複数リーダ=smpstat)。 */
 extern volatile uint64_t g_core2_heartbeat;
 extern volatile int      g_core2_alive;
 
-/* 4コア化(x86マルチコネクション、2026-08-15): core3。x86-linuxのみ
- * (SMP_MAX_CORES=4)。2 initiator(core0/core2)+ 2 target(core1/core3)。 */
-int smp_boot_core3(void);
 extern volatile uint64_t g_core3_heartbeat;
 extern volatile int      g_core3_alive;
 
@@ -158,7 +146,6 @@ void sim_delay_tick(void);
  * LL/SCのみで書いてあるため追加のコンパイラフラグは不要。 */
 typedef volatile uint32_t smp_spinlock_t;
 
-
 /* x86-linux: x86 は TSO。GCC の __atomic 組み込みで acquire/release を明示した
  * test-and-set スピンロックにする(LSE/LL-SC 相当を C11 メモリモデルで表現)。
  * 待ちループでは pause 命令(_mm_pause 相当)でスピン圧を下げる。 */
@@ -173,6 +160,5 @@ static inline void smp_spin_unlock(smp_spinlock_t *lock)
 {
     __atomic_store_n(lock, 0u, __ATOMIC_RELEASE);
 }
-
 
 #endif /* SMP_H */

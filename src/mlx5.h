@@ -3,7 +3,6 @@
 
 #include <stdint.h>
 
-void wqe_logs(int opcode, volatile uint8_t *wqe, uint16_t num);
 #define LOG_SET 0
 #define LOG_GET 1 
 #define LOG_CLR 2 
@@ -51,7 +50,6 @@ void wqe_logs(int opcode, volatile uint8_t *wqe, uint16_t num);
 // mlx5_cmd_prot_block))`(576→1024)と同値 -- 実機で確認済み(上記参照)。
 #define MLX5_CMD_MBOX_ALIGN 1024u
 
-
 // メールボックスチェイン: CREATE_FLOW_GROUP等、単一メールボックスブロック
 // (576バイト)を大きく超える固定長フィールドを持つコマンド向けに、複数の
 // mlx5_cmd_prot_block_tを`next`で連結して送受信する(mlx5.cの
@@ -61,7 +59,6 @@ void wqe_logs(int opcode, volatile uint8_t *wqe, uint16_t num);
 // 1024`、上記コメント参照)と同じ理由で、チェインの2番目以降のブロックも
 // 同じ制約を受ける。
 #define MLX5_CMD_MBOX_CHAIN_BLOCKS 4u // 方向あたり最大 16+4*512=2064バイト
-
 
 // CREATE_EQ用のEQバッファ(1ページ=4096バイト、EQE(mlx5_ifc.hのstruct
 // mlx5_eqe相当)は64バイト固定なので64エントリ分)。fw_pagesの直後に配置。
@@ -309,7 +306,6 @@ void wqe_logs(int opcode, volatile uint8_t *wqe, uint16_t num);
                                     // qp.hのMLX5_RCV_DBR=0/MLX5_SND_DBR=1
                                     // で確認済み、CQドアベルとは別物)だが
                                     // 既存の64B枠規約に揃える。
-
 
 // RC QP用の完了確認CQ(送受信共有)。既存のRQ/SQ用CQと同じ理由でNormal
 // cacheable RAM(board.hのMLX5_QP_CACHE_BASE)に置く -- 上記MLX5_RQ_CQ_BUF_
@@ -633,9 +629,6 @@ void mlx5_monitor_set_devs(const mlx5_dev_t *dev0, const mlx5_dev_t *dev1);
 void mlx5_monitor_summary3(mlx5_dev_t *d0, mlx5_dev_t *d1,
                            uint32_t (*rd)(void *ctx, uint32_t off), void *cx0, void *cx1);
 
-// 直近にbringupされたPF(pf=0/1)のハンドルを返す(未初期化ならNULL)。
-mlx5_dev_t *mlx5_monitor_saved_dev(unsigned pf);
-
 /* x86-vfio-port Phase 5: 既に bring-up 済みの 2 PF を net_ctx(mlx5-pf0/pf1)
  * として登録する -- mlx5_net_init_dual_loopback() から pcie1 bring-up 部分を
  * 除いた「登録のみ」版。x86 は VFIO で bring-up 済みの dev を渡して呼ぶ
@@ -649,31 +642,12 @@ int mlx5_net_register_dual(mlx5_dev_t *dev0, mlx5_dev_t *dev1);
 // 実装・バイトオフセットの根拠はmlx5.cの各関数コメント参照。
 // ============================================================================
 
-// 一般capability(QUERY_HCA_CAP general, cur)の"roce"総合ビットを確認する。
-int mlx5_query_hca_cap_roce_supported(mlx5_dev_t *dev, int *out_supported);
-
-// native_port_num/num_vhca_ports(フェーズ(b)実機診断用、mlx5.cのコメント参照)。
-int mlx5_query_hca_cap_ports(mlx5_dev_t *dev, uint8_t *out_native_port_num, uint8_t *out_num_vhca_ports);
-
-// 詳細RoCE capability(QUERY_HCA_CAP roce, cur)。l3_type/versionは各対応
-// ビットマップ、addr_table_sizeはGIDテーブルの実サイズ。失敗時いずれも
-// 0のまま。
-int mlx5_query_hca_cap_roce(mlx5_dev_t *dev, uint32_t *out_l3_type_cap,
-                             uint32_t *out_version_cap, uint32_t *out_addr_table_size);
-
 // IPv4-mapped IPv6形式のRoCEv2 GID(::ffff:a.b.c.d)を構築する。
 void mlx5_build_roce_gid_v4(uint32_t ipv4_host_order, uint8_t out_gid[16]);
 
 // SET_ROCE_ADDRESS(opcode 0x761)でGIDテーブルのindexへgid/macを書き込む。
 // roce_version=RoCEv2固定、roce_l3_type=IPv4固定。
 int mlx5_set_roce_address(mlx5_dev_t *dev, uint32_t index, const uint8_t gid[16], const uint8_t mac[6]);
-
-// QUERY_ROCE_ADDRESS(opcode 0x760)でGIDテーブルのindexからgid/macを読む。
-int mlx5_query_roce_address(mlx5_dev_t *dev, uint32_t index, uint8_t out_gid[16], uint8_t out_mac[6]);
-
-// `mlx5roce <0|1>`シェルコマンド用の一発診断(cap確認〜GID書込〜読返し
-// 一致確認)。詳細はmlx5.cのコメント参照。pf_indexは0または1。
-void mlx5_roce_probe(int pf_index);
 
 // ============================================================================
 // フェーズ(b): RC QP(mlx5.cに実装 -- FWコマンド[mlx5_cmd_exec()]を発行する
@@ -787,10 +761,6 @@ int mlx5_qp_modify_init2rtr(mlx5_dev_t *dev, mlx5_qp_t *qp, uint32_t remote_qpn,
 // RTS状態(データ送受信可能)になる。
 int mlx5_qp_modify_rtr2rts(mlx5_dev_t *dev, mlx5_qp_t *qp);
 
-// QUERY_QP: 現在のqpc.state(下位4bit、mlx5_qp_state_t相当の生値: RST=0/
-// INIT=1/RTR=2/RTS=3/SQER=4/SQD=5/ERR=6)を読む。
-int mlx5_qp_query_state(mlx5_dev_t *dev, mlx5_qp_t *qp, uint8_t *out_state);
-
 // QUERY_QP診断拡張: このQP自身のRQ/SQでHWが実際に処理したWQE数
 // (hw_rq_counter/hw_sq_wqebb_counter)とソフトウェアが投稿したWQE数
 // (sw_rq_counter/sw_sq_wqebb_counter)を読む。mlx5stat/QUERY_RQ/QUERY_SQ
@@ -800,35 +770,8 @@ int mlx5_qp_query_state(mlx5_dev_t *dev, mlx5_qp_t *qp, uint8_t *out_state);
 int mlx5_qp_query_counters(mlx5_dev_t *dev, mlx5_qp_t *qp, uint32_t *out_hw_rq, uint32_t *out_sw_rq,
                             uint16_t *out_hw_sq, uint16_t *out_sw_sq);
 
-// QUERY_QP診断拡張: primary_address_path(qpc相対byte24-67、44バイト)の
-// 生バイトをそのまま返す -- INIT2RTR_QPで実際に設定したAV(GID/MAC/UDP
-// 宛先ポート等)がFW側で本当に保持されているかを、コマンド出力とは別に
-// 直接確認するための一時診断用(実フェーズiの接続確立トラブルシュート、
-// 原因特定後に呼び出し元だけ削除してよい -- 関数自体は汎用診断として
-// 残す価値がある)。
-int mlx5_qp_query_ads_raw(mlx5_dev_t *dev, mlx5_qp_t *qp, uint8_t out_ads[44]);
-
-// qpc先頭24バイト(mtu[byte8]・log_msg_max・pd等)の生バイトダンプ用
-// (mlx5_qp_query_ads_raw()と同じ一時診断)。
-int mlx5_qp_query_qpc_head_raw(mlx5_dev_t *dev, mlx5_qp_t *qp, uint8_t out_head[24]);
-
-// qpc任意範囲の生バイトダンプ(一時診断、2026-08-13)。next_send_psn=
-// qpc byte121-123、next_rcv_psn=qpc byte149-151(torvalds/linuxの
-// mlx5_ifc.hから手計算で確認済み、実装コメント参照)。offset+lenは
-// qpc全体(232バイト)の範囲内に収まること。
-int mlx5_qp_query_qpc_range_raw(mlx5_dev_t *dev, mlx5_qp_t *qp, unsigned offset, unsigned len, uint8_t *out);
-
 // DESTROY_QP。
 int mlx5_qp_destroy(mlx5_dev_t *dev, mlx5_qp_t *qp);
-
-// `mlx5qp create/query/pingpong`シェルコマンド用。直近の`mlx5`/`net init
-// mlx5`ブリングアップ(s_last_dev0/dev1、mlx5_monitor_dump_saved()と同じ
-// もの)に対して動作する。pf_indexは0または1。
-void mlx5_qp_cmd_create(int pf_index);
-void mlx5_qp_cmd_query(int pf_index);
-void mlx5_qp_cmd_pingpong(void);
-void mlx5_qp_cmd_rdma(void);
-void mlx5_qp_cmd_loop(int pf_index);
 
 // ============================================================================
 // フェーズ(d): GSI/MAD/UD QP1相当(最重要リスク領域)。ConnectX RoCEv2
@@ -837,11 +780,6 @@ void mlx5_qp_cmd_loop(int pf_index);
 // mlx5_qp.c、という既存の役割分担を踏襲する。MAD送受信の一発診断・
 // 実機プローブはsrc/mlx5_gsi.c[新規]に置く。
 // ============================================================================
-
-// CREATE_QP: UD(汎用データグラム、st=0x2)QPを1本作成する。手順・DMA
-// レイアウトはmlx5_qp_create_rc()と同型だが、GSI専用のWQE/CQ領域
-// (MLX5_GSI_WQE_ADDR等)を使う点とst値が異なる。
-int mlx5_qp_create_ud(mlx5_dev_t *dev, mlx5_qp_t *qp);
 
 // CREATE_QP: GSI(QP1相当、st=0x8、drivers/infiniband/hw/mlx5/qp.cの
 // to_mlx5_st()でMLX5_IB_QPT_HW_GSI->MLX5_QP_ST_QP1と確認済み)QPを1本
@@ -883,19 +821,6 @@ uint16_t mlx5_calc_udp_sport(uint32_t lqpn, uint32_t rqpn);
 // 余裕を含めること。CQEのbyte_cntにはGRH込みの長さが報告される。
 #define MLX5_GRH_BYTES 40u
 
-// `mlx5mad probe <0|1> <ud|gsi>`シェルコマンド用。指定PFで指定transport
-// のCREATE_QPを試し、成功/失敗(syndrome込み)を報告する一発診断
-// -- フェーズ(d)着手時の最初の確認(「CREATE_QPへUD+特殊QPフラグを
-// 立てた際の実機の反応」)に対応する。
-void mlx5_gsi_cmd_probe(int pf_index, int is_gsi);
-
-// `mlx5mad test <ud|gsi>`シェルコマンド用。PF0<->PF1でUD(またはGSI、
-// use_gsiで選択、通常は`mlx5mad probe`で成功した方を選ぶ)QPを1本ずつ
-// 作り、RST2INIT->INIT2RTR->RTR2RTSを経てRTSへ遷移させ、PF0からPF1へ
-// ダミーのMAD形式パケットを1個送信、到着・内容一致を確認する(CM無し、
-// 手動でQPN/GID/MACを交換する、フェーズ(b)の手動RC QP確立と同じ設計)。
-void mlx5_gsi_cmd_test(int use_gsi);
-
 // ============================================================================
 // フェーズ(e): RDMA CM(REQ/REP/RTU)。実際の状態機械・MAD組み立てはsrc/
 // rdma_cm.c/rdma_cm.h(新規、job.hのnon-blocking契約に準拠)に置く。
@@ -904,42 +829,6 @@ void mlx5_gsi_cmd_test(int use_gsi);
 // mlx5_qp_cmd_pingpong()/mlx5_gsi_cmd_test()と同じパターン)。
 // ============================================================================
 
-// `mlx5rdmacm test`シェルコマンド用。PF0をactive、PF1をpassiveとして
-// rdma_cm_run_test()(src/rdma_cm.c)を実行する -- CM REQ->REP->RTUでRC QP
-// を自動確立し、確立されたQPでのSEND/RECV ping-pongまで確認する。
-void mlx5_rdma_cm_cmd_test(void);
-
-// フェーズ(f): `mlx5rdmaconnect`シェルコマンド用。rdma_cm_run_connect()
-// (src/rdma_cm.c)を実行する -- CM REQ->REP->RTUでRC QPを自動確立した
-// 直後、RDMA_WRITE/READ疎通まで1コマンドで確認する。
-void mlx5_rdma_cm_cmd_connect(void);
-
-// ConnectX RoCEv2 NVMe-oF実装計画フェーズ(g): `nvmerdmaconnect`シェル
-// コマンド用。nvme_rdma_run_connect_test()(src/nvme_rdma.c)を実行する --
-// CM確立(単一の統合RC QP、nvme_rdma.hコメント参照)->Fabrics Connect->
-// CC有効化->Identify Controller/Namespace->write->readまで1コマンドで
-// 確認する。
-void mlx5_nvme_rdma_cmd_connect(void);
-
-// ConnectX RoCEv2 NVMe-oF実装計画フェーズ(h): `nvmermabench`シェル
-// コマンド用。nvme_rdma_run_bench()(src/nvme_rdma.c)を実行する --
-// CM確立〜Identify Namespaceまでは`nvmerdmaconnect`と同じ手順を踏んだ
-// 上で、write(is_read=0)/read(is_read=1)コマンドを同一LBAへ
-// duration_ms間繰り返し発行し、スループット/IOPSを計測する。
-// chunk_bytes=0なら既定値(65536)を使う。qdepth(2026-08-12追加)は1で
-// 従来通り単一コマンド逐次発行、2以上でコマンドパイプライン化する
-// (nvme_rdma.h参照)。
-void mlx5_nvme_rdma_cmd_bench(uint32_t duration_ms, int is_read, uint32_t chunk_bytes, uint32_t qdepth);
-
-// ConnectX RoCEv2 NVMe-oF実装計画フェーズ(i): `nvmetrdmastart <0|1>
-// [peer_mac]`シェルコマンド用。上記と同じパターン(s_last_dev0/dev1への
-// アクセスが必要なラッパーのみここに置く)、実体はnvmet_rdma.cのnvmet_
-// rdma_run_standalone()。pf_index=0ならPF0("mlx5-pf0")、1ならPF1
-// ("mlx5-pf1")を常駐target(外部ホストからのCM接続待ち)として起動する。
-// peer_macはNULL可(nvmet_rdma_run_standalone()のコメント参照)。
-void mlx5_nvmet_rdma_cmd_start(int pf_index, const uint8_t peer_mac[6]);
-
-
 // mlx5_net.cのs_state_pf0/s_state_pf1(TCP/IPスタック統合バックエンド用の
 // sq_pc/sq_cc)とdev->sqn/sq_cqnから、SQのCQバッファ・WQEリングの実際の
 // 物理アドレスを計算し、sq_cc周辺のCQEの生バイト(op_own/wqe_counter/
@@ -947,24 +836,5 @@ void mlx5_nvmet_rdma_cmd_start(int pf_index, const uint8_t peer_mac[6]);
 // (2026-08-08、mlx5 SQ TXタイムアウトの実機調査用に追加、ロジックは
 // 一切変更しない純粋な読み取り専用の診断)。pf_indexは0または1。
 void mlx5_net_dump_sq_debug(int pf_index);
-
-// 2026-08-08、ユーザー指示(LOCAL_QP_OP_ERR根本原因調査を可能にするための
-// 前提整備): PF0/PF1いずれかのSQがs_sq_halted[]状態(サーキットブレーカー
-// 発動または復帰失敗、mlx5_net.cのmlx5_net_try_recover()参照)にあるかを
-// 外部から確認する。test.cのwrite負荷テストループが、halted状態のSQへ
-// 新しいコマンドを無条件に送り続け(1回の失敗コストが最大tcp_send()の
-// 全体タイムアウト[30秒]にもなりうる)、結果としてdispatch()が長時間
-// (観測上は数分オーダー)ブロックしtelnetからの新規コマンドを一切受け
-// 付けなくなる問題(実機でreboot=物理再起動が必要になるまで悪化した)を
-// 防ぐため、ループの各反復でこれを確認し、halted済みなら即座に中断する。
-int mlx5_net_any_sq_halted(void);
-
-// 診断専用(2026-08-11、原因特定後に削除すること)。mlx5_net.cコメント
-// 参照 -- mlx5_net_send_frags()(同期送信、post+CQE完了までbusy-wait)を
-// PF<pf_index>でiterations回連続で呼び、1回あたりの所要時間(timer_now()
-// 差分)のmin/avg/maxをns単位でuart_printfへ表示する。「BlueFlameドアベル
-// 往復に本当に何us かかっているか」を、他のソフトウェア処理を一切
-// 挟まずに直接切り出して計測するための`mlx5txlat`シェルコマンド用。
-void mlx5_net_measure_bf_latency(int pf_index, unsigned iterations);
 
 #endif /* MLX5_H */

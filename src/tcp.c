@@ -47,11 +47,6 @@ void tcp_copy_stats_get(uint64_t *c2_ns, uint64_t *c2_by,
     if (c3_ns) *c3_ns = g_tcp_copy3_ns;
     if (c3_by) *c3_by = g_tcp_copy3_bytes;
 }
-void tcp_copy_stats_reset(void)
-{
-    g_tcp_copy2_ns = g_tcp_copy2_bytes = 0;
-    g_tcp_copy3_ns = g_tcp_copy3_bytes = 0;
-}
 
 /* マルチコア化 Phase 4(~/.claude/plans/wondrous-baking-gadget.md参照):
  * このファイルのモジュール静的状態(s_conns/s_priv/s_timewait/
@@ -813,7 +808,6 @@ static void tcp_rx_buf_push(tcp_priv_t *priv, const volatile uint8_t *data, uint
     priv->rx_count = priv->rx_count + data_len;
 }
 
-
 /* ================================================================
  * tcp_input()で使われるゼロコピー用handlerの登録関数
  * nvmet_io_job_step_impl()からコールされる
@@ -1428,11 +1422,6 @@ int tcp_abort_requested(void)
 void tcp_clear_abort_request(void)
 {
     s_abort_requested = 0;
-}
-
-void tcp_request_abort(void)
-{
-    s_abort_requested = 1;
 }
 
 /* tcp_send_async()(tcp.h参照)が送りっぱなしにした未確認セグメントの
@@ -2089,26 +2078,6 @@ int tcp_connect_poll(tcp_conn_t *conn)
     return 0;
 }
 
-int tcp_connect(tcp_conn_t *conn, uint32_t dst_ip, uint16_t dst_port)
-{
-    tcp_connect_begin(conn, dst_ip, dst_port);
-    if (conn->state == TCP_CLOSED) {
-        return -1;  /* tcp_connect_begin()内で即座に失敗(スロット枯渇/送信失敗) */
-    }
-
-    int r;
-    while ((r = tcp_connect_poll(conn)) == 0) {
-        /* tcp_connect_poll()自体はtcp_poll_once()を呼ばない(ジョブ化された
-         * 呼び出し元は、メインループが毎tick呼ぶnet_poll_all_and_dispatch()
-         * に相乗りする設計、CLAUDE.md「NVMe/TCP制御のステートマシン化」
-         * 節参照)。このブロッキング版では自前でポーリングを回す必要が
-         * ある -- 旧実装のtcp_send_reliable()内のdo-whileループが果たして
-         * いたのと同じ役割。 */
-        tcp_poll_once();
-    }
-    return (r == 1) ? 0 : -1;
-}
-
 /* cwnd(輻輳ウィンドウ)成長ロジック(RFC5681簡易版、priv->ack_advanced=1を
  * 見た時に呼ぶ)。元はtcp_send()自身のバーストループに直書きされていたが、
  * tcp_send_async()専用コネクション(priv->ack_advancedをtcp_send()以外の
@@ -2414,40 +2383,6 @@ static void tcp_async_flush_until_room(tcp_conn_t *conn, tcp_priv_t *priv)
             /* Ctrl+C中断、追跡を打ち切る。 */
             priv->async_head  = 0;
             priv->async_count = 0;
-            break;
-        }
-    }
-}
-
-/* tcp_async_flush_until_room()と同じ待ちループだが、「最低1件」ではなく
- * キューが完全に空になるまで待つ版。2026-08-09、NVMe/TCPコマンド
- * パイプライン化(nvme.cのnvme_write_pipelined_run()、nvme_tcp.cの
- * nvme_tcp_send_cmd_async()参照)向けに追加 -- 呼び出し規則(tcp.hの
- * tcp_send_async()コメント)「いずれかのtcp_send_async()がまだ未確認の
- * 間に同一connへtcp_send()を呼んではならない」を満たすため、複数の
- * async送信(SQE)をキューした後、同じコネクションへブロッキング
- * tcp_send()(H2CData等、TCP_ASYNC_MAX_LENを超える一括送信)を呼ぶ前に
- * 必ずこれで完全に空にしておく必要がある。 */
-void tcp_send_async_drain(tcp_conn_t *conn)
-{
-    tcp_priv_t *priv = tcp_priv_for(conn);
-    if (!priv) {
-        return;
-    }
-    /* 2026-08-11、短小PDU専用キュー(async_short_*)追加に伴い、こちらの
-     * 未確認分もまとめて空になるまで待つよう拡張した -- 呼び出し元の
-     * 契約(この後のtcp_send()呼び出しが安全であること)は、コネクション上の
-     * 「いずれの」tcp_send_async()も未確認でないことを要求するため、
-     * 基礎キューだけを見て早期に戻ると短小キュー側の未確認分がtcp_send()に
-     * よって静かに追跡不能になる(tcp_send_async()呼び出し規則コメント
-     * 参照)。 */
-    while (priv->async_count > 0 || priv->async_short_count > 0) {
-        tcp_poll_once();
-        if (tcp_abort_requested()) {
-            priv->async_head  = 0;
-            priv->async_count = 0;
-            priv->async_short_head  = 0;
-            priv->async_short_count = 0;
             break;
         }
     }
@@ -3066,36 +3001,6 @@ void tcp_accept_begin(int listener, tcp_conn_t *conn)
     conn->state    = TCP_CLOSED;
     l->accept_conn  = conn;
     l->accept_ready = 0;
-}
-
-int tcp_accept_wait(int listener, tcp_conn_t *conn, uint32_t timeout_val_ms)
-{
-    (void)conn;  /* 実体はl->accept_conn(tcp_accept_begin()が設定済み)を見る */
-    tcp_listener_slot_t *l = tcp_listener_for(listener);
-    if (!l) return -1;
-    uint64_t start = timer_now();
-    while (!timeout_ms(start, timeout_val_ms)) {
-        tcp_poll_once();
-        if (tcp_abort_requested()) {
-            /* Ctrl+C中断(tcp.hのtcp_abort_requested()参照)。タイムアウトと
-             * 同じ-1を返す(呼び出し元は既に接続待ちタイムアウトとして
-             * tcp_close()等の後始末を行う設計になっている)。 */
-            break;
-        }
-        if (l->accept_ready) {
-            l->accept_ready = 0;
-            l->accept_conn  = NULL;
-            return 0;
-        }
-    }
-    l->accept_conn = NULL;
-    return -1;
-}
-
-int tcp_accept(int listener, tcp_conn_t *conn, uint32_t timeout_val_ms)
-{
-    tcp_accept_begin(listener, conn);
-    return tcp_accept_wait(listener, conn, timeout_val_ms);
 }
 
 int tcp_accept_ready_poll(int listener)

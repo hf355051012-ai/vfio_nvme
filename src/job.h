@@ -175,59 +175,9 @@ void job_scheduler_tick(void);
 /* 現在アクティブなジョブ数。 */
 unsigned job_active_count(void);
 
-/* nameと完全一致する名前のジョブを除いた、現在アクティブなジョブ数。
- * command.cのメインループが「本当にアイドルか」を判定するために使う
- * (telnet.hのtelnet_job_step()は接続が無い間もリスナー待ちとして常に
- * job_spawn(..., "telnet")で登録され続けるため、job_active_count()単体
- * では「telnetサーバが立っている限り絶対に0にならない」--
- * command_shell_run()のコメント参照)。 */
-unsigned job_active_count_excluding(const char *name);
-
 /* アクティブジョブの一覧をuart_printf()で表示する(`jobs`コマンド用の
  * 診断出力)。表示される番号(`[N]`)はjob_request_cancel()に渡す番号と
  * 同じ、s_jobs[]内の生インデックス。 */
 void job_list_dump(void);
-
-/* msミリ秒の間、job_scheduler_tick()を繰り返し呼びながら待つ
- * (timer_delay_ms()と違い、待っている間もジョブが進行する)。
- * dispatch()内の同期呼び出し(shell コマンドハンドラ、temp_test()等)から
- * 使うことを想定 -- そこではメインループのjob_scheduler_tick()が
- * 呼ばれないため、job_spawn()したジョブ(nvme-write-test等)の進行状況を
- * 待つにはこの関数で明示的にティックする必要がある(CLAUDE.md「job
- * scheduler飢餓バグ」節参照)。job.c冒頭のs_ticking再入ガードにより、
- * 呼び出し先のjob step関数が内部で(tcp_recv_internal()経由等)さらに
- * job_scheduler_tick()を呼んでも安全。 */
-void job_delay_ms(uint32_t ms);
-
-/* `job stop <番号>`シェルコマンドから使う。indexは共有ジョブテーブル
- * (jobsコマンドの`[N]`と同じ番号体系、job.c参照)内のインデックス --
- * job.cのジョブテーブルはコアごとの個別枠ではなく単一の共有配列なので、
- * どのコアから呼んでも同じ番号体系になる。indexが有効(範囲内かつ
- * in_use)ならそのジョブのcancel_requestedを立てて0を返す -- 実際に
- * いつ停止するか(即座か、安全なタイミングまで遅延するか)はジョブの
- * 種類ごとのstep関数の実装次第(全てのジョブがcancel_requestedを
- * チェックするとは限らない -- ping等の一時的なジョブは自然に完了する
- * ため未対応でも実害が無い)。
- * 戻り値: 0=要求を送った、-1=indexが範囲外またはそのジョブは稼働していない */
-int job_request_cancel(unsigned index);
-
-/* stepが一致する現在in_useの全ジョブにcancel_requestedを立てる
- * (job_request_cancel()を番号ではなくstep関数ポインタで一括指定する版)。
- * 戻り値: 立てた数。実際の除去は各ジョブのstep()が次tickでcancel_requested
- * を見てJOB_DONEを返した時点 -- 別コアへpinされたジョブはそのコアのidle
- * ループ(smp.cのsecondary_main())が処理するので、呼び出し側はこの後
- * しばらくjob_scheduler_tick()を回して除去され切るのを待つこと。RoCEv2
- * 一括停止(nvmet_rdma_stop_all()、pcie1 resetから)が、pcie1 reset/
- * net init mlx5では消えないRDMA系ジョブ(.bss上のジョブテーブルに残る)を
- * 畳むために使う。 */
-unsigned job_cancel_all_by_step(job_step_fn step);
-
-/* ctx(job_spawn時のctx引数のポインタ)が一致する現在in_useのジョブに
- * cancel_requestedを立てる(番号ではなくctxポインタで個別指定する版)。
- * 戻り値: 立てた数(通常0または1)。job_cancel_all_by_step()がstep一括で
- * あるのに対し、こちらは同じstepの中から特定インスタンスだけを畳むのに
- * 使う(例: pcie1 resetがConnectXにbindされたTCP nvmetジョブだけを停止、
- * nvmet.cのnvmet_stop_connectx_instances()参照)。 */
-unsigned job_cancel_by_ctx(void *ctx);
 
 #endif /* JOB_H */

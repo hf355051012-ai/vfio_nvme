@@ -131,12 +131,6 @@ unsigned eth_tx_wait_free_slot(void)
     return g_active_ctx->nic->tx_wait_free_slot(g_active_ctx->nic_priv); // -> mlx5_net_tx_wait_free_slot
 }
 
-net_buf_t *eth_poll_recv(void)
-{
-    if (!g_active_ctx) return NULL;
-    return g_active_ctx->nic->poll_recv(g_active_ctx->nic_priv); // -> mlx5_net_poll_recv
-}
-
 /* nb は net_buf.c の一般プール由来で Normal cacheable。そのまま NIC の
  * DMA ソースになるため、CPU の書き込みを Point of Coherency までクリーン
  * してから渡す(cache.h のコメント参照)。 */
@@ -178,26 +172,6 @@ void netif_register(netif_t *ctx)
 void netif_set_owner_core(netif_t *ctx, unsigned core)
 {
     ctx->owner_core = core;
-}
-
-void netif_register_alias(netif_t *ctx, const netif_t *primary)
-{
-    ctx->nic        = primary->nic;
-    ctx->nic_priv   = primary->nic_priv;
-    ctx->owner_core = primary->owner_core;
-
-    smp_spin_lock(&s_registered_lock);
-    for (unsigned i = 0; i < s_registered_count; i++) {
-        if (s_registered[i] == ctx) {
-            smp_spin_unlock(&s_registered_lock);
-            return; // 既に登録済み
-        }
-    }
-    if (s_registered_count < NETIF_MAX_TOTAL) {
-        ctx->is_poll_owner = 0;  /* netif.hのnetif_register_alias()コメント参照 */
-        s_registered[s_registered_count++] = ctx;
-    }
-    smp_spin_unlock(&s_registered_lock);
 }
 
 /* 検索(netif_find()/netif_find_by_ip())・巡回(net_poll_all_and_

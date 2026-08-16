@@ -170,11 +170,6 @@ dma_region_t dma_alloc(uint64_t size, uint64_t align, dma_kind_t kind)
     return r;
 }
 
-void dma_free(dma_region_t region)
-{
-    (void)region; /* bump アロケータ: 解放しない(platform.h 契約) */
-}
-
 /* core に残る唯一の cpu->dev 変換(mlx5.h の x86 分岐が宣言)。cpu ポインタが属する
  * マップ済み領域を引いて対応する IOVA を返す。 */
 uint64_t mlx5_dma_addr(const volatile void *cpu_ptr)

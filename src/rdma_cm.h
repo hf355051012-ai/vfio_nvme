@@ -175,21 +175,4 @@ void rdma_cm_fill_addr(rdma_cm_ctx_t *ctx, mlx5_dev_t *dev, const char *self_lab
                        uint32_t peer_ip_fallback, const uint8_t self_mac_fallback[6],
                        const uint8_t peer_mac_fallback[6]);
 
-// PF0をactive、PF1をpassiveとしてrdma_cm_job_step()を2つ協調動作させ、
-// CM確立(REQ->REP->RTU)から、確立されたRC QPでのSEND/RECV ping-pong
-// (mlx5_qp_pingpong_test()相当)まで一気通貫で確認する。job_spawn()で
-// 実際にjob.hのスケジューラへ登録した上で、完了(または失敗/タイムアウト)
-// までjob_scheduler_tick()を同期的に回す(既存のmlx5qp pingpong等と同じ
-// 「実行結果をその場でPASS/FAILとして返す」診断コマンドのUXを維持しつつ、
-// 内部実装は計画通りjob.hのnon-blocking契約に完全準拠させる)。
-void rdma_cm_run_test(mlx5_dev_t *dev0, mlx5_dev_t *dev1);
-
-// ConnectX RoCEv2 NVMe-oF実装計画フェーズ(f)((c)+(e)の統合)。PF0を
-// active、PF1をpassiveとしてCM(REQ->REP->RTU)でRC QPを自動確立した
-// 直後、確立されたQP自体でRDMA_WRITE(active->passive)・RDMA_READ
-// (passive->active)を実行し、フェーズ(c)の`mlx5qp rdma`と同じデータ
-// 完全一致確認を行う。「CM接続要求→自動QP確立→即RDMA_WRITE/READ疎通」
-// を1コマンドで完走させる、というフェーズ(f)の完了条件そのもの。
-void rdma_cm_run_connect(mlx5_dev_t *dev0, mlx5_dev_t *dev1);
-
 #endif /* RDMA_CM_H */

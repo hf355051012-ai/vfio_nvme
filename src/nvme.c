@@ -114,20 +114,6 @@ static void nvme_set_sgl_inline(nvme_sqe_t *sqe, uint32_t len)
     sqe->dptr[15] = (uint8_t)NVME_SGL_TYPE_DATA_BLOCK_OFFSET;
 }
 
-/* sqeを送信し、応答(データ転送込み)を待つ共通ヘルパ。
- * 戻り値: nvme_tcp_recv_resp()の戻り値をそのまま返す
- *         (CQEステータスコード、0=success、通信エラー等は-1) */
-static int nvme_exec(nvme_tcp_conn_t *conn, const nvme_sqe_t *sqe,
-                     const void *send_data, uint32_t send_len,
-                     void *recv_buf, uint32_t recv_buflen,
-                     nvme_cqe_t *cqe_out, uint32_t timeout_ms)
-{
-    if (nvme_tcp_send_cmd(conn, sqe, send_data, send_len) != 0) {
-        return -1;
-    }
-    return nvme_tcp_recv_resp(conn, cqe_out, recv_buf, recv_buflen, timeout_ms);
-}
-
 /* ================================================================
  * NVMe/TCP制御のジョブ化(nvme.h冒頭コメント参照)向けの共有低レベル
  * ステートマシン。nvme_exec()(上記、ブロッキング)と同じロジックを
@@ -145,11 +131,6 @@ typedef enum {
     NVEXEC_ST_DONE,
 } nvme_exec_state_t;
 
-/* stateprof.h向けの人間可読なステート名(nvme_exec_state_tと同じ並び順)。 */
-static const char *const NVEXEC_STATE_NAMES[] = {
-    "SEND", "RECV_HDR", "RECV_CQE", "RECV_C2H_REST",
-    "RECV_C2H_DATA", "RECV_R2T_REST", "SEND_H2C", "DONE",
-};
 #define NVEXEC_STATE_NAME_COUNT (sizeof(NVEXEC_STATE_NAMES) / sizeof(NVEXEC_STATE_NAMES[0]))
 
 void nvme_exec_begin(nvme_exec_ctx_t *ec, nvme_tcp_conn_t *conn, const nvme_sqe_t *sqe,
@@ -163,16 +144,10 @@ void nvme_exec_begin(nvme_exec_ctx_t *ec, nvme_tcp_conn_t *conn, const nvme_sqe_
     ec->send_len    = send_len;
     ec->recv_buf    = recv_buf;
     ec->recv_buflen = recv_buflen;
-    /* ec->profは意図的にリセットしない(nvme.hのnvme_exec_ctx_t.prof
-     * コメント参照 -- 複数回のexec呼び出しにまたがって累積させる)。 */
 }
 
 int nvme_exec_step(nvme_exec_ctx_t *ec)
 {
-    /* stateprof.h -- このステートに何回・合計どれだけ滞在したかを記録
-     * する(呼ばれるたびに毎回、switchより前で)。 */
-    state_prof_mark(&ec->prof, ec->state);
-
     switch ((nvme_exec_state_t)ec->state) {
 
     case NVEXEC_ST_SEND:
@@ -401,15 +376,6 @@ static void nvme_build_property_set_sqe(nvme_sqe_t *sqe, uint32_t offset, uint64
     wr32le(&sqe->cdw13, (uint32_t)(value >> 32));
 }
 
-static int nvme_property_set(nvme_tcp_conn_t *conn, uint32_t offset, uint64_t value)
-{
-    nvme_sqe_t sqe;
-    nvme_build_property_set_sqe(&sqe, offset, value);
-
-    nvme_cqe_t cqe;
-    return nvme_exec(conn, &sqe, NULL, 0, NULL, 0, &cqe, NVME_ADMIN_CMD_TIMEOUT_MS);
-}
-
 /* Fabrics Property Get(fctype=0x04): CC/CSTS等の4バイトプロパティを読む
  * (attrib=0固定)。値はCQEのdw0(nvmet側がresult.u64の下位32bitとして
  * 返す、nvme_types.hのnvmet_execute_prop_get()コメント参照)に入る。 */
@@ -421,23 +387,6 @@ static void nvme_build_property_get_sqe(nvme_sqe_t *sqe, uint32_t offset)
     nvme_set_sgl(sqe, 0);
     wr32le(&sqe->cdw10, 0u);  /* attrib=0: 4バイトプロパティ */
     wr32le(&sqe->cdw11, offset);
-}
-
-static int nvme_property_get(nvme_tcp_conn_t *conn, uint32_t offset, uint32_t *value_out)
-{
-    nvme_sqe_t sqe;
-    nvme_build_property_get_sqe(&sqe, offset);
-
-    /* nvme_cqe_tはpacked構造体(alignment=1) -- ローカル変数として置いても
-     * コンパイラがスタック上で4バイト境界に配置する保証は無いため、
-     * dw0の読み出しは必ずrd32le経由にする(net.h冒頭の規約、
-     * nvme_exec_step()のコメント参照)。 */
-    nvme_cqe_t cqe;
-    int ret = nvme_exec(conn, &sqe, NULL, 0, NULL, 0, &cqe, NVME_ADMIN_CMD_TIMEOUT_MS);
-    if (ret == 0 && value_out) {
-        *value_out = rd32le(&cqe.dw0);
-    }
-    return ret;
 }
 
 /* admin queue(qid=0)へのFabrics Connect。成功するとctx->ctrlr_idに
@@ -473,97 +422,6 @@ static void nvme_build_fabrics_connect_sqe(nvme_sqe_t *sqe, uint16_t qid, uint32
     wr32le(&sqe->cdw12, 0u);
 }
 
-static int nvme_connect_admin_queue(nvme_ctx_t *ctx, uint32_t ip, uint16_t port)
-{
-    if (nvme_tcp_connect(&ctx->admin, ip, port) != 0) {
-        uart_printf("[!] nvme: admin queueのTCP/ICReq確立失敗\n");
-        return -1;
-    }
-
-    static nvmf_connect_data_t s_connect_data __attribute__((aligned(64)));
-    nvme_build_connect_data(&s_connect_data, (uint16_t)NVME_CNTLID_DYNAMIC, ctx->subnqn);
-
-    nvme_sqe_t sqe;
-    nvme_build_fabrics_connect_sqe(&sqe, 0u, sizeof(s_connect_data));
-
-    nvme_cqe_t cqe;
-    int ret = nvme_exec(&ctx->admin, &sqe, &s_connect_data, sizeof(s_connect_data),
-                        NULL, 0, &cqe, NVME_ADMIN_CMD_TIMEOUT_MS);
-    if (ret != 0) {
-        uart_printf("[!] nvme: admin queue Fabrics Connect失敗 (status=0x%x)\n", ret);
-        nvme_tcp_close(&ctx->admin);
-        return -1;
-    }
-
-    ctx->ctrlr_id = (uint16_t)(rd32le(&cqe.dw0) & 0xFFFFu);
-    uart_printf("[nvme] admin queue接続完了 (controller id=%u)\n", ctx->ctrlr_id);
-
-    /* コントローラ有効化(CC.EN=1)。IOSQES/IOCQESを規定値(64B/16B)に
-     * しないとtarget側がCSTS.CFSへ落ちる(nvme_types.hのNVME_CC_*
-     * コメント参照)。 */
-    uint32_t cc = NVME_CC_EN | NVME_CC_CSS_NVM | NVME_CC_AMS_RR | NVME_CC_SHN_NONE |
-                  NVME_CC_IOSQES | NVME_CC_IOCQES;
-    if (nvme_property_set(&ctx->admin, NVME_REG_CC, cc) != 0) {
-        uart_printf("[!] nvme: CC(Controller Configuration)有効化失敗\n");
-        nvme_tcp_close(&ctx->admin);
-        return -1;
-    }
-
-    for (unsigned i = 0; i < NVME_CTRL_READY_POLL_MAX; i++) {
-        uint32_t csts;
-        if (nvme_property_get(&ctx->admin, NVME_REG_CSTS, &csts) != 0) {
-            uart_printf("[!] nvme: CSTS読み出し失敗\n");
-            nvme_tcp_close(&ctx->admin);
-            return -1;
-        }
-        if (csts & NVME_CSTS_CFS) {
-            uart_printf("[!] nvme: CSTS.CFS(Controller Fatal Status)が立った "
-                        "(CC値の不整合、nvme_types.hのNVME_CC_*コメント参照)\n");
-            nvme_tcp_close(&ctx->admin);
-            return -1;
-        }
-        if (csts & NVME_CSTS_RDY) {
-            uart_printf("[nvme] コントローラ有効化完了 (CSTS.RDY=1)\n");
-            return 0;
-        }
-        timer_delay_ms(NVME_CTRL_READY_POLL_MS);
-    }
-
-    uart_printf("[!] nvme: CSTS.RDY待ちタイムアウト\n");
-    nvme_tcp_close(&ctx->admin);
-    return -1;
-}
-
-/* IO queue(qid=1)へのFabrics Connect -- 別TCPコネクション、cntlidは
- * admin queue接続時に割り当てられたctx->ctrlr_idを使う(既存controllerの
- * 2本目のqueueとして接続するため、NVME_CNTLID_DYNAMICは使わない)。 */
-static int nvme_connect_io_queue(nvme_ctx_t *ctx, uint32_t ip, uint16_t port)
-{
-    if (nvme_tcp_connect(&ctx->io, ip, port) != 0) {
-        uart_printf("[!] nvme: IO queueのTCP/ICReq確立失敗\n");
-        return -1;
-    }
-
-    static nvmf_connect_data_t s_io_connect_data __attribute__((aligned(64)));
-    nvme_build_connect_data(&s_io_connect_data, ctx->ctrlr_id, ctx->subnqn);
-
-    nvme_sqe_t sqe;
-    nvme_build_fabrics_connect_sqe(&sqe, 1u, sizeof(s_io_connect_data));
-
-    nvme_cqe_t cqe;
-    int ret = nvme_exec(&ctx->io, &sqe, &s_io_connect_data, sizeof(s_io_connect_data),
-                        NULL, 0, &cqe, NVME_ADMIN_CMD_TIMEOUT_MS);
-    if (ret != 0) {
-        uart_printf("[!] nvme: IO queue Fabrics Connect失敗 (status=0x%x)\n", ret);
-        nvme_tcp_close(&ctx->io);
-        return -1;
-    }
-
-    ctx->io_connected = 1;
-    uart_printf("[nvme] IO queue接続完了 (qid=1)\n");
-    return 0;
-}
-
 void nvme_build_identify_sqe(nvme_sqe_t *sqe, uint8_t cns, uint32_t nsid)
 {
     nvme_zero(sqe, sizeof(*sqe));
@@ -586,29 +444,6 @@ void nvme_update_lba_size_from_id_ns(nvme_ctx_t *ctx, uint32_t nsid, const void 
                 nsid, flbas, ctx->lba_size, (unsigned)ctx->nsze);
 }
 
-static int nvme_identify_common(nvme_tcp_conn_t *conn, uint8_t cns, uint32_t nsid, void *buf4096)
-{
-    nvme_sqe_t sqe;
-    nvme_build_identify_sqe(&sqe, cns, nsid);
-
-    nvme_cqe_t cqe;
-    return nvme_exec(conn, &sqe, NULL, 0, buf4096, 4096u, &cqe, NVME_ADMIN_CMD_TIMEOUT_MS);
-}
-
-int nvme_identify_ctrl(nvme_ctx_t *ctx, void *buf4096)
-{
-    return nvme_identify_common(&ctx->admin, (uint8_t)NVME_IDENTIFY_CNS_CONTROLLER, 0, buf4096);
-}
-
-int nvme_identify_ns(nvme_ctx_t *ctx, uint32_t nsid, void *buf4096)
-{
-    int ret = nvme_identify_common(&ctx->admin, (uint8_t)NVME_IDENTIFY_CNS_NAMESPACE, nsid, buf4096);
-    if (ret == 0) {
-        nvme_update_lba_size_from_id_ns(ctx, nsid, buf4096);
-    }
-    return ret;
-}
-
 static void nvme_build_set_features_num_queues_sqe(nvme_sqe_t *sqe)
 {
     nvme_zero(sqe, sizeof(*sqe));
@@ -616,55 +451,6 @@ static void nvme_build_set_features_num_queues_sqe(nvme_sqe_t *sqe)
     nvme_set_sgl(sqe, 0);
     wr32le(&sqe->cdw10, 0x07u);        /* FID=7: Number of Queues */
     wr32le(&sqe->cdw11, 0x00010001u);  /* NSQR=1, NCQR=1 (IO SQ/CQ各1本を要求) */
-}
-
-static int nvme_set_features_num_queues(nvme_ctx_t *ctx)
-{
-    nvme_sqe_t sqe;
-    nvme_build_set_features_num_queues_sqe(&sqe);
-
-    nvme_cqe_t cqe;
-    return nvme_exec(&ctx->admin, &sqe, NULL, 0, NULL, 0, &cqe, NVME_ADMIN_CMD_TIMEOUT_MS);
-}
-
-int nvme_connect(nvme_ctx_t *ctx, uint32_t ip, uint16_t port, const char *subnqn)
-{
-    ctx->io_connected = 0;
-    ctx->ctrlr_id     = NVME_CNTLID_DYNAMIC;
-    ctx->lba_size     = 512u;  /* nvme_identify_ns()が上書きするまでの暫定値 */
-    nvme_copy_str(ctx->subnqn, sizeof(ctx->subnqn), subnqn);
-
-    if (nvme_connect_admin_queue(ctx, ip, port) != 0) {
-        return -1;
-    }
-
-    static uint8_t s_id_buf[4096] __attribute__((aligned(64)));
-
-    if (nvme_identify_ctrl(ctx, s_id_buf) != 0) {
-        uart_printf("[!] nvme: Identify Controller失敗\n");
-        nvme_tcp_close(&ctx->admin);
-        return -1;
-    }
-
-    if (nvme_identify_ns(ctx, 1u, s_id_buf) != 0) {
-        uart_printf("[!] nvme: Identify Namespace(nsid=1)失敗\n");
-        nvme_tcp_close(&ctx->admin);
-        return -1;
-    }
-
-    if (nvme_set_features_num_queues(ctx) != 0) {
-        uart_printf("[!] nvme: Set Features(Number of Queues)失敗\n");
-        nvme_tcp_close(&ctx->admin);
-        return -1;
-    }
-
-    if (nvme_connect_io_queue(ctx, ip, port) != 0) {
-        nvme_tcp_close(&ctx->admin);
-        return -1;
-    }
-
-    uart_printf("[nvme] 接続完了 (subnqn=%s)\n", ctx->subnqn);
-    return 0;
 }
 
 /* ================================================================
@@ -694,15 +480,6 @@ typedef enum {
     NCONN_ST_EXEC_FABRIC_CONNECT_IO,
 } nvme_connect_state_t;
 
-/* stateprof.h向けの人間可読なステート名(nvme_connect_state_tと同じ
- * 並び順)。 */
-static const char *const NCONN_STATE_NAMES[] = {
-    "TCP_ADMIN_BEGIN", "TCP_ADMIN_WAIT", "ICRESP_ADMIN_RECV",
-    "EXEC_FABRIC_CONNECT_ADMIN", "EXEC_PROPSET_CC", "CSTS_POLL_WAIT",
-    "CSTS_POLL_EXEC", "EXEC_IDENTIFY_CTRL", "EXEC_IDENTIFY_NS",
-    "EXEC_SET_FEATURES", "TCP_IO_WAIT", "ICRESP_IO_RECV",
-    "EXEC_FABRIC_CONNECT_IO",
-};
 #define NCONN_STATE_NAME_COUNT (sizeof(NCONN_STATE_NAMES) / sizeof(NCONN_STATE_NAMES[0]))
 
 typedef struct {
@@ -720,10 +497,6 @@ typedef struct {
     uint32_t              csts_poll_count;
     uint8_t               id_buf[4096] __attribute__((aligned(64)));
 
-    /* NCONN_ST_*(接続シーケンス全体)の各ステート滞在時間プロファイラ
-     * (stateprof.h)。execサブステートマシン自身の統計はexec.profに
-     * 別途記録される(nvme_exec_step()参照)。 */
-    state_prof_t          prof;
 } nvme_connect_job_ctx_t;
 
 static nvme_connect_job_ctx_t s_nvme_connect_job_ctx;
@@ -754,10 +527,6 @@ static job_result_t nvme_connect_job_step(job_t *self)
 {
     nvme_connect_job_ctx_t *jc  = (nvme_connect_job_ctx_t *)self->ctx;
     nvme_ctx_t              *ctx = jc->ctx;
-
-    /* stateprof.h -- このステートに何回・合計どれだけ滞在したかを記録
-     * する(呼ばれるたびに毎回、switchより前で)。 */
-    state_prof_mark(&jc->prof, self->state);
 
     /* `job stop <番号>`(job_request_cancel())対応。以前はこのジョブが
      * cancel_requestedを一切見ておらず、`job stop`しても何も起きない
@@ -1032,9 +801,6 @@ int nvme_connect_job_start(nvme_ctx_t *ctx, uint32_t ip, uint16_t port, const ch
     nvme_copy_str(ctx->subnqn, sizeof(ctx->subnqn), subnqn);
     ctx->busy = 1;
 
-    state_prof_reset(&s_nvme_connect_job_ctx.prof);
-    state_prof_reset(&s_nvme_connect_job_ctx.exec.prof);
-
     s_nvme_connect_job_ctx.ctx     = ctx;
     s_nvme_connect_job_ctx.ip      = ip;
     s_nvme_connect_job_ctx.port    = port;
@@ -1106,51 +872,6 @@ void nvme_build_write_sqe(nvme_sqe_t *sqe, uint32_t nsid, uint64_t slba, uint32_
     wr32le(&sqe->cdw12, (uint32_t)(nlb - 1) & 0xFFFFu);
 }
 
-int nvme_read(nvme_ctx_t *ctx, uint32_t nsid, uint64_t slba, void *buf, uint32_t nlb)
-{
-    if (!ctx->io_connected) {
-        uart_printf("[!] nvme_read: IO queue未接続\n");
-        return -1;
-    }
-    if (nlb == 0) {
-        return 0;
-    }
-    uint32_t total_len = nlb * ctx->lba_size;
-
-    nvme_sqe_t sqe;
-    nvme_build_read_sqe(&sqe, nsid, slba, nlb, total_len);
-
-    nvme_cqe_t cqe;
-    return nvme_exec(&ctx->io, &sqe, NULL, 0, buf, total_len, &cqe, NVME_IO_CMD_TIMEOUT_MS);
-}
-
-int nvme_write(nvme_ctx_t *ctx, uint32_t nsid, uint64_t slba, const void *buf, uint32_t nlb)
-{
-    if (!ctx->io_connected) {
-        uart_printf("[!] nvme_write: IO queue未接続\n");
-        return -1;
-    }
-    if (nlb == 0) {
-        return 0;
-    }
-    uint32_t total_len = nlb * ctx->lba_size;
-
-    nvme_sqe_t sqe;
-    nvme_build_write_sqe(&sqe, nsid, slba, nlb, total_len);
-
-    nvme_cqe_t cqe;
-    return nvme_exec(&ctx->io, &sqe, buf, total_len, NULL, 0, &cqe, NVME_IO_CMD_TIMEOUT_MS);
-}
-
-void nvme_disconnect(nvme_ctx_t *ctx)
-{
-    if (ctx->io_connected) {
-        nvme_tcp_close(&ctx->io);
-        ctx->io_connected = 0;
-    }
-    nvme_tcp_close(&ctx->admin);
-}
-
 /* ================================================================
  * nvme_write_begin()/nvme_read_begin()/nvme_identify_ctrl_begin()/
  * nvme_identify_ns_begin() -- 非ブロッキング「開始」API群(job.h基盤)。
@@ -1166,119 +887,11 @@ void nvme_disconnect(nvme_ctx_t *ctx)
  * ここに一本化することで、呼び出し元ごとの重複/実装漏れ(busyチェック
  * 忘れ等)を防ぐ。 */
 
-static nvme_ctx_t     *s_io_job_ctx;
-static nvme_sqe_t      s_io_job_sqe __attribute__((aligned(64)));
-static nvme_exec_ctx_t s_io_job_exec;
 static volatile int    s_io_job_done = 0;
-
-static job_result_t nvme_io_job_step(job_t *self)
-{
-    (void)self;
-    if (!nvme_exec_step(&s_io_job_exec)) {
-        return JOB_WAITING;
-    }
-    s_io_job_done = 1;
-    if (s_io_job_ctx) {
-        s_io_job_ctx->busy = 0;
-    }
-    return JOB_DONE;
-}
-
-/* s_io_job_sqeが呼び出し元(各begin関数)によって既に組み立て済みである
- * ことを前提に、exec開始+job_spawn()を行う共通部分。 */
-static int nvme_io_begin(nvme_ctx_t *ctx, nvme_tcp_conn_t *conn,
-                          const void *send_data, uint32_t send_len,
-                          void *recv_buf, uint32_t recv_buflen,
-                          const char *job_name)
-{
-    if (ctx->busy) {
-        uart_printf("[!] nvme: 前回の操作がまだ実行中です\n");
-        return -1;
-    }
-    nvme_exec_begin(&s_io_job_exec, conn, &s_io_job_sqe, send_data, send_len, recv_buf, recv_buflen);
-    s_io_job_done = 0;
-    s_io_job_ctx  = ctx;
-    ctx->busy = 1;
-    if (!job_spawn(nvme_io_job_step, NULL, job_name)) {
-        uart_printf("[!] nvme: ジョブ生成失敗\n");
-        ctx->busy = 0;
-        return -1;
-    }
-    return 0;
-}
-
-int nvme_write_begin(nvme_ctx_t *ctx, uint32_t nsid, uint64_t lba, const void *buf, uint32_t nlb)
-{
-    if (!ctx->io_connected) {
-        uart_printf("[!] nvme: IO queue未接続\n");
-        return -1;
-    }
-    uint32_t total_len = nlb * ctx->lba_size;
-    nvme_build_write_sqe(&s_io_job_sqe, nsid, lba, nlb, total_len);
-    return nvme_io_begin(ctx, &ctx->io, buf, total_len, NULL, 0, "nvme-write");
-}
-
-int nvme_read_begin(nvme_ctx_t *ctx, uint32_t nsid, uint64_t lba, void *buf, uint32_t nlb)
-{
-    if (!ctx->io_connected) {
-        uart_printf("[!] nvme: IO queue未接続\n");
-        return -1;
-    }
-    uint32_t total_len = nlb * ctx->lba_size;
-    nvme_build_read_sqe(&s_io_job_sqe, nsid, lba, nlb, total_len);
-    return nvme_io_begin(ctx, &ctx->io, NULL, 0, buf, total_len, "nvme-read");
-}
-
-int nvme_identify_ctrl_begin(nvme_ctx_t *ctx, void *buf4096)
-{
-    nvme_build_identify_sqe(&s_io_job_sqe, (uint8_t)NVME_IDENTIFY_CNS_CONTROLLER, 0);
-    return nvme_io_begin(ctx, &ctx->admin, NULL, 0, buf4096, 4096u, "nvme-identify");
-}
-
-int nvme_identify_ns_begin(nvme_ctx_t *ctx, uint32_t nsid, void *buf4096)
-{
-    nvme_build_identify_sqe(&s_io_job_sqe, (uint8_t)NVME_IDENTIFY_CNS_NAMESPACE, nsid);
-    return nvme_io_begin(ctx, &ctx->admin, NULL, 0, buf4096, 4096u, "nvme-identify");
-}
-
-int nvme_io_job_done(void)
-{
-    return s_io_job_done;
-}
-
-int nvme_io_job_result(void)
-{
-    return s_io_job_exec.result;
-}
 
 /* ================================================================
  * ステート滞在時間プロファイラ(nvme.hコメント参照)へのアクセサ実装。
  * ================================================================ */
-
-void nvme_connect_prof_reset(void)
-{
-    state_prof_reset(&s_nvme_connect_job_ctx.prof);
-    state_prof_reset(&s_nvme_connect_job_ctx.exec.prof);
-}
-
-void nvme_connect_prof_dump(void)
-{
-    state_prof_dump(&s_nvme_connect_job_ctx.prof, NCONN_STATE_NAMES,
-                     (unsigned)NCONN_STATE_NAME_COUNT, "nvme-connect");
-    state_prof_dump(&s_nvme_connect_job_ctx.exec.prof, NVEXEC_STATE_NAMES,
-                     (unsigned)NVEXEC_STATE_NAME_COUNT, "nvme-connect/exec");
-}
-
-void nvme_io_exec_prof_reset(void)
-{
-    state_prof_reset(&s_io_job_exec.prof);
-}
-
-void nvme_io_exec_prof_dump(void)
-{
-    state_prof_dump(&s_io_job_exec.prof, NVEXEC_STATE_NAMES,
-                     (unsigned)NVEXEC_STATE_NAME_COUNT, "nvme-io/exec");
-}
 
 /* ================================================================
  * NVMe/TCPコマンドパイプライン化(nvme.hのNVME_IO_QDEPTH/

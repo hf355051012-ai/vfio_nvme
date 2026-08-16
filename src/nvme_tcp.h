@@ -30,12 +30,6 @@ typedef struct {
     uint16_t       pending_cid;
 } nvme_tcp_conn_t;
 
-/* dst_ip:portへTCP接続し、続けてICReq/ICResp交換(NVMe/TCP接続確立の
- * 最初の一歩、Fabrics Connectコマンドより前に必要)まで行う。
- * 戻り値: 0=成功、-1=失敗(TCP接続失敗、ICResp未応答/タイムアウト、
- *         targetがdigestを要求してきた場合(未対応)等) */
-int nvme_tcp_connect(nvme_tcp_conn_t *c, uint32_t ip, uint16_t port);
-
 /* sqeをCommand Capsule PDUとして送信する。cidはこの関数が採番し
  * (sqeのcdw0内cidフィールドを上書きする)、応答待ち(nvme_tcp_recv_resp())
  * との対応付けに使う。
@@ -67,20 +61,6 @@ int nvme_tcp_send_cmd(nvme_tcp_conn_t *c, const nvme_sqe_t *sqe,
  * 呼ぶ前に必ずtcp_send_async_drain()(tcp.h)で未確認送信を空にすること。
  * 戻り値: 0=キュー成功(*out_cidに採番値)、-1=失敗 */
 int nvme_tcp_send_cmd_async(nvme_tcp_conn_t *c, const nvme_sqe_t *sqe, uint16_t *out_cid);
-
-/* 直前のnvme_tcp_send_cmd()に対する応答を待つ。target側の以下の
- * PDU列を内部で処理しきる:
- *   - 読み出しコマンドの場合: 1個以上のC2HData(データをbufへ格納)
- *     に続けてCapsuleResp、またはC2HData自体がDATA_SUCCESSフラグを
- *     伴う場合はそれだけで完了(暗黙のsuccess応答)。
- *   - 書き込みコマンドの場合: 1個以上のR2Tに応じてH2CDataを送出し
- *     (nvme_tcp_send_cmd()で保留したdataから)、最終的にCapsuleResp。
- * buf/buflen: 読み出しデータの格納先(書き込みコマンドの場合は無視される
- *             が、NULL/0でよい)。
- * 戻り値: CQEのステータスコード(nvme_cqe_status_code()適用済み、
- *         0=success)、通信エラー/タイムアウト等は-1 */
-int nvme_tcp_recv_resp(nvme_tcp_conn_t *c, nvme_cqe_t *cqe_out,
-                       void *buf, uint32_t buflen, uint32_t timeout_ms);
 
 /* コネクションを閉じる(tcp_close()をそのまま呼ぶ)。 */
 void nvme_tcp_close(nvme_tcp_conn_t *c);

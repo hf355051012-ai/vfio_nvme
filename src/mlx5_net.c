@@ -45,7 +45,6 @@
 #include "timer.h"
 #include "mmio.h"
 #include "cache.h"
-#include "rxcopy.h"
 #include "timestamp.h"
 #include "smp.h"
 #include <stddef.h>
@@ -145,15 +144,6 @@ typedef struct {
      * dispatch+freeしてから次のpoll_recv()を呼ぶので、poll_recv()冒頭で「前回まで
      * のpending分」をまとめて再武装する(1フレーム遅延、mlx5_net_rq_flush_rearm())。 */
     uint32_t rq_rearm_pending;
-    /* RXコピーオフロード有効時の再武装ゲート(rxcopy.h、2026-08-13)。
-     * 消費済みだが再武装保留中のフレームごとに「コピー完了に必要なrxcopy
-     * submitted seq(=watermark)」をFIFOで持ち、rxcopy_done()がそれに達した
-     * ものだけを再武装する(core1がコピー元RQバッファを読み終える前にNICへ
-     * 返却して上書き破損させないため)。off時は一切使わない(既存の即時
-     * 再武装のまま=挙動不変)。深さはRQバッファ数=最大在庫数で十分。 */
-    uint32_t rq_wm[MLX5_RQ_NUM_WQES];
-    uint32_t rq_wm_head;   /* 生産(watermark記録) */
-    uint32_t rq_wm_tail;   /* 消費(再武装) */
     // 2026-08-09、TCPゼロコピー送信(2 data_seg構成)対応: 「偶数アライン
     // 方式」(mlx5.hのMLX5_SQ_WQE_COUNTコメント参照)を採用したため、
     // sq_pc/sq_ccは以前と同じ「論理WQE単位」の単純な累積カウンタの
@@ -225,16 +215,10 @@ static int mlx5_net_pf_index(const mlx5_net_state_t *st)
     return (st == &s_state_pf0) ? 0 : 1;
 }
 
-int mlx5_net_any_sq_halted(void)
-{
-    return s_sq_halted[0] || s_sq_halted[1];
-}
-
 // mlx5_net_dump_sq_debug()より前で使うための前方宣言(定義はmlx5_net_dump_
 // sq_debug()の直後、mlx5_net_send_frags()より後にある)。
 static int mlx5_net_try_recover(int pf_index, mlx5_dev_t *dev, mlx5_net_state_t *st);
 
-void mlx5_wqe_analyze(volatile uint8_t *wqe);
 // ============================================================================
 // CQEポーリング共通ヘルパ
 // ============================================================================
@@ -747,146 +731,6 @@ static int mlx5_net_post_lso_frame(mlx5_net_state_t *st, const void *hdr, uint16
     return 0;
 }
 
-void wqe_logs(int opcode, volatile uint8_t *wqe, uint16_t num)
-{
-    static uint8_t  wqe_log[512][128] = {{0,}};
-    static uint64_t wqe_ts[512] = {0};
-    static uint16_t wqe_n = 0;
-    uint16_t i,j;
-    uint16_t n;
-    int valid = 0;
-
-    if(num > 512){
-        uart_printf("wqe_logs : Num error\n");
-        return;
-    }
-    switch(opcode){
-        case LOG_SET:
-            int l2_hdrofst = 0x1e;                             // Ethernet headr offset
-            int l2_hdrlen  = 14;                               // Ethernet header 固定長(14byte)
-            int l3_hdrofst = l2_hdrofst + l2_hdrlen;           // IPv4 Header offset
-            int l3_hdrlen = (wqe[l3_hdrofst+0]&0xf) * 4;       // IPv4 Header length
-            int l4_hdrofst = l3_hdrofst + l3_hdrlen;           // TCP Header offset
-            uint16_t src_port = 0, dst_port = 0;
-
-            if (wqe[3] == 0x0e){ // LSO(L2+L3+L4が54バイト全てWQEへインライン)
-                src_port = (wqe[l4_hdrofst + 0] << 8) | wqe[l4_hdrofst + 1];  // BE16(ワイヤ順そのまま)
-                dst_port = (wqe[l4_hdrofst + 2] << 8) | wqe[l4_hdrofst + 3];
-            }
-            else if(wqe[3] == 0x0a){ // SEND(L2の18バイトのみインライン、残りはdata_seg経由)
-                uint32_t adrl = __builtin_bswap32(*(uint32_t*)&wqe[0x3c]);  // addrの下位32bit(CPUポインタ)
-                volatile uint8_t *p = (volatile uint8_t *)(uintptr_t)adrl;
-                src_port = (p[16] << 8) | p[17];  // BE16(ワイヤ順そのまま)
-                dst_port = (p[18] << 8) | p[19];
-            }
-
-            if(src_port == 4420 || dst_port == 4420) valid = 1; // NVMe/TCP port
-
-            if(valid){
-                for(i=0;i<128;i++){
-                    wqe_log[wqe_n][i] = wqe[i];
-                }
-                wqe_ts[wqe_n] = timer_now();
-                wqe_n = (wqe_n + 1)%512;
-            }
-            break;
-        case LOG_GET:
-            if(wqe_n > num){ n = wqe_n - num; }
-            else           { n = (wqe_n+512) - num; } 
-            while(n!=wqe_n){
-                for(i=0;i<128;i+=16){
-                    uart_printf("ts=%016x : WQE[%02x] : ", wqe_ts[n], i);
-                    for(j=0;j<16;j++){
-                        uart_printf("%02x ", wqe_log[n][i+j]);
-                    }
-                    uart_printf("\n");
-                }
-                n = (n+1)%512;
-            }
-            break;
-        case LOG_CLR:
-            for(wqe_n=0;wqe_n<512;wqe_n++){
-                for(i=0;i<128;i++){
-                    wqe_log[wqe_n][i] = 0;
-                }
-            }
-            wqe_n = 0;
-            break;
-    }
-}
-void mlx5_wqe_analyze(volatile uint8_t *wqe)
-{
-    struct nvme_tcp_ch {
-        uint8_t  pdu_type;      // PDU Type (0x06 = H2CData)
-        uint8_t  flags;         // PDU Flags (bit 0: HDGST, bit 1: DDGST, bit 2: LAST_PDU)
-        uint8_t  hlen;          // Header Length (24 bytes = 0x18)
-        uint8_t  pdo;           // Packet Data Offset
-        uint32_t plen;          // PDU Length
-    };
-
-    wqe_logs(LOG_SET, wqe, 0);
-
-    int l2_hdrofst = 0x1e;                             // Ethernet headr offset
-    int l2_hdrlen  = 14;                               // Ethernet header 固定長(14byte)
-    int l3_hdrofst = l2_hdrofst + l2_hdrlen;           // IPv4 Header offset
-    int l3_hdrlen = (wqe[l3_hdrofst+0]&0xf) * 4;       // IPv4 Header length
-    int l4_hdrofst = l3_hdrofst + l3_hdrlen;           // TCP Header offset
-    int l4_hdrlen =( (wqe[l4_hdrofst+12]>>4)&0xf) * 4; // TCP Header length
-    int l7_hdrofst = l4_hdrofst + l4_hdrlen;           // NVMe/TCP PDU Header offset
-    uint16_t src_port;
-    uint16_t dst_port;
-
-    uint32_t byte_count = __builtin_bswap32(*(uint32_t*)&wqe[0x60]);
-    uint32_t adrl  = __builtin_bswap32(*(uint32_t*)&wqe[0x6c]);
-
-    struct nvme_tcp_ch *ch;
-
-    uint16_t cid = 0;
-    uint16_t cccid = 0;
-    uint16_t status = 0;
-    uint32_t ttag = 0;
-
-    if (wqe[3] == 0x0e){ // LSO(L2+L3+L4が54バイト全てWQEへインライン)
-        src_port = (wqe[l4_hdrofst + 0] << 8) | wqe[l4_hdrofst + 1];  // BE16(ワイヤ順そのまま)
-        dst_port = (wqe[l4_hdrofst + 2] << 8) | wqe[l4_hdrofst + 3];
-        if (byte_count & 0x80000000) {  // inline bit : L7にPDUが格納
-            ch = (struct nvme_tcp_ch *)&wqe[l7_hdrofst+4];
-        }
-        else{ // SGE方式
-            ch = (struct nvme_tcp_ch *)(uint64_t)adrl;
-        }
-    }
-    else if(wqe[3] == 0x0a){ // SEND(L2の18バイトのみインライン、残りはdata_seg経由)
-        uint32_t adrl = __builtin_bswap32(*(uint32_t*)&wqe[0x3c]);  // addrの下位32bit(CPUポインタ)
-        volatile uint8_t *p = (volatile uint8_t *)(uintptr_t)adrl;
-        src_port = (p[16] << 8) | p[17];  // BE16(ワイヤ順そのまま)
-        dst_port = (p[18] << 8) | p[19];
-        ch = (struct nvme_tcp_ch *)&p[36];
-    }
-    else{
-        return;
-    }
-
-    if(src_port == 4420 || dst_port == 4420) { // NVMe/TCP port
-        if((ch->pdu_type > 0) && (ch->pdu_type < 10)){
-            /* このワイヤ生スヌープはPSHを個別解析しないため送受信・
-             * pdu_type別のフィールド対応付けをせず、判明している値だけを
-             * 汎用フォールバック表示(timestamp.cのdefaultケース)に渡す
-             * -- NRCV/NSNDへの統合対象外(nvme.c/nvmet_tcp.c/nvmet.c限定、
-             * ユーザー指示)。 */
-            volatile ts_nvme_pdu_t info = {0};
-            info.pdu_type = ch->pdu_type;
-            info.hlen     = ch->hlen;
-            info.pdo      = ch->pdo;
-            info.plen     = ch->plen;
-            info.cid      = cid;
-            info.cccid    = cccid;
-            info.status   = status;
-            info.ttag     = ttag;
-            ts_log_nvme_tcp_pdu(TS_MK(TS_FILE_MLX5_NET, TS_FUNC_mlx5_wqe_analyze, 0), &info);
-        }
-    }
-}
 // 2026-08-08、ユーザー指摘("core0だけなら動く、core1を動かすと事象が
 // 起きるのは何かが重複している証拠"/"ベンダのドライバでもロックを
 // 取っているのか")を受けた調査の記録: 当初、PF0/PF1間でこの関数全体を
@@ -1172,56 +1016,6 @@ static int mlx5_net_send_frags(void *priv, const eth_frag_t *frags, unsigned fra
     return 0;
 }
 
-// 診断専用(2026-08-11、ユーザー指示「ドアベル更新にそんなに時間がかかる
-// 意味が分からない、16-20usがどこにかかっているのか」への回答用 --
-// 原因特定後に削除すること)。mlx5_net_send_frags()(同期、自分の
-// WQEの完了までbusy-waitする既存関数、上記参照)をそのままN回呼び、
-// timer_now()差分だけを直接計測する -- NVMeパイプラインの状態遷移・
-// TCP受信ポーリング・関数呼び出しの積み重ねを一切挟まない、「ドアベルを
-// 鳴らしてから完了(CQE)が見えるまで」の純粋なラウンドトリップを
-// 切り出すのが目的。実際のACK送信経路(tcp_send_segment()->
-// eth_send_frags_async())とは違い、こちらは待ち処理まで含む同期呼び
-// (mlx5_net_send_frags())を使うため、フレーム自体はEtherType=0xFFFF
-// (未使用、相手側は無視する)の40バイトダミー(<60バイト、ACKと同じ
-// フォールバックコピー経路を通る)を使い、実際のACKと同じWQE構築コスト
-// クラスに合わせる。
-void mlx5_net_measure_bf_latency(int pf_index, unsigned iterations)
-{
-    mlx5_net_state_t *st = (pf_index == 0) ? &s_state_pf0 : &s_state_pf1;
-    if (!st->dev) {
-        uart_printf("[mlx5txlat] PF%d は未初期化です\n", pf_index);
-        return;
-    }
-    static uint8_t frame[64];
-    for (unsigned i = 0; i < sizeof(frame); i++) frame[i] = 0;
-    for (unsigned i = 0; i < 6; i++) frame[i] = 0xFFu;     /* dst MAC = broadcast */
-    frame[12] = 0xFFu; frame[13] = 0xFFu;                   /* EtherType = 0xFFFF (未使用) */
-    eth_frag_t frag = { .data = frame, .len = 40u };
-
-    uint64_t min_ticks = 0xFFFFFFFFFFFFFFFFull, max_ticks = 0, sum_ticks = 0;
-    unsigned ok = 0, fail = 0;
-    for (unsigned i = 0; i < iterations; i++) {
-        uint64_t t0 = timer_now();
-        int rc = mlx5_net_send_frags(st, &frag, 1);
-        uint64_t elapsed = timer_now() - t0;
-        if (rc != 0) { fail++; continue; }
-        ok++;
-        if (elapsed < min_ticks) min_ticks = elapsed;
-        if (elapsed > max_ticks) max_ticks = elapsed;
-        sum_ticks += elapsed;
-    }
-    if (ok == 0) {
-        uart_printf("[mlx5txlat] PF%d: 全%u回失敗\n", pf_index, iterations);
-        return;
-    }
-    uint64_t avg_ticks = sum_ticks / ok;
-    uart_printf("[mlx5txlat] PF%d: ok=%u fail=%u  min=%uns avg=%uns max=%uns "
-                "(mlx5_net_send_frags()自体の所要時間、post+busy-wait-for-CQE込み)\n",
-                pf_index, ok, fail,
-                (unsigned)ticks_to_ns(min_ticks), (unsigned)ticks_to_ns(avg_ticks),
-                (unsigned)ticks_to_ns(max_ticks));
-}
-
 // nic_ops_t.send_lso()の実体(netif.hのnic_ops_t.send_lso参照、RP1側は
 // NULL)。mlx5_net_send_frags_async()と同じ非同期パイプライン方式
 // (SQリングに空きが無い時だけmlx5_net_sq_wait_room()で待つ、完了[CQE]は
@@ -1491,44 +1285,12 @@ static inline void mlx5_net_rq_write_dbr(mlx5_dev_t *dev, mlx5_net_state_t *st)
 
 static inline void mlx5_net_rq_flush_rearm(mlx5_dev_t *dev, mlx5_net_state_t *st)
 {
-    if (!rxcopy_enabled()) {
-        /* off(既定): 従来の即時再武装。挙動は完全に不変。 */
-        if (st->rq_rearm_pending == 0u) {
-            return;
-        }
-        st->rq_posted_ctr += st->rq_rearm_pending;
-        st->rq_rearm_pending = 0u;
-        mlx5_net_rq_write_dbr(dev, st);
+    if (st->rq_rearm_pending == 0u) {
         return;
     }
-
-    /* on: RXコピーオフロード有効。この flush_rearm 時点で、前回 poll_recv が
-     * 返したフレームの eth_dispatch(=コピーの rxcopy_submit)は既に完了して
-     * いる(net_poll_all_and_dispatch のバッチループが dispatch+free してから
-     * 次の poll_recv を呼ぶため)。よって今の rxcopy_submitted() は、再武装
-     * 保留中フレームのコピー投入を含む。それを watermark として記録する。 */
-    if (st->rq_rearm_pending > 0u) {
-        uint32_t wm = rxcopy_submitted();
-        while (st->rq_rearm_pending > 0u &&
-               (st->rq_wm_head - st->rq_wm_tail) < MLX5_RQ_NUM_WQES) {
-            st->rq_wm[st->rq_wm_head % MLX5_RQ_NUM_WQES] = wm;
-            st->rq_wm_head++;
-            st->rq_rearm_pending--;
-        }
-    }
-    /* コピーが完了(rxcopy_done がその watermark に達した)フレームだけを
-     * FIFO順に再武装する。ラップ安全な符号付き差分で比較。 */
-    uint32_t done = rxcopy_done();
-    uint32_t reposted = 0;
-    while (st->rq_wm_tail != st->rq_wm_head &&
-           (int32_t)(done - st->rq_wm[st->rq_wm_tail % MLX5_RQ_NUM_WQES]) >= 0) {
-        st->rq_wm_tail++;
-        reposted++;
-    }
-    if (reposted) {
-        st->rq_posted_ctr += reposted;
-        mlx5_net_rq_write_dbr(dev, st);
-    }
+    st->rq_posted_ctr += st->rq_rearm_pending;
+    st->rq_rearm_pending = 0u;
+    mlx5_net_rq_write_dbr(dev, st);
 }
 
 static net_buf_t *mlx5_net_poll_recv(void *priv)

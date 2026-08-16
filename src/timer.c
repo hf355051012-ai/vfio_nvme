@@ -64,11 +64,6 @@ uint64_t get_sec_from(uint64_t ticks)
     return ticks_to_sec(timer_now() - ticks);
 }
 
-int timeout_ns(uint64_t start, uint64_t threshold_ns)
-{
-    return get_ns_from(start) >= threshold_ns;
-}
-
 int timeout_us(uint64_t start, uint64_t threshold_us)
 {
     return get_us_from(start) >= threshold_us;

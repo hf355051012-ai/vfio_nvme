@@ -29,12 +29,6 @@
 static net_buf_t s_pool[SMP_MAX_CORES][NET_BUF_COUNT];
 static uint8_t   s_used[SMP_MAX_CORES][NET_BUF_COUNT];
 
-void net_buf_pool_init(void)
-{
-    unsigned core = smp_core_index();
-    for (unsigned i = 0; i < NET_BUF_COUNT; i++) s_used[core][i] = 0;
-}
-
 net_buf_t *net_buf_alloc(void)
 {
     unsigned core = smp_core_index();

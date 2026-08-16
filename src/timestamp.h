@@ -356,9 +356,6 @@ void ts_log_rdma(uint32_t tag, const volatile ts_rdma_t *info);
 void ts_log_tcp_ack(uint32_t tag, uint8_t conn_slot, uint32_t seq,
                      uint32_t ack_seq, uint32_t window, uint16_t flags);
 
-/* これまでにts_log*()系が呼ばれた累計回数(ラップしても減らない単調増加値)。 */
-uint64_t ts_log_total(void);
-
 /* ================================================================
  * 表示系API(2026-08-08、ユーザー指示で統一): モードごとに別々の表示
  * 関数を持つのをやめ、「(必要なら)開始通し番号をquery関数で問い合わせる
@@ -377,15 +374,6 @@ uint64_t ts_log_total(void);
 /* 直近count件を表示するための開始通し番号を返す
  * (ts_log_dump_core()のstart引数にそのまま渡せる)。 */
 uint64_t ts_log_query_start_last_n(unsigned core, uint32_t count);
-
-/* tick(timer_now()の生値、ts_print_entry()が表示する
- * "tick=XXXXXXXXYYYYYYYY"の16桁hexを1つの数値として渡す)より後の
- * 最初のエントリの通し番号を返す -- 他コアのts/nprof出力等で「この
- * tick付近で何が起きたか」を見つけた後、通し番号ではなく実時刻を起点に
- * そのコアの記録を追いたい場合に使う(2026-08-08、ユーザー指示)。
- * 該当が無ければ現在の累計件数を返す(ts_log_dump_core()に渡すと
- * 「0件表示」になる)。 */
-uint64_t ts_log_query_start_after_tick(unsigned core, uint64_t tick);
 
 /* (tag & mask)==value に一致するエントリのうち直近count件を表示するための
  * 開始通し番号を返す -- ts_log_dump_core()を呼ぶ際は同じmask/valueを渡す
@@ -420,41 +408,11 @@ void ts_log_dump_core(unsigned core, uint64_t start, uint32_t count, uint32_t ma
 
 void ts_log_freeze(void);
 
-/* ts_log_freeze()が保存したスナップショットの直近count件を表示する
- * (ts_log_dump_core()と同じ表示形式、通し番号はfreeze時点のもの)。
- * フリーズ未実行なら記録無しである旨を表示する。coreの扱いは
- * ts_log_dump_core()と同じ(ts_log_freeze()はPF0/PF1(core0/core1)が
- * それぞれ自コアで呼ぶため、常にcore0で動くシェルから任意のコアの
- * フリーズ内容を読めるようにする)。 */
-void ts_log_dump_frozen_core(unsigned core, uint32_t count);
-
-
-/* 一時停止機能(2026-08-07追加、ユーザー指示)。ts_log()系は115200bpsの
- * UARTダンプに数十秒かかることがあり、その間も他のジョブ(nvmet/telnet
- * 等)がts_log()を呼び続けるため、ダンプを準備している間・読んでいる間に
- * リングバッファ(16384件)がどんどん新しいエントリで上書きされ、直前に
- * 見ていたはずの文脈が消えてしまう問題があった(ts_log_freeze()は「今
- * この瞬間の直近2048件」を保存するだけで、任意のタイミングで記録自体を
- * 止める用途には向かない)。
- *
- * ts_log_set_paused(1)を呼ぶと、以後のts_log()/ts_log_nvme_tcp_pdu()/
- * ts_log_tcp_ack()呼び出しは即座に何もせず返る(s_ts_totalも一切進まない)
- * -- リングバッファの内容・通し番号が完全に静止するため、その間に
- * `ts`/`ts type`等でじっくり読める。ts_log_set_paused(0)で記録を再開
- * すると、以後の新規エントリは一時停止前の続き(既存の通し番号)から
- * 記録される(一時停止中に失われたイベントの記録が存在しないだけで、
- * 既存の記録内容・通し番号の整合性は壊さない)。 */
-void ts_log_set_paused(int paused);
-
-/* 現在一時停止中かどうか(1=停止中)。`ts`コマンドの状態表示用。 */
-int ts_log_is_paused(void);
-
 /* ts_log_set_paused()/ts_log_is_paused()の明示的コア指定版
  * (ts_log_dump_core()と同じ理由 -- 常にcore0で動くコード
  * (temp_test()等)から、core1にpin止めしたジョブの記録も一緒に
  * 一時停止/再開するため)。coreがSMP_MAX_CORES以上ならcore0として扱う。 */
 void ts_log_set_paused_core(unsigned core, int paused);
-int  ts_log_is_paused_core(unsigned core);
 
 uint32_t ts_log_mode(void);
 void  ts_log_mode_set(uint32_t mode);

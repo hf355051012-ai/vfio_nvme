@@ -12,14 +12,12 @@
 // 替わる(ticks_to_*/get_*_from/timeout_* の変換ヘルパは timer.c 実装で core 共有)。
 // ================================================================
 
-
 // x86-linux: clock_gettime(CLOCK_MONOTONIC) 実装(platform/x86-linux/
 // hal_timer.c)。timer_now() は ns 値、timer_freq() は 1e9(Hz)を返すので、
 // 下記の ticks_to_*/get_*_from/timeout_*(timer.c、arch 非依存)がそのまま
 // 使える。VxWorks では tickGet/sysTimestamp に差し替わる。
 uint64_t timer_now(void);
 uint64_t timer_freq(void);
-
 
 /* ================================================================
  * ticks<->時間単位の変換ヘルパ(timer.c実装)。
@@ -55,16 +53,6 @@ uint64_t get_us_from(uint64_t ticks);
 uint64_t get_ms_from(uint64_t ticks);
 uint64_t get_sec_from(uint64_t ticks);
 
-/* タイムアウト判定ヘルパ。startから閾値以上経過していれば非0(真)を返す
- * (get_*_from(start) >= 閾値、と同じ)。「if (elapsed > threshold) { ... }」
- * という定型コードをさらに1行にまとめる:
- *
- *   旧: if (get_ms_from(start) > 100u) { タイムアウト処理 }
- *   新: if (timeout_ms(start, 100u)) { タイムアウト処理 }
- *
- * whileループの継続条件としても使える(!timeout_ms(start, N)で
- * 「まだタイムアウトしていない間」)。 */
-int timeout_ns(uint64_t start, uint64_t threshold_ns);
 int timeout_us(uint64_t start, uint64_t threshold_us);
 int timeout_ms(uint64_t start, uint32_t threshold_ms);
 int timeout_sec(uint64_t start, uint32_t threshold_sec);
