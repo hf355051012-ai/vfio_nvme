@@ -25,6 +25,19 @@ static volatile int      s_echo_reply_ready[SMP_MAX_CORES];
 static volatile uint16_t s_echo_reply_ident[SMP_MAX_CORES];
 static volatile uint16_t s_echo_reply_seq[SMP_MAX_CORES];
 
+/*
+ * 受信 ICMP メッセージを処理する。Echo Reply なら RTT 計測用に受信時刻と
+ * id/seq を記録し(uart_printf より前に時刻を取る)、Echo Request なら
+ * Echo Reply を返す。
+ *
+ * 引数:
+ *   data    - ICMP メッセージ本体(IP ヘッダの直後)
+ *   len     - data のバイト数
+ *   src_ip  - 送信元 IPv4(4 オクテット)
+ *   src_mac - 送信元 MAC(reply の宛先に使う)
+ * コール元:
+ *   ip_handle_frame()
+ */
 void icmp_handle(const uint8_t *data, size_t len,
                  const uint8_t src_ip[4], const uint8_t *src_mac)
 {

@@ -23,6 +23,15 @@
 #include "timestamp.h" /* ts コマンド(ts_log ダンプ) */
 #include "tcp.h"       /* ackthresh コマンド(g_tcp_ack_threshold) */
 
+/*
+ * CRC32C の既知テストベクタ CRC32C("123456789")=0xE3069283 を確認する。
+ * crc32c() は生の実行中 CRC を返す規約なので、ここで ~ を取る。
+ *
+ * 戻り値:
+ *   0=一致、-1=不一致
+ * コール元:
+ *   main()
+ */
 static int crc32c_selftest(void)
 {
     const char *v = "123456789";
@@ -33,6 +42,12 @@ static int crc32c_selftest(void)
     return (digest == 0xE3069283u) ? 0 : -1;
 }
 
+/*
+ * タイマ周波数を表示し、timer_delay_ms(10) の実測経過を出す。
+ *
+ * コール元:
+ *   main()
+ */
 static void timer_selftest(void)
 {
     uart_printf("[selftest] timer_freq = %u Hz\n", (uint32_t)timer_freq());
@@ -43,6 +58,12 @@ static void timer_selftest(void)
                 (uint32_t)us);
 }
 
+/*
+ * スピンロックの lock/unlock が期待通り状態を変えるかを確認する。
+ *
+ * コール元:
+ *   main()
+ */
 static void spinlock_selftest(void)
 {
     smp_spinlock_t lock = 0;
@@ -54,6 +75,13 @@ static void spinlock_selftest(void)
                 (held && freed) ? "OK" : "NG");
 }
 
+/*
+ * core1 を起動し、ハートビートが増加すること(pthread が実際に回っている
+ * こと)を確認する。
+ *
+ * コール元:
+ *   main()
+ */
 static void smp_selftest(void)
 {
     uart_printf("[selftest] smp_core_index()(メインスレッド) = %u (期待 0)\n",
@@ -72,7 +100,21 @@ static void smp_selftest(void)
 
 static mlx5_dev_t s_dev0, s_dev1; /* 大きい構造体なので static */
 
-/* vfio スロット slot(vfio_init が返す)の PF を掴んで bring-up する。0=成功。 */
+/*
+ * VFIO スロットの PF を掴んで ConnectX を bring-up する。Bus Master を
+ * 有効化し BAR0 を mmap して dev->bar0_base に入れ、mlx5_hca_bringup() を
+ * 通す。
+ *
+ * 引数:
+ *   slot     - vfio_init() が返したスロット番号
+ *   dev      - 初期化する HCA ハンドル
+ *   pf_index - 0=PF0 / 1=PF1(DMA 領域の前半後半の割り当てに使う)
+ *   label    - ログ用の名前("PF0" 等)
+ * 戻り値:
+ *   0=成功、-1=失敗
+ * コール元:
+ *   run_dual_pf()
+ */
 static int bringup_pf(int slot, mlx5_dev_t *dev, uint8_t pf_index, const char *label)
 {
     if (slot < 0) {
@@ -104,6 +146,17 @@ static nvmet_ctx_t s_x86_nvmet; /* .bss(内蔵 RAM ディスク含む、TCP 経�
 
 static uint8_t s_nvmetcp_buf[262144] __attribute__((aligned(4096)));
 
+/*
+ * mlx5_monitor_summary3() へ渡す PCI コンフィグ空間リード関数。
+ *
+ * 引数:
+ *   ctx - VFIO スロット番号を intptr_t で包んだもの
+ *   off - コンフィグ空間オフセット
+ * 戻り値:
+ *   読んだ 32bit 値
+ * コール元:
+ *   shell_dispatch() から関数ポインタとして
+ */
 static uint32_t x86_cfg_rd(void *ctx, uint32_t off)
 {
     return vfio_cfg_read32((int)(intptr_t)ctx, off);
@@ -124,6 +177,16 @@ static uint32_t x86_cfg_rd(void *ctx, uint32_t off)
 static int s_shell_nvmet_started = 0;
 static int s_shell_tcp_connected = 0;
 
+/*
+ * NVMe/TCP の常駐セッション(target@core1 + initiator@core0)を 1 回だけ
+ * 確立し、以後の tcpbench で再利用する。`nvmet` コマンドで既にターゲットが
+ * 常駐していればそれを使う。
+ *
+ * 戻り値:
+ *   0=確立済み、-1=インターフェース未登録/接続タイムアウト
+ * コール元:
+ *   shell_tcpbench()
+ */
 static int shell_ensure_tcp_session(void)
 {
     if (s_shell_tcp_connected) return 0;
@@ -161,7 +224,18 @@ static int shell_ensure_tcp_session(void)
 typedef struct { uint32_t chunk; int is_read; uint32_t mbps_x100; } bench_res_t;
 typedef struct { uint32_t chunks[BENCH_MAX_CHUNKS]; unsigned nchunks; int do_r, do_w; uint32_t qd; } bench_plan_t;
 
-/* 文字列 s を空白区切りで最大 n トークンに分割(s を破壊、tok[] に格納)。 */
+/*
+ * 文字列を空白区切りで最大 n トークンに分割する(s を破壊する)。
+ *
+ * 引数:
+ *   s   - 分割対象(書き換えられる)
+ *   tok - 各トークン先頭の格納先
+ *   n   - tok の要素数
+ * 戻り値:
+ *   実際に得られたトークン数
+ * コール元:
+ *   bench_plan_parse(), shell_simdelay(), shell_ts()
+ */
 static unsigned shell_tokenize(char *s, char *tok[], unsigned n)
 {
     unsigned c = 0;
@@ -175,6 +249,16 @@ static unsigned shell_tokenize(char *s, char *tok[], unsigned n)
     return c;
 }
 
+/*
+ * ベンチ引数 "[KB[,KB...]] [r|w|rw] [qd]" を解析する。省略時は
+ * 8/64/256KB・read+write・qd=8。
+ *
+ * 引数:
+ *   args - 引数文字列(破壊される)
+ *   pl   - 解析結果の格納先
+ * コール元:
+ *   shell_tcpbench(), shell_rdmabench()
+ */
 static void bench_plan_parse(char *args, bench_plan_t *pl)
 {
     char *tok[3];
@@ -202,6 +286,17 @@ static void bench_plan_parse(char *args, bench_plan_t *pl)
     if (nt >= 3) { uint32_t q = (uint32_t)atoi(tok[2]); if (q) pl->qd = q; }
 }
 
+/*
+ * ベンチ結果を chunk ごとの write/read 表として表示する。
+ *
+ * 引数:
+ *   tag - 見出し("NVMe/TCP" / "RDMA")
+ *   qd  - 表示する queue depth
+ *   r   - 測定結果の配列
+ *   n   - その件数
+ * コール元:
+ *   shell_tcpbench(), shell_rdmabench()
+ */
 static void bench_summary(const char *tag, uint32_t qd, const bench_res_t *r, unsigned n)
 {
     uart_printf("\n==== %s スループットまとめ (qd=%u, MB/s) ====\n", tag, qd);
@@ -225,6 +320,17 @@ static void bench_summary(const char *tag, uint32_t qd, const bench_res_t *r, un
     }
 }
 
+/*
+ * NVMe/TCP を 1 条件だけ 3 秒間回してスループットを測る。
+ *
+ * 引数:
+ *   chunk   - 1 コマンドあたりの転送バイト数
+ *   is_read - 1=read、0=write
+ * 戻り値:
+ *   MB/s の 100 倍固定小数点値
+ * コール元:
+ *   shell_tcpbench()
+ */
 static uint32_t tcp_measure(uint32_t chunk, int is_read)
 {
     uint32_t nlb = chunk / s_nvme_ctx.lba_size;
@@ -235,6 +341,15 @@ static uint32_t tcp_measure(uint32_t chunk, int is_read)
     return (el > 0) ? (uint32_t)((by * 100000ull) / ((uint64_t)el * 1000000ull)) : 0u;
 }
 
+/*
+ * シェルの `tcpbench`。セッションを確立(既にあれば再利用)し、指定 chunk ×
+ * read/write でスループットを測って表を出す。
+ *
+ * 引数:
+ *   args - "[KB[,KB...]] [r|w|rw]"
+ * コール元:
+ *   shell_dispatch()
+ */
 static void shell_tcpbench(char *args)
 {
     if (shell_ensure_tcp_session() != 0) return;
@@ -248,7 +363,15 @@ static void shell_tcpbench(char *args)
     bench_summary("NVMe/TCP", 8u, res, nr);
 }
 
-/* bench [chunkKB] [r|w|rw] [qd] -- NVMe-oF RDMA スループット。末尾にサマリ表。 */
+/*
+ * シェルの `bench`。NVMe-oF RDMA のスループットを指定 chunk × read/write ×
+ * qdepth で測って表を出す。
+ *
+ * 引数:
+ *   args - "[KB[,KB...]] [r|w|rw] [qd]"
+ * コール元:
+ *   shell_dispatch()
+ */
 static void shell_rdmabench(char *args)
 {
     bench_plan_t pl; bench_plan_parse(args, &pl);
@@ -260,6 +383,14 @@ static void shell_rdmabench(char *args)
     bench_summary("RDMA", pl.qd, res, nr);
 }
 
+/*
+ * シェルの `ts`。ts_log リングのダンプと pause/resume/mode 切り替えを行う。
+ *
+ * 引数:
+ *   args - "[core N] [num N] [mask M V] | pause | resume"
+ * コール元:
+ *   shell_dispatch()
+ */
 static void shell_ts(char *args)
 {
     char *tok[8];
@@ -287,6 +418,15 @@ static void shell_ts(char *args)
     ts_log_dump_core(core, start, num, mask, val);
 }
 
+/*
+ * シェルの `simdelay`。指定コアのメインループへ注入する人為的遅延(us)を
+ * 設定する(律速要因の切り分け用)。
+ *
+ * 引数:
+ *   args - "<core> <us>" または "show"
+ * コール元:
+ *   shell_dispatch()
+ */
 static void shell_simdelay(char *args)
 {
     char *tok[2];
@@ -303,6 +443,15 @@ static void shell_simdelay(char *args)
     uart_printf("simdelay: core%u = %uus\n", core, (unsigned)g_sim_delay_us[core]);
 }
 
+/*
+ * シェルの `ackthresh`。TCP の遅延 ACK 閾値(フルサイズ何セグメントごとに
+ * ACK するか)を設定/表示する。
+ *
+ * 引数:
+ *   args - 新しい閾値。省略時は現在値を表示
+ * コール元:
+ *   shell_dispatch()
+ */
 static void shell_ackthresh(char *args)
 {
     while (*args == ' ') args++;
@@ -315,6 +464,16 @@ static void shell_ackthresh(char *args)
                 (unsigned)g_tcp_ack_threshold, (unsigned)g_tcp_ack_threshold);
 }
 
+/*
+ * 入力 1 行をコマンドとして解釈し実行する(monitor / nvmet / tcpbench /
+ * bench / simdelay / ackthresh / ts / jobs / help / quit)。
+ *
+ * 引数:
+ *   line   - 入力行(破壊される)
+ *   s0, s1 - PF0/PF1 の VFIO スロット番号(monitor が config 空間を読む)
+ * コール元:
+ *   run_shell()
+ */
 static void shell_dispatch(char *line, int s0, int s1)
 {
     /* 先頭の空白を飛ばし、コマンド語を取り出す。 */
@@ -388,6 +547,14 @@ typedef struct {
     int      esc;        /* 0=通常, 1=ESC受信, 2=ESC[受信 */
 } shell_editor_t;
 
+/*
+ * 確定した入力行をコマンド履歴へ積む(上下キーで呼び出せるようにする)。
+ *
+ * 引数:
+ *   l - 積む行
+ * コール元:
+ *   run_shell()
+ */
 static void shell_hist_push(const char *l)
 {
     if (l[0] == 0) return;
@@ -402,6 +569,16 @@ static void shell_hist_push(const char *l)
     s_hist_count++;
 }
 
+/*
+ * 行編集バッファの内容を src で置き換え、画面の表示も更新する
+ * (履歴の呼び出しに使う)。
+ *
+ * 引数:
+ *   ed  - 行エディタ状態
+ *   src - 新しい行内容
+ * コール元:
+ *   shell_editor_byte()
+ */
 static void shell_set_line(shell_editor_t *ed, const char *src)
 {
     unsigned i = 0;
@@ -410,7 +587,18 @@ static void shell_set_line(shell_editor_t *ed, const char *src)
     uart_printf("\r\033[K> %s", ed->line);   /* 行クリア + プロンプト + 再描画 */
 }
 
-/* stdin 1バイト処理。戻り値1=行確定(ed->line にNUL終端)。 */
+/*
+ * 入力 1 バイトを行エディタへ与える。通常文字の挿入・バックスペース・
+ * 上下キー(履歴)・改行による行確定を扱う。
+ *
+ * 引数:
+ *   ed - 行エディタ状態
+ *   ch - 入力バイト
+ * 戻り値:
+ *   1=行が確定した(ed->line が有効)、0=編集継続中
+ * コール元:
+ *   run_shell()
+ */
 static int shell_editor_byte(shell_editor_t *ed, unsigned char ch)
 {
     if (ed->esc == 1) { ed->esc = (ch == '[') ? 2 : 0; return 0; }
@@ -447,6 +635,13 @@ static int shell_editor_byte(shell_editor_t *ed, unsigned char ch)
 static struct termios s_orig_tio;
 static int s_raw_active = 0;
 static void shell_restore_tty(void) { if (s_raw_active) { tcsetattr(0, TCSANOW, &s_orig_tio); s_raw_active = 0; } }
+/*
+ * 端末を raw モード(canonical/echo 無効)にする。矢印キーと 1 文字ずつの
+ * 即時エコーのため。プロセス終了時に元へ戻す atexit ハンドラも登録する。
+ *
+ * コール元:
+ *   run_shell()
+ */
 static void shell_raw_mode(void)
 {
     if (!isatty(0)) return;
@@ -457,6 +652,16 @@ static void shell_raw_mode(void)
     if (tcsetattr(0, TCSANOW, &t) == 0) { s_raw_active = 1; atexit(shell_restore_tty); }
 }
 
+/*
+ * 常駐シェル。起動時に 1 回だけ arp/ip ハンドラ登録と netif 登録を行い、
+ * 以後はコマンドを対話的に受け付けつつ、アイドル時に job_scheduler_tick()
+ * と net_poll_all_and_dispatch() を回し続ける(戻らない)。
+ *
+ * 引数:
+ *   s0, s1 - PF0/PF1 の VFIO スロット番号
+ * コール元:
+ *   run_dual_pf()
+ */
 static void run_shell(int s0, int s1)
 {
     /* Ethernet/TCP/nvmet 用の net_ctx を1回だけ登録(以後のコマンドで再利用)。 */
@@ -490,7 +695,16 @@ static void run_shell(int s0, int s1)
     }
 }
 
-/* PF0=bdf0 / PF1=bdf1 を両方 bring-up し、常駐シェルへ入る(戻らない)。 */
+/*
+ * PF0/PF1 を両方 bring-up し、常駐シェルへ入る(戻らない)。
+ *
+ * 引数:
+ *   bdf0, bdf1 - 2 つの PF の PCI アドレス
+ * 戻り値:
+ *   -1=bring-up 失敗(成功時は run_shell() から戻らない)
+ * コール元:
+ *   main()
+ */
 static int run_dual_pf(const char *bdf0, const char *bdf1)
 {
     uart_printf("\n========== dual-PF bring-up: %s + %s ==========\n", bdf0, bdf1);
@@ -502,6 +716,15 @@ static int run_dual_pf(const char *bdf0, const char *bdf1)
     return 0;
 }
 
+/*
+ * エントリポイント。自己テスト(crc32c / timer / spinlock / smp)を行い、
+ * 引数に 2 つの PCI アドレスが与えられていれば bring-up + 常駐シェルへ。
+ *
+ * 引数:
+ *   argc, argv - argv[1], argv[2] が PF0/PF1 の PCI アドレス
+ * 戻り値:
+ *   0=正常、1=自己テスト失敗または bring-up 失敗
+ */
 int main(int argc, char **argv)
 {
     uart_puts("\nvfio_nvme -- ConnectX-4 / VFIO / NVMe-oF (RoCEv2 + TCP)\n\n");

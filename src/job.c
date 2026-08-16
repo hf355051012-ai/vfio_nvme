@@ -29,6 +29,17 @@ job_t *job_spawn(job_step_fn step, void *ctx, const char *name)
     return NULL;
 }
 
+/*
+ * ジョブに affinity key を設定する。同じ key を持つジョブは同時に 1 本しか
+ * 実行されない(別コアが既に実行中ならスキップされる)。同一コネクション
+ * を触る admin/IO ジョブの同時実行を防ぐために使う。
+ *
+ * 引数:
+ *   job          - 対象ジョブ
+ *   affinity_key - 排他の単位を表す任意のポインタ。NULL で排他無し
+ * コール元:
+ *   nvme_connect_job_start(), nvmet_job_start()
+ */
 void job_set_affinity(job_t *job, void *affinity_key)
 {
     if (!job) return;
@@ -37,6 +48,16 @@ void job_set_affinity(job_t *job, void *affinity_key)
     smp_spin_unlock(&s_job_lock);
 }
 
+/*
+ * ジョブを特定のコアに固定する。以後そのコアの job_scheduler_tick() だけが
+ * このジョブを実行する。
+ *
+ * 引数:
+ *   job  - 対象ジョブ
+ *   core - 固定先のコア番号
+ * コール元:
+ *   nvmet_job_start(), nvmer_pin_target_to_core1()
+ */
 void job_pin_to_core(job_t *job, unsigned core)
 {
     if (!job) return;
@@ -47,6 +68,18 @@ void job_pin_to_core(job_t *job, unsigned core)
 
 static volatile int s_ticking[SMP_MAX_CORES];
 
+/*
+ * 同じ affinity_key を持つ他のジョブが今どこかのコアで実行中(claimed)かを
+ * 調べる。s_job_lock を保持したまま呼ぶこと。
+ *
+ * 引数:
+ *   skip_index - 判定から除外するジョブ(自分自身)のインデックス
+ *   key        - 調べる affinity key(NULL なら常に 0)
+ * 戻り値:
+ *   1=他のジョブが実行中、0=空いている
+ * コール元:
+ *   job_scheduler_tick()
+ */
 static int job_affinity_busy_locked(unsigned skip_index, void *key)
 {
     if (!key) return 0;
@@ -96,6 +129,14 @@ void job_scheduler_tick(void)
     s_ticking[core] = 0;
 }
 
+/*
+ * 現在ジョブテーブルに登録されている(=完了していない)ジョブ数を返す。
+ *
+ * 戻り値:
+ *   アクティブなジョブ数
+ * コール元:
+ *   nvme_connect_job_start(), nvmet_job_start()
+ */
 unsigned job_active_count(void)
 {
     smp_spin_lock(&s_job_lock);
@@ -107,6 +148,12 @@ unsigned job_active_count(void)
     return n;
 }
 
+/*
+ * アクティブなジョブの一覧(名前と state)を表示する。シェルの `jobs`。
+ *
+ * コール元:
+ *   shell_dispatch()
+ */
 void job_list_dump(void)
 {
     smp_spin_lock(&s_job_lock);

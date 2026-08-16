@@ -22,10 +22,31 @@
 
 static const char RDMA_CM_PING_MSG[] = "rdma_cm phase(e) established ping-pong";
 
+/*
+ * 受信した MAD の attribute id(REQ=0x0010 / REP=0x0013 / RTU=0x0014)を
+ * 読む。GRH 40 バイトの直後が MAD ヘッダである前提。
+ *
+ * 引数:
+ *   recv_buf - GSI RQ が受信したバッファ先頭(GRH から)
+ * 戻り値:
+ *   attribute id
+ * コール元:
+ *   rdma_cm_job_step(), nvmetr_check_gsi_disconnect()
+ */
 uint16_t rdma_cm_recv_attr_id(const volatile uint8_t *recv_buf) {
     return rd16be_ib(&recv_buf[MLX5_GRH_BYTES + 16]);
 }
 
+/*
+ * CM REQ を組み立てる。フィールドのバイトオフセットは IBTA Vol1 Ch12 の
+ * Table 106。private data には cma_hdr(36 バイト)+ ULP private data を
+ * 載せる(REQ にだけ cma_hdr が付く)。
+ *
+ * 引数:
+ *   ctx - 送信バッファと自 QPN/PSN/GID を持つ CM コンテキスト
+ * コール元:
+ *   rdma_cm_job_step()
+ */
 static void rdma_cm_build_req(rdma_cm_ctx_t *ctx) {
     volatile uint8_t *buf = ctx->send_buf;
     for (unsigned i = 0; i < RDMA_CM_MAD_SIZE; i++) {
@@ -78,7 +99,14 @@ static void rdma_cm_build_req(rdma_cm_ctx_t *ctx) {
     wr16le(&priv[44], 0xFFFFu); // cntlid(未接続)
 }
 
-// REPペイロード(Table 110)。cma_hdrは含まない(cma_accept_ib()確認済み)。
+/*
+ * CM REP を組み立てる(Table 110)。REQ と違い cma_hdr は含めない。
+ *
+ * 引数:
+ *   ctx - CM コンテキスト
+ * コール元:
+ *   rdma_cm_job_step()
+ */
 static void rdma_cm_build_rep(rdma_cm_ctx_t *ctx) {
     volatile uint8_t *buf = ctx->send_buf;
     for (unsigned i = 0; i < RDMA_CM_MAD_SIZE; i++) {
@@ -109,7 +137,14 @@ static void rdma_cm_build_rep(rdma_cm_ctx_t *ctx) {
     wr16le(&priv[2], 32); // crqsize(プレースホルダ)
 }
 
-// RTUペイロード(Table 111)。NVMe-oFではprivate data無しが通常。
+/*
+ * CM RTU を組み立てる(Table 111)。NVMe-oF では private data 無し。
+ *
+ * 引数:
+ *   ctx - CM コンテキスト
+ * コール元:
+ *   rdma_cm_job_step()
+ */
 static void rdma_cm_build_rtu(rdma_cm_ctx_t *ctx) {
     volatile uint8_t *buf = ctx->send_buf;
     for (unsigned i = 0; i < RDMA_CM_MAD_SIZE; i++) {
@@ -122,6 +157,16 @@ static void rdma_cm_build_rtu(rdma_cm_ctx_t *ctx) {
     wr32be_ib(&p[4], ctx->remote_comm_id);
 }
 
+/*
+ * 受信 REQ から相手の RC QPN / 開始 PSN / comm_id / GID / path MTU を
+ * 取り出す。GID とワイヤ上の path MTU は事前設定値より優先する。
+ *
+ * 引数:
+ *   ctx      - 結果を書き込む CM コンテキスト
+ *   recv_buf - 受信バッファ(GRH から)
+ * コール元:
+ *   rdma_cm_job_step()
+ */
 static void rdma_cm_parse_req(rdma_cm_ctx_t *ctx, const volatile uint8_t *recv_buf) {
     const volatile uint8_t *p = &recv_buf[MLX5_GRH_BYTES + IB_MAD_HDR_LEN];
     ctx->remote_comm_id = rd32be_ib(&p[0]);
@@ -133,6 +178,15 @@ static void rdma_cm_parse_req(rdma_cm_ctx_t *ctx, const volatile uint8_t *recv_b
     }
 }
 
+/*
+ * 受信 REP から相手の RC QPN / 開始 PSN / comm_id を取り出す。
+ *
+ * 引数:
+ *   ctx      - 結果を書き込む CM コンテキスト
+ *   recv_buf - 受信バッファ(GRH から)
+ * コール元:
+ *   rdma_cm_job_step()
+ */
 static void rdma_cm_parse_rep(rdma_cm_ctx_t *ctx, const volatile uint8_t *recv_buf) {
     const volatile uint8_t *p = &recv_buf[MLX5_GRH_BYTES + IB_MAD_HDR_LEN];
     ctx->remote_comm_id = rd32be_ib(&p[0]);
@@ -140,6 +194,17 @@ static void rdma_cm_parse_rep(rdma_cm_ctx_t *ctx, const volatile uint8_t *recv_b
     ctx->peer_starting_psn = ((uint32_t)p[20] << 16) | ((uint32_t)p[21] << 8) | p[22];
 }
 
+/*
+ * GSI QP を 1 本作って RTS まで遷移させ、初回 RECV WQE を投稿する。
+ * GID テーブル index0 への自 GID 登録(RC QP 側とも共有)もここで行う。
+ *
+ * 引数:
+ *   ctx - CM コンテキスト
+ * 戻り値:
+ *   0=成功、-1=作成/遷移失敗
+ * コール元:
+ *   rdma_cm_job_step()
+ */
 static int rdma_cm_setup_gsi(rdma_cm_ctx_t *ctx) {
     if (mlx5_qp_create_gsi(ctx->dev, ctx->gsi_qp) != 0) {
         uart_printf("rdma_cm: FAILED (GSI CREATE_QP)\n");
@@ -164,6 +229,18 @@ static int rdma_cm_setup_gsi(rdma_cm_ctx_t *ctx) {
     return 0;
 }
 
+/*
+ * GSI を新規作成せず、呼び出し元が ctx->gsi_qp に共有させた既存の(既に
+ * RTS の)GSI QP をそのまま使う。1 PF につき GSI は物理的に 1 本しか無い
+ * ため、2 本目の CM(IO キュー用)はこちらを使う。RECV WQE の再武装だけ行う。
+ *
+ * 引数:
+ *   ctx - CM コンテキスト(gsi_qp が既に設定済みであること)
+ * 戻り値:
+ *   0=成功、-1=失敗
+ * コール元:
+ *   rdma_cm_job_step()
+ */
 static int rdma_cm_setup_gsi_reused(rdma_cm_ctx_t *ctx) {
     if (mlx5_qp_post_recv_gsi(ctx->dev, ctx->gsi_qp, (void *)(uintptr_t)ctx->recv_buf,
                               sizeof(ctx->recv_buf)) != 0) {
@@ -173,6 +250,17 @@ static int rdma_cm_setup_gsi_reused(rdma_cm_ctx_t *ctx) {
     return 0;
 }
 
+/*
+ * RC QP を 1 本作り RST->INIT まで遷移させる(相手の情報が揃うのは REQ/REP
+ * 受信後なので、ここでは INIT 止まり)。
+ *
+ * 引数:
+ *   ctx - CM コンテキスト(rc_qp_index で admin 用/IO 用を選ぶ)
+ * 戻り値:
+ *   0=成功、-1=失敗
+ * コール元:
+ *   rdma_cm_job_step()
+ */
 static int rdma_cm_setup_rc(rdma_cm_ctx_t *ctx) {
     if (mlx5_qp_create_rc(ctx->dev, &ctx->rc_qp, ctx->rc_qp_index) != 0) {
         uart_printf("rdma_cm: FAILED (RC CREATE_QP)\n");
@@ -186,6 +274,19 @@ static int rdma_cm_setup_rc(rdma_cm_ctx_t *ctx) {
     return 0;
 }
 
+/*
+ * IB CM(REQ/REP/RTU)のステートマシン 1 tick。active 側は
+ * GSI/RC 準備 -> REQ 送信 -> REP 受信 -> RC を RTR/RTS へ -> RTU 送信、
+ * passive 側は REQ 受信 -> RC を RTR/RTS へ -> REP 送信 -> RTU 受信 と進み、
+ * RC QP が RTS になった時点で established を立てる。
+ *
+ * 引数:
+ *   self - このジョブ(self->state が CM のステート)
+ * 戻り値:
+ *   JOB_WAITING=継続、JOB_DONE=確立完了/失敗で終了
+ * コール元:
+ *   job_scheduler_tick() から関数ポインタ経由
+ */
 job_result_t rdma_cm_job_step(job_t *self) {
     rdma_cm_ctx_t *ctx = (rdma_cm_ctx_t *)self->ctx;
 
@@ -498,6 +599,23 @@ job_result_t rdma_cm_job_step(job_t *self) {
     }
 }
 
+/*
+ * CM コンテキストをゼロクリアし、HCA・自分/相手のラベル・IP・MAC から
+ * GID と MAC を埋める。ゼロクリアで生じたダーティキャッシュラインが
+ * 後の dcache_invalidate_range() で DMA 済みデータを上書きしないよう、
+ * 最後に dcache_clean_range() をかける。
+ *
+ * 引数:
+ *   ctx                - 初期化する CM コンテキスト
+ *   dev                - 使用する HCA
+ *   self_label         - 自分のインターフェース名(netif_find() で引く)
+ *   peer_label         - 相手のインターフェース名(無ければ引けない名前)
+ *   self_ip / peer_ip  - ラベルで引けない場合に使う IPv4
+ *   self_mac_fallback  - 同上の自 MAC
+ *   peer_mac_fallback  - 同上の相手 MAC(実ホスト接続では必須)
+ * コール元:
+ *   nvme_rdma_run_bench(), nvmetr_reset_admin_for_reconnect()
+ */
 void rdma_cm_fill_addr(rdma_cm_ctx_t *ctx, mlx5_dev_t *dev, const char *self_label,
                               const char *peer_label, uint32_t self_ip_fallback,
                               uint32_t peer_ip_fallback, const uint8_t self_mac_fallback[6],

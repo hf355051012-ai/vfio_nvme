@@ -28,7 +28,17 @@ typedef struct {
 static vfio_dev_t s_dev[VFIO_MAX_DEVICES];
 static int        s_ndev = 0;
 
-/* /sys/bus/pci/devices/<BDF>/iommu_group のリンク先末尾からグループ番号を得る。 */
+/*
+ * /sys/bus/pci/devices/<BDF>/iommu_group のリンク先末尾から IOMMU グループ
+ * 番号を得る。
+ *
+ * 引数:
+ *   bdf - PCI アドレス("0000:01:00.0")
+ * 戻り値:
+ *   グループ番号。取得できなければ -1
+ * コール元:
+ *   container_open_once()
+ */
 static int read_iommu_group(const char *bdf)
 {
     char path[256];
@@ -46,7 +56,17 @@ static int read_iommu_group(const char *bdf)
     return (int)strtol(num, 0, 10);
 }
 
-/* container/group を初回のみ開いて TYPE1 IOMMU を設定する。0=成功。 */
+/*
+ * VFIO コンテナと IOMMU グループを初回だけ開き、TYPE1 IOMMU を設定する。
+ * 2 枚目以降の PF は同じコンテナを共有する。
+ *
+ * 引数:
+ *   bdf - PCI アドレス
+ * 戻り値:
+ *   0=成功、-1=失敗
+ * コール元:
+ *   vfio_init()
+ */
 static int container_open_once(const char *bdf)
 {
     if (s_container >= 0) {
@@ -104,6 +124,17 @@ fail:
     return -1;
 }
 
+/*
+ * BDF で指定した PCI デバイスを VFIO で掴み、以後の操作に使うスロット番号を
+ * 返す。コンテナ/グループの初期化は初回のみ行う。
+ *
+ * 引数:
+ *   pci_bdf - PCI アドレス("0000:01:00.0")
+ * 戻り値:
+ *   スロット番号(>=0)。失敗なら -1
+ * コール元:
+ *   run_dual_pf()
+ */
 int vfio_init(const char *pci_bdf)
 {
     /* 既に掴んでいる BDF なら既存スロットを返す。 */
@@ -154,16 +185,47 @@ int vfio_init(const char *pci_bdf)
     return slot;
 }
 
+/*
+ * VFIO コンテナが利用可能な状態か(DMA マップを発行できるか)を返す。
+ *
+ * 戻り値:
+ *   1=利用可能、0=未初期化
+ * コール元:
+ *   remap_process_memory()
+ */
 int vfio_is_ready(void)
 {
     return (s_container >= 0) && (s_ndev > 0);
 }
 
+/*
+ * スロット番号が有効な範囲で、かつそのデバイスが開かれているかを確認する。
+ *
+ * 引数:
+ *   dev - スロット番号
+ * 戻り値:
+ *   1=有効、0=無効
+ * コール元:
+ *   vfio_map_bar(), vfio_cfg_read32(), vfio_cfg_write32(),
+ *   vfio_enable_bus_master()
+ */
 static int dev_ok(int dev)
 {
     return dev >= 0 && dev < s_ndev && s_dev[dev].fd >= 0;
 }
 
+/*
+ * デバイスの BAR を mmap してユーザ空間アドレスを返す。
+ *
+ * 引数:
+ *   dev      - スロット番号
+ *   bar      - BAR 番号(ConnectX のレジスタは BAR0)
+ *   size_out - マップしたサイズの格納先
+ * 戻り値:
+ *   マップ先アドレス。失敗なら NULL
+ * コール元:
+ *   bringup_pf()
+ */
 void *vfio_map_bar(int dev, int bar, uint64_t *size_out)
 {
     if (!dev_ok(dev) || bar < 0 || bar > 5) return 0;
@@ -190,6 +252,17 @@ void *vfio_map_bar(int dev, int bar, uint64_t *size_out)
     return va;
 }
 
+/*
+ * PCI コンフィグ空間から 32bit 読む。
+ *
+ * 引数:
+ *   dev    - スロット番号
+ *   offset - コンフィグ空間オフセット
+ * 戻り値:
+ *   読んだ値。失敗時は 0xFFFFFFFF
+ * コール元:
+ *   bringup_pf(), vfio_enable_bus_master(), x86_cfg_rd()
+ */
 uint32_t vfio_cfg_read32(int dev, uint32_t offset)
 {
     if (!dev_ok(dev)) return 0xffffffffu;
@@ -201,6 +274,16 @@ uint32_t vfio_cfg_read32(int dev, uint32_t offset)
     return v;
 }
 
+/*
+ * PCI コンフィグ空間へ 32bit 書く。
+ *
+ * 引数:
+ *   dev    - スロット番号
+ *   offset - コンフィグ空間オフセット
+ *   val    - 書く値
+ * コール元:
+ *   vfio_enable_bus_master()
+ */
 void vfio_cfg_write32(int dev, uint32_t offset, uint32_t val)
 {
     if (!dev_ok(dev)) return;
@@ -209,6 +292,17 @@ void vfio_cfg_write32(int dev, uint32_t offset, uint32_t val)
     }
 }
 
+/*
+ * Command レジスタの Bus Master Enable を立てる(NIC が DMA を発行できる
+ * ようにする)。
+ *
+ * 引数:
+ *   dev - スロット番号
+ * 戻り値:
+ *   0=成功、-1=失敗
+ * コール元:
+ *   bringup_pf()
+ */
 int vfio_enable_bus_master(int dev)
 {
     if (!dev_ok(dev)) return -1;
@@ -217,6 +311,19 @@ int vfio_enable_bus_master(int dev)
     return 0;
 }
 
+/*
+ * ユーザ空間アドレス vaddr から size バイトを IOVA へマップする
+ * (VFIO_IOMMU_MAP_DMA)。
+ *
+ * 引数:
+ *   vaddr - マップするユーザ空間アドレス
+ *   iova  - 割り当てる IOVA
+ *   size  - バイト数
+ * 戻り値:
+ *   0=成功、-1=失敗
+ * コール元:
+ *   remap_process_memory()
+ */
 int vfio_dma_map(void *vaddr, uint64_t iova, uint64_t size)
 {
     if (s_container < 0) return -1;

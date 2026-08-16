@@ -12,6 +12,20 @@
 
 #define NVME_TCP_H2C_CHUNK_MAX 262144u
 
+/*
+ * Command Capsule PDU(固定 72 バイト + 任意の in-capsule データ)を
+ * ブロッキング送信する。cid は内部で採番して out_cid へ返す。
+ *
+ * 引数:
+ *   c            - 送信先コネクション
+ *   sqe          - 送る SQE(64 バイト)
+ *   data/data_len- in-capsule データ(不要なら NULL/0)
+ *   out_cid      - 採番された command id の格納先
+ * 戻り値:
+ *   0=送信完了、-1=失敗
+ * コール元:
+ *   nvme_exec_step()
+ */
 int nvme_tcp_send_cmd(nvme_tcp_conn_t *c, const nvme_sqe_t *sqe,
                       const void *data, uint32_t dlen)
 {
@@ -58,6 +72,20 @@ int nvme_tcp_send_cmd(nvme_tcp_conn_t *c, const nvme_sqe_t *sqe,
     return 0;
 }
 
+/*
+ * nvme_tcp_send_cmd() の非同期版。in-capsule データ無しの 72 バイト固定
+ * PDU を tcp_send_async() で送り、ACK を待たずに返る(コマンド
+ * パイプライン化用)。
+ *
+ * 引数:
+ *   c       - 送信先コネクション
+ *   sqe     - 送る SQE
+ *   out_cid - 採番された command id の格納先
+ * 戻り値:
+ *   0=キューイング成功、-1=失敗
+ * コール元:
+ *   nvme_write_pipelined_run(), nvme_read_pipelined_run()
+ */
 int nvme_tcp_send_cmd_async(nvme_tcp_conn_t *c, const nvme_sqe_t *sqe, uint16_t *out_cid)
 {
     static uint8_t s_cmd_async_buf[NVME_TCP_CMD_PDU_LEN] __attribute__((aligned(64)));
@@ -84,6 +112,21 @@ int nvme_tcp_send_cmd_async(nvme_tcp_conn_t *c, const nvme_sqe_t *sqe, uint16_t 
     return 0;
 }
 
+/*
+ * R2T で要求された [r2to, r2to+r2tl) を、明示的に渡したバッファから
+ * H2CData PDU(NVME_TCP_H2C_CHUNK_MAX ごとに分割)として送出する下位実装。
+ * cid も呼び出し元が明示するため、複数コマンドを同時に in-flight にできる。
+ *
+ * 引数:
+ *   c            - 送信先コネクション
+ *   cid / ttag   - 対応するコマンドの id と R2T の転送タグ
+ *   r2to / r2tl  - 要求された範囲(オフセットと長さ)
+ *   data/data_len- 送信元バッファ全体
+ * 戻り値:
+ *   0=送信完了、-1=範囲不正/送信失敗
+ * コール元:
+ *   nvme_tcp_send_h2c_data()
+ */
 int nvme_tcp_send_h2c_data_ex(nvme_tcp_conn_t *c, uint16_t cid, uint16_t ttag,
                                uint32_t r2to, uint32_t r2tl,
                                const void *data, uint32_t data_len)
@@ -128,6 +171,19 @@ int nvme_tcp_send_h2c_data_ex(nvme_tcp_conn_t *c, uint16_t cid, uint16_t ttag,
     return 0;
 }
 
+/*
+ * コネクションが保持する pending_data/pending_cid を使って
+ * nvme_tcp_send_h2c_data_ex() を呼ぶ薄いラッパ(単発コマンド用)。
+ *
+ * 引数:
+ *   c           - 送信先コネクション
+ *   ttag        - R2T の転送タグ
+ *   r2to / r2tl - 要求された範囲
+ * 戻り値:
+ *   0=送信完了、-1=失敗
+ * コール元:
+ *   nvme_exec_step()
+ */
 int nvme_tcp_send_h2c_data(nvme_tcp_conn_t *c, uint16_t ttag, uint32_t r2to, uint32_t r2tl)
 {
     return nvme_tcp_send_h2c_data_ex(c, c->pending_cid, ttag, r2to, r2tl,
@@ -167,6 +223,17 @@ int nvme_tcp_recv_poll(nvme_tcp_conn_t *c, nvme_tcp_xfer_t *x)
     return 0;
 }
 
+/*
+ * コネクション確立直後の ICReq PDU を送信する(PDU データダイジェスト等の
+ * ネゴシエーション開始)。
+ *
+ * 引数:
+ *   c - 送信先コネクション
+ * 戻り値:
+ *   0=送信完了、-1=失敗
+ * コール元:
+ *   nvme_connect_job_step()
+ */
 int nvme_tcp_send_icreq(nvme_tcp_conn_t *c)
 {
     c->maxdata      = 8192u;  /* ICRespが届くまでの暫定値 */
@@ -197,6 +264,18 @@ int nvme_tcp_send_icreq(nvme_tcp_conn_t *c)
     return 0;
 }
 
+/*
+ * 受信した ICResp を検証し、type/hlen/digest 設定を確認して c->maxdata
+ * (1 回の H2CData で送れる上限)を確定させる。
+ *
+ * 引数:
+ *   c           - 対象コネクション
+ *   icresp_buf  - 受信した ICResp(NVME_TCP_ICRESP_LEN バイト)
+ * 戻り値:
+ *   0=正常、-1=フォーマット不正/非対応設定
+ * コール元:
+ *   nvme_connect_job_step()
+ */
 int nvme_tcp_verify_icresp(nvme_tcp_conn_t *c, const uint8_t icresp_buf[NVME_TCP_ICRESP_LEN])
 {
     uint8_t type = icresp_buf[0];
@@ -215,6 +294,14 @@ int nvme_tcp_verify_icresp(nvme_tcp_conn_t *c, const uint8_t icresp_buf[NVME_TCP
     return 0;
 }
 
+/*
+ * NVMe/TCP コネクションの TCP を切断し、状態をクリアする。
+ *
+ * 引数:
+ *   c - 対象コネクション
+ * コール元:
+ *   nvme_connect_job_fail()
+ */
 void nvme_tcp_close(nvme_tcp_conn_t *c)
 {
     tcp_close(&c->tcp);

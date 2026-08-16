@@ -23,11 +23,30 @@
 
 static uint16_t s_ip_id[SMP_MAX_CORES];  /* IP identification: 単純増加カウンタ(固定値でも可) */
 
+/*
+ * EtherType 0x0800(IPv4)のフレームハンドラを登録する。
+ *
+ * コール元:
+ *   run_shell()
+ */
 void ip_init(void)
 {
     eth_register_handler(0x0800u, ip_handle_frame);  /* EtherType: IPv4 */
 }
 
+/*
+ * 受信 IPv4 フレームを検証して上位プロトコルへ渡す。version/IHL/チェック
+ * サム/total_length/宛先 IP を確認し、ICMP は icmp_handle()、TCP は
+ * tcp_input() へ。HW チェックサムオフロード済み(eth_rx_hw_csum_ok())なら
+ * ソフトウェア検証は省く。
+ *
+ * 引数:
+ *   payload - IPv4 ヘッダ先頭(Ethernet ヘッダの直後)
+ *   len     - payload のバイト数
+ *   src_mac - 送信元 MAC(ICMP reply 用に icmp_handle へ渡す)
+ * コール元:
+ *   eth_dispatch() から関数ポインタ経由(ip_init() で登録)
+ */
 void ip_handle_frame(const uint8_t *payload, size_t len, const uint8_t *src_mac)
 {
     if (len < sizeof(ip_header_t)) {
@@ -98,6 +117,20 @@ void ip_handle_frame(const uint8_t *payload, size_t len, const uint8_t *src_mac)
     }
 }
 
+/*
+ * buf の先頭へ Ethernet ヘッダ + IPv4 ヘッダ(20 バイト、オプション無し)を
+ * 組み立てる。IP ヘッダチェックサムもここで確定させる。
+ *
+ * 引数:
+ *   buf         - 書き込み先(ETH_HDR_LEN + 20 バイト以上)
+ *   dst_ip      - 宛先 IPv4(4 オクテット)
+ *   dst_mac     - 宛先 MAC(6 バイト)
+ *   protocol    - IP プロトコル番号(IP_PROTO_ICMP / IP_PROTO_TCP)
+ *   payload_len - IP ペイロードのバイト数(total_length の算出に使う)
+ * コール元:
+ *   ip_prepare_send_buf(), tcp_send_segment(), tcp_send_segment_lso(),
+ *   tcp_send_bare_ack()
+ */
 void ip_build_header(uint8_t *buf, const uint8_t dst_ip[4], const uint8_t dst_mac[6],
                       uint8_t protocol, uint16_t payload_len)
 {
@@ -134,6 +167,17 @@ void ip_build_header(uint8_t *buf, const uint8_t dst_ip[4], const uint8_t dst_ma
     wr16be(iph + IP_OFF_CHECKSUM, csum);
 }
 
+/*
+ * net_buf を1つ確保し、Ethernet+IPv4 ヘッダまで書いた状態で返す。
+ * 呼び出し元はペイロードを IP_PAYLOAD_OFFSET から書き込む。
+ *
+ * 引数:
+ *   dst_ip / dst_mac / protocol / payload_len - ip_build_header() と同じ
+ * 戻り値:
+ *   ヘッダ構築済みの net_buf。フレーム長超過/プール枯渇なら NULL
+ * コール元:
+ *   ip_send()
+ */
 net_buf_t *ip_prepare_send_buf(const uint8_t dst_ip[4], const uint8_t dst_mac[6],
                                 uint8_t protocol, uint16_t payload_len)
 {
@@ -155,12 +199,37 @@ net_buf_t *ip_prepare_send_buf(const uint8_t dst_ip[4], const uint8_t dst_mac[6]
     return nb;
 }
 
+/*
+ * ip_prepare_send_buf() で用意しペイロードまで書き終えた net_buf を送信する
+ * (IP ヘッダは既に確定済みなので、そのまま eth_send() へ渡すだけ)。
+ *
+ * 引数:
+ *   nb          - 送信する net_buf(所有権は eth_send() へ渡る)
+ *   payload_len - 未使用(ヘッダ確定済みのため)
+ * 戻り値:
+ *   eth_send() の結果。0=送信完了、-1=失敗
+ * コール元:
+ *   ip_send()
+ */
 int ip_send_prepared(net_buf_t *nb, uint16_t payload_len)
 {
     (void)payload_len;  /* IPヘッダはip_prepare_send_buf()内で既に確定済み(チェックサム込み) */
     return eth_send(nb);
 }
 
+/*
+ * ペイロードを IPv4 パケットとして 1 つ送信する(バッファ確保・ヘッダ構築・
+ * ペイロードコピー・送信をまとめて行う)。
+ *
+ * 引数:
+ *   dst_ip / dst_mac / protocol - ip_build_header() と同じ
+ *   payload     - IP ペイロード
+ *   payload_len - そのバイト数
+ * 戻り値:
+ *   0=送信完了、-1=バッファ確保失敗/送信失敗
+ * コール元:
+ *   icmp_handle()
+ */
 int ip_send(const uint8_t dst_ip[4], const uint8_t dst_mac[6],
             uint8_t protocol, const uint8_t *payload, uint16_t payload_len)
 {

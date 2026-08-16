@@ -9,6 +9,22 @@
 #error "crc32c: no hardware CRC32C backend for this architecture"
 #endif
 
+/*
+ * CRC-32C(Castagnoli)を SSE4.2 のハードウェア命令で計算する。ポインタの
+ * 実アライメントを見て 8/4/1 バイト単位を切り替える(ワイヤバッファ由来で
+ * 任意にアラインされうるため)。返すのは「実行中の生 CRC 値」で、最終
+ * ダイジェストにするには呼び出し側が ~ を取る。
+ *
+ * 引数:
+ *   crc  - 継続値。先頭では 0xFFFFFFFF を渡す
+ *   data - 対象バイト列
+ *   len  - バイト数
+ * 戻り値:
+ *   len バイト分を取り込んだ後の生 CRC 値
+ * コール元:
+ *   nvmet_tcp_append_hdgst(), nvmet_tcp_append_ddgst(),
+ *   nvmet_tcp_verify_hdgst(), nvmet_tcp_verify_ddgst(), crc32c_selftest()
+ */
 uint32_t crc32c(uint32_t crc, const volatile void *data, size_t len)
 {
     const volatile uint8_t *p = (const volatile uint8_t *)data;
