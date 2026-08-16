@@ -9,6 +9,11 @@ NVMe/TCP のターゲットとイニシエータを同一プロセスに立て�
 構成・レイヤ・シェルコマンド・性能値といった説明は `README.md` にある。
 このファイルには**作業上の手順と、実機で踏んだ落とし穴**だけを書く。
 
+**未実装のプロトコル機能とその実装順は `PLAN_protocol_gaps.md` にある。**
+TCP の RST 送信 / 高速再送、RDMA のリソース解放、NVMe-oF Discovery、
+ルーティングや IPv6 の SLAAC/DAD/PMTUD 等。着手したらあのファイルの進捗表を
+更新すること。
+
 ## 編集とビルド
 
 **編集は Windows 側 `C:\Users\fukud\Documents\vfio_nvme` が正。** ビルドと実機
