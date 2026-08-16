@@ -39,6 +39,21 @@ Windows の `python` は Microsoft Store のスタブで exit 49 になる。ス
   EOF を送るため、長時間ブロックするコマンドの後続が dispatch されない。
   `(sleep 15; echo cmd1; sleep 45; echo cmd2; sleep 5; echo quit) | binary` の
   ように sleep で間隔を空け、pipe を開いたままにする。
+- **常駐シェルが `quit` で終わらず残ると、`vfio-pci` からの unbind が無期限に
+  ブロックする。** dmesg に `vfio-pci 0000:01:00.0: No device request channel
+  registered, blocked until released by user` が出ていたらこれ。
+  `~/script/disable_vfio.sh` が `tee .../unbind` で固まったまま帰ってこない、
+  という形で気づく。対処:
+
+  ```bash
+  ps aux | grep "[v]fio_nvme/build"      # 残っている PID を探す
+  sudo lsof /dev/vfio/*                  # 掴んでいるプロセスの確認
+  sudo kill -KILL <pid>                  # 親の sudo も一緒に落とす
+  echo 0000:01:00.0 | sudo tee /sys/bus/pci/drivers_probe
+  ```
+
+  実際に 15 分以上ブロックした。**vfio-pci へ切り替える前と、実機テストを
+  終えた後は必ず残存プロセスの有無を確認すること。**
 - シェルの `nvmet <port>` は **4421 以外を指定すると後続の `tcpbench` が壊れる**
   (`tcpbench` は常に 4421 へ繋ぎに行く)。さらにその失敗は後続の `bench` も
   巻き添えにする。
@@ -142,6 +157,76 @@ kernel/spdk × tcp/rocev2 を同じ書式で測る。`bench`/`tcpbench` の要�
 - kernel イニシエータは接続条件(トランスポート + ダイジェスト)を
   `/tmp/linux_loopback_initiator.state` に記録し、前回と違えば自動で
   `nvme disconnect` してから繋ぎ直す(sysfs から digest の現在値は読めない)。
+
+## 最新の性能(2026-08-16)
+
+**この章は 5% 以上の性能変化があったら随時更新すること。** 変化が 5% 未満なら
+測定ばらつきの範囲として更新しない(下記「測定条件」の注意も参照)。
+
+### 測定条件
+
+| 項目 | 値 |
+|---|---|
+| 機材 | OptiPlex 3060 (i3-8100 @3.6GHz, DDR4-2400 dual channel) |
+| NIC | ConnectX-4 MCX456A-ECAT (100GbE, MT27700), FW 12.28.2006, PCIe Gen3 x16 |
+| 構成 | 2 ポートを DAC 直結したループバック (PF0=initiator / PF1=target) |
+| MTU | 9000 |
+| queue depth | 8 |
+| 計測時間 | 各パターン 3 秒 |
+| 単位 | **MiB/s**(1024 進。MB/s ではない) |
+
+「kernel」= カーネル nvmet + nvme-tcp/rdma + fio(io_uring_cmd passthru)、
+「spdk」= SPDK nvmf_tgt + spdk_nvme_perf、いずれも `~/script/linux_loopback.sh`。
+「独自」= このリポジトリ(`tcpbench` / `bench`)。
+
+### NVMe/TCP(ダイジェスト無し)
+
+| | kernel | spdk | **独自** | 独自/kernel |
+|---|---|---|---|---|
+| write 8k | 293 | 406 | **856** | 2.9x |
+| write 64k | 779 | 1289 | **3309** | 4.2x |
+| write 256k | 1220 | 2068 | **3968** | 3.3x |
+| read 8k | 307 | 482 | **2453** | 8.0x |
+| read 64k | 902 | 1642 | **5024** | 5.6x |
+| read 256k | 1366 | 2175 | **5242** | 3.8x |
+
+### NVMe/TCP(ダイジェスト有り: hdgst + ddgst)
+
+括弧内はダイジェスト無しに対する比。
+
+| | kernel | spdk | **独自** |
+|---|---|---|---|
+| write 8k | 273 (−7%) | 400 (−1%) | **766** (−10%) |
+| write 64k | 778 (±0%) | 1035 (−20%) | **3009** (−9%) |
+| write 256k | 1065 (−13%) | 1945 (−6%) | **3944** (−1%) |
+| read 8k | 300 (−2%) | 513 (+6%) | **1784** (−27%) |
+| read 64k | 809 (−10%) | 1321 (−20%) | **4427** (−12%) |
+| read 256k | 1257 (−8%) | 1731 (−20%) | **4713** (−10%) |
+
+### NVMe-oF RoCEv2(ダイジェストの概念は無い)
+
+| | kernel | spdk | **独自** |
+|---|---|---|---|
+| write 8k | 1315 | **3717** | 1849 |
+| write 64k | 2892 | **5206** | 4739 |
+| write 256k | 3084 | 5237 | **5608** |
+| read 8k | 1207 | 3667 | **4124** |
+| read 64k | 3318 | 5774 | **6730** |
+| read 256k | 3770 | **5778** | 5753 |
+
+### 読み取り
+
+- **TCP は全条件で独自が最速**(kernel 比 2.9〜8.0 倍、spdk 比 2.1〜5.1 倍)。
+  カーネル/SPDK 側は netns + 実 TCP スタックを通るのに対し、独自は同一プロセス
+  内でループバックするので条件は対等ではない。順位そのものより、変更前後で
+  同じ列を比べることに意味がある。
+- **RoCEv2 は独自が一方的に速いわけではない。** 特に **write 8k は spdk が
+  独自の 2 倍(3717 対 1849)** で、小 I/O のコマンド発行効率で負けている。
+  64k write も spdk が上。read と大きい write では独自が勝つ。
+- ダイジェストのコストは独自で −1〜−27%。**最悪は read 8k の −27%**(小 I/O
+  ほど 1 コマンドあたりの固定コストが相対的に重い)。256k write はほぼゼロ。
+  spdk が 64k/256k で −20% と大きいのは、ISA-L の CRC が速い分ほかの要因が
+  見えているためか未調査。
 
 ## 測定で繰り返し間違えたこと
 
