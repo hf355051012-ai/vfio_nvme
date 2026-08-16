@@ -52,23 +52,35 @@ typedef enum {
 /* 毎パケット触るスカラを前半へ固め、17 バイトのアドレスは後半へ置く
  * (tcp_input() の 4-tuple 照合はポートを先に見るので、一致しないコネクション
  * のアドレスまで読みに行かずに済む)。アドレスの netaddr_t 化でこの構造体は
- * 36 -> 62 バイトに膨らんでおり、1 コマンドあたり約 180ns の固定コストとして
- * 残っている(CLAUDE.md「IPv6 対応の代償」参照)。64 バイト境界への整列も
- * 試したが実測で差が出なかったので付けていない。 */
-typedef struct {
-    volatile tcp_state_t state;
-    volatile uint16_t    local_port;
-    volatile uint16_t    remote_port;
-    volatile uint32_t    snd_seq;   /* 次に送るシーケンス番号 */
-    volatile uint32_t    rcv_seq;   /* 次に期待する受信シーケンス番号 */
-    volatile uint32_t    snd_win;
-    volatile uint16_t    snd_mss;
-    volatile unsigned    owner_core;
+ * 36 -> 64 バイトに膨らんでおり、1 コマンドあたり約 180ns の固定コストとして
+ * 残っている(CLAUDE.md「IPv6 対応の代償」参照)。
+ *
+ * ちょうど 64 バイト(パディング込み)にして 64 バイト境界へ揃えてある。
+ * 実測では整列の有無で差は出なかったが、揃えておかないと「キャッシュライン
+ * を跨いでいるせいでは」という疑いを毎回消せないので、疑う余地を無くす方を
+ * 選んだ。パディングは明示し、サイズは _Static_assert で固定する
+ * (フィールドを足してあふれたらビルドで落ちる)。 */
+typedef struct __attribute__((aligned(64))) {
+    volatile tcp_state_t state;        /*  0: 4 */
+    volatile uint16_t    local_port;   /*  4: 2 */
+    volatile uint16_t    remote_port;  /*  6: 2 */
+    volatile uint32_t    snd_seq;      /*  8: 4  次に送るシーケンス番号 */
+    volatile uint32_t    rcv_seq;      /* 12: 4  次に期待する受信シーケンス番号 */
+    volatile uint32_t    snd_win;      /* 16: 4 */
+    volatile uint16_t    snd_mss;      /* 20: 2 */
+    uint8_t              pad0[2];      /* 22: 2  owner_core の 4 バイト整列用 */
+    volatile unsigned    owner_core;   /* 24: 4 */
     /* IPv4/IPv6 の両方をこの型で持つ。L3 ヘッダを組み立てる直前にだけ
      * family を見て分岐する(tcp_send_segment 系)。 */
-    netaddr_t            local_ip;
-    netaddr_t            remote_ip;
+    netaddr_t            local_ip;     /* 28:17 */
+    netaddr_t            remote_ip;    /* 45:17 */
+    uint8_t              pad1[2];      /* 62: 2  64 バイトちょうどに揃える */
 } tcp_conn_t;
+
+_Static_assert(sizeof(tcp_conn_t) == 64,
+               "tcp_conn_t は 1 キャッシュラインちょうどに収める(パディングを調整すること)");
+_Static_assert(_Alignof(tcp_conn_t) == 64,
+               "tcp_conn_t はキャッシュライン境界に揃える");
 
 uint32_t tcp_conn_arg(const tcp_conn_t *conn, uint32_t value);
 
