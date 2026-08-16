@@ -8,7 +8,7 @@
 
 CC      := gcc
 CFLAGS  := -Wall -Wextra -O2 -ffunction-sections -fdata-sections -MMD -MP \
-           -Iinclude -Isrc -msse4.2 -pthread -D_GNU_SOURCE
+           -Iinclude -Isrc -msse4.2 -mpclmul -pthread -D_GNU_SOURCE
 LDFLAGS := -pthread -Wl,--gc-sections
 
 SRC_DIR   := src
