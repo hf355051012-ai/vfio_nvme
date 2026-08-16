@@ -90,6 +90,10 @@ void tcp_connect_begin(tcp_conn_t *conn, uint32_t dst_ip, uint16_t dst_port);
  * インターフェースのリンクローカルを使う。 */
 void tcp_connect_begin6(tcp_conn_t *conn, const uint8_t dst_ip[16], uint16_t dst_port);
 
+/* family を問わない能動 open。自分側アドレスは dst の family に合わせて
+ * アクティブなインターフェースから決める(v4=netif の IPv4、v6=リンクローカル)。 */
+void tcp_connect_begin_to(tcp_conn_t *conn, const netaddr_t *dst, uint16_t dst_port);
+
 int  tcp_connect_poll(tcp_conn_t *conn);
 
 int  tcp_send(tcp_conn_t *conn, const void *buf, uint32_t len);

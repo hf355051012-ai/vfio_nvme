@@ -563,7 +563,7 @@ typedef enum {
 
 typedef struct {
     nvme_ctx_t         *ctx;
-    uint32_t             ip;
+    netaddr_t             addr;   /* 接続先。IPv4/IPv6 のどちらでもよい */
     uint16_t              port;
     netif_t            *src_ctx;  /* spawn時点のg_active_ctx、下記コメント参照 */
     uint64_t              wait_started_ticks;
@@ -621,7 +621,7 @@ static job_result_t nvme_connect_job_step(job_t *self)
 
     case NCONN_ST_TCP_ADMIN_BEGIN:
         if (jc->src_ctx) netif_activate(jc->src_ctx);
-        tcp_connect_begin(&ctx->admin.tcp, jc->ip, jc->port);
+        tcp_connect_begin_to(&ctx->admin.tcp, &jc->addr, jc->port);
         self->state = NCONN_ST_TCP_ADMIN_WAIT;
         return JOB_WAITING;
 
@@ -758,7 +758,7 @@ static job_result_t nvme_connect_job_step(job_t *self)
             return nvme_connect_job_fail(jc, 1, 0, "Set Features(Number of Queues)失敗");
         }
         if (jc->src_ctx) netif_activate(jc->src_ctx);
-        tcp_connect_begin(&ctx->io.tcp, jc->ip, jc->port);
+        tcp_connect_begin_to(&ctx->io.tcp, &jc->addr, jc->port);
         self->state = NCONN_ST_TCP_IO_WAIT;
         return JOB_WAITING;
     }
@@ -844,7 +844,8 @@ static job_result_t nvme_connect_job_step(job_t *self)
  * コール元:
  *   shell_ensure_tcp_session()
  * ===============================================================*/
-int nvme_connect_job_start(nvme_ctx_t *ctx, uint32_t ip, uint16_t port, const char *subnqn)
+int nvme_connect_job_start_addr(nvme_ctx_t *ctx, const netaddr_t *addr, uint16_t port,
+                                const char *subnqn)
 {
     if (ctx->busy) {
         uart_printf("[!] nvme: 前回の操作がまだ実行中です\n");
@@ -870,7 +871,7 @@ int nvme_connect_job_start(nvme_ctx_t *ctx, uint32_t ip, uint16_t port, const ch
     ctx->busy = 1;
 
     s_nvme_connect_job_ctx.ctx     = ctx;
-    s_nvme_connect_job_ctx.ip      = ip;
+    s_nvme_connect_job_ctx.addr    = *addr;
     s_nvme_connect_job_ctx.port    = port;
     s_nvme_connect_job_ctx.src_ctx = g_active_ctx;
 
@@ -2060,4 +2061,20 @@ int nvme_read_pipelined_run(nvme_ctx_t *ctx, uint32_t nsid, uint64_t lba,
     if (out_bytes)      *out_bytes      = bytes;
     if (out_elapsed_ms) *out_elapsed_ms = elapsed_ms;
     return 0;
+}
+
+/*=================================================================
+ * IPv4 用の薄いラッパ。従来の呼び出し元(シェルなど)がそのまま使える。
+ *
+ * 引数:
+ *   ctx / ip / port / subnqn - 接続先(IPv4 はホストバイトオーダー)
+ * 戻り値:
+ *   nvme_connect_job_start_addr() の戻り値
+ * コール元:
+ *   shell_ensure_tcp_session()
+ * ===============================================================*/
+int nvme_connect_job_start(nvme_ctx_t *ctx, uint32_t ip, uint16_t port, const char *subnqn)
+{
+    netaddr_t a = netaddr_v4(ip);
+    return nvme_connect_job_start_addr(ctx, &a, port, subnqn);
 }

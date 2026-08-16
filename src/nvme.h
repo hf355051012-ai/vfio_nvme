@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include "nvme_tcp.h"
+#include "netaddr.h"
 #include "nvme_types.h"
 
 #define NVME_SUBNQN_MAX 224u
@@ -58,6 +59,11 @@ void nvme_build_write_sqe(nvme_sqe_t *sqe, uint32_t nsid, uint64_t slba, uint32_
 
 void nvme_update_lba_size_from_id_ns(nvme_ctx_t *ctx, uint32_t nsid, const void *buf4096);
 
+/* 接続先を netaddr_t で指定する本体。IPv4/IPv6 のどちらでもよい。 */
+int nvme_connect_job_start_addr(nvme_ctx_t *ctx, const netaddr_t *addr, uint16_t port,
+                                const char *subnqn);
+
+/* IPv4 用の薄いラッパ。 */
 int nvme_connect_job_start(nvme_ctx_t *ctx, uint32_t ip, uint16_t port, const char *subnqn);
 
 #define NVME_IO_QDEPTH 8u

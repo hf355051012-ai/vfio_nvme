@@ -687,11 +687,11 @@ static int tcp_send_segment(tcp_conn_t *conn, tcp_priv_t *priv, uint8_t flags,
         }
     }
 
-    /* HW チェックサムオフロードは IPv4 前提で組んである(mlx5 側の cs_flags は
-     * L3+L4 を無条件で立てる)。IPv6 では疑似ヘッダの形が違ううえ NIC 側の
-     * 設定を家族ごとに変える経路が無いので、v6 はソフトウェアで全計算する。 */
-    int hw_partial = net_active_hw_csum_offload() &&
-                     (conn->remote_ip.family != NETADDR_V6);
+    /* HW チェックサムオフロードは v4/v6 共通で使える。種として書き込む疑似
+     * ヘッダ部分和は tcp_checksum() が family ごとに正しい形で計算するし、
+     * mlx5 が立てる cs_flags の L3_CSUM ビットは IPv6 では埋める対象が無いので
+     * 無視される(L4_CSUM だけが効く)。 */
+    int hw_partial = net_active_hw_csum_offload();
     uint16_t csum = tcp_checksum((const netaddr_t *)&conn->local_ip,
                                   (const netaddr_t *)&conn->remote_ip,
                                   tcph, hdr_total, data, data_len, hw_partial);
@@ -1418,6 +1418,24 @@ void tcp_connect_begin6(tcp_conn_t *conn, const uint8_t dst_ip[16], uint16_t dst
 }
 
 /*=================================================================
+ * family を問わない能動 open。自分側アドレスは dst の family に合わせて
+ * アクティブなインターフェースから決める。
+ *
+ * 引数:
+ *   conn / dst / dst_port - コネクションと接続先
+ * コール元:
+ *   nvme_connect_job_step()
+ * ===============================================================*/
+void tcp_connect_begin_to(tcp_conn_t *conn, const netaddr_t *dst, uint16_t dst_port)
+{
+    if (dst->family == NETADDR_V6) {
+        tcp_connect_begin6(conn, dst->a, dst_port);
+    } else {
+        tcp_connect_begin(conn, netaddr_v4_host(dst), dst_port);
+    }
+}
+
+/*=================================================================
  * tcp_connect_begin() で始めた接続を 1 tick 分進める。SYN の RTO を自前で
  * 見て再送し、SYN-ACK 到着(tcp_input() が処理)で ESTABLISHED になる。
  *
@@ -1869,9 +1887,7 @@ static int tcp_send_async_ex(tcp_conn_t *conn, const void *buf, uint16_t len, in
     }
 
     netif_t *conn_ctx = tcp_netif_for((const netaddr_t *)&conn->local_ip);
-    /* LSO は NIC が IPv4 ヘッダを書き換える前提の機能なので v6 では使わない。 */
-    uint32_t lso_cap = (conn_ctx && conn->remote_ip.family != NETADDR_V6)
-                           ? conn_ctx->hw_lso_max_bytes : 0u;
+    uint32_t lso_cap = conn_ctx ? conn_ctx->hw_lso_max_bytes : 0u;
     if (lso_cap > TCP_ASYNC_MAX_LEN) lso_cap = TCP_ASYNC_MAX_LEN;
 
     uint32_t sent_total = 0;

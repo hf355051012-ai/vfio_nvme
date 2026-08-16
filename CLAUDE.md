@@ -350,12 +350,23 @@ Port Unreachable を返す**ようになった。相手側に大量の `[ICMP] t
 - **`netif.c`**: `netif_find_by_ip6()`(各インターフェースの MAC から EUI-64 を
   組み立てて比較。IPv6 アドレスは netif_t に持たず毎回導出する)。
 
-### v6 で意図的に無効化しているもの
+### HW オフロードは v6 でもそのまま使える(当初「無効化が必要」と判断したのは誤り)
 
-- **HW チェックサムオフロード**: mlx5 側の `cs_flags` は L3+L4 を無条件で
-  立てる IPv4 前提の実装で、family ごとに切り替える経路が無い。v6 は
-  ソフトウェアで全計算する。
-- **LSO**: NIC が IPv4 ヘッダの total_length/ID を書き換える前提の機能。
+実装時、HW チェックサムオフロードと LSO は「mlx5 側が IPv4 前提だから」と
+考えて v6 では無効化した。しかし**実測すると両方とも v6 でそのまま動き**、
+無効化していた間は IPv4 比で write 64k −38% / read 64k −47% という大きな
+差が出ていた。有効化後は全条件で IPv4 と同水準になる(下表)。
+
+- **チェックサム**: 種として書く疑似ヘッダ部分和は `tcp_checksum()` が family
+  ごとに正しく計算する。mlx5 が立てる `cs_flags` の L3_CSUM ビットは IPv6 では
+  埋める対象が無いので無視され、L4_CSUM だけが効く。
+- **LSO**: ConnectX は IPv6 の TSO に対応しており、payload_length と TCP seq を
+  HW が更新する。`tcp_build_l3()` が v6 ヘッダを組めば、あとは hdr_len が
+  74(=14+40+20)になるだけで経路は共通。
+
+**教訓**: 「NIC の機能は IPv4 前提だろう」という推測で機能を切ると、動くはずの
+ものを落としたまま気付かない。切る前に一度有効にして実測すること。今回は
+`tcp6test`(64KB のバイト一致)で正しさを、`tcpbench ipv6` で速度を確認した。
 
 ### 実機で踏んだ本物のバグ
 
@@ -410,3 +421,36 @@ family 分岐ヘルパの `static inline` 化(合計で 2247 → 2334 まで回�
 
 - `ping6` / `udptest`(v4)/ `udptest6`(v6)/ `tcp6test`(IPv6 上で TCP を
   確立し 64KB 往復してバイト一致確認、MSS=9196 でフルサイズ 8 本)。
+
+## NVMe-oF を IPv6 で待ち受ける
+
+**ターゲット側は何も変えていない。** `nvmet <port>` が使う `tcp_listen()` は
+ポートだけで待つ family 非依存の実装で、`nvmet.c`/`nvmet_tcp.c` に IPv4 固有の
+コードは 1 行も無い(実際に grep して確認)。IPv6 の SYN が来れば
+`tcp_input_addr()` が `aconn->local_ip = *dst` でそのまま v6 コネクションとして
+受理する。**必要だったのはイニシエータ側だけ**だった。
+
+- `tcp_connect_begin_to(conn, const netaddr_t *dst, port)`(`tcp.c`)— family を
+  問わない能動 open。自分側アドレスは dst の family に合わせてアクティブな
+  インターフェースから決める(v4=netif の IPv4、v6=リンクローカル)。
+- `nvme_connect_job_start_addr(ctx, const netaddr_t *addr, port, subnqn)`
+  (`nvme.c`)— 接続先を `netaddr_t` で受ける本体。従来の
+  `nvme_connect_job_start()` は IPv4 用の薄いラッパとして残してある。
+- シェル: `tcpbench ... ipv6` で対向 PF のリンクローカルへ IPv6 で接続する。
+  ダイジェストと同じく IPv4/IPv6 もコネクション単位で決まるので、指定が
+  前回と変われば `shell_ensure_tcp_session()` がセッションを張り直す。
+
+### 実測(同一セッション内、qd=8、対向 PF ループバック)
+
+| | IPv4 | IPv6 | 差 |
+|---|---|---|---|
+| write 8k | 831 | 835 | +0.4% |
+| write 64k | 3325 | 3172 | −4.6% |
+| write 256k | 3973 | 3903 | −1.8% |
+| read 8k | 2297 | 2317 | +0.9% |
+| read 64k | 5038 | 4990 | −1.0% |
+| read 256k | 5259 | 5242 | −0.3% |
+
+**IPv6 でも IPv4 と同水準**(差は測定ばらつきの範囲)。admin キュー確立 →
+Fabrics Connect → Set Features(Number of Queues)→ IO キュー確立 → read/write
+まで、IPv4 と同じ経路をそのまま通る。

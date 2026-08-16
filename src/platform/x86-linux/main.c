@@ -200,8 +200,12 @@ static uint32_t x86_cfg_rd(void *ctx, uint32_t off)
 /* これで monitor は再初期化なしで即実行でき、nvmet ターゲットも常駐する。    */
 /* ====================================================================== */
 
-static int s_shell_nvmet_started = 0;
-static int s_shell_tcp_connected = 0;
+static int     s_shell_nvmet_started = 0;
+static int     s_shell_tcp_connected = 0;
+static uint8_t s_shell_tcp_ipv6      = 0;  /* 現在のセッションが IPv6 か */
+
+/* 定義は下方(ping6/udptest6 群と一緒に置いてある)。 */
+static netif_t *shell_peer_ll6(uint8_t out[16]);
 
 /*=================================================================
  * NVMe/TCP の常駐セッション(target@core1 + initiator@core0)を 1 回だけ
@@ -213,13 +217,15 @@ static int s_shell_tcp_connected = 0;
  * コール元:
  *   shell_tcpbench()
  * ===============================================================*/
-static int shell_ensure_tcp_session(uint8_t want_hdgst, uint8_t want_ddgst)
+static int shell_ensure_tcp_session(uint8_t want_hdgst, uint8_t want_ddgst, uint8_t want_ipv6)
 {
     /* ダイジェストは ICReq/ICResp でコネクション確立時に一度だけ合意する。
-     * 要求が変わったら既存セッションは使い回せないので張り直す。 */
+     * IPv4/IPv6 もコネクション単位で決まる。いずれも要求が変わったら既存
+     * セッションは使い回せないので張り直す。 */
     if (s_shell_tcp_connected &&
-        (s_nvme_ctx.req_hdgst != want_hdgst || s_nvme_ctx.req_ddgst != want_ddgst)) {
-        uart_printf("tcpbench: digest設定が変わったのでセッションを張り直します\n");
+        (s_nvme_ctx.req_hdgst != want_hdgst || s_nvme_ctx.req_ddgst != want_ddgst ||
+         s_shell_tcp_ipv6 != want_ipv6)) {
+        uart_printf("tcpbench: digest/IP版の設定が変わったのでセッションを張り直します\n");
         nvme_tcp_close(&s_nvme_ctx.io);
         nvme_tcp_close(&s_nvme_ctx.admin);
         s_nvme_ctx.io_connected = 0;
@@ -250,7 +256,20 @@ static int shell_ensure_tcp_session(uint8_t want_hdgst, uint8_t want_ddgst)
 
     netif_activate(ctx0);
     static char subnqn[128] = "nqn.2014-08.org.nvmexpress:uuid:deadbeef-cafe-babe-dead-beefcafebabe";
-    nvme_connect_job_start(&s_nvme_ctx, ip_from_octets(192, 168, 101, 11), 4421u, subnqn);
+    netaddr_t target;
+    if (want_ipv6) {
+        /* nvmet 側の listener はポートだけで待つ family 非依存の実装なので、
+         * ターゲットには手を入れず、イニシエータが v6 で繋ぎに行くだけでよい。 */
+        uint8_t peer_ll[16];
+        if (!shell_peer_ll6(peer_ll)) {
+            uart_printf("tcpbench: 対向インターフェースが見つかりません\n");
+            return -1;
+        }
+        target = netaddr_v6(peer_ll);
+    } else {
+        target = netaddr_v4(ip_from_octets(192, 168, 101, 11));
+    }
+    nvme_connect_job_start_addr(&s_nvme_ctx, &target, 4421u, subnqn);
     uint64_t t = timer_now();
     while (s_nvme_ctx.busy) {
         job_scheduler_tick();
@@ -259,7 +278,9 @@ static int shell_ensure_tcp_session(uint8_t want_hdgst, uint8_t want_ddgst)
     }
     if (s_nvme_ctx.lba_size == 0u) { uart_printf("tcpbench: lba_size=0\n"); return -1; }
     s_shell_tcp_connected = 1;
-    uart_printf("tcpbench: initiator 接続完了 (lba_size=%u)\n", s_nvme_ctx.lba_size);
+    s_shell_tcp_ipv6      = want_ipv6;
+    uart_printf("tcpbench: initiator 接続完了 (lba_size=%u, %s)\n",
+                s_nvme_ctx.lba_size, want_ipv6 ? "IPv6" : "IPv4");
     return 0;
 }
 
@@ -602,6 +623,7 @@ typedef struct {
     int      do_r, do_w;
     uint32_t qd;
     uint8_t  hdgst, ddgst;  /* NVMe/TCP のみ。RDMA には digest の概念が無い */
+    uint8_t  ipv6;          /* NVMe/TCP のみ。1=対向のリンクローカルへ IPv6 で繋ぐ */
 } bench_plan_t;
 
 /*=================================================================
@@ -630,7 +652,7 @@ static unsigned shell_tokenize(char *s, char *tok[], unsigned n)
 }
 
 /*=================================================================
- * ベンチ引数 "[KB[,KB...]] [r|w|rw] [qd] [hdgst] [ddgst]" を解析する。
+ * ベンチ引数 "[KB[,KB...]] [r|w|rw] [qd] [hdgst] [ddgst] [ipv6]" を解析する。
  * 省略時は 8/64/256KB・read+write・qd=8・digest 無効。hdgst/ddgst は
  * 位置ではなくキーワードで判定するので、qd の有無に関わらず書ける
  * (NVMe/TCP 専用。RDMA トランスポートには digest の概念が無い)。
@@ -646,7 +668,7 @@ static void bench_plan_parse(char *args, bench_plan_t *pl)
     char *tok[5];
     unsigned nt = shell_tokenize(args, tok, 5);
     pl->qd = 8u; pl->do_r = 1; pl->do_w = 1;
-    pl->hdgst = 0; pl->ddgst = 0;
+    pl->hdgst = 0; pl->ddgst = 0; pl->ipv6 = 0;
 
     /* 先に digest キーワードを抜き取り、残りを従来通り位置引数として扱う。 */
     unsigned kept = 0;
@@ -654,6 +676,8 @@ static void bench_plan_parse(char *args, bench_plan_t *pl)
         if (strcmp(tok[i], "hdgst") == 0)  { pl->hdgst = 1; continue; }
         if (strcmp(tok[i], "ddgst") == 0)  { pl->ddgst = 1; continue; }
         if (strcmp(tok[i], "digest") == 0) { pl->hdgst = 1; pl->ddgst = 1; continue; }
+        if (strcmp(tok[i], "ipv6") == 0)   { pl->ipv6 = 1; continue; }
+        if (strcmp(tok[i], "ipv4") == 0)   { pl->ipv6 = 0; continue; }
         tok[kept++] = tok[i];
     }
     nt = kept;
@@ -843,7 +867,7 @@ static void tcp_measure(uint32_t chunk, int is_read, bench_res_t *out)
 static void shell_tcpbench(char *args)
 {
     bench_plan_t pl; bench_plan_parse(args, &pl);
-    if (shell_ensure_tcp_session(pl.hdgst, pl.ddgst) != 0) return;
+    if (shell_ensure_tcp_session(pl.hdgst, pl.ddgst, pl.ipv6) != 0) return;
     if (pl.hdgst != s_nvme_ctx.io.hdgst || pl.ddgst != s_nvme_ctx.io.ddgst) {
         uart_printf("[!] tcpbench: digestの合意結果が要求と異なります "
                     "(要求 hdgst=%u ddgst=%u / 合意 hdgst=%u ddgst=%u)\n",
