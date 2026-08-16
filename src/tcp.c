@@ -14,7 +14,7 @@
 
 uint64_t g_tcp_copy2_ns = 0, g_tcp_copy2_bytes = 0;
 uint64_t g_tcp_copy3_ns = 0, g_tcp_copy3_bytes = 0;
-/*
+/*=================================================================
  * 受信経路のコピー時間累積(rx_buf への push とそこからの排出)を取り出す。
  * 律速要因の切り分け用の計装。
  *
@@ -23,7 +23,7 @@ uint64_t g_tcp_copy3_ns = 0, g_tcp_copy3_bytes = 0;
  *   c3_ns / c3_by - rx_buf -> 呼び出し元バッファのコピーの累積 ns とバイト数
  * コール元:
  *   nvmet_io_job_step_impl()
- */
+ * ===============================================================*/
 void tcp_copy_stats_get(uint64_t *c2_ns, uint64_t *c2_by,
                         uint64_t *c3_ns, uint64_t *c3_by)
 {
@@ -82,14 +82,14 @@ volatile uint32_t g_tcp_retransmit_count[SMP_MAX_CORES];
 
 volatile uint32_t g_tcp_ack_threshold = 4u;
 
-/*
+/*=================================================================
  * 受信循環バッファの容量を返す(パイプライン受信の in-flight 上限計算用)。
  *
  * 戻り値:
  *   TCP_RX_BUF_SIZE
  * コール元:
  *   nvme_read_pipelined_run()
- */
+ * ===============================================================*/
 uint32_t tcp_rx_buf_size(void)
 {
     return TCP_RX_BUF_SIZE;
@@ -191,7 +191,7 @@ typedef struct {
 static tcp_timewait_t s_timewait[TCP_TIMEWAIT_TOTAL];
 static smp_spinlock_t s_timewait_lock;
 
-/*
+/*=================================================================
  * TIME_WAIT テーブルから 4-tuple が一致するエントリを探す。閉じた直後の
  * コネクション宛に届いた再送セグメントへ ACK を返すために使う。
  *
@@ -201,7 +201,7 @@ static smp_spinlock_t s_timewait_lock;
  *   見つかったエントリ。無ければ NULL
  * コール元:
  *   tcp_input()
- */
+ * ===============================================================*/
 static tcp_timewait_t *tcp_timewait_find(uint32_t remote_ip, uint16_t remote_port, uint16_t local_port)
 {
     smp_spin_lock(&s_timewait_lock);
@@ -218,7 +218,7 @@ static tcp_timewait_t *tcp_timewait_find(uint32_t remote_ip, uint16_t remote_por
     return NULL;
 }
 
-/*
+/*=================================================================
  * クローズしたコネクションを TIME_WAIT テーブルへ登録する(スロットを
  * 解放した後も、相手の再送に ACK を返せるようにするため)。
  *
@@ -227,7 +227,7 @@ static tcp_timewait_t *tcp_timewait_find(uint32_t remote_ip, uint16_t remote_por
  *   snd_seq / rcv_seq - 応答 ACK に使うシーケンス番号
  * コール元:
  *   tcp_close()
- */
+ * ===============================================================*/
 static void tcp_timewait_register(uint32_t local_ip, uint16_t local_port,
                                    uint32_t remote_ip, uint16_t remote_port,
                                    uint32_t local_seq)
@@ -248,12 +248,12 @@ static void tcp_timewait_register(uint32_t local_ip, uint16_t local_port,
     smp_spin_unlock(&s_timewait_lock);
 }
 
-/*
+/*=================================================================
  * 期限切れの TIME_WAIT エントリを掃除する(ポーリングのたびに呼ぶ軽量処理)。
  *
  * コール元:
  *   tcp_poll_once_ex()
- */
+ * ===============================================================*/
 static void tcp_timewait_reap(void)
 {
     smp_spin_lock(&s_timewait_lock);
@@ -277,7 +277,7 @@ typedef struct {
 static tcp_listener_slot_t s_listeners[TCP_LISTENER_TOTAL];
 static smp_spinlock_t      s_listener_lock;
 
-/*
+/*=================================================================
  * リッスンハンドルからリスナースロットを引く。
  *
  * 引数:
@@ -286,7 +286,7 @@ static smp_spinlock_t      s_listener_lock;
  *   リスナースロット。範囲外/未使用なら NULL
  * コール元:
  *   tcp_accept_begin(), tcp_accept_ready_poll(), tcp_unlisten()
- */
+ * ===============================================================*/
 static tcp_listener_slot_t *tcp_listener_for(int listener)
 {
     if (listener < 0 || (unsigned)listener >= TCP_LISTENER_TOTAL) return NULL;
@@ -294,7 +294,7 @@ static tcp_listener_slot_t *tcp_listener_for(int listener)
     return &s_listeners[listener];
 }
 
-/*
+/*=================================================================
  * コネクションに対応するプライベート状態(受信バッファ・輻輳制御・非同期
  * 送信キュー等、tcp_conn_t には収まらない大きな状態)を引く。
  *
@@ -304,7 +304,7 @@ static tcp_listener_slot_t *tcp_listener_for(int listener)
  *   プライベート状態。s_conns[] に未登録なら NULL
  * コール元:
  *   tcp_close(), tcp_connect_poll(), tcp_send(), tcp_recv_internal() ほか
- */
+ * ===============================================================*/
 static tcp_priv_t *tcp_priv_for(tcp_conn_t *conn)
 {
     unsigned core = conn->owner_core;
@@ -316,14 +316,14 @@ static tcp_priv_t *tcp_priv_for(tcp_conn_t *conn)
     return NULL;
 }
 
-/*
+/*=================================================================
  * コネクションスロットの空きを探す。
  *
  * 戻り値:
  *   スロット番号。満杯なら -1
  * コール元:
  *   tcp_connect_begin(), tcp_input()
- */
+ * ===============================================================*/
 static int tcp_find_free_slot(void)
 {
     unsigned core = smp_core_index();
@@ -335,7 +335,7 @@ static int tcp_find_free_slot(void)
     return -1;
 }
 
-/*
+/*=================================================================
  * コネクションが s_conns[] のどのスロットに登録されているかを返す
  * (ts_log の識別子に埋める)。
  *
@@ -345,7 +345,7 @@ static int tcp_find_free_slot(void)
  *   スロット番号。未登録なら TCP_MAX_CONNS
  * コール元:
  *   tcp_conn_arg(), tcp_connect_poll(), tcp_input()
- */
+ * ===============================================================*/
 static unsigned tcp_conn_slot(const tcp_conn_t *conn)
 {
     /* tcp_priv_for()と同じ理由でconn->owner_coreを使う(上記コメント参照)。 */
@@ -366,7 +366,7 @@ uint32_t tcp_conn_arg(const tcp_conn_t *conn, uint32_t value)
 static inline int tcp_seq_lt(uint32_t a, uint32_t b) { return (int32_t)(a - b) < 0; }
 static inline int tcp_seq_gt(uint32_t a, uint32_t b) { return (int32_t)(a - b) > 0; }
 
-/*
+/*=================================================================
  * data を受信循環バッファへ追記する。折り返しをまたぐ場合は 2 回に分けて
  * volatile_fast_copy() を呼ぶ。呼び出し元が事前に空き容量を確認しておくこと。
  *
@@ -376,7 +376,7 @@ static inline int tcp_seq_gt(uint32_t a, uint32_t b) { return (int32_t)(a - b) >
  *   data_len - そのバイト数
  * コール元:
  *   tcp_deliver_data()
- */
+ * ===============================================================*/
 static void tcp_rx_buf_push(tcp_priv_t *priv, const volatile uint8_t *data, uint16_t data_len)
 {
     uint32_t write_pos = (uint32_t)((priv->rx_read + priv->rx_count) % TCP_RX_BUF_SIZE);
@@ -395,7 +395,7 @@ static void tcp_rx_buf_push(tcp_priv_t *priv, const volatile uint8_t *data, uint
     priv->rx_count = priv->rx_count + data_len;
 }
 
-/*
+/*=================================================================
  * in-order で届いたデータを配置する。upcall が登録されていればその場で
  * upcall へ渡し(rx_buf を経由しない push 型受信)、無ければ rx_buf へ積む。
  *
@@ -403,7 +403,7 @@ static void tcp_rx_buf_push(tcp_priv_t *priv, const volatile uint8_t *data, uint
  *   priv / data / data_len - tcp_rx_buf_push() と同じ
  * コール元:
  *   tcp_input()
- */
+ * ===============================================================*/
 static void tcp_deliver_data(tcp_priv_t *priv, const volatile uint8_t *data, uint16_t data_len)
 {
     if (priv->recv_upcall) { // tcp_set_recv_upcall()で設定されるhandler
@@ -414,7 +414,7 @@ static void tcp_deliver_data(tcp_priv_t *priv, const volatile uint8_t *data, uin
     }
 }
 
-/*
+/*=================================================================
  * push 型受信の upcall を登録する。以後このコネクションの in-order データは
  * rx_buf へ積まれず upcall へ直接渡る。
  *
@@ -424,7 +424,7 @@ static void tcp_deliver_data(tcp_priv_t *priv, const volatile uint8_t *data, uin
  *   ctx  - ハンドラへ渡す任意のポインタ
  * コール元:
  *   nvme_read_pipelined_run(), nvmet_io_job_step_impl()
- */
+ * ===============================================================*/
 void tcp_set_recv_upcall(tcp_conn_t *conn, tcp_recv_upcall_fn fn, void *ctx)
 {
     tcp_priv_t *priv = tcp_priv_for(conn);
@@ -433,14 +433,14 @@ void tcp_set_recv_upcall(tcp_conn_t *conn, tcp_recv_upcall_fn fn, void *ctx)
     priv->recv_upcall_ctx = ctx;
 }
 
-/*
+/*=================================================================
  * push 型受信の upcall を解除し、以後は rx_buf 経由の pull 型受信へ戻す。
  *
  * 引数:
  *   conn - 対象コネクション
  * コール元:
  *   nvme_read_pipelined_run(), nvmet_io_job_end(), nvmet_io_job_step_impl()
- */
+ * ===============================================================*/
 void tcp_clear_recv_upcall(tcp_conn_t *conn)
 {
     tcp_priv_t *priv = tcp_priv_for(conn);
@@ -449,7 +449,7 @@ void tcp_clear_recv_upcall(tcp_conn_t *conn)
     priv->recv_upcall_ctx = NULL;
 }
 
-/*
+/*=================================================================
  * RTT 推定を更新する(RFC 6298 の SRTT/RTTVAR、alpha=1/8・beta=1/4・K=4)。
  * Karn のアルゴリズムに従い、再送したセグメントの計測値は呼び出し元が除く。
  *
@@ -458,7 +458,7 @@ void tcp_clear_recv_upcall(tcp_conn_t *conn)
  *   measured_ticks - 実測 RTT(tick 差分)
  * コール元:
  *   tcp_connect_poll(), tcp_send(), tcp_send_reliable()
- */
+ * ===============================================================*/
 static void tcp_rtt_update(tcp_priv_t *priv, uint64_t measured_ticks)
 {
     uint64_t measured_us = ticks_to_us(measured_ticks);
@@ -608,7 +608,7 @@ static int tcp_send_segment(tcp_conn_t *conn, tcp_priv_t *priv, uint8_t flags,
 
 #define TCP_LSO_MAX_DATA_LEN (0xFFFFu - (uint32_t)sizeof(ip_header_t) - (uint32_t)TCP_HDR_LEN)
 
-/*
+/*=================================================================
  * LSO 対応の送信ヘルパ。ヘッダを 1 つ組み立て、複数 MSS 分のペイロードを
  * まとめて NIC へ渡して HW に分割させる(LSO 非対応なら呼ばれない)。
  *
@@ -621,7 +621,7 @@ static int tcp_send_segment(tcp_conn_t *conn, tcp_priv_t *priv, uint8_t flags,
  *   0=キューイング成功、-1=失敗
  * コール元:
  *   tcp_send(), tcp_async_poll(), tcp_send_async_enqueue()
- */
+ * ===============================================================*/
 static int tcp_send_segment_lso(tcp_conn_t *conn, tcp_priv_t *priv,
                                  const void *data, uint32_t data_len)
 {
@@ -695,7 +695,7 @@ static int tcp_send_segment_lso(tcp_conn_t *conn, tcp_priv_t *priv,
     return eth_send_lso_async(seg_buf, hdr_bytes, data, data_len, conn->snd_mss);
 }
 
-/*
+/*=================================================================
  * 登録済みコネクションを持たない相手(既にスロットから外れた TIME_WAIT の
  * 相手など)へ、単発の ACK だけを送る tcp_send_segment() の最小構成版。
  *
@@ -704,7 +704,7 @@ static int tcp_send_segment_lso(tcp_conn_t *conn, tcp_priv_t *priv,
  *   seq / ack - 送出する シーケンス/確認応答番号
  * コール元:
  *   tcp_input()
- */
+ * ===============================================================*/
 static void tcp_send_bare_ack(uint32_t local_ip, uint16_t local_port,
                                uint32_t remote_ip, uint16_t remote_port,
                                uint32_t seq, uint32_t ack)
@@ -762,13 +762,13 @@ int tcp_abort_requested(void)
     return s_abort_requested;
 }
 
-/*
+/*=================================================================
  * Ctrl+C による中断要求フラグをクリアする。長時間コマンドの開始前に必ず
  * 呼び、前回の Ctrl+C が次のコマンドを即座に中断しないようにする。
  *
  * コール元:
  *   nvmet_io_job_recv_fail(), nvmet_io_job_step_impl()
- */
+ * ===============================================================*/
 void tcp_clear_abort_request(void)
 {
     s_abort_requested = 0;
@@ -778,7 +778,7 @@ static void tcp_cwnd_grow_on_ack(tcp_priv_t *priv, uint16_t mss);
 
 static tcp_async_slot_t *tcp_async_slot_at(tcp_priv_t *priv, unsigned core, unsigned logical_idx);
 
-/*
+/*=================================================================
  * 非同期送信(tcp_send_async)キューの背後処理。届いた ACK で確認済みの
  * スロットを解放し、RTO を超えた未確認スロットを再送する。呼び出し元は
  * 一切ブロックされない。
@@ -787,7 +787,7 @@ static tcp_async_slot_t *tcp_async_slot_at(tcp_priv_t *priv, unsigned core, unsi
  *   conn / priv - 対象コネクションとプライベート状態
  * コール元:
  *   tcp_poll_once_ex()
- */
+ * ===============================================================*/
 static void tcp_async_poll(tcp_conn_t *conn, tcp_priv_t *priv)
 {
     if (priv->ack_advanced && !priv->in_bulk_send) {
@@ -841,7 +841,7 @@ static void tcp_async_poll(tcp_conn_t *conn, tcp_priv_t *priv)
     }
 }
 
-/*
+/*=================================================================
  * tcp_async_poll() の短小 PDU 専用キュー版(CMD/RSP/R2T/ICResp のような
  * 小さい単発 PDU を、大きいデータ送信とは別のキューで追跡する)。
  *
@@ -849,7 +849,7 @@ static void tcp_async_poll(tcp_conn_t *conn, tcp_priv_t *priv)
  *   conn / priv - 対象コネクションとプライベート状態
  * コール元:
  *   tcp_poll_once_ex()
- */
+ * ===============================================================*/
 static void tcp_async_short_poll(tcp_conn_t *conn, tcp_priv_t *priv)
 {
     while (priv->async_short_count > 0) {
@@ -892,7 +892,7 @@ static void tcp_async_short_poll(tcp_conn_t *conn, tcp_priv_t *priv)
     }
 }
 
-/*
+/*=================================================================
  * TCP の共通ポーリング 1 回分。受信ポーリング、非同期送信の ACK 確認と
  * 再送、TIME_WAIT の掃除を行う。check_ctrl_c=0 なら UART の未読バイトを
  * 一切消費しない(ジョブ化された非ブロッキング受信から呼ぶとき用)。
@@ -901,7 +901,7 @@ static void tcp_async_short_poll(tcp_conn_t *conn, tcp_priv_t *priv)
  *   check_ctrl_c - 1=Ctrl+C 検出も行う、0=UART に触れない
  * コール元:
  *   tcp_poll_once(), tcp_recv_internal(), tcp_accept_ready_poll()
- */
+ * ===============================================================*/
 static void tcp_poll_once_ex(int check_ctrl_c)
 {
     unsigned core = smp_core_index();
@@ -922,20 +922,20 @@ static void tcp_poll_once_ex(int check_ctrl_c)
     tcp_timewait_reap();
 }
 
-/*
+/*=================================================================
  * tcp_poll_once_ex(1) の薄いラッパ(Ctrl+C 検出あり)。あらゆる長時間
  * ブロックする待ちループがここを経由する。
  *
  * コール元:
  *   tcp_send(), tcp_close(), tcp_send_async_ex(),
  *   tcp_async_flush_until_room()
- */
+ * ===============================================================*/
 static void tcp_poll_once(void)
 {
     tcp_poll_once_ex(1);
 }
 
-/*
+/*=================================================================
  * セグメントを送信し、priv->expected_ack に一致する ACK が返るまで RTO の
  * 指数バックオフで再送する(FIN のような制御セグメント用)。
  *
@@ -947,7 +947,7 @@ static void tcp_poll_once(void)
  *   0=ACK を得た、-1=再送上限に達した
  * コール元:
  *   tcp_close()
- */
+ * ===============================================================*/
 static int tcp_send_reliable(tcp_conn_t *conn, tcp_priv_t *priv, uint8_t flags,
                               const void *data, uint16_t data_len,
                               uint32_t expected_ack)
@@ -993,7 +993,7 @@ static int tcp_send_reliable(tcp_conn_t *conn, tcp_priv_t *priv, uint8_t flags,
     return -1;
 }
 
-/*
+/*=================================================================
  * 受信した SYN / SYN-ACK のオプション領域から MSS と Window Scale を
  * 取り出してコネクションへ反映する。MSS は自分の上限との小さい方を採る。
  *
@@ -1003,7 +1003,7 @@ static int tcp_send_reliable(tcp_conn_t *conn, tcp_priv_t *priv, uint8_t flags,
  *   opts_len    - そのバイト数
  * コール元:
  *   tcp_input()
- */
+ * ===============================================================*/
 static void tcp_parse_syn_options(tcp_conn_t *conn, tcp_priv_t *priv,
                                    const volatile uint8_t *opts, uint8_t opts_len)
 {
@@ -1046,7 +1046,7 @@ typedef tcp_async_slot_t tcp_async_mlx5_extra_t[TCP_ASYNC_SLOTS_MLX5_EXTRA];
 static tcp_async_mlx5_extra_t s_async_mlx5_overflow[SMP_MAX_CORES][TCP_ASYNC_MLX5_OVERFLOW_CONNS];
 static uint8_t s_async_mlx5_overflow_used[SMP_MAX_CORES][TCP_ASYNC_MLX5_OVERFLOW_CONNS];
 
-/*
+/*=================================================================
  * このコネクションが借りていた非同期送信のオーバーフロースロット群を
  * 共有プールへ返す。
  *
@@ -1055,7 +1055,7 @@ static uint8_t s_async_mlx5_overflow_used[SMP_MAX_CORES][TCP_ASYNC_MLX5_OVERFLOW
  *   idx  - 返すプールブロックの番号
  * コール元:
  *   tcp_priv_init()
- */
+ * ===============================================================*/
 static void tcp_async_overflow_release(unsigned core, int idx)
 {
     if (idx >= 0 && (unsigned)idx < TCP_ASYNC_MLX5_OVERFLOW_CONNS) {
@@ -1063,7 +1063,7 @@ static void tcp_async_overflow_release(unsigned core, int idx)
     }
 }
 
-/*
+/*=================================================================
  * 共有プールから非同期送信のオーバーフロースロット群を 1 ブロック借りる。
  *
  * 引数:
@@ -1072,7 +1072,7 @@ static void tcp_async_overflow_release(unsigned core, int idx)
  *   ブロック番号。空きが無ければ -1
  * コール元:
  *   tcp_priv_try_grant_mlx5_async_overflow()
- */
+ * ===============================================================*/
 static int tcp_async_overflow_acquire(unsigned core)
 {
     for (unsigned i = 0; i < TCP_ASYNC_MLX5_OVERFLOW_CONNS; i++) {
@@ -1084,7 +1084,7 @@ static int tcp_async_overflow_acquire(unsigned core)
     return -1;  /* プール枯渇 -- 呼び出し元はTCP_ASYNC_SLOTS基礎値のままフォールバックする */
 }
 
-/*
+/*=================================================================
  * 論理スロット番号から実際の非同期送信スロットを引く(前半は priv 自身の
  * 配列、後半は借りたオーバーフロープール)。
  *
@@ -1096,7 +1096,7 @@ static int tcp_async_overflow_acquire(unsigned core)
  *   スロットへのポインタ
  * コール元:
  *   tcp_async_poll(), tcp_send_async_enqueue(), tcp_debug_dump_rx()
- */
+ * ===============================================================*/
 static tcp_async_slot_t *tcp_async_slot_at(tcp_priv_t *priv, unsigned core, unsigned logical_idx)
 {
     if (logical_idx < TCP_ASYNC_SLOTS) {
@@ -1109,7 +1109,7 @@ static tcp_async_slot_t *tcp_async_slot_at(tcp_priv_t *priv, unsigned core, unsi
     return NULL;  /* async_cap管理が正しければ到達しないはず */
 }
 
-/*
+/*=================================================================
  * 送信元インターフェースが mlx5 なら、非同期送信スロットを共有プールから
  * 増やして深いパイプラインを許可する(帯域が広く in-flight を稼ぐ必要が
  * あるバックエンドだけを対象にする)。
@@ -1120,7 +1120,7 @@ static tcp_async_slot_t *tcp_async_slot_at(tcp_priv_t *priv, unsigned core, unsi
  *   local_ip - 自機 IPv4(インターフェース判定に使う)
  * コール元:
  *   tcp_connect_begin(), tcp_input()
- */
+ * ===============================================================*/
 static void tcp_priv_try_grant_mlx5_async_overflow(tcp_priv_t *priv, unsigned core, uint32_t local_ip)
 {
     netif_t *ctx = netif_find_by_ip(local_ip);
@@ -1134,7 +1134,7 @@ static void tcp_priv_try_grant_mlx5_async_overflow(tcp_priv_t *priv, unsigned co
     }
 }
 
-/*
+/*=================================================================
  * コネクションのプライベート状態を初期値へ戻す(能動 open と受動 open の
  * 両方から呼ぶ)。借りていたオーバーフロースロットもここで返す。
  *
@@ -1143,7 +1143,7 @@ static void tcp_priv_try_grant_mlx5_async_overflow(tcp_priv_t *priv, unsigned co
  *   core - 対象コア
  * コール元:
  *   tcp_connect_begin(), tcp_input()
- */
+ * ===============================================================*/
 static void tcp_priv_init(tcp_priv_t *priv, unsigned core)
 {
     if (priv->async_overflow_ever_init) {
@@ -1184,7 +1184,7 @@ static void tcp_priv_init(tcp_priv_t *priv, unsigned core)
     priv->connect_sent_at = 0;
 }
 
-/*
+/*=================================================================
  * RFC5681 の初期ウィンドウ IW = min(4*MSS, max(2*MSS, 4380)) で cwnd と
  * ssthresh を設定する(MSS が確定した時点で呼ぶ)。
  *
@@ -1192,7 +1192,7 @@ static void tcp_priv_init(tcp_priv_t *priv, unsigned core)
  *   conn / priv - 対象コネクションとプライベート状態
  * コール元:
  *   tcp_connect_poll(), tcp_input()
- */
+ * ===============================================================*/
 static void tcp_cwnd_init(tcp_conn_t *conn, tcp_priv_t *priv)
 {
     uint32_t four_mss  = 4u * conn->snd_mss;
@@ -1202,7 +1202,7 @@ static void tcp_cwnd_init(tcp_conn_t *conn, tcp_priv_t *priv)
     priv->ssthresh = 0xFFFFFFFFu;  /* 初回はロスがあるまで実質無制限(スロースタート主導) */
 }
 
-/*
+/*=================================================================
  * 能動 open を開始する。スロットを確保して SYN を送り、ブロックせずに返る
  * (完了確認は tcp_connect_poll())。
  *
@@ -1212,7 +1212,7 @@ static void tcp_cwnd_init(tcp_conn_t *conn, tcp_priv_t *priv)
  *   dst_port - 接続先ポート
  * コール元:
  *   nvme_connect_job_step()
- */
+ * ===============================================================*/
 void tcp_connect_begin(tcp_conn_t *conn, uint32_t dst_ip, uint16_t dst_port)
 {
     unsigned core = smp_core_index();
@@ -1262,7 +1262,7 @@ void tcp_connect_begin(tcp_conn_t *conn, uint32_t dst_ip, uint16_t dst_port)
     }
 }
 
-/*
+/*=================================================================
  * tcp_connect_begin() で始めた接続を 1 tick 分進める。SYN の RTO を自前で
  * 見て再送し、SYN-ACK 到着(tcp_input() が処理)で ESTABLISHED になる。
  *
@@ -1272,7 +1272,7 @@ void tcp_connect_begin(tcp_conn_t *conn, uint32_t dst_ip, uint16_t dst_port)
  *   1=確立した、0=継続中、-1=再送上限に達した
  * コール元:
  *   nvme_connect_job_step()
- */
+ * ===============================================================*/
 int tcp_connect_poll(tcp_conn_t *conn)
 {
     tcp_priv_t *priv = tcp_priv_for(conn);
@@ -1338,7 +1338,7 @@ int tcp_connect_poll(tcp_conn_t *conn)
     return 0;
 }
 
-/*
+/*=================================================================
  * ACK でウィンドウが進んだときの cwnd 成長(RFC5681 簡易版のスロースタート
  * と輻輳回避)。
  *
@@ -1347,7 +1347,7 @@ int tcp_connect_poll(tcp_conn_t *conn)
  *   mss  - 現在の MSS
  * コール元:
  *   tcp_send(), tcp_async_poll()
- */
+ * ===============================================================*/
 static void tcp_cwnd_grow_on_ack(tcp_priv_t *priv, uint16_t mss)
 {
     if (priv->cwnd < priv->ssthresh) {
@@ -1359,7 +1359,7 @@ static void tcp_cwnd_grow_on_ack(tcp_priv_t *priv, uint16_t mss)
     }
 }
 
-/*
+/*=================================================================
  * データを送信し、全バイトが ACK されるまでブロックする。内側のバースト
  * ループで cwnd と相手の広告ウィンドウが許すだけ連続送信し(1 セグメント
  * ごとに tcp_poll_once() を呼んで受信を飢えさせない)、RTO で再送する。
@@ -1372,7 +1372,7 @@ static void tcp_cwnd_grow_on_ack(tcp_priv_t *priv, uint16_t mss)
  *   送信できたバイト数。失敗/中断なら -1
  * コール元:
  *   nvme_tcp_send_cmd(), nvme_tcp_send_h2c_data_ex(), nvmet_tcp_send_c2h()
- */
+ * ===============================================================*/
 int tcp_send(tcp_conn_t *conn, const void *buf, uint32_t len)
 {
     if (conn->state != TCP_ESTABLISHED && conn->state != TCP_CLOSE_WAIT) {
@@ -1544,7 +1544,7 @@ int tcp_send(tcp_conn_t *conn, const void *buf, uint32_t len)
     return sent_total > 0 ? (int)sent_total : -1;
 }
 
-/*
+/*=================================================================
  * 非同期送信キューが満杯のとき、少なくとも 1 件空くまでブロッキングで
  * 解決する(ACK 待ちと必要なら再送)。
  *
@@ -1552,7 +1552,7 @@ int tcp_send(tcp_conn_t *conn, const void *buf, uint32_t len)
  *   conn / priv - 対象コネクションとプライベート状態
  * コール元:
  *   tcp_send_async_ex()
- */
+ * ===============================================================*/
 static void tcp_async_flush_until_room(tcp_conn_t *conn, tcp_priv_t *priv)
 {
     (void)conn;
@@ -1567,7 +1567,7 @@ static void tcp_async_flush_until_room(tcp_conn_t *conn, tcp_priv_t *priv)
     }
 }
 
-/*
+/*=================================================================
  * 1 チャンク(MSS 以下)を非同期送信スロットへキューする共通処理。
  * 呼び出し元が事前に空きを確保しておくこと。
  *
@@ -1579,7 +1579,7 @@ static void tcp_async_flush_until_room(tcp_conn_t *conn, tcp_priv_t *priv)
  *   0=キューイング成功、-1=失敗
  * コール元:
  *   tcp_send_async_ex()
- */
+ * ===============================================================*/
 static int tcp_send_async_enqueue(tcp_conn_t *conn, tcp_priv_t *priv,
                                    const void *buf, uint16_t len, int use_lso,
                                    int is_ref)
@@ -1615,7 +1615,7 @@ static int tcp_send_async_enqueue(tcp_conn_t *conn, tcp_priv_t *priv,
     return 0;
 }
 
-/*
+/*=================================================================
  * 短小 PDU(CMD/RSP/R2T/ICResp)専用の非同期送信経路。大きいデータ送信とは
  * 別のキューを使うことで、小さい制御 PDU が大きい転送の背後で待たされない
  * ようにする。
@@ -1627,7 +1627,7 @@ static int tcp_send_async_enqueue(tcp_conn_t *conn, tcp_priv_t *priv,
  *   0=キューイング成功、-1=失敗
  * コール元:
  *   tcp_send_async_ex()
- */
+ * ===============================================================*/
 static int tcp_send_async_short(tcp_conn_t *conn, tcp_priv_t *priv, const void *buf, uint16_t len)
 {
     while (priv->async_short_count >= TCP_ASYNC_SHORT_SLOTS) {
@@ -1676,7 +1676,7 @@ static int tcp_send_async_short(tcp_conn_t *conn, tcp_priv_t *priv, const void *
     return (int)len;
 }
 
-/*
+/*=================================================================
  * tcp_send_async()(コピー版)と tcp_send_async_ref()(ゼロコピー版)の共通
  * 実装。短小 PDU は専用経路へ、それ以外は MSS 単位に分割してキューする。
  *
@@ -1688,7 +1688,7 @@ static int tcp_send_async_short(tcp_conn_t *conn, tcp_priv_t *priv, const void *
  *   0=キューイング成功、-1=失敗
  * コール元:
  *   tcp_send_async(), tcp_send_async_ref()
- */
+ * ===============================================================*/
 static int tcp_send_async_ex(tcp_conn_t *conn, const void *buf, uint16_t len, int is_ref)
 {
     if (conn->state != TCP_ESTABLISHED && conn->state != TCP_CLOSE_WAIT) {
@@ -1760,7 +1760,7 @@ static int tcp_send_async_ex(tcp_conn_t *conn, const void *buf, uint16_t len, in
     return (int)sent_total;
 }
 
-/*
+/*=================================================================
  * データを非同期送信キューへ積み、ACK を待たずに即座に返る。信頼性は
  * tcp_async_poll() が背後で ACK 確認と RTO 再送を行って担保する。
  *
@@ -1773,13 +1773,13 @@ static int tcp_send_async_ex(tcp_conn_t *conn, const void *buf, uint16_t len, in
  * コール元:
  *   nvme_tcp_send_cmd_async(), nvme_pipeline_h2c_pump(),
  *   nvmet_tcp_send_r2t(), nvmet_tcp_send_resp(), nvmet_tcp_send_icresp()
- */
+ * ===============================================================*/
 int tcp_send_async(tcp_conn_t *conn, const void *buf, uint16_t len)
 {
     return tcp_send_async_ex(conn, buf, len, 0);
 }
 
-/*
+/*=================================================================
  * 送信元バッファをコピーせずポインタだけ保持する非同期送信(再送もそこ
  * から読む)。呼び出し元は ACK されるまでバッファを書き換えないこと。
  *
@@ -1789,13 +1789,13 @@ int tcp_send_async(tcp_conn_t *conn, const void *buf, uint16_t len)
  *   0=キューイング成功、-1=失敗
  * コール元:
  *   nvmet_tcp_send_c2h_async()
- */
+ * ===============================================================*/
 int tcp_send_async_ref(tcp_conn_t *conn, const void *buf, uint16_t len)
 {
     return tcp_send_async_ex(conn, buf, len, 1);
 }
 
-/*
+/*=================================================================
  * tcp_recv() / tcp_recv_no_ack() の共通実装。do-while 構造なので
  * timeout_val_ms=0 でも本体を必ず 1 回実行してから返る(=「1 回だけ試す」
  * 非ブロッキング受信として使える)。send_ack=0 でも消費バイト数が閾値を
@@ -1809,7 +1809,7 @@ int tcp_send_async_ref(tcp_conn_t *conn, const void *buf, uint16_t len)
  *   受信バイト数。0=FIN/RST、-1=タイムアウト/中断
  * コール元:
  *   tcp_recv(), tcp_recv_no_ack()
- */
+ * ===============================================================*/
 static int tcp_recv_internal(tcp_conn_t *conn, void *buf, uint32_t maxlen, uint32_t timeout_val_ms, int send_ack)
 {
     tcp_priv_t *priv = tcp_priv_for(conn);
@@ -1878,7 +1878,7 @@ static int tcp_recv_internal(tcp_conn_t *conn, void *buf, uint32_t maxlen, uint3
     return -1;  /* タイムアウト */
 }
 
-/*
+/*=================================================================
  * 受信バッファからデータを取り出し、読み取りごとにウィンドウ更新 ACK を
  * 送る。
  *
@@ -1888,13 +1888,13 @@ static int tcp_recv_internal(tcp_conn_t *conn, void *buf, uint32_t maxlen, uint3
  *   受信バイト数。0=FIN/RST、-1=タイムアウト/中断
  * コール元:
  *   nvme_tcp_recv_poll()
- */
+ * ===============================================================*/
 int tcp_recv(tcp_conn_t *conn, void *buf, uint32_t maxlen, uint32_t timeout_ms)
 {
     return tcp_recv_internal(conn, buf, maxlen, timeout_ms, 1);
 }
 
-/*
+/*=================================================================
  * tcp_recv() と同じだが、読み取りごとの明示的な ACK を送らない(閾値を
  * 超えたときだけウィンドウ更新 ACK を出す)。
  *
@@ -1904,13 +1904,13 @@ int tcp_recv(tcp_conn_t *conn, void *buf, uint32_t maxlen, uint32_t timeout_ms)
  *   受信バイト数。0=FIN/RST、-1=タイムアウト/中断
  * コール元:
  *   nvmet_tcp_recv_poll()
- */
+ * ===============================================================*/
 int tcp_recv_no_ack(tcp_conn_t *conn, void *buf, uint32_t maxlen, uint32_t timeout_ms)
 {
     return tcp_recv_internal(conn, buf, maxlen, timeout_ms, 0);
 }
 
-/*
+/*=================================================================
  * コネクションを閉じる。FIN を再送付きで送り、スロットを解放して
  * TIME_WAIT テーブルへ登録する(閉じた後に届く再送へ ACK を返せるように)。
  *
@@ -1918,7 +1918,7 @@ int tcp_recv_no_ack(tcp_conn_t *conn, void *buf, uint32_t maxlen, uint32_t timeo
  *   conn - 閉じるコネクション
  * コール元:
  *   nvme_tcp_close(), nvmet_tcp_close()
- */
+ * ===============================================================*/
 void tcp_close(tcp_conn_t *conn)
 {
     tcp_priv_t *priv = tcp_priv_for(conn);
@@ -1965,7 +1965,7 @@ void tcp_close(tcp_conn_t *conn)
     }
 }
 
-/*
+/*=================================================================
  * 指定インターフェースの port でリッスンを開始する。
  *
  * 引数:
@@ -1975,7 +1975,7 @@ void tcp_close(tcp_conn_t *conn)
  *   リッスンハンドル。空きが無ければ -1
  * コール元:
  *   nvmet_job_start()
- */
+ * ===============================================================*/
 int tcp_listen(uint16_t port, netif_t *ctx)
 {
     smp_spin_lock(&s_listener_lock);
@@ -1994,14 +1994,14 @@ int tcp_listen(uint16_t port, netif_t *ctx)
     return -1;
 }
 
-/*
+/*=================================================================
  * リッスンを終了しスロットを解放する。
  *
  * 引数:
  *   listener - tcp_listen() が返したハンドル
  * コール元:
  *   nvmet_job_start(), nvmet_admin_job_step()
- */
+ * ===============================================================*/
 void tcp_unlisten(int listener)
 {
     smp_spin_lock(&s_listener_lock);
@@ -2014,7 +2014,7 @@ void tcp_unlisten(int listener)
     smp_spin_unlock(&s_listener_lock);
 }
 
-/*
+/*=================================================================
  * このコネクションで Window Scale オプションが双方合意できたかを返す。
  *
  * 引数:
@@ -2023,14 +2023,14 @@ void tcp_unlisten(int listener)
  *   1=有効、0=無効
  * コール元:
  *   nvmet_tcp_max_h2c_data()
- */
+ * ===============================================================*/
 int tcp_window_scaling_enabled(const tcp_conn_t *conn)
 {
     tcp_priv_t *priv = tcp_priv_for((tcp_conn_t *)conn);
     return priv ? priv->wscale_enabled : 0;
 }
 
-/*
+/*=================================================================
  * コネクションの受信バッファ・シーケンス番号・非同期送信キューの状態を
  * 表示する(ストリーム desync 疑いのときの診断用)。
  *
@@ -2038,7 +2038,7 @@ int tcp_window_scaling_enabled(const tcp_conn_t *conn)
  *   conn - 対象コネクション
  * コール元:
  *   nvmet_io_debug_desync()
- */
+ * ===============================================================*/
 void tcp_debug_dump_rx(const tcp_conn_t *conn)
 {
     tcp_priv_t *priv = tcp_priv_for((tcp_conn_t *)conn);
@@ -2097,7 +2097,7 @@ void tcp_debug_dump_rx(const tcp_conn_t *conn)
     }
 }
 
-/*
+/*=================================================================
  * ブロックせずに accept の受け皿だけを用意する。早着 SYN を取りこぼさない
  * よう、待ち始める前に呼んでおく。
  *
@@ -2106,7 +2106,7 @@ void tcp_debug_dump_rx(const tcp_conn_t *conn)
  *   conn     - 受け皿にするコネクション
  * コール元:
  *   nvmet_tcp_accept_arm()
- */
+ * ===============================================================*/
 void tcp_accept_begin(int listener, tcp_conn_t *conn)
 {
     tcp_listener_slot_t *l = tcp_listener_for(listener);
@@ -2116,7 +2116,7 @@ void tcp_accept_begin(int listener, tcp_conn_t *conn)
     l->accept_ready = 0;
 }
 
-/*
+/*=================================================================
  * accept が成立したかを 1 回だけ確認する(ブロックしない)。
  *
  * 引数:
@@ -2125,7 +2125,7 @@ void tcp_accept_begin(int listener, tcp_conn_t *conn)
  *   1=接続確立、0=まだ、-1=エラー
  * コール元:
  *   nvmet_admin_job_step(), nvmet_io_job_step_impl()
- */
+ * ===============================================================*/
 int tcp_accept_ready_poll(int listener)
 {
     tcp_poll_once_ex(0);
@@ -2142,7 +2142,7 @@ int tcp_accept_ready_poll(int listener)
     return 0;
 }
 
-/*
+/*=================================================================
  * 受信 TCP セグメントを処理する。チェックサム検証(HW 検証済みなら省略)、
  * リスナーへの SYN 受け付け、既存コネクションの状態遷移、in-order データの
  * 配置(upcall か rx_buf)、順序不正セグメントの先読み保持、ACK 処理と
@@ -2154,7 +2154,7 @@ int tcp_accept_ready_poll(int listener)
  *   src_ip - 送信元 IPv4(ホストバイトオーダー)
  * コール元:
  *   ip_handle_frame()
- */
+ * ===============================================================*/
 void tcp_input(const uint8_t *pkt, uint16_t len, uint32_t src_ip)
 {
     unsigned core = smp_core_index();

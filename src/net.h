@@ -206,7 +206,7 @@ static inline uint32_t checksum_accumulate(uint32_t sum, const volatile void *da
     return sum;
 }
 
-/*
+/*=================================================================
  * IPv4 ヘッダチェックサム(RFC1071 の 1 の補数和)を計算する。検証時は
  * ヘッダ全体に対して呼び、結果が 0 なら正しい。
  *
@@ -217,7 +217,7 @@ static inline uint32_t checksum_accumulate(uint32_t sum, const volatile void *da
  *   チェックサム値(検証時は 0 であるべき)
  * コール元:
  *   ip_build_header(), ip_handle_frame(), icmp_handle()
- */
+ * ===============================================================*/
 static inline uint16_t inet_checksum(const volatile void *data, size_t len)
 {
     uint32_t sum = checksum_accumulate(0, data, len);
@@ -228,7 +228,7 @@ static inline uint16_t inet_checksum(const volatile void *data, size_t len)
     return (uint16_t)(~sum & 0xFFFFu);
 }
 
-/*
+/*=================================================================
  * TCP チェックサムを疑似ヘッダ + TCP ヘッダ + ペイロード全体から計算する
  * (受信セグメントの検証用)。
  *
@@ -241,7 +241,7 @@ static inline uint16_t inet_checksum(const volatile void *data, size_t len)
  *   チェックサム値(検証時は 0 であるべき)
  * コール元:
  *   tcp_input()
- */
+ * ===============================================================*/
 static inline uint16_t pseudo_header_checksum(const uint8_t src_ip[4],
                                                const uint8_t dst_ip[4],
                                                uint8_t protocol,
@@ -267,7 +267,7 @@ static inline uint16_t pseudo_header_checksum(const uint8_t src_ip[4],
     return (uint16_t)(~sum & 0xFFFFu);
 }
 
-/*
+/*=================================================================
  * 疑似ヘッダ 12 バイトだけのチェックサムを返す(O(1)、実データを読まない)。
  * HW チェックサムオフロード時は、この部分和をチェックサムフィールドへ
  * 書いておき、残りは NIC が計算して完成させる。
@@ -278,7 +278,7 @@ static inline uint16_t pseudo_header_checksum(const uint8_t src_ip[4],
  *   疑似ヘッダ部分の部分和
  * コール元:
  *   tcp_send_segment(), tcp_send_segment_lso()
- */
+ * ===============================================================*/
 static inline uint16_t pseudo_header_checksum_only(const uint8_t src_ip[4],
                                                      const uint8_t dst_ip[4],
                                                      uint8_t protocol,
@@ -301,7 +301,7 @@ static inline uint16_t pseudo_header_checksum_only(const uint8_t src_ip[4],
     return (uint16_t)(~sum & 0xFFFFu);
 }
 
-/*
+/*=================================================================
  * ヘッダとペイロードが別バッファに分かれている送信経路用の TCP チェック
  * サム計算(疑似ヘッダ + ヘッダ + ペイロードを 1 つの和にまとめる)。
  *
@@ -313,7 +313,7 @@ static inline uint16_t pseudo_header_checksum_only(const uint8_t src_ip[4],
  *   チェックサム値
  * コール元:
  *   tcp_send_segment(), tcp_send_bare_ack()
- */
+ * ===============================================================*/
 static inline uint16_t pseudo_header_checksum2(const uint8_t src_ip[4],
                                                 const uint8_t dst_ip[4],
                                                 uint8_t protocol,

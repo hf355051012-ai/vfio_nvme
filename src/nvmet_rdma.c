@@ -43,7 +43,7 @@ static void nvmetr_copy_padded(volatile uint8_t *dst, const char *src, uint32_t 
     for (uint32_t i = src_len; i < field_len; i++) dst[i] = ' ';
 }
 
-/*
+/*=================================================================
  * Identify Controller 応答(4096 バイト)を組み立てる。SN/MN/FR、MDTS、
  * SGLS の Keyed SGL 対応ビット、MAXCMD などを設定する(バイトオフセットは
  * nvmet.c の同名処理と同一)。
@@ -52,7 +52,7 @@ static void nvmetr_copy_padded(volatile uint8_t *dst, const char *src, uint32_t 
  *   ctx - ターゲットコンテキスト(ctrl->id_ctrl へ書く)
  * コール元:
  *   nvmet_rdma_job_step(), nvmetr_reset_admin_for_reconnect()
- */
+ * ===============================================================*/
 static void nvmetr_build_id_ctrl(nvmet_rdma_ctx_t *ctx)
 {
     nvmetr_zero_v(ctx->ctrl->id_ctrl, sizeof(ctx->ctrl->id_ctrl));
@@ -81,7 +81,7 @@ static void nvmetr_build_id_ctrl(nvmet_rdma_ctx_t *ctx)
     dcache_clean_range((const void *)(uintptr_t)ctx->ctrl->id_ctrl, sizeof(ctx->ctrl->id_ctrl));
 }
 
-/*
+/*=================================================================
  * Identify Namespace 応答(4096 バイト)を組み立てる。NSZE/NCAP/NUSE と
  * LBA フォーマット(512 バイト)を設定する。
  *
@@ -89,7 +89,7 @@ static void nvmetr_build_id_ctrl(nvmet_rdma_ctx_t *ctx)
  *   ctx - ターゲットコンテキスト(ctrl->id_ns へ書く)
  * コール元:
  *   nvmet_rdma_job_step(), nvmetr_reset_admin_for_reconnect()
- */
+ * ===============================================================*/
 static void nvmetr_build_id_ns(nvmet_rdma_ctx_t *ctx)
 {
     nvmetr_zero_v(ctx->ctrl->id_ns, sizeof(ctx->ctrl->id_ns));
@@ -101,7 +101,7 @@ static void nvmetr_build_id_ns(nvmet_rdma_ctx_t *ctx)
     dcache_clean_range((const void *)(uintptr_t)ctx->ctrl->id_ns, sizeof(ctx->ctrl->id_ns));
 }
 
-/*
+/*=================================================================
  * 受信 SQE の dptr(相対 offset 24)にある Keyed SGL descriptor から、
  * 相手側アドレス・長さ・rkey を取り出す。
  *
@@ -110,7 +110,7 @@ static void nvmetr_build_id_ns(nvmet_rdma_ctx_t *ctx)
  *   out_addr / out_len / out_key - 取り出した値の格納先
  * コール元:
  *   nvmetr_parse_command()
- */
+ * ===============================================================*/
 static void nvmetr_parse_ksgl_into(const volatile uint8_t *rb, uint64_t *out_addr,
                                     uint32_t *out_len, uint32_t *out_key)
 {
@@ -121,7 +121,7 @@ static void nvmetr_parse_ksgl_into(const volatile uint8_t *rb, uint64_t *out_add
                 ((uint32_t)dptr[13] << 16) | ((uint32_t)dptr[14] << 24);
 }
 
-/*
+/*=================================================================
  * 受信 capsule を解釈し、1 コマンド分の情報(opcode / cid / Keyed SGL /
  * LBA 範囲 / 必要なデータ移動の向き)を解析結果構造体へ書き出す。
  * パイプライン化で複数コマンドを同時に扱うため、結果はコンテキストでは
@@ -133,7 +133,7 @@ static void nvmetr_parse_ksgl_into(const volatile uint8_t *rb, uint64_t *out_add
  *   p   - 解析結果の格納先
  * コール元:
  *   nvmet_rdma_job_step(), nvmetr_dispatch()
- */
+ * ===============================================================*/
 static void nvmetr_parse_command(nvmet_rdma_ctx_t *ctx, const volatile uint8_t *rb,
                                   nvmet_rdma_pl_pending_t *p)
 {
@@ -216,7 +216,7 @@ static void nvmetr_parse_command(nvmet_rdma_ctx_t *ctx, const volatile uint8_t *
     }
 }
 
-/*
+/*=================================================================
  * 応答 capsule(CQE 16 バイト)を指定バッファへ組み立てる。
  *
  * 引数:
@@ -226,7 +226,7 @@ static void nvmetr_parse_command(nvmet_rdma_ctx_t *ctx, const volatile uint8_t *
  *   status   - ステータスフィールド
  * コール元:
  *   nvmetr_build_resp_capsule(), nvmetr_pl_send_response()
- */
+ * ===============================================================*/
 static void nvmetr_build_resp_capsule_into(volatile uint8_t *b, uint32_t dw0, uint32_t dw1,
                                             uint16_t cid, uint16_t status)
 {
@@ -240,7 +240,7 @@ static void nvmetr_build_resp_capsule_into(volatile uint8_t *b, uint32_t dw0, ui
     dcache_clean_range((const void *)(uintptr_t)b, NVME_CQE_LEN);
 }
 
-/*
+/*=================================================================
  * 単発コマンド処理経路で、受信済みコマンドを解釈して応答内容
  * (resp_dw0/resp_status)と必要なデータ移動の有無・向きを決める。
  *
@@ -248,7 +248,7 @@ static void nvmetr_build_resp_capsule_into(volatile uint8_t *b, uint32_t dw0, ui
  *   ctx - ターゲットコンテキスト
  * コール元:
  *   nvmet_rdma_job_step()
- */
+ * ===============================================================*/
 static void nvmetr_dispatch(nvmet_rdma_ctx_t *ctx)
 {
     nvmet_rdma_pl_pending_t p;
@@ -271,7 +271,7 @@ static void nvmetr_dispatch(nvmet_rdma_ctx_t *ctx)
     ctx->resp_status = p.resp_status;
 }
 
-/*
+/*=================================================================
  * コンテキストが保持する応答内容から応答 capsule を組み立てる
  * (単発コマンド処理経路用)。
  *
@@ -279,13 +279,13 @@ static void nvmetr_dispatch(nvmet_rdma_ctx_t *ctx)
  *   ctx - ターゲットコンテキスト
  * コール元:
  *   nvmet_rdma_job_step()
- */
+ * ===============================================================*/
 static void nvmetr_build_resp_capsule(nvmet_rdma_ctx_t *ctx)
 {
     nvmetr_build_resp_capsule_into(ctx->send_buf, ctx->resp_dw0, ctx->resp_dw1, ctx->cid, ctx->resp_status);
 }
 
-/*
+/*=================================================================
  * QP が作成済みなら DESTROY_QP で FW 側のオブジェクトを解放する
  * (切断検出後の作り直しに備える)。
  *
@@ -294,7 +294,7 @@ static void nvmetr_build_resp_capsule(nvmet_rdma_ctx_t *ctx)
  *   qp  - 解放する QP(qpn==0 なら何もしない)
  * コール元:
  *   nvmetr_reset_admin_for_reconnect()
- */
+ * ===============================================================*/
 static void nvmetr_destroy_qp_if_valid(mlx5_dev_t *dev, mlx5_qp_t *qp)
 {
     if (dev != NULL && qp->qpn != 0) {
@@ -302,7 +302,7 @@ static void nvmetr_destroy_qp_if_valid(mlx5_dev_t *dev, mlx5_qp_t *qp)
     }
 }
 
-/*
+/*=================================================================
  * CM DREP MAD(Table 113)を組み立てる。LOCAL_COMM_ID は自分の comm_id、
  * REMOTE_COMM_ID は受信した DREQ の LOCAL_COMM_ID をそのまま返す。
  *
@@ -312,7 +312,7 @@ static void nvmetr_destroy_qp_if_valid(mlx5_dev_t *dev, mlx5_qp_t *qp)
  *   dreq_local_comm_id  - 受信 DREQ の LOCAL_COMM_ID
  * コール元:
  *   nvmetr_check_gsi_disconnect()
- */
+ * ===============================================================*/
 static void nvmetr_build_drep(nvmet_rdma_ctx_t *ctx, uint64_t dreq_tid, uint32_t dreq_local_comm_id)
 {
     volatile uint8_t *buf = ctx->cm.send_buf;
@@ -324,7 +324,7 @@ static void nvmetr_build_drep(nvmet_rdma_ctx_t *ctx, uint64_t dreq_tid, uint32_t
     wr32be_ib(&p[4], dreq_local_comm_id);    // REMOTE_COMM_ID = DREQ.LOCAL_COMM_IDのecho
 }
 
-/*
+/*=================================================================
  * admin queue の切断(DREQ 受信または RC QP のエラー完了)を検出したときに、
  * RC/GSI QP を FW 側から解放し、ペアの IO キューも畳んで、次のクライアント
  * を待てる初期状態へ戻す。
@@ -334,7 +334,7 @@ static void nvmetr_build_drep(nvmet_rdma_ctx_t *ctx, uint64_t dreq_tid, uint32_t
  *   self - このジョブ
  * コール元:
  *   nvmet_rdma_job_step(), nvmetr_check_gsi_disconnect()
- */
+ * ===============================================================*/
 static void nvmetr_reset_admin_for_reconnect(nvmet_rdma_ctx_t *ctx, job_t *self)
 {
     nvmetr_destroy_qp_if_valid(ctx->cm.dev, &ctx->cm.rc_qp);
@@ -374,7 +374,7 @@ static void nvmetr_reset_admin_for_reconnect(nvmet_rdma_ctx_t *ctx, job_t *self)
     uart_printf("[nvmet-rdma] %sで次のホスト接続を待ちます\n", self_label);
 }
 
-/*
+/*=================================================================
  * GSI を所有する admin queue 側から毎 tick 呼ばれ、GSI CQ を 1 件だけ
  * 非ブロッキングでポーリングして CM DREQ(切断要求)が来ていないか調べる。
  * 来ていれば DREP を返して再接続待ちへ戻す。
@@ -386,7 +386,7 @@ static void nvmetr_reset_admin_for_reconnect(nvmet_rdma_ctx_t *ctx, job_t *self)
  *   1=切断を検出して処理した、0=何も無い
  * コール元:
  *   nvmet_rdma_job_step()
- */
+ * ===============================================================*/
 static int nvmetr_check_gsi_disconnect(nvmet_rdma_ctx_t *ctx, job_t *self)
 {
     if (ctx->queue_id != 0 || ctx->self_label == NULL || !ctx->cm.rtu_phase_done) {
@@ -433,7 +433,7 @@ static int nvmetr_check_gsi_disconnect(nvmet_rdma_ctx_t *ctx, job_t *self)
     return 1;
 }
 
-/*
+/*=================================================================
  * パイプライン用スロットの受信バッファへ RECV WQE を投稿する。
  *
  * 引数:
@@ -443,7 +443,7 @@ static int nvmetr_check_gsi_disconnect(nvmet_rdma_ctx_t *ctx, job_t *self)
  *   0=成功、-1=失敗
  * コール元:
  *   nvmet_rdma_job_step()
- */
+ * ===============================================================*/
 static int nvmetr_pl_post_recv_slot(nvmet_rdma_ctx_t *ctx, unsigned slot)
 {
     if (mlx5_qp_post_recv(ctx->cm.dev, &ctx->cm.rc_qp, (void *)(uintptr_t)ctx->pl.recv_bufs[slot],
@@ -455,7 +455,7 @@ static int nvmetr_pl_post_recv_slot(nvmet_rdma_ctx_t *ctx, unsigned slot)
     return 0;
 }
 
-/*
+/*=================================================================
  * write コマンドのデータをホストから引き込む RDMA_READ を 1 件発行する。
  * 同時発行数は HCA の Responder Resources 上限(実測 1)で制限されるため、
  * 上限に達している間は呼び出し元が保留キューへ積む。
@@ -467,7 +467,7 @@ static int nvmetr_pl_post_recv_slot(nvmet_rdma_ctx_t *ctx, unsigned slot)
  *   0=発行成功、-1=失敗
  * コール元:
  *   nvmetr_pl_start_data_move(), nvmet_rdma_job_step()
- */
+ * ===============================================================*/
 static int nvmetr_pl_issue_rdma_read(nvmet_rdma_ctx_t *ctx, unsigned slot)
 {
     nvmet_rdma_pl_pending_t *p = &ctx->pl.pending[slot];
@@ -483,7 +483,7 @@ static int nvmetr_pl_issue_rdma_read(nvmet_rdma_ctx_t *ctx, unsigned slot)
     return 0;
 }
 
-/*
+/*=================================================================
  * スロットのデータ移動を開始する。read/Identify(ホストへ RDMA_WRITE)は
  * 無条件で即時発行、write(ホストから RDMA_READ)は RRA 上限に空きがある
  * ときだけ発行し、無ければ保留キューへ積む。
@@ -495,7 +495,7 @@ static int nvmetr_pl_issue_rdma_read(nvmet_rdma_ctx_t *ctx, unsigned slot)
  *   0=即時発行した、1=RRA 上限のため保留した、-1=失敗
  * コール元:
  *   nvmet_rdma_job_step()
- */
+ * ===============================================================*/
 static int nvmetr_pl_start_data_move(nvmet_rdma_ctx_t *ctx, unsigned slot)
 {
     nvmet_rdma_pl_pending_t *p = &ctx->pl.pending[slot];
@@ -527,7 +527,7 @@ static int nvmetr_pl_start_data_move(nvmet_rdma_ctx_t *ctx, unsigned slot)
     return (nvmetr_pl_issue_rdma_read(ctx, slot) == 0) ? 0 : -1;
 }
 
-/*
+/*=================================================================
  * スロットの応答 capsule(CQE)を組み立てて SEND する。
  *
  * 引数:
@@ -537,7 +537,7 @@ static int nvmetr_pl_start_data_move(nvmet_rdma_ctx_t *ctx, unsigned slot)
  *   0=成功、-1=失敗
  * コール元:
  *   nvmet_rdma_job_step()
- */
+ * ===============================================================*/
 static int nvmetr_pl_send_response(nvmet_rdma_ctx_t *ctx, unsigned slot)
 {
     nvmet_rdma_pl_pending_t *p = &ctx->pl.pending[slot];
@@ -552,7 +552,7 @@ static int nvmetr_pl_send_response(nvmet_rdma_ctx_t *ctx, unsigned slot)
     return 0;
 }
 
-/*
+/*=================================================================
  * NVMe-oF RDMA ターゲットのステートマシン 1 tick。CM 待ち受け -> RC QP 確立
  * -> パイプラインループ(RECV 完了でコマンド解析 -> RDMA_READ/WRITE でデータ
  * 移動 -> 応答 SEND -> RECV 再投稿)と進む。admin queue 側は GSI を監視して
@@ -564,7 +564,7 @@ static int nvmetr_pl_send_response(nvmet_rdma_ctx_t *ctx, unsigned slot)
  *   JOB_WAITING=継続、JOB_DONE=停止要求で終了
  * コール元:
  *   job_scheduler_tick() から関数ポインタ経由
- */
+ * ===============================================================*/
 job_result_t nvmet_rdma_job_step(job_t *self)
 {
     nvmet_rdma_ctx_t *ctx = (nvmet_rdma_ctx_t *)self->ctx;

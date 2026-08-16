@@ -36,7 +36,7 @@ static dma_region_map_t s_regions[DMA_MAX_REGIONS];
 static int              s_nregions = 0;
 static uint64_t         s_next_iova = DMA_IOVA_BASE;
 
-/*
+/*=================================================================
  * /proc/self/maps を読み、プロセスの読み書き可能領域を低位 IOVA へ順に
  * VFIO_IOMMU_MAP_DMA する。ベストエフォート(失敗した領域はスキップ)で、
  * [vvar]/[vdso]/[vsyscall] は除外する。これにより .bss 上のバッファも
@@ -44,7 +44,7 @@ static uint64_t         s_next_iova = DMA_IOVA_BASE;
  *
  * コール元:
  *   pool_init_locked()
- */
+ * ===============================================================*/
 static void remap_process_memory(void)
 {
     if (s_maps_done || !vfio_is_ready()) {
@@ -93,7 +93,7 @@ static void remap_process_memory(void)
                 (uint32_t)(s_next_iova >> 32), (uint32_t)s_next_iova);
 }
 
-/*
+/*=================================================================
  * DMA プールを初期化する(hugepage を優先して確保し、IOVA へマップする)。
  * s_pool_lock を保持したまま呼ぶこと。
  *
@@ -101,7 +101,7 @@ static void remap_process_memory(void)
  *   0=初期化済み/成功、-1=確保失敗
  * コール元:
  *   dma_alloc()
- */
+ * ===============================================================*/
 static int pool_init_locked(void)
 {
     if (s_pool) {

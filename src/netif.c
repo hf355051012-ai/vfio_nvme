@@ -29,7 +29,7 @@ static struct {
     int           used;
 } g_handlers[HANDLER_MAX];
 
-/*
+/*=================================================================
  * EtherType 別の受信ハンドラを登録する。同一 EtherType への再登録は上書き、
  * handler=NULL で解除。
  *
@@ -38,7 +38,7 @@ static struct {
  *   handler   - eth_dispatch() から呼ばれる関数。NULL で登録解除
  * コール元:
  *   arp_init(), ip_init()
- */
+ * ===============================================================*/
 void eth_register_handler(uint16_t ethertype, eth_handler_t handler)
 {
     for (int i = 0; i < HANDLER_MAX; i++) {
@@ -64,7 +64,7 @@ void eth_register_handler(uint16_t ethertype, eth_handler_t handler)
 /* eth_dispatch() 呼び出しのネストは無い前提の per-core スカラー。 */
 static int s_rx_hw_csum_ok[SMP_MAX_CORES];
 
-/*
+/*=================================================================
  * いま eth_dispatch() が処理中のフレームが、NIC で L3/L4 チェックサム検証
  * 済みかを返す。真ならソフトウェア再検証を省いてよい。
  *
@@ -72,13 +72,13 @@ static int s_rx_hw_csum_ok[SMP_MAX_CORES];
  *   1=HW 検証済み、0=未検証(ソフトウェアで検証すること)
  * コール元:
  *   ip_handle_frame(), tcp_input()
- */
+ * ===============================================================*/
 int eth_rx_hw_csum_ok(void)
 {
     return s_rx_hw_csum_ok[smp_core_index()];
 }
 
-/*
+/*=================================================================
  * 受信フレームの EtherType を見て、登録済みハンドラへペイロードを渡す。
  * ハンドラ実行中だけ nb->hw_csum_ok を per-core スロットへ公開する
  * (eth_rx_hw_csum_ok() が読む)。nb の解放は呼び出し側の責任。
@@ -87,7 +87,7 @@ int eth_rx_hw_csum_ok(void)
  *   nb - 受信フレーム(Ethernet ヘッダから)
  * コール元:
  *   net_poll_all_and_dispatch()
- */
+ * ===============================================================*/
 void eth_dispatch(net_buf_t *nb)
 {
     if (!nb || nb->len < ETH_HDR_LEN) return;
@@ -108,14 +108,14 @@ void eth_dispatch(net_buf_t *nb)
     s_rx_hw_csum_ok[core] = 0;
 }
 
-/*
+/*=================================================================
  * アクティブインターフェースの MAC アドレスを取得する。
  *
  * 引数:
  *   mac - 格納先(6 バイト)。未初期化ならゼロ MAC を返す
  * コール元:
  *   arp_handle_frame(), arp_send_request(), ip_build_header()
- */
+ * ===============================================================*/
 void eth_get_mac(uint8_t mac[ETH_ALEN])
 {
     for (int i = 0; i < ETH_ALEN; i++) {
@@ -123,7 +123,7 @@ void eth_get_mac(uint8_t mac[ETH_ALEN])
     }
 }
 
-/*
+/*=================================================================
  * 断片列を 1 フレームとして送信し、ハードウェアの送信完了まで待つ
  * (戻った時点で全断片のメモリを再利用してよい)。実体は
  * g_active_ctx->nic->send_frags = mlx5_net_send_frags()。
@@ -135,7 +135,7 @@ void eth_get_mac(uint8_t mac[ETH_ALEN])
  *   0=送信完了、-1=アクティブインターフェース無し/送信失敗
  * コール元:
  *   eth_send()
- */
+ * ===============================================================*/
 int eth_send_frags(const eth_frag_t *frags, unsigned frag_count)
 {
     if (!g_active_ctx) {
@@ -145,7 +145,7 @@ int eth_send_frags(const eth_frag_t *frags, unsigned frag_count)
     return g_active_ctx->nic->send_frags(g_active_ctx->nic_priv, frags, frag_count); // -> mlx5_net_send_frags
 }
 
-/*
+/*=================================================================
  * eth_send_frags() と同じキューイングを行うが送信完了を待たずに返る。
  * 到達保証は呼び出し元(TCP の ACK ベース再送)が担保する。
  *
@@ -155,14 +155,14 @@ int eth_send_frags(const eth_frag_t *frags, unsigned frag_count)
  *   0=キューイング成功、-1=失敗
  * コール元:
  *   tcp_send_segment(), tcp_send_bare_ack()
- */
+ * ===============================================================*/
 int eth_send_frags_async(const eth_frag_t *frags, unsigned frag_count)
 {
     if (!g_active_ctx) return -1;
     return g_active_ctx->nic->send_frags_async(g_active_ctx->nic_priv, frags, frag_count); // -> mlx5_net_send_frags_async
 }
 
-/*
+/*=================================================================
  * LSO(TCP Segmentation Offload)送信。hdr をテンプレートとして payload を
  * HW が mss 単位に分割送出する。非対応バックエンドでは -1。
  *
@@ -174,7 +174,7 @@ int eth_send_frags_async(const eth_frag_t *frags, unsigned frag_count)
  *   0=キューイング成功、-1=非対応/失敗
  * コール元:
  *   tcp_send_segment_lso()
- */
+ * ===============================================================*/
 int eth_send_lso_async(const void *hdr, uint16_t hdr_len,
                        const void *payload, uint32_t payload_len, uint16_t mss)
 {
@@ -182,7 +182,7 @@ int eth_send_lso_async(const void *hdr, uint16_t hdr_len,
     return g_active_ctx->nic->send_lso(g_active_ctx->nic_priv, hdr, hdr_len, payload, payload_len, mss); // -> mlx5_net_send_lso_async
 }
 
-/*
+/*=================================================================
  * 次に eth_send_frags_async() が使う TX スロット番号を返す。そのスロットの
  * 前回のフレームが未完了なら完了までブロックする。呼び出し元は戻ってから
  * 初めて、そのスロット専用の送信バッファへ書き込んでよい。
@@ -191,14 +191,14 @@ int eth_send_lso_async(const void *hdr, uint16_t hdr_len,
  *   使用予定の TX スロット番号
  * コール元:
  *   tcp_send_segment(), tcp_send_segment_lso(), tcp_send_bare_ack()
- */
+ * ===============================================================*/
 unsigned eth_tx_wait_free_slot(void)
 {
     if (!g_active_ctx) return 0;
     return g_active_ctx->nic->tx_wait_free_slot(g_active_ctx->nic_priv); // -> mlx5_net_tx_wait_free_slot
 }
 
-/*
+/*=================================================================
  * net_buf 1 個を 1 フレームとして送信する。nb の所有権は本関数に渡り、
  * 成否によらず内部で net_buf_free() される。NIC の DMA ソースになるため、
  * 送信前に dcache_clean_range() でキャッシュをクリーンする。
@@ -209,7 +209,7 @@ unsigned eth_tx_wait_free_slot(void)
  *   0=送信完了、-1=フレーム長不正/送信失敗
  * コール元:
  *   arp_handle_frame(), arp_send_request(), ip_send_prepared()
- */
+ * ===============================================================*/
 int eth_send(net_buf_t *nb)
 {
     if (!nb) return -1;
@@ -225,7 +225,7 @@ int eth_send(net_buf_t *nb)
     return ret;
 }
 
-/*
+/*=================================================================
  * インターフェースを受信ポーリングの巡回対象として登録する。登録した瞬間の
  * コアがそのハードウェアのポーリング担当(owner_core)になる。二重登録は無視。
  *
@@ -233,7 +233,7 @@ int eth_send(net_buf_t *nb)
  *   ctx - 登録するインターフェース
  * コール元:
  *   mlx5_net_register_dual()
- */
+ * ===============================================================*/
 void netif_register(netif_t *ctx)
 {
     smp_spin_lock(&s_registered_lock);
@@ -251,7 +251,7 @@ void netif_register(netif_t *ctx)
     smp_spin_unlock(&s_registered_lock);
 }
 
-/*
+/*=================================================================
  * インターフェースのポーリング担当コアを変更する(target を core1 へ移す等)。
  *
  * 引数:
@@ -259,13 +259,13 @@ void netif_register(netif_t *ctx)
  *   core - 新しい担当コア番号
  * コール元:
  *   shell_dispatch(), shell_ensure_tcp_session()
- */
+ * ===============================================================*/
 void netif_set_owner_core(netif_t *ctx, unsigned core)
 {
     ctx->owner_core = core;
 }
 
-/*
+/*=================================================================
  * 登録済みインターフェースを名前("mlx5-pf0" 等)で引く。
  *
  * 引数:
@@ -274,7 +274,7 @@ void netif_set_owner_core(netif_t *ctx, unsigned core)
  *   見つかったインターフェース。無ければ NULL
  * コール元:
  *   shell_dispatch(), shell_ensure_tcp_session(), rdma_cm_fill_addr()
- */
+ * ===============================================================*/
 netif_t *netif_find(const char *name)
 {
     for (unsigned i = 0; i < s_registered_count; i++) {
@@ -289,7 +289,7 @@ netif_t *netif_find(const char *name)
     return NULL;
 }
 
-/*
+/*=================================================================
  * 登録済みインターフェースを自機 IPv4 で引く。TCP がコネクションの
  * local_ip から送信元インターフェースを逆引きするのに使う。
  *
@@ -300,7 +300,7 @@ netif_t *netif_find(const char *name)
  * コール元:
  *   tcp_send_segment(), tcp_send_segment_lso(), tcp_send_bare_ack(),
  *   tcp_send_async_ex(), tcp_priv_try_grant_mlx5_async_overflow()
- */
+ * ===============================================================*/
 netif_t *netif_find_by_ip(uint32_t ip)
 {
     for (unsigned i = 0; i < s_registered_count; i++) {
@@ -311,7 +311,7 @@ netif_t *netif_find_by_ip(uint32_t ip)
     return NULL;
 }
 
-/*
+/*=================================================================
  * 受信フレームの宛先 IP(ARP なら tpa、IPv4 なら dst_ip)を見て、同じ物理
  * NIC を共有する別名インターフェースの中にその IP を名乗るものがあれば
  * それを返す。無ければポーリング主体をそのまま返す。
@@ -323,7 +323,7 @@ netif_t *netif_find_by_ip(uint32_t ip)
  *   このフレームを処理すべきインターフェース
  * コール元:
  *   net_poll_all_and_dispatch()
- */
+ * ===============================================================*/
 static netif_t *netif_resolve_frame_owner(netif_t *poller, const net_buf_t *nb)
 {
     if (nb->len < 14u + 20u) return poller;  /* ARP/IPどちらの最小長にも満たない */
@@ -353,7 +353,7 @@ static netif_t *netif_resolve_frame_owner(netif_t *poller, const net_buf_t *nb)
 
 #define NET_POLL_BATCH_MAX 64u
 
-/*
+/*=================================================================
  * 自コアが担当する全インターフェースを巡回し、受信フレームを 1 インター
  * フェースあたり最大 NET_POLL_BATCH_MAX 個まで取り出して eth_dispatch()
  * へ流す。アクティブインターフェースは呼び出し前の値に復元して返る。
@@ -363,7 +363,7 @@ static netif_t *netif_resolve_frame_owner(netif_t *poller, const net_buf_t *nb)
  * コール元:
  *   run_shell(), worker_main(), tcp_poll_once_ex(), arp_resolve(),
  *   shell_ensure_tcp_session()
- */
+ * ===============================================================*/
 int net_poll_all_and_dispatch(void)
 {
     unsigned core = smp_core_index();

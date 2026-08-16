@@ -24,7 +24,7 @@
 #define ARP_RESOLVE_TIMEOUT_MS 300u /* 1回のrequestあたりのポーリング待ち */
 #define ARP_RESOLVE_MAX_ATTEMPTS 3u /* requestを再送する最大回数(合計最大約900ms) */
 
-/*
+/*=================================================================
  * 解決済みの IP -> MAC 対応をアクティブインターフェースの ARP キャッシュへ
  * 登録する。同じ IP のエントリがあれば上書き、空きが無ければ先頭を潰す。
  *
@@ -33,7 +33,7 @@
  *   mac - その IP の MAC アドレス(6 バイト)
  * コール元:
  *   arp_handle_frame()
- */
+ * ===============================================================*/
 static void arp_cache_insert(uint32_t ip, const uint8_t mac[ETH_ALEN])
 {
     arp_cache_entry_t *cache = g_active_ctx->arp_cache;
@@ -56,7 +56,7 @@ static void arp_cache_insert(uint32_t ip, const uint8_t mac[ETH_ALEN])
     cache[0].valid = 1;
 }
 
-/*
+/*=================================================================
  * ARP キャッシュを引く(ネットワークへは一切問い合わせない)。
  *
  * 引数:
@@ -66,7 +66,7 @@ static void arp_cache_insert(uint32_t ip, const uint8_t mac[ETH_ALEN])
  *   0=ヒット、-1=未登録
  * コール元:
  *   arp_resolve(), tcp_send_segment(), tcp_send_segment_lso(), tcp_send_bare_ack()
- */
+ * ===============================================================*/
 int arp_cache_lookup(uint32_t ip, uint8_t out_mac[ETH_ALEN])
 {
     arp_cache_entry_t *cache = g_active_ctx->arp_cache;
@@ -79,19 +79,19 @@ int arp_cache_lookup(uint32_t ip, uint8_t out_mac[ETH_ALEN])
     return -1;
 }
 
-/*
+/*=================================================================
  * EtherType 0x0806(ARP)のフレームハンドラを登録する。ハードウェアには
  * 触れないので、インターフェース登録の前後どちらで呼んでもよい。
  *
  * コール元:
  *   run_shell()
- */
+ * ===============================================================*/
 void arp_init(void)
 {
     eth_register_handler(0x0806u, arp_handle_frame);  /* EtherType: ARP */
 }
 
-/*
+/*=================================================================
  * 受信 ARP フレームを処理する。reply なら送信元をキャッシュへ入れ、自機宛の
  * request なら reply を返す。Ethernet/IPv4 以外のフォーマットは無視する。
  *
@@ -101,7 +101,7 @@ void arp_init(void)
  *   src_mac - 送信元 MAC(reply の宛先に使う)
  * コール元:
  *   eth_dispatch() から関数ポインタ経由(arp_init() で登録)
- */
+ * ===============================================================*/
 void arp_handle_frame(const uint8_t *payload, size_t len, const uint8_t *src_mac)
 {
     if (len < sizeof(arp_packet_t)) {
@@ -178,7 +178,7 @@ void arp_handle_frame(const uint8_t *payload, size_t len, const uint8_t *src_mac
         uart_printf("[!] ARP reply 送信失敗\n");
 }
 
-/*
+/*=================================================================
  * target_ip の MAC を問う ARP request をブロードキャストする。
  *
  * 引数:
@@ -187,7 +187,7 @@ void arp_handle_frame(const uint8_t *payload, size_t len, const uint8_t *src_mac
  *   0=送信成功、-1=net_buf 枯渇/送信失敗
  * コール元:
  *   arp_resolve()
- */
+ * ===============================================================*/
 int arp_send_request(uint32_t target_ip)
 {
     net_buf_t *nb = net_buf_alloc();
@@ -234,7 +234,7 @@ int arp_send_request(uint32_t target_ip)
     return ret;
 }
 
-/*
+/*=================================================================
  * IP から MAC を解決する。まずキャッシュを引き、無ければ request を送って
  * ARP_RESOLVE_TIMEOUT_MS ずつ最大 ARP_RESOLVE_MAX_ATTEMPTS 回待つ
  * (待っている間も net_poll_all_and_dispatch() で受信を回す)。
@@ -246,7 +246,7 @@ int arp_send_request(uint32_t target_ip)
  *   0=解決成功、-1=タイムアウト/送信失敗
  * コール元:
  *   tcp_send_segment(), tcp_send_segment_lso(), tcp_send_bare_ack()
- */
+ * ===============================================================*/
 int arp_resolve(uint32_t ip, uint8_t out_mac[ETH_ALEN])
 {
     if (arp_cache_lookup(ip, out_mac) == 0) {

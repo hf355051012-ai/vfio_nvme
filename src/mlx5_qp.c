@@ -23,7 +23,7 @@
 
 _Static_assert(MLX5_QP_CQ_NUM_ENTRIES == 1024u, "MLX5_CQ_BUF_SIZE/MLX5_QP_CQE_SIZE assumption changed");
 
-/*
+/*=================================================================
  * RC QP の SQ へ SEND WQE を 1 個投稿し、BlueFlame ドアベルを鳴らす。
  * 送信完了は待たない(mlx5_qp_poll_cqe() で確認する)。
  *
@@ -37,7 +37,7 @@ _Static_assert(MLX5_QP_CQ_NUM_ENTRIES == 1024u, "MLX5_CQ_BUF_SIZE/MLX5_QP_CQE_SI
  * コール元:
  *   rdma_cm_job_step(), nvmet_rdma_job_step(), nvmetr_pl_send_response(),
  *   nvme_rdma_connect_job_step(), nvmer_post_send()
- */
+ * ===============================================================*/
 int mlx5_qp_post_send(mlx5_dev_t *dev, mlx5_qp_t *qp, const void *data, uint32_t len) {
     uint32_t pc = qp->sq_pc;
     uint32_t idx = pc & 63u; // log_sq_size=6 -- 64 WQEBB
@@ -109,7 +109,7 @@ int mlx5_qp_post_send(mlx5_dev_t *dev, mlx5_qp_t *qp, const void *data, uint32_t
     return 0;
 }
 
-/*
+/*=================================================================
  * UD/GSI QP の SQ へ SEND WQE を 1 個投稿する。ctrl_seg + datagram_seg
  * (struct mlx5_av 相当、宛先 GID/MAC/QPN/UDP sport)+ data_seg の構成。
  * GSI 宛の送信では remote_qpn に常に 1(既知の GSI QPN)を渡すこと。
@@ -124,7 +124,7 @@ int mlx5_qp_post_send(mlx5_dev_t *dev, mlx5_qp_t *qp, const void *data, uint32_t
  *   0=投稿成功、-1=失敗
  * コール元:
  *   rdma_cm_job_step(), nvmetr_check_gsi_disconnect()
- */
+ * ===============================================================*/
 int mlx5_qp_post_send_ud(mlx5_dev_t *dev, mlx5_qp_t *qp, const void *data, uint32_t len,
                           uint32_t remote_qpn, uint32_t remote_qkey,
                           const uint8_t remote_gid[16], const uint8_t remote_mac[6]) {
@@ -228,7 +228,7 @@ int mlx5_qp_post_send_ud(mlx5_dev_t *dev, mlx5_qp_t *qp, const void *data, uint3
     return 0;
 }
 
-/*
+/*=================================================================
  * RDMA_WRITE / RDMA_READ 共通の WQE 組み立て。ctrl_seg + raddr_seg
  * (リモートアドレス + rkey)+ data_seg(ローカルバッファ)の ds_cnt=3。
  *
@@ -242,7 +242,7 @@ int mlx5_qp_post_send_ud(mlx5_dev_t *dev, mlx5_qp_t *qp, const void *data, uint3
  *   0=投稿成功、-1=失敗
  * コール元:
  *   mlx5_qp_post_rdma_write(), mlx5_qp_post_rdma_read()
- */
+ * ===============================================================*/
 static int mlx5_qp_post_rdma_common(mlx5_dev_t *dev, mlx5_qp_t *qp, uint32_t opcode,
                                      void *local_data, uint32_t len,
                                      uint64_t remote_addr, uint32_t remote_rkey) {
@@ -327,7 +327,7 @@ static int mlx5_qp_post_rdma_common(mlx5_dev_t *dev, mlx5_qp_t *qp, uint32_t opc
     return 0;
 }
 
-/*
+/*=================================================================
  * local_data(len バイト)を相手の remote_addr へ書き込む。CQE は送信元
  * (この QP)にのみ生成され、相手側には一切通知されない(IBTA 仕様)。
  *
@@ -339,14 +339,14 @@ static int mlx5_qp_post_rdma_common(mlx5_dev_t *dev, mlx5_qp_t *qp, uint32_t opc
  *   0=投稿成功、-1=失敗
  * コール元:
  *   nvmet_rdma_job_step(), nvmetr_pl_start_data_move()
- */
+ * ===============================================================*/
 int mlx5_qp_post_rdma_write(mlx5_dev_t *dev, mlx5_qp_t *qp, const void *local_data, uint32_t len,
                              uint64_t remote_addr, uint32_t remote_rkey) {
     return mlx5_qp_post_rdma_common(dev, qp, MLX5_OPCODE_RDMA_WRITE,
                                      (void *)(uintptr_t)local_data, len, remote_addr, remote_rkey);
 }
 
-/*
+/*=================================================================
  * 相手の remote_addr から len バイト読み出して local_buf へ書き込む。
  * CQE は要求した側(この QP)にのみ生成される。同時発行数は相手の
  * Responder Resources 上限に制約される。
@@ -359,14 +359,14 @@ int mlx5_qp_post_rdma_write(mlx5_dev_t *dev, mlx5_qp_t *qp, const void *local_da
  *   0=投稿成功、-1=失敗
  * コール元:
  *   nvmet_rdma_job_step(), nvmetr_pl_issue_rdma_read()
- */
+ * ===============================================================*/
 int mlx5_qp_post_rdma_read(mlx5_dev_t *dev, mlx5_qp_t *qp, void *local_buf, uint32_t len,
                             uint64_t remote_addr, uint32_t remote_rkey) {
     return mlx5_qp_post_rdma_common(dev, qp, MLX5_OPCODE_RDMA_READ,
                                      local_buf, len, remote_addr, remote_rkey);
 }
 
-/*
+/*=================================================================
  * RC QP の RQ へ RECV WQE を 1 個投稿する(data_seg 1 個のみ)。
  *
  * 引数:
@@ -378,7 +378,7 @@ int mlx5_qp_post_rdma_read(mlx5_dev_t *dev, mlx5_qp_t *qp, void *local_buf, uint
  * コール元:
  *   rdma_cm_job_step(), nvmet_rdma_job_step(), nvmetr_pl_post_recv_slot(),
  *   nvmer_post_recv(), nvmer_pl_post_recv_slot()
- */
+ * ===============================================================*/
 int mlx5_qp_post_recv(mlx5_dev_t *dev, mlx5_qp_t *qp, void *buf, uint32_t buf_len) {
     uint32_t pc = qp->rq_pc;
     uint32_t idx = pc & 255u; // log_rq_size=8 -- 256エントリ
@@ -420,7 +420,7 @@ int mlx5_qp_post_recv(mlx5_dev_t *dev, mlx5_qp_t *qp, void *buf, uint32_t buf_le
     return 0;
 }
 
-/*
+/*=================================================================
  * RC QP の CQ を 1 件だけ非ブロッキングでポーリングする。owner bit の
  * 周回トグルと opcode!=INVALID の両方で「HW が書いた完了か」を判定する。
  *
@@ -434,7 +434,7 @@ int mlx5_qp_post_recv(mlx5_dev_t *dev, mlx5_qp_t *qp, void *buf, uint32_t buf_le
  * コール元:
  *   rdma_cm_job_step(), nvmet_rdma_job_step(), nvme_rdma_connect_job_step(),
  *   nvmer_wait_exec()
- */
+ * ===============================================================*/
 int mlx5_qp_poll_cqe(mlx5_dev_t *dev, mlx5_qp_t *qp, int *out_is_send,
                      uint32_t *out_recv_len, uint8_t *out_syndrome) {
     uint64_t cq_buf = mlx5_qp_cq_buf_addr(dev, qp);
@@ -502,7 +502,7 @@ int mlx5_qp_poll_cqe(mlx5_dev_t *dev, mlx5_qp_t *qp, int *out_is_send,
     return 1;
 }
 
-/*
+/*=================================================================
  * 直前に mlx5_qp_poll_cqe() が消費した CQE の opcode(上位 nibble)を返す。
  * エラー完了が REQ_ERR(自分が requester)か RESP_ERR(responder)かの
  * 切り分けに使う診断用。
@@ -513,7 +513,7 @@ int mlx5_qp_poll_cqe(mlx5_dev_t *dev, mlx5_qp_t *qp, int *out_is_send,
  *   CQE opcode(0xd=REQ_ERR, 0xe=RESP_ERR 等)
  * コール元:
  *   nvmet_rdma_job_step(), nvme_rdma_connect_job_step()
- */
+ * ===============================================================*/
 uint8_t mlx5_qp_last_cqe_opcode(mlx5_dev_t *dev, mlx5_qp_t *qp) {
     uint64_t cq_buf = mlx5_qp_cq_buf_addr(dev, qp);
     uint32_t ci = (qp->cq_cc - 1u) & (MLX5_QP_CQ_NUM_ENTRIES - 1u);
@@ -562,7 +562,7 @@ int mlx5_qp_post_recv_gsi(mlx5_dev_t *dev, mlx5_qp_t *qp, void *buf, uint32_t bu
     return 0;
 }
 
-/*
+/*=================================================================
  * GSI/UD QP の共有 CQ を 1 件だけ非ブロッキングでポーリングする。
  * mlx5_qp_poll_cqe() と同じロジックだが GSI 専用の CQ アドレスを見る。
  *
@@ -573,7 +573,7 @@ int mlx5_qp_post_recv_gsi(mlx5_dev_t *dev, mlx5_qp_t *qp, void *buf, uint32_t bu
  *   1=完了を1件取り出した、0=まだ無い、-1=エラー完了
  * コール元:
  *   rdma_cm_job_step(), nvmetr_check_gsi_disconnect()
- */
+ * ===============================================================*/
 int mlx5_qp_poll_cqe_gsi(mlx5_dev_t *dev, mlx5_qp_t *qp, int *out_is_send,
                           uint32_t *out_recv_len, uint8_t *out_syndrome) {
     uint64_t cq_buf = (uint64_t)dev->gsi_cq_buf_cpu;

@@ -11,14 +11,14 @@ static volatile int s_ts_paused[SMP_MAX_CORES];  // 1の間はts_log*()系が即
 _Static_assert(sizeof(ts_entry_t) == TS_LOG_ENTRY_BYTES,
                "ts_entry_t must be exactly 64 bytes");
 
-/*
+/*=================================================================
  * ts エントリの拡張領域(kind 別の詳細フィールド)をゼロクリアする。
  *
  * 引数:
  *   e - 対象エントリ
  * コール元:
  *   ts_log(), ts_log_nvme_tcp_pdu(), ts_log_rdma(), ts_log_tcp_ack()
- */
+ * ===============================================================*/
 static void ts_entry_clear_ext(volatile ts_entry_t *e)
 {
     e->kind        = TS_KIND_PLAIN;
@@ -115,7 +115,7 @@ void ts_log_rdma(uint32_t tag, const volatile ts_rdma_t *info)
     s_ts_total[core]++;
 }
 
-/*
+/*=================================================================
  * TCP の ACK 処理イベントを、seq/ack/flags 付きで ts リングへ記録する。
  *
  * 引数:
@@ -123,7 +123,7 @@ void ts_log_rdma(uint32_t tag, const volatile ts_rdma_t *info)
  *   info - 記録する TCP フィールド一式
  * コール元:
  *   tcp_input()
- */
+ * ===============================================================*/
 void ts_log_tcp_ack(uint32_t tag, uint8_t conn_slot, uint32_t seq,
                      uint32_t ack_seq, uint32_t window, uint16_t flags)
 {
@@ -147,7 +147,7 @@ void ts_log_tcp_ack(uint32_t tag, uint8_t conn_slot, uint32_t seq,
     s_ts_total[core]++;
 }
 
-/*
+/*=================================================================
  * tag の File# をソースファイル名の文字列へ変換する。
  *
  * 引数:
@@ -156,7 +156,7 @@ void ts_log_tcp_ack(uint32_t tag, uint8_t conn_slot, uint32_t seq,
  *   ファイル名。未知の値なら "?"
  * コール元:
  *   ts_print_entry()
- */
+ * ===============================================================*/
 static const char *ts_file_name(uint8_t f)
 {
     switch (f) {
@@ -173,7 +173,7 @@ static const char *ts_file_name(uint8_t f)
     }
 }
 
-/*
+/*=================================================================
  * tag の Func# を関数名の文字列へ変換する。
  *
  * 引数:
@@ -182,7 +182,7 @@ static const char *ts_file_name(uint8_t f)
  *   関数名。未知の値なら "?"
  * コール元:
  *   ts_print_entry()
- */
+ * ===============================================================*/
 static const char *ts_func_name(uint8_t f)
 {
     switch (f) {
@@ -239,7 +239,7 @@ static const char *ts_func_name(uint8_t f)
     }
 }
 
-/*
+/*=================================================================
  * NVMe/TCP の PDU 種別コードを表示用の文字列へ変換する。
  *
  * 引数:
@@ -248,7 +248,7 @@ static const char *ts_func_name(uint8_t f)
  *   種別名。未知の値なら "?"
  * コール元:
  *   ts_print_entry()
- */
+ * ===============================================================*/
 static const char *ts_nvme_tcp_pdu_type_str(uint8_t type)
 {
     switch (type) {
@@ -265,7 +265,7 @@ static const char *ts_nvme_tcp_pdu_type_str(uint8_t type)
     }
 }
 
-/*
+/*=================================================================
  * ts_log_rdma() が記録した RDMA サブイベント種別を文字列へ変換する。
  *
  * 引数:
@@ -274,7 +274,7 @@ static const char *ts_nvme_tcp_pdu_type_str(uint8_t type)
  *   種別名。未知の値なら "?"
  * コール元:
  *   ts_print_entry()
- */
+ * ===============================================================*/
 static const char *ts_rdma_op_str(uint8_t op)
 {
     switch (op) {
@@ -289,7 +289,7 @@ static const char *ts_rdma_op_str(uint8_t op)
     }
 }
 
-/*
+/*=================================================================
  * ts エントリ 1 件を 1 行(kind 別の詳細があれば追加行)で表示する。
  * 通し番号・前エントリからの経過時間・tag の File:Func#info を出す。
  *
@@ -299,7 +299,7 @@ static const char *ts_rdma_op_str(uint8_t op)
  *   prev - 直前エントリの tick(delta 表示用)
  * コール元:
  *   ts_log_dump_core()
- */
+ * ===============================================================*/
 static void ts_print_entry(uint64_t n, const ts_entry_t *e, uint32_t delta_us)
 {
     uart_printf("  #%8u tick=%08x%08x delta=%8uus tag=0x%08x %s:%s#%u arg=0x%08x",
@@ -369,7 +369,7 @@ static void ts_print_entry(uint64_t n, const ts_entry_t *e, uint32_t delta_us)
     uart_printf("\n");
 }
 
-/*
+/*=================================================================
  * リングバッファ内で最も古い有効エントリの通し番号を返す(まだ一周して
  * いなければ 0)。
  *
@@ -380,14 +380,14 @@ static void ts_print_entry(uint64_t n, const ts_entry_t *e, uint32_t delta_us)
  * コール元:
  *   ts_log_dump_core(), ts_log_freeze(), ts_log_query_start_last_n(),
  *   ts_log_query_start_last_n_matching()
- */
+ * ===============================================================*/
 static uint64_t ts_first_valid(uint64_t total)
 {
     uint32_t avail = (total < TS_LOG_COUNT) ? (uint32_t)total : (uint32_t)TS_LOG_COUNT;
     return total - avail;
 }
 
-/*
+/*=================================================================
  * 「直近 n 件」を表示するための開始通し番号を求める。
  *
  * 引数:
@@ -397,7 +397,7 @@ static uint64_t ts_first_valid(uint64_t total)
  *   ts_log_dump_core() へ渡す開始通し番号
  * コール元:
  *   shell_ts()
- */
+ * ===============================================================*/
 uint64_t ts_log_query_start_last_n(unsigned core, uint32_t count)
 {
     if (core >= SMP_MAX_CORES) core = 0;
@@ -408,7 +408,7 @@ uint64_t ts_log_query_start_last_n(unsigned core, uint32_t count)
     return total - count;
 }
 
-/*
+/*=================================================================
  * (tag & mask) == value に一致するエントリのうち「直近 n 件」を表示する
  * ための開始通し番号を求める。
  *
@@ -420,7 +420,7 @@ uint64_t ts_log_query_start_last_n(unsigned core, uint32_t count)
  *   ts_log_dump_core() へ渡す開始通し番号
  * コール元:
  *   shell_ts()
- */
+ * ===============================================================*/
 uint64_t ts_log_query_start_last_n_matching(unsigned core, uint32_t mask, uint32_t value, uint32_t count)
 {
     if (core >= SMP_MAX_CORES) core = 0;
@@ -441,7 +441,7 @@ uint64_t ts_log_query_start_last_n_matching(unsigned core, uint32_t mask, uint32
     return first;  // 一致がcount件に満たない場合は保持範囲の先頭から
 }
 
-/*
+/*=================================================================
  * 指定コアの ts リングを、開始通し番号から count 件表示する。tag_mask が
  * 非 0 なら (tag & mask) == value のエントリだけを出す。
  *
@@ -452,7 +452,7 @@ uint64_t ts_log_query_start_last_n_matching(unsigned core, uint32_t mask, uint32
  *   mask/value - tag の絞り込み条件(mask=0 で絞り込み無し)
  * コール元:
  *   shell_ts()
- */
+ * ===============================================================*/
 void ts_log_dump_core(unsigned core, uint64_t start, uint32_t count, uint32_t mask, uint32_t value)
 {
     if (core >= SMP_MAX_CORES) core = 0;
@@ -499,7 +499,7 @@ static uint64_t   s_ts_frozen_start_n[SMP_MAX_CORES];  // フリーズした先�
 static uint32_t   s_ts_frozen_count[SMP_MAX_CORES];    // 実際にフリーズした件数(TS_FREEZE_COUNT以下)
 static int        s_ts_frozen_valid[SMP_MAX_CORES];
 
-/*
+/*=================================================================
  * その時点までの直近エントリを、以後の ts_log() で上書きされない専用
  * バッファへ退避する。障害検出の瞬間に呼び、後始末で流れる前の記録を残す。
  *
@@ -507,7 +507,7 @@ static int        s_ts_frozen_valid[SMP_MAX_CORES];
  *   core - 対象コア
  * コール元:
  *   mlx5_net_try_recover()
- */
+ * ===============================================================*/
 void ts_log_freeze(void)
 {
     unsigned core     = smp_core_index();
@@ -526,7 +526,7 @@ void ts_log_freeze(void)
     s_ts_frozen_valid[core]   = 1;
 }
 
-/*
+/*=================================================================
  * 指定コアの ts 記録を一時停止/再開する(シェルの `ts pause|resume`)。
  *
  * 引数:
@@ -534,7 +534,7 @@ void ts_log_freeze(void)
  *   paused - 1=停止、0=再開
  * コール元:
  *   shell_ts()
- */
+ * ===============================================================*/
 void ts_log_set_paused_core(unsigned core, int paused)
 {
     if (core >= SMP_MAX_CORES) core = 0;
@@ -547,7 +547,7 @@ inline uint32_t ts_log_mode(void)
     return g_ts_log_mode;
 }
 
-/*
+/*=================================================================
  * ts 記録モードのビットマスクを設定する。bit1 で受信経路の詳細計測など、
  * 通常運用ではゼロコストにしたい計装を切り替える。
  *
@@ -555,7 +555,7 @@ inline uint32_t ts_log_mode(void)
  *   mode - 新しいモード(ビットマスク)
  * コール元:
  *   shell_ts()
- */
+ * ===============================================================*/
 void  ts_log_mode_set(uint32_t mode)
 {
     g_ts_log_mode = mode;
