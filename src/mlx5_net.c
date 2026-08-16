@@ -43,7 +43,6 @@
 #include "net_buf.h"
 #include "uart.h"
 #include "timer.h"
-#include "pcie1.h"
 #include "mmio.h"
 #include "cache.h"
 #include "rxcopy.h"
@@ -186,8 +185,6 @@ typedef struct {
 
 static mlx5_net_state_t s_state_pf0;
 static mlx5_net_state_t s_state_pf1;
-static mlx5_dev_t       s_dev_pf0;
-static mlx5_dev_t       s_dev_pf1;
 static netif_t        s_ctx_pf0;
 static netif_t        s_ctx_pf1;
 
@@ -745,7 +742,6 @@ static int mlx5_net_post_lso_frame(mlx5_net_state_t *st, const void *hdr, uint16
         nop_wqe[6] = (uint8_t)(nop_qpn_ds >> 8);
         nop_wqe[7] = (uint8_t)nop_qpn_ds;
     }
-
 
     mlx5_net_wqe_commit(dev, st, pc, wqe);
     return 0;
@@ -1775,79 +1771,5 @@ int mlx5_net_register_dual(mlx5_dev_t *dev0, mlx5_dev_t *dev1)
     netif_activate(&s_ctx_pf0);
     mlx5_monitor_set_devs(dev0, dev1);
     uart_printf("[mlx5net] dual registered: pf0=192.168.101.10 pf1=192.168.101.11 (active=pf0)\n");
-    return 0;
-}
-
-int mlx5_net_init_dual_loopback(void)
-{
-    if (pcie1_rc_init() != 0) {
-        uart_printf("[mlx5net] pcie1_rc_init failed\n");
-        return -1;
-    }
-
-    uint64_t size0 = 0;
-    if (pcie1_assign_bar0_at(0, 0x0, &size0, NULL) != 0) {
-        uart_printf("[mlx5net] BAR0 assignment failed for PF0 (devfn=0)\n");
-        return -1;
-    }
-    uint64_t size1 = 0;
-    if (pcie1_assign_bar0_at(1, size0, &size1, NULL) != 0) {
-        uart_printf("[mlx5net] BAR0 assignment failed for PF1 (devfn=1)\n");
-        return -1;
-    }
-
-    // 実機で発見した本物のバグ(2026-08-12、CLAUDE.md「`pcie1 reset`直後
-    // でも同一QPNで再利用判定された事象」節で一度観測されたまま未調査
-    // だったものの真因): s_dev_pf0/s_dev_pf1をここで丸ごとゼロクリアする
-    // と、bringup_generation(接続再利用機構が「pcie1 reset+net init
-    // mlx5をやり直したか」を判定する唯一の手がかり)も0へ戻ってしまい、
-    // 直後のmlx5_hca_bringup()内の`dev->bringup_generation++`で常に1に
-    // なる -- つまり`net init mlx5`を何度実行してもbringup_generationは
-    // 常に1のままで、古いFW世代のQPハンドルを「再利用可能」と誤判定
-    // してしまう(実機で`nvmetrdmastat`のQUERY_QPが状態=?[255]エラーを
-    // 返すという形で確認済み)。ゼロクリアの前後でbringup_generationだけ
-    // 保存・復元することで、モノトニックな増加を維持する。
-    uint32_t gen0 = s_dev_pf0.bringup_generation;
-    uint32_t gen1 = s_dev_pf1.bringup_generation;
-
-    s_dev_pf0 = (mlx5_dev_t){0};
-    s_dev_pf0.bar0_base = PCIE1_OUTBOUND_CPU_BASE + 0;
-    s_dev_pf0.pf_index = 0;
-    s_dev_pf0.bringup_generation = gen0;
-
-    s_dev_pf1 = (mlx5_dev_t){0};
-    s_dev_pf1.bar0_base = PCIE1_OUTBOUND_CPU_BASE + size0;
-    s_dev_pf1.pf_index = 1;
-    s_dev_pf1.bringup_generation = gen1;
-
-    if (mlx5_hca_bringup(&s_dev_pf0, "PF0(port1)", 0) != 0) {
-        uart_printf("[mlx5net] PF0 bringup failed\n");
-        return -1;
-    }
-    if (mlx5_hca_bringup(&s_dev_pf1, "PF1(port2)", 0) != 0) {
-        uart_printf("[mlx5net] PF1 bringup failed\n");
-        return -1;
-    }
-
-    // ループバックケーブル配線を前提に、PF0/PF1へ同一サブネット上の
-    // 別々のIPを割り当てる(ユーザー指示: しばらくPCとは通信させず、
-    // ループバック構成のままARP/ICMPの基本機能を確認する予定)。
-    mlx5_netif_setup(&s_ctx_pf0, &s_state_pf0, &s_dev_pf0, "mlx5-pf0",
-                        ip_from_octets(192, 168, 101, 10), 0x10);
-    mlx5_netif_setup(&s_ctx_pf1, &s_state_pf1, &s_dev_pf1, "mlx5-pf1",
-                        ip_from_octets(192, 168, 101, 11), 0x11);
-
-    netif_register(&s_ctx_pf0);
-    netif_register(&s_ctx_pf1);
-    netif_activate(&s_ctx_pf0);
-
-    // `mlx5stat`シェルコマンド(PPCNT physical port統計カウンタ・
-    // QUERY_RQ/SQ/CQ)でこの2つのPFも診断できるようにする(CLAUDE.md
-    // 「モニタ機能でCQ/RQ無応答の原因を特定」節と同じ調査手法を、TCP/IP
-    // スタック統合後の経路でも使えるようにするため)。
-    mlx5_monitor_set_devs(&s_dev_pf0, &s_dev_pf1);
-
-    uart_printf("[mlx5net] dual-loopback ready: pf0=192.168.101.10 pf1=192.168.101.11 (active=pf0)\n");
-    uart_printf("[mlx5net] `net use mlx5-pf0`/`net use mlx5-pf1`でアクティブ側(arp/pingの発信元)を切り替えられる\n");
     return 0;
 }

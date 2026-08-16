@@ -1869,20 +1869,6 @@ static job_result_t nvmet_io_job_step(job_t *self)
     return nvmet_io_job_step_impl(self);
 }
 
-void nvmet_instances_zero_all(void)
-{
-    /* nvmet.hのnvmet_instances_zero_all()コメント参照 -- NVMET_CTX_SLOT()
-     * の指す領域は`.bss`/`.dma_bss`のどちらでもなく`boot.S`のゼロクリア
-     * 対象外なので、ここで明示的にゼロクリアする。8バイト単位の素朴な
-     * ループ(volatile不要 -- ワイドストアを妨げる理由が無い、単純な
-     * ゼロフィルなので結合されるならむしろ望ましい)。 */
-    uint64_t *p = (uint64_t *)NVMET_INSTANCES_BASE;
-    uint64_t count = ((uint64_t)NVMET_MAX_INSTANCES * NVMET_INSTANCE_SLOT_SIZE) / sizeof(uint64_t);
-    for (uint64_t i = 0; i < count; i++) {
-        p[i] = 0;
-    }
-}
-
 int nvmet_job_start(nvmet_ctx_t *ctx, uint16_t port, netif_t *bound_ctx, const char *label)
 {
     if (ctx->session_active) {

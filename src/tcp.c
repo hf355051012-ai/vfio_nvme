@@ -147,9 +147,6 @@ void tcp_copy_stats_reset(void)
  * ジャンボ接続で約636KB)で別途クランプされるため、TCP_RX_BUF_SIZE
  * 自体を2MBまで拡張しても16bit windowフィールドへの書き込みが
  * オーバーフローすることはない(scaled > 0xFFFFuの保護も既存)。 */
-#if defined(__aarch64__)
-#define TCP_RX_BUF_SIZE (2u * 1024u * 1024u)
-#else
 /* x86(VFIO)は RAM 潤沢なので rx_buf を 2MB→16MB へ拡大する。write の受信側
  * (target)がバースト受信を大きく吸収でき、単一コアで受信と処理が競合しても
  * バックプレッシャが減るため、実機で 256KB write が ~1006→~1865MB/s(+85%)へ
@@ -158,7 +155,6 @@ void tcp_copy_stats_reset(void)
  * ~1512MB/s へ低下した。s_priv[SMP_MAX_CORES][TCP_MAX_CONNS]=2×12=24 インスタンス
  * 分なので 16MB×24≒384MB(x86 の .bss、hal_dma が VFIO で pin する)。 */
 #define TCP_RX_BUF_SIZE (16u * 1024u * 1024u)
-#endif
 
 /* tcp_recv_no_ack()(send_ack=0)経由で消費したバイト数が、相手の実MSS
  * (conn->snd_mss)の何倍に達したら強制的にウィンドウ更新ACKを送るかの

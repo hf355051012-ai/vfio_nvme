@@ -12,25 +12,6 @@
 // 替わる(ticks_to_*/get_*_from/timeout_* の変換ヘルパは timer.c 実装で core 共有)。
 // ================================================================
 
-#if defined(__aarch64__)
-
-// ARMv8-Aジェネリックタイマー。
-
-// 現在のカウンタ値を返す。
-static inline uint64_t timer_now(void) {
-    uint64_t val;
-    __asm__ volatile("mrs %0, cntpct_el0" : "=r"(val));
-    return val;
-}
-
-// カウンタの動作周波数(Hz)を返す。
-static inline uint64_t timer_freq(void) {
-    uint64_t val;
-    __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(val));
-    return val;
-}
-
-#else /* !__aarch64__ */
 
 // x86-linux: clock_gettime(CLOCK_MONOTONIC) 実装(platform/x86-linux/
 // hal_timer.c)。timer_now() は ns 値、timer_freq() は 1e9(Hz)を返すので、
@@ -39,7 +20,6 @@ static inline uint64_t timer_freq(void) {
 uint64_t timer_now(void);
 uint64_t timer_freq(void);
 
-#endif /* __aarch64__ */
 
 /* ================================================================
  * ticks<->時間単位の変換ヘルパ(timer.c実装)。

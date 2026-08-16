@@ -112,18 +112,9 @@ extern volatile int      g_core3_alive;
  * 起動)では起こり得ないが、per-coreモジュール側はSMP_MAX_CORESでの
  * 配列サイズ確保・インデックス計算を前提にしているため、3コア目以降を
  * 起動する変更をする際はSMP_MAX_CORES自体を必ず見直すこと。 */
-#if defined(__aarch64__)
-static inline unsigned smp_core_index(void)
-{
-    uint64_t mpidr;
-    __asm__ volatile("mrs %0, mpidr_el1" : "=r"(mpidr));
-    return (unsigned)((mpidr >> 8) & 0xFFu);
-}
-#else
 /* x86-linux: コア番号は MPIDR ではなく TLS で持つ(platform/x86-linux/
  * hal_smp.c が pthread 起動時にスレッドローカルへ設定する)。 */
 unsigned smp_core_index(void);
-#endif
 
 /* 2026-08-11、ユーザー指示による性能分析用の一時計装(原因特定後に削除
  * すること) -- initiator(core0)/target(core1)のどちらが実際のスループット
@@ -167,35 +158,6 @@ void sim_delay_tick(void);
  * LL/SCのみで書いてあるため追加のコンパイラフラグは不要。 */
 typedef volatile uint32_t smp_spinlock_t;
 
-#if defined(__aarch64__)
-
-static inline void smp_spin_lock(smp_spinlock_t *lock)
-{
-    uint32_t tmp;
-    __asm__ volatile(
-        "1:\n"
-        "   ldaxr   %w0, %1\n"      /* tmp = *lock (acquireセマンティクス) */
-        "   cbnz    %w0, 2f\n"      /* 既にロック済みなら待ちへ */
-        "   stxr    %w0, %w2, %1\n" /* tmp(ステータス) = 1をストア試行 */
-        "   cbnz    %w0, 1b\n"      /* ストア失敗(競合)なら最初からやり直し */
-        "   b       3f\n"
-        "2:\n"
-        "   wfe\n"                  /* unlock側のsevで起床 */
-        "   b       1b\n"
-        "3:\n"
-        : "=&r"(tmp), "+Q"(*lock)
-        : "r"(1u)
-        : "cc", "memory"
-    );
-}
-
-static inline void smp_spin_unlock(smp_spinlock_t *lock)
-{
-    __asm__ volatile("stlr wzr, %0" : "+Q"(*lock) :: "memory"); /* releaseセマンティクスで0を書く */
-    __asm__ volatile("sev" ::: "memory"); /* wfeで待っている他コアを起こす */
-}
-
-#else /* !__aarch64__ */
 
 /* x86-linux: x86 は TSO。GCC の __atomic 組み込みで acquire/release を明示した
  * test-and-set スピンロックにする(LSE/LL-SC 相当を C11 メモリモデルで表現)。
@@ -212,6 +174,5 @@ static inline void smp_spin_unlock(smp_spinlock_t *lock)
     __atomic_store_n(lock, 0u, __ATOMIC_RELEASE);
 }
 
-#endif /* __aarch64__ */
 
 #endif /* SMP_H */

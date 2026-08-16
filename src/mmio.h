@@ -45,10 +45,6 @@ static inline void mmio_write64(uint64_t addr, uint64_t val) {
 // -O0 でビルドされ(Makefile 参照)、static inline だと -O0 では out-of-line
 // 呼び出しになってバイト同一が崩れるため -- マクロなら aarch64 展開が元の
 // `__asm__ volatile("dsb sy" ::: "memory")` と字面同一になり byte-identical を保つ。
-#if defined(__aarch64__)
-#define dma_wmb() __asm__ volatile("dsb sy" ::: "memory")
-#else
 #define dma_wmb() __asm__ volatile("mfence" ::: "memory")
-#endif
 
 #endif

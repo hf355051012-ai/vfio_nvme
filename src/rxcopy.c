@@ -31,20 +31,10 @@ static uint32_t s_done_cache;      /* producer専用: s_doneのキャッシュ(�
  * SPSCの発行/消費はこれで十分な順序(データ書き込み→head公開、
  * コピー完了→done公開)を保証する(smp.hのspinlockと同じ流儀)。 */
 static inline void store_rel_u32(volatile uint32_t *p, uint32_t v) {
-#if defined(__aarch64__)
-    __asm__ volatile("stlr %w1, %0" : "=Q"(*p) : "r"(v) : "memory");
-#else
     __atomic_store_n(p, v, __ATOMIC_RELEASE); /* x86: C11 release(smp.h と同じ流儀) */
-#endif
 }
 static inline uint32_t load_acq_u32(volatile uint32_t *p) {
-#if defined(__aarch64__)
-    uint32_t v;
-    __asm__ volatile("ldar %w0, %1" : "=r"(v) : "Q"(*p) : "memory");
-    return v;
-#else
     return __atomic_load_n(p, __ATOMIC_ACQUIRE); /* x86: C11 acquire */
-#endif
 }
 
 int  rxcopy_enabled(void) { return s_enabled; }
@@ -54,11 +44,7 @@ void rxcopy_set_enabled(int on)
     if (on) {
         s_head = 0; s_done = 0;
         s_head_local = 0; s_done_cache = 0;
-#if defined(__aarch64__)
-        __asm__ volatile("dmb ish" ::: "memory");
-#else
         __atomic_thread_fence(__ATOMIC_SEQ_CST); /* x86: フルフェンス */
-#endif
         s_enabled = 1;
         /* 3コア化: コピー専任のcore2を起動する(core1はtarget本体専任、
          * smp.cのsecondary_main()参照)。core2がrxcopy_worker_drain()を

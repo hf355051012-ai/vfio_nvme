@@ -16,11 +16,7 @@
  *              直接対応する(§4-6)。
  * どちらも「実行中の生 CRC 値」を返す規約は同一(最終反転は呼び出し側、
  * crc32c.h 参照)。ワイド/バイト単位のアライメント分岐ロジックも共通。 */
-#if defined(__aarch64__)
-#define CRC32C_U8(crc, v)  ((uint32_t)__builtin_aarch64_crc32cb((crc), (v)))
-#define CRC32C_U32(crc, v) ((uint32_t)__builtin_aarch64_crc32cw((crc), (v)))
-#define CRC32C_U64(crc, v) ((uint32_t)__builtin_aarch64_crc32cx((crc), (v)))
-#elif defined(__x86_64__)
+#if defined(__x86_64__)
 #include <nmmintrin.h>
 #define CRC32C_U8(crc, v)  ((uint32_t)_mm_crc32_u8((crc), (v)))
 #define CRC32C_U32(crc, v) ((uint32_t)_mm_crc32_u32((crc), (v)))

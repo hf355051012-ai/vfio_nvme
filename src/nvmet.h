@@ -4,7 +4,6 @@
 #include <stdint.h>
 #include "nvmet_tcp.h"
 #include "netif.h"
-#include "board.h"
 #include "stateprof.h"
 
 /* ================================================================
@@ -251,45 +250,6 @@ typedef struct {
     nvmet_pending_write_t pending_writes[NVMET_MAX_PENDING_WRITES];
 } nvmet_ctx_t;
 
-/* インスタンス番号(0..NVMET_MAX_INSTANCES-1)から、そのインスタンスの
- * nvmet_ctx_t本体を指す固定物理アドレスのポインタを返す。呼び出し元
- * (platform_init.c/command.c)は`static nvmet_ctx_t s_nvmet_rp1;`のような
- * `.bss`グローバルの代わりに`#define s_nvmet_rp1 (*NVMET_CTX_SLOT(0))`の
- * ようなマクロでこれを使う -- board.hのNVMET_INSTANCES_BASEコメント参照
- * (fwupdateのLOAD_ADDR受信ステージング窓との物理衝突を、`.bss`から完全に
- * 切り離すことで構造的に防ぐ、MMU_TABLES_BASE/l1_table・l2_tableと同じ
- * 手法)。各呼び出し元は重複しないインデックスを静的に選ぶこと(現状:
- * platform_init.cがrp1=0/mlx5-pf0=1/mlx5-pf1=2、command.cの`nvmet`手動
- * 起動がslot=3、NVMET_MAX_INSTANCESの4つを過不足なく使い切る)。 */
-#define NVMET_CTX_SLOT(i) \
-    ((nvmet_ctx_t *)(NVMET_INSTANCES_BASE + (uint64_t)(i) * NVMET_INSTANCE_SLOT_SIZE))
-
-_Static_assert(sizeof(nvmet_ctx_t) <= NVMET_INSTANCE_SLOT_SIZE,
-                "nvmet_ctx_t exceeds NVMET_INSTANCE_SLOT_SIZE (board.h) -- raise the slot size");
-_Static_assert(NVMET_INSTANCES_BASE % 0x200000ULL == 0,
-                "NVMET_INSTANCES_BASE must be 2MB-aligned");
-_Static_assert(NVMET_INSTANCE_SLOT_SIZE % 0x200000ULL == 0,
-                "NVMET_INSTANCE_SLOT_SIZE must be a multiple of 2MB");
-_Static_assert((NVMET_INSTANCES_BASE + (uint64_t)NVMET_MAX_INSTANCES * NVMET_INSTANCE_SLOT_SIZE) <= 0x40000000ULL,
-                "NVMET instance region must fall within L1 index 0 (first 1GB, mmu.c)");
-/* この一群が今回の修正の核心: fwupdateのXmodem受信ステージング窓
- * (LOAD_ADDR..+LOAD_MAX_SIZE)、および他の固定領域(MLX5_DMA_BASE/
- * MMU_TABLES_BASE/DMA_BSS_BASE、いずれもboard.h)のいずれとも重ならない
- * ことをコンパイル時に保証する。全てコンパイル時定数同士の比較なので
- * (どのリンカシンボルにも依存しない)、mmu.cの__dma_bss_size関連チェック
- * と違い実行時チェックは不要。 */
-_Static_assert(NVMET_INSTANCES_BASE >= LOAD_ADDR + LOAD_MAX_SIZE
-                || (NVMET_INSTANCES_BASE + (uint64_t)NVMET_MAX_INSTANCES * NVMET_INSTANCE_SLOT_SIZE) <= LOAD_ADDR,
-                "NVMET instance region must not overlap fwupdate's LOAD_ADDR staging window");
-_Static_assert(NVMET_INSTANCES_BASE >= MLX5_DMA_BASE + MLX5_DMA_SIZE
-                || (NVMET_INSTANCES_BASE + (uint64_t)NVMET_MAX_INSTANCES * NVMET_INSTANCE_SLOT_SIZE) <= MLX5_DMA_BASE,
-                "NVMET instance region must not overlap MLX5_DMA_BASE");
-_Static_assert(NVMET_INSTANCES_BASE >= MMU_TABLES_BASE + MMU_TABLES_SIZE
-                || (NVMET_INSTANCES_BASE + (uint64_t)NVMET_MAX_INSTANCES * NVMET_INSTANCE_SLOT_SIZE) <= MMU_TABLES_BASE,
-                "NVMET instance region must not overlap MMU_TABLES_BASE");
-_Static_assert(NVMET_INSTANCES_BASE >= DMA_BSS_BASE + 0x200000ULL
-                || (NVMET_INSTANCES_BASE + (uint64_t)NVMET_MAX_INSTANCES * NVMET_INSTANCE_SLOT_SIZE) <= DMA_BSS_BASE,
-                "NVMET instance region must not overlap DMA_BSS_BASE's 2MB block");
 
 /* portでリッスンするNVMe/TCPターゲットセッションを開始する。admin/IO
  * キューをそれぞれ独立したjob_t(job.h)としてspawnし、即座に呼び出し元へ
@@ -307,27 +267,6 @@ _Static_assert(NVMET_INSTANCES_BASE >= DMA_BSS_BASE + 0x200000ULL
  * 文字列(例"rp1"、呼び出し元が生存期間中保持する静的文字列を渡すこと)。
  * 戻り値: 0=spawn成功、-1=インスタンス上限/ジョブテーブル満杯等で失敗 */
 int nvmet_job_start(nvmet_ctx_t *ctx, uint16_t port, netif_t *bound_ctx, const char *label);
-
-/* NVMET_INSTANCES_BASE(board.h)全域を0クリアする。main.cの起動シーケンス
- * (mmu_init()直後、command_shell_run()より前)から一度呼ぶこと。
- *
- * 【重要】NVMET_CTX_SLOT()の指す領域は`.bss`/`.dma_bss`と違いリンカの
- * NOLOADセクションではなく単なる固定物理アドレスへの生ポインタのため、
- * `boot.S`の`.bss`/`.dma_bss`ゼロクリアの対象に含まれない。実機で発見
- * した本物のバグ(2026-08-07): `nvmet_job_start()`は`ctx->session_active`
- * が0であることを「まだ使われていない」の判定に使うが、この領域が未
- * 初期化のまま(電源投入時のDRAM不定値)残ると、たまたま非ゼロだと
- * `ctx->label`(同じく未初期化の生ポインタ)を`uart_printf("%s", ...)`
- * でそのまま参照してしまいData Abortでクラッシュする(実機の
- * `far`/`x0`が共に`0xffffffffffffffff`という全1ビットの典型的な未初期化
- * DRAMパターンで確認済み)。`exception_handler()`は生UARTにのみクラッシュ
- * ダンプを出すため、telnet越しには「延々応答が無い」ようにしか見えず、
- * 診断が難航した。
- *
- * `.bss`/`.dma_bss`と同じく、真のコールドブート・チェインロードジャンプ・
- * `exception_handler()`によるクラッシュ回復のいずれの`_start`エントリでも
- * 毎回ゼロクリアする必要がある(いずれも以前のプロセス状態を保証しない)。 */
-void nvmet_instances_zero_all(void);
 
 /* pcie1 reset(command.c)から呼ぶ: ConnectX(mlx5-pf0/pf1)にbindされた
  * TCP nvmet常駐サーバだけを停止する(RP1 bindは残す)。pcie1 resetは

@@ -100,29 +100,9 @@ typedef struct {
     volatile uint8_t *ram_disk;
 } nvmet_rdma_ctrl_t;
 
-/* インスタンス番号(0=nvmet_rdma_run_standalone()の実ホスト接続用、
- * 1=nvme_rdma.cのs_target_ctrl、ループバック検証用)から、そのRAM
- * ディスクの固定物理アドレスを返す(nvmet.hのNVMET_CTX_SLOT()と同じ
- * パターン)。 */
-#define NVMET_RDMA_RAMDISK_SLOT(i) \
-    ((volatile uint8_t *)(NVMET_RDMA_RAMDISK_BASE + (uint64_t)(i) * NVMET_RDMA_RAMDISK_SLOT_SIZE))
+/* 1インスタンス分の RAM ディスク容量(dma_alloc で確保する、nvmet_rdma.c)。 */
+#define NVMET_RDMA_RAMDISK_SLOT_SIZE 0x10000000ULL  /* 256MB */
 
-#define NVMET_RDMA_MAX_RAMDISK_INSTANCES 2u
-
-/* ram_diskはCQバッファのpas[]のようなDMA記述子ページアライン要件を
- * 持たない(mlx5_qp_post_rdma_write()/post_rdma_read()のローカル
- * バッファ側に整列要件は無い、mlx5_dma_addr()は単純なオフセット加算)
- * ため、2MBアラインは不要 -- 64バイト(キャッシュライン)アラインのみ
- * 検証する。他の*_CACHE_BASE領域(MLX5_QP2_CACHE_BASE等)も同様の理由で
- * 2MBアラインされていない(mmu.cのL1 index 0ループがこの領域を含む
- * 2MBブロック全体を既にNormal cacheable RAMとしてカバーしているため、
- * 個々のバッファ自身が2MB境界に乗る必要はない)。 */
-_Static_assert(NVMET_RDMA_RAMDISK_BASE % 64u == 0,
-                "NVMET_RDMA_RAMDISK_BASE must be 64-byte-aligned");
-_Static_assert((NVMET_RDMA_RAMDISK_BASE + (uint64_t)NVMET_RDMA_MAX_RAMDISK_INSTANCES * NVMET_RDMA_RAMDISK_SLOT_SIZE)
-                    <= 0x40000000ULL,
-                "NVMET_RDMA_RAMDISK region must stay within L1 index 0 (first 1GB, "
-                "identity-mapped Normal cacheable RAM by mmu.c's catch-all sweep)");
 
 /* コマンドパイプライン化(nvmet_rdma.cの「パイプライン化」節参照)で
  * 使う、1コマンド分の解析結果。単一コマンド逐次処理・パイプライン化の

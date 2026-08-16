@@ -2,7 +2,6 @@
 #define MLX5_H
 
 #include <stdint.h>
-#include "board.h"
 
 void wqe_logs(int opcode, volatile uint8_t *wqe, uint16_t num);
 #define LOG_SET 0
@@ -46,8 +45,6 @@ void wqe_logs(int opcode, volatile uint8_t *wqe, uint16_t num);
 // (board.hで64個の2MB L2ブロックとコメントされている通り)。実使用量は
 // 現状PF1個あたり約17MB(MLX5_MAX_FW_PAGESの16MBが支配的)なので、
 // 64MBあれば十分な余裕がある。
-#define MLX5_DMA_PF_SIZE (MLX5_DMA_SIZE / 2u)
-_Static_assert(MLX5_DMA_PF_SIZE % 0x200000u == 0, "MLX5_DMA_PF_SIZE must stay 2MB-aligned (mmu.c L2 block granularity)");
 
 // mlx5_cmd_prot_block_t(576バイト、mlx5.c)のDMAプールアライメント要件。
 // Linux cmd.cのmlx5_cmd_enable()の`roundup_pow_of_two(sizeof(struct
@@ -148,8 +145,6 @@ _Static_assert(MLX5_DMA_PF_SIZE % 0x200000u == 0, "MLX5_DMA_PF_SIZE must stay 2M
 // MLX5_SQ_CQ_BUF_ADDR等のレイアウト計算を変更しないよう、予約領域として
 // そのまま残す(実際には未使用、約2.5MB/PFが無駄になるがMLX5_DMA_SIZE
 // [128MB]の予算に対しては無視できる)。
-_Static_assert(MLX5_RQ_DATA_SIZE <= MLX5_RQ_CACHE_PF_SIZE,
-               "MLX5_RQ_DATA_SIZE must fit within MLX5_RQ_CACHE_PF_SIZE (board.h)");
 
 // CREATE_SQ用の専用CQ(送信完了確認用)。RQ用のMLX5_CQ_BUF_ADDR/DBR_ADDRとは
 // 別の独立したCQ -- 実ドライバもTX/RXで別々のCQを使う(en/params.cの
@@ -361,15 +356,9 @@ _Static_assert(MLX5_RQ_DATA_SIZE <= MLX5_RQ_CACHE_PF_SIZE,
 // ため、この関数を platform で再実装する(cpu->IOVA ルックアップ、または
 // dma_alloc が返す dev を各バッファに保持して直接使う)。バッファ自体の
 // アドレスは既に dma_alloc 経由(固定アドレスマクロは段階1-4で全廃)。
-#if defined(__aarch64__)
-static inline uint64_t mlx5_dma_addr(const volatile void *cpu_ptr) {
-    return ((uint64_t)MLX5_DMA_ADDR_HI32 << 32) | (uint32_t)(uintptr_t)cpu_ptr;
-}
-#else
 /* x86-linux: dev=IOMMU の IOVA。cpu ポインタから IOVA を引く変換は
  * platform/x86-linux/hal_dma.c が dma_alloc の払い出し表を使って実装する。 */
 uint64_t mlx5_dma_addr(const volatile void *cpu_ptr);
-#endif
 
 // SQ WQE(Send Queue Work Queue Entry)組み立てに使うハードウェア定数
 // (Linux mlx5_core `include/linux/mlx5/qp.h`/`doorbell.h`より、実機で
@@ -618,17 +607,6 @@ int mlx5_hca_bringup(mlx5_dev_t *dev, const char *label, int monitor_only);
 // WQEカウンタもリセットされるため。
 int mlx5_recover_sq(mlx5_dev_t *dev);
 
-// pcie1_rc_init()からPF0(devfn=0)/PF1(devfn=1)双方のBAR0割り当て・
-// mlx5_hca_bringup()・クロスポートループバック送受信テスト(両方向)まで
-// を一貫して行う、`mlx5`シェルコマンドから呼ばれるトップレベル関数。
-// 成功時0、失敗時負値を返す(ただしクロスポート送受信テスト自体の
-// 成否は戻り値に反映しない -- ログで報告するのみ、これは「機能の
-// 検証結果」であって「初期化の成否」とは別軸のため)。
-// 内部でPF0/PF1双方のリンクアップ確認・レジスタモニタ(下記
-// mlx5_monitor_dump_saved()参照)のベースライン取得・各クロスポート
-// テストの前後でのモニタ再取得も行う。
-int mlx5_dual_port_bringup_and_test(void);
-
 // mlx5_dual_port_bringup_and_test()が最後に初期化したPF0/PF1のハンドルを
 // 使い、PPCNT(Ports Performance Counters, physical port統計カウンタ)・
 // QUERY_RQ/QUERY_SQ(hw_counter/sw_counter, RQ/SQのstate)・QUERY_CQ
@@ -657,16 +635,6 @@ void mlx5_monitor_summary3(mlx5_dev_t *d0, mlx5_dev_t *d1,
 
 // 直近にbringupされたPF(pf=0/1)のハンドルを返す(未初期化ならNULL)。
 mlx5_dev_t *mlx5_monitor_saved_dev(unsigned pf);
-
-// mlx5_net.c: ConnectX(mlx5) PF0/PF1をTCP/IPスタック(arp.c/ip.c/icmp.c)の
-// nic_ops_tバックエンド(netif.h参照)として使えるよう、PF0/PF1双方を
-// mlx5_hca_bringup()した上で、それぞれをnetif_tとして構成・登録する。
-// mlx5_dual_port_bringup_and_test()(診断用の`mlx5`コマンド、一発の
-// テストフレーム送受信のみ)とは別物 -- こちらは継続的なRX/TXが可能な
-// 実運用バックエンドを用意する。現状はPF0<->PF1のループバックケーブル
-// 構成での動作確認用(CLAUDE.md「TCP/IPスタックのConnectX統合」節参照)。
-// 成功時0、失敗時負値を返す。`net init mlx5`シェルコマンドから呼ばれる。
-int mlx5_net_init_dual_loopback(void);
 
 /* x86-vfio-port Phase 5: 既に bring-up 済みの 2 PF を net_ctx(mlx5-pf0/pf1)
  * として登録する -- mlx5_net_init_dual_loopback() から pcie1 bring-up 部分を

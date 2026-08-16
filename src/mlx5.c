@@ -17,11 +17,9 @@
 // 〜ポーリング開始までの命令列の違いから当たりを付けること。
 
 #include "mlx5.h"
-#include "board.h"
 #include "mmio.h"
 #include "timer.h"
 #include "uart.h"
-#include "pcie1.h"
 #include "cache.h"
 #include "net.h"
 #include "netif.h"
@@ -114,10 +112,8 @@ static int mlx5_create_flow_table_nic_rx(mlx5_dev_t *dev, uint32_t *out_table_id
 static int mlx5_set_flow_table_root_nic_rx(mlx5_dev_t *dev, uint32_t table_id);
 static int mlx5_create_flow_group_catchall(mlx5_dev_t *dev, uint32_t table_id, uint32_t *out_group_id);
 static int mlx5_set_fte_fwd_tir(mlx5_dev_t *dev, uint32_t table_id, uint32_t group_id, uint32_t tirn);
-static int mlx5_cq_poll_any(uint64_t buf_addr, uint32_t timeout_val_ms);
 static int mlx5_create_sq(mlx5_dev_t *dev, uint32_t cqn, uint32_t pdn, uint32_t uarn, uint32_t tisn, uint32_t *out_sqn);
 static int mlx5_modify_sq_to_rdy(mlx5_dev_t *dev, uint32_t sqn);
-static int mlx5_sq_send_test_frame(mlx5_dev_t *dev, uint32_t sqn, uint32_t uarn, uint32_t mkey, uint32_t pc);
 static int mlx5_set_port_admin_status_up(mlx5_dev_t *dev);
 static int mlx5_query_port_oper_status(mlx5_dev_t *dev, uint8_t *out_oper_status);
 static int mlx5_set_port_mtu(mlx5_dev_t *dev, uint16_t desired_mtu, uint16_t *out_applied_mtu);
@@ -686,116 +682,6 @@ mlx5_dev_t *mlx5_monitor_saved_dev(unsigned pf)
 {
     if (!s_last_devs_valid) return 0;
     return (pf == 0) ? &s_last_dev0 : &s_last_dev1;
-}
-
-// pcie1_rc_init()からPF0(devfn=0)/PF1(devfn=1)双方のBAR0割り当て・
-// mlx5_hca_bringup()・クロスポートループバック送受信テスト(両方向)まで
-// を一貫して行う。このConnectXはマルチファンクションデバイスで、物理
-// ポートごとに別々のPCI関数(devfn=0/1)を持つ完全に独立したHCAインスタンス
-// と判明した(CLAUDE.md「ConnectXデュアルポート対応」節参照) -- 送信元PF
-// 自身のRQを見ていた以前の自己ループバックテストは、ケーブルが物理的に
-// 繋いでいる相手(もう一方のPF)を見ていなかったため機能しなかった。
-int mlx5_dual_port_bringup_and_test(void) {
-    if (pcie1_rc_init() != 0) {
-        uart_printf("mlx5: pcie1_rc_init failed\n");
-        return -1;
-    }
-
-    uint64_t size0 = 0;
-    if (pcie1_assign_bar0_at(0, 0x0, &size0, NULL) != 0) {
-        uart_printf("mlx5: BAR0 assignment failed for PF0 (devfn=0)\n");
-        return -1;
-    }
-    uint64_t size1 = 0;
-    if (pcie1_assign_bar0_at(1, size0, &size1, NULL) != 0) {
-        uart_printf("mlx5: BAR0 assignment failed for PF1 (devfn=1)\n");
-        return -1;
-    }
-
-    mlx5_dev_t dev0 = {0};
-    dev0.bar0_base = PCIE1_OUTBOUND_CPU_BASE + 0;
-    dev0.pf_index = 0;
-
-    mlx5_dev_t dev1 = {0};
-    dev1.bar0_base = PCIE1_OUTBOUND_CPU_BASE + size0;
-    dev1.pf_index = 1;
-
-    if (mlx5_hca_bringup(&dev0, "PF0(port1)", 0) != 0) {
-        uart_printf("mlx5: PF0 bringup failed\n");
-        return -1;
-    }
-    if (mlx5_hca_bringup(&dev1, "PF1(port2)", 0) != 0) {
-        uart_printf("mlx5: PF1 bringup failed\n");
-        return -1;
-    }
-
-    // 両ポートのbringupがここまで成功した時点で、各々のmlx5_hca_bringup()
-    // 内でPAOS admin UP設定 -> oper_status(実リンク状態)ポーリングが
-    // 完了しているため、デュアルポートのリンクアップはこの時点で既に
-    // 確認済み(oper_status=1がログに出ていない場合は3秒のタイムアウトで
-    // 抜けているだけなので、下記モニタのPAOS行で改めてoper_statusを確認
-    // できる)。ここでレジスタモニタのベースラインを取得しておく --
-    // 以降のクロスポートテスト前後との比較材料にする。
-    uart_printf("mlx5: ===== dual-port link-up confirmed -- baseline register monitor =====\n");
-    mlx5_monitor_dump_dev(&dev0, "PF0(port1)");
-    mlx5_monitor_dump_dev(&dev1, "PF1(port2)");
-
-    // クロスポート検証その1: PF0から送信し、PF1のRQでCQEを確認する。
-    uart_printf("mlx5: ===== cross-port test: PF0 -> PF1 =====\n");
-    if (mlx5_sq_send_test_frame(&dev0, dev0.sqn, dev0.uarn, dev0.mkey, 0u) != 0) {
-        uart_printf("mlx5: PF0 SQ test frame post failed\n");
-    } else {
-        uart_printf("mlx5: polling PF0's own SQ CQ for TX completion (1000ms)...\n");
-        if (mlx5_cq_poll_any((uint64_t)dev0.sq_cq_buf_cpu, 1000u) == 0) {
-            uart_printf("mlx5: TX CQE observed -- PF0 send WQE was processed by HW\n");
-        } else {
-            uart_printf("mlx5: no TX CQE within timeout (PF0)\n");
-        }
-        uart_printf("mlx5: polling PF1's RQ CQ for the looped-back frame (3000ms)...\n");
-        if (mlx5_cq_poll_any((uint64_t)dev1.rxq[0].cq_buf_cpu, 3000u) == 0) {
-            uart_printf("mlx5: CQE observed on PF1 -- frame crossed the loopback cable PF0->PF1\n");
-        } else {
-            uart_printf("mlx5: no CQE on PF1 within timeout\n");
-        }
-    }
-    // このテストの直後にモニタを再取得する -- ベースラインとの比較で、
-    // 「PF0のMACが実際に送信したか(IEEE802.3 tx_frames_ok)」「PF1のMACが
-    // 実際に受信したか(同rx_frames_ok、CQEの有無とは独立にPHY/MACレベル
-    // で判定できる)」「PF1のRQ/CQのhw_counter・producer_counterがHW
-    // 自身の視点で動いたか」を切り分ける。
-    uart_printf("mlx5: ----- register monitor after PF0->PF1 test -----\n");
-    mlx5_monitor_dump_dev(&dev0, "PF0(port1)");
-    mlx5_monitor_dump_dev(&dev1, "PF1(port2)");
-
-    // クロスポート検証その2(逆方向): PF1から送信し、PF0のRQでCQEを確認する。
-    uart_printf("mlx5: ===== cross-port test: PF1 -> PF0 =====\n");
-    if (mlx5_sq_send_test_frame(&dev1, dev1.sqn, dev1.uarn, dev1.mkey, 0u) != 0) {
-        uart_printf("mlx5: PF1 SQ test frame post failed\n");
-    } else {
-        uart_printf("mlx5: polling PF1's own SQ CQ for TX completion (1000ms)...\n");
-        if (mlx5_cq_poll_any((uint64_t)dev1.sq_cq_buf_cpu, 1000u) == 0) {
-            uart_printf("mlx5: TX CQE observed -- PF1 send WQE was processed by HW\n");
-        } else {
-            uart_printf("mlx5: no TX CQE within timeout (PF1)\n");
-        }
-        uart_printf("mlx5: polling PF0's RQ CQ for the looped-back frame (3000ms)...\n");
-        if (mlx5_cq_poll_any((uint64_t)dev0.rxq[0].cq_buf_cpu, 3000u) == 0) {
-            uart_printf("mlx5: CQE observed on PF0 -- frame crossed the loopback cable PF1->PF0\n");
-        } else {
-            uart_printf("mlx5: no CQE on PF0 within timeout\n");
-        }
-    }
-    uart_printf("mlx5: ----- register monitor after PF1->PF0 test -----\n");
-    mlx5_monitor_dump_dev(&dev0, "PF0(port1)");
-    mlx5_monitor_dump_dev(&dev1, "PF1(port2)");
-
-    // `mlx5stat`シェルコマンドが再クエリできるよう、このセッションで
-    // 最後に初期化に成功したPF0/PF1のハンドルを保存しておく。
-    s_last_dev0 = dev0;
-    s_last_dev1 = dev1;
-    s_last_devs_valid = 1;
-
-    return 0;
 }
 
 // ============================================================================
@@ -4094,181 +3980,6 @@ void mlx5_nvmet_rdma_cmd_start(int pf_index, const uint8_t peer_mac[6]) {
 // MLX5_OPCODE_SEND/MLX5_WQE_CTRL_CQ_UPDATE/MLX5_SEND_WQE_BB/MLX5_BF_OFFSET
 // はmlx5.hへ移した(mlx5_net.cもSQ WQE組み立てに同じ定数が必要なため)。
 
-// SQ経由でループバック確認用の最小Ethernetフレームを1個送信する。
-// WQE(Work Queue Entry)はctrl_seg(16B)+eth_seg(16B)+data_seg(16B)の
-// 3セグメント=48バイト(qp.hのstruct mlx5_wqe_ctrl_seg/mlx5_wqe_eth_seg/
-// mlx5_wqe_data_seg)。WQEBB(64バイト)1個に収まる。
-//
-// 最小実装のため省略していること: インラインヘッダ(eth_seg.inline_hdr、
-// 性能最適化でありHW動作の必須要件ではない -- data_seg経由のDMA読み出し
-// だけでHWはL2ヘッダを含む全バイトを取得できるため、eth_segは全0のまま
-// で良い)、チェックサム/VLAN/LSOオフロード、ctrl_seg末尾unionの
-// tis_tir_num等(実ドライバもRAWパケット送信では未使用、TIS紐付けは
-// CREATE_SQのtis_num_0のみで完結、en_tx.c参照)。
-//
-// - ctrl_seg.opmod_idx_opcode(wqe[0..3]、BE32): (pc<<8)|MLX5_OPCODE_SEND
-//   -- pcはこのSQで最初のWQEなので0(en_tx.cのcseg->opmod_idx_opcode =
-//   cpu_to_be32((sq->pc<<8)|attr->opcode)と同じ式)。
-// - ctrl_seg.qpn_ds(wqe[4..7]、BE32): (sqn<<8)|ds_cnt -- ds_cnt=4
-//   (ctrl+eth各16バイト=1DSずつ + インラインヘッダ1DS + data_seg1DS、
-//   下記参照)。
-// - ctrl_seg.fm_ce_se(wqe[11]、1バイト): MLX5_WQE_CTRL_CQ_UPDATE(0x08)
-//   -- このWQEの完了をCQへ書かせる(呼び出し元がポーリングで確認する
-//   ため必須、通常の連続送信ドライバはモデレーションのため毎回は
-//   立てないが、ここでは1回きりの診断用途)。
-//
-// 実機で見つかった本物のバグ(修正済み): 当初eth_segを全0(インライン
-// ヘッダ無し、data_seg経由のDMA読み出しのみ)で送信したところ、
-// CREATE_SQ/MODIFY_SQは成功するのにWQEが一切処理された形跡がなかった
-// (TX側のCQEも、ループバック経由のRX側CQEも共に一切観測されない --
-// エラーも一切返らない完全な沈黙)。en_tx.cのmlx5e_sq_calc_wqe_attr()/
-// mlx5e_sq_xmit_wqe()を確認したところ、実ドライバは`sq->min_inline_mode`
-// (HCA_CAPのwqe_inline_mode、mode=L2の場合)に応じて**常に**最低
-// MLX5E_MIN_INLINE(=ETH_HLEN+VLAN_HLEN=18バイト)をeth_seg.inline_hdr
-// 経由でWQEに埋め込んでおり、data_seg経由のDMA読み出しだけに頼る
-// ことは無い(mlx5e_calc_min_inline()参照)。このConnectX実機の実際の
-// wqe_inline_mode値は未確認のままだが、インライン化は必要無い場合でも
-// 常に安全(性能最適化の選択肢であり禁止された形式ではない)なため、
-// 実ドライバの安全側デフォルトに合わせて常に18バイトをインライン化する
-// よう修正した -- 修正後、実機でTX/RX双方のCQEが観測できた(CLAUDE.md
-// 「ConnectXデュアルポート対応」節参照)。
-//
-// - eth_seg(wqe[16..31]): mss/cs_flags/swp_flags/flow_table_metadata等は
-//   全0(オフロード不使用)。inline_hdr.sz(wqe[28..29]、BE16)=18
-//   (MLX5E_MIN_INLINE)。inline_hdr.start(wqe[30..31]、eth_seg自身が
-//   持つ2バイト分)にフレーム先頭2バイトを書き、残り16バイト
-//   (`ihs - INL_HDR_START_SZ` = 18-2 = 16、ちょうど1DS、en_tx.cの
-//   mlx5e_sq_calc_wqe_attr()のds_cnt_inl計算と同じ式)はeth_seg自身の
-//   構造体境界を越えて直後のDS(wqe[32..47])へ続けて書く
-//   (unsafe_memcpy(eseg->inline_hdr.start, skb->data, ihs, ...)と同じ
-//   「flex arrayがDSの境界を意図的に跨ぐ」書き方)。
-// - data_seg(wqe[48..63]、インラインヘッダの直後の1DS): 残り42バイト
-//   (60-18)をbyte_count(BE32)=42、lkey(BE32)=既存のPAモードMKey、
-//   addr(BE64)=mlx5_dma_addr(テストフレーム+18)で参照する。
-//
-// ドアベル: SQ自身のドアベルレコード(MLX5_SQ_DBR_ADDR、send producer
-// index、先頭4バイトBE32)をpc+1で更新した後、dsb sy(dma_wmb()相当、
-// mlx5_cmdq_init()と同じ理由 -- HWがWQE/ドアベルレコードを見る前に
-// 後続のBlueFlame書き込みが先に見えてしまわないように)、続いて
-// ctrl_seg先頭8バイトをUAR_ADDR+MLX5_BF_OFFSET(0x800)へMMIO書き込み
-// する(doorbell.hのmlx5_write64()と同じセマンティクス -- 追加の
-// バイトスワップはしない、生のメモリバイト列をそのまま8バイトコピー
-// するのと等価。64bit単一ストアではなく既存のmmio_write32()を2回
-// 使う32bit分割方式(doorbell.hの#else分岐と同義)を採用し、
-// エンディアン変換を明示的なバイト単位の再構成に閉じ込めている)。
-// UAR_ADDR = dev->bar0_base + uarn*4096(uar_4kケーパビリティ=0という
-// 未検証の前提、CLAUDE.md「将来目標」節参照)。
-static int mlx5_sq_send_test_frame(mlx5_dev_t *dev, uint32_t sqn, uint32_t uarn, uint32_t mkey, uint32_t pc) {
-    // 最小Ethernetフレーム(60バイト、IEEE802.3最小フレームサイズ、
-    // FCSはHWが付加する)を組み立てる: dst=broadcast、src=ローカル管理
-    // アドレス、EtherType=0x88B5(IEEE 802 Local Experimental、未使用の
-    // 実験用値)、ペイロードは目視確認用の固定ASCII文字列+ゼロ
-    // パディング。
-    volatile uint8_t *frame = (volatile uint8_t *)(uintptr_t)(uint64_t)dev->sq_tx_frame_cpu;
-    const uint32_t frame_len = 60u;
-    for (unsigned i = 0; i < frame_len; i++) {
-        frame[i] = 0;
-    }
-    for (unsigned i = 0; i < 6; i++) {
-        frame[i] = 0xFFu; // dst: broadcast
-    }
-    frame[6] = 0x02; frame[7] = 0x00; frame[8] = 0x00; // src: locally administered
-    frame[9] = 0x00; frame[10] = 0x00; frame[11] = 0x01;
-    frame[12] = 0x88; frame[13] = 0xB5; // ethertype (experimental)
-    {
-        static const char msg[] = "rpi5-boot mlx5 SQ loopback test";
-        for (unsigned i = 0; i < sizeof(msg) - 1 && (14u + i) < frame_len; i++) {
-            frame[14 + i] = (uint8_t)msg[i];
-        }
-    }
-
-    // WQEをリングのWQEBB[pc]へ構築する(呼び出し元がこのSQで既に他の
-    // WQEを投稿済みの場合、同じproducer indexを再利用しないよう引数化)。
-    // このテストフレーム自体は常に単一WQEBB(ds_cnt=4)構成。
-    volatile uint8_t *wqe =
-        (volatile uint8_t *)(uintptr_t)((uint64_t)dev->sq_wqe_cpu + (uint64_t)pc * MLX5_SEND_WQE_BB);
-    for (unsigned i = 0; i < MLX5_SEND_WQE_BB; i++) {
-        wqe[i] = 0;
-    }
-
-    const uint32_t ihs = 18u; // ETH_HLEN(14) + VLAN_HLEN(4)、wqe_inline_mode=L2確認済み(実機QUERY_HCA_CAP(eth))
-    uint32_t ds_cnt = 4u; // ctrl(1) + eth(1) + inline_hdr(1) + data_seg(1)
-    /* 2026-08-08、mlx5_net.cで発見した本物のバグ(opmod_idx_opcodeの中間
-     * 16bitがwqe indexであり、32bitのpcをマスク無しで詰めるとpc>=65536で
-     * 上位のopmodバイトへビットが漏れ出す)の予防的修正 -- この関数は
-     * pcが常に0(このSQで最初のWQEのみ送る一発診断)なので実害は無いが、
-     * 念のため同じマスクを適用しておく。 */
-    uint32_t opmod_idx_opcode = ((pc & 0xFFFFu) << 8) | MLX5_OPCODE_SEND;
-    wqe[0] = (uint8_t)(opmod_idx_opcode >> 24);
-    wqe[1] = (uint8_t)(opmod_idx_opcode >> 16);
-    wqe[2] = (uint8_t)(opmod_idx_opcode >> 8);
-    wqe[3] = (uint8_t)opmod_idx_opcode;
-
-    uint32_t qpn_ds = (sqn << 8) | ds_cnt;
-    wqe[4] = (uint8_t)(qpn_ds >> 24);
-    wqe[5] = (uint8_t)(qpn_ds >> 16);
-    wqe[6] = (uint8_t)(qpn_ds >> 8);
-    wqe[7] = (uint8_t)qpn_ds;
-
-    wqe[11] = (uint8_t)MLX5_WQE_CTRL_CQ_UPDATE; // fm_ce_se
-
-    // eth_seg(wqe[16..31]): mss/cs_flags等は全0のまま。inline_hdr.sz/
-    // start(eth_seg自身の2バイト)にフレーム先頭2バイトを書く。
-    wqe[28] = (uint8_t)(ihs >> 8);
-    wqe[29] = (uint8_t)ihs;
-    wqe[30] = frame[0];
-    wqe[31] = frame[1];
-
-    // インラインヘッダの続き(ihs - INL_HDR_START_SZ(2)バイト)を
-    // eth_seg構造体の境界を越えて直後のDSへ書く。
-    for (unsigned i = 0; i < (ihs - 2u); i++) {
-        wqe[32 + i] = frame[2 + i];
-    }
-    uint32_t dseg_off = 32u + (ihs - 2u);
-
-    // data_seg: 残り(frame_len - ihs)バイトをDMA参照する。
-    uint32_t remaining = frame_len - ihs;
-    wqe[dseg_off + 0] = (uint8_t)(remaining >> 24);
-    wqe[dseg_off + 1] = (uint8_t)(remaining >> 16);
-    wqe[dseg_off + 2] = (uint8_t)(remaining >> 8);
-    wqe[dseg_off + 3] = (uint8_t)remaining;
-    wqe[dseg_off + 4] = (uint8_t)(mkey >> 24);
-    wqe[dseg_off + 5] = (uint8_t)(mkey >> 16);
-    wqe[dseg_off + 6] = (uint8_t)(mkey >> 8);
-    wqe[dseg_off + 7] = (uint8_t)mkey;
-    uint64_t frame_pa = mlx5_dma_addr((volatile void *)(uintptr_t)((uint64_t)dev->sq_tx_frame_cpu + ihs));
-    for (unsigned b = 0; b < 8; b++) {
-        wqe[dseg_off + 8 + b] = (uint8_t)(frame_pa >> (56 - 8 * b));
-    }
-
-    // SQ自身のドアベルレコード: 先頭4バイト(BE32)がsend producer index。
-    volatile uint8_t *sq_dbr = (volatile uint8_t *)(uintptr_t)(uint64_t)dev->sq_dbr_cpu;
-    uint32_t new_pc = pc + 1u;
-    sq_dbr[0] = (uint8_t)(new_pc >> 24);
-    sq_dbr[1] = (uint8_t)(new_pc >> 16);
-    sq_dbr[2] = (uint8_t)(new_pc >> 8);
-    sq_dbr[3] = (uint8_t)new_pc;
-
-    dma_wmb();
-
-    // BlueFlame: ctrl_seg先頭8バイト(wqe[0..7])を、追加のバイトスワップ
-    // なしでそのままUARへコピーする。32bit単位に分割し、各4バイトを
-    // 「そのメモリ順序を保つLE即値」として再構成した上でmmio_write32()
-    // (生のvolatileストア、追加のバイトスワップ無し)で書く -- 結果として
-    // wqe[0..7]がUAR側にも同じバイト順で現れる、doorbell.hの
-    // __raw_writel(val[0],dest)/__raw_writel(val[1],dest+4)と等価な操作。
-    uint32_t raw0 = (uint32_t)wqe[0] | ((uint32_t)wqe[1] << 8) |
-                    ((uint32_t)wqe[2] << 16) | ((uint32_t)wqe[3] << 24);
-    uint32_t raw1 = (uint32_t)wqe[4] | ((uint32_t)wqe[5] << 8) |
-                    ((uint32_t)wqe[6] << 16) | ((uint32_t)wqe[7] << 24);
-    uint64_t uar_addr = dev->bar0_base + (uint64_t)uarn * 4096u;
-    mmio_write32(uar_addr + MLX5_BF_OFFSET, raw0);
-    mmio_write32(uar_addr + MLX5_BF_OFFSET + 4u, raw1);
-
-    uart_printf("mlx5: SQ test frame posted (sqn=%u, len=%u)\n", sqn, frame_len);
-    return 0;
-}
-
 // ============================================================================
 // フェーズ9: フローステアリング -- NIC RX用フローテーブル作成
 // (CREATE_FLOW_TABLE)、root設定(SET_FLOW_TABLE_ROOT)、catch-allフロー
@@ -4481,33 +4192,6 @@ static int mlx5_set_fte_fwd_tir(mlx5_dev_t *dev, uint32_t table_id, uint32_t gro
         uart_printf("mlx5: SET_FLOW_TABLE_ENTRY: command status=0x%02x syndrome=0x%08x\n",
                     status, syndrome);
         return -1;
-    }
-    return 0;
-}
-
-// CQ[0]のop_own上位nibbleをポーリングし、mlx5_create_cq()が焼き込んだ
-// 初期値MLX5_CQE_INVALID(0xF)から変化するのを待つ(FWコマンドではなく、
-// 単にDMAバッファを直接読むだけ)。所有権ビットの周回トグル規約(実運用の
-// 連続ポーリングでは必須)はここでは追わない -- CQ作成直後の1回きりの
-// 診断であり、CQE[0]が初期値から変化したかどうかだけを見れば「HWが
-// 何か書いたか」を十分正しく判定できるため。timeout_ms以内に変化が
-// 見えれば0、見えなければ-1を返す。
-//
-// 2026-08-09: buf_addrがboard.hのMLX5_CQ_CACHE_BASE(Normal cacheable RAM)
-// を指すようになったため(以前はMLX5_DMA_BASE領域内のDevice-nGnRnEで
-// キャッシュを経由せず即座に反映されていた)、ループの毎回で明示的に
-// dcache_invalidate_range()を呼ばないとCPUキャッシュに残った初期値
-// (MLX5_CQE_INVALID)を読み続けてしまい、HWの書き込みが永遠に見えない。
-static int mlx5_cq_poll_any(uint64_t buf_addr, uint32_t timeout_val_ms) {
-    volatile uint8_t *cqe0_op_own =
-        (volatile uint8_t *)(uintptr_t)(buf_addr + (MLX5_CQE_SIZE - 1));
-    uint64_t start = timer_now();
-    dcache_invalidate_range((const void *)(uintptr_t)buf_addr, MLX5_CQE_SIZE);
-    while ((*cqe0_op_own >> 4) == MLX5_CQE_INVALID) {
-        if (timeout_ms(start, timeout_val_ms)) {
-            return -1;
-        }
-        dcache_invalidate_range((const void *)(uintptr_t)buf_addr, MLX5_CQE_SIZE);
     }
     return 0;
 }
