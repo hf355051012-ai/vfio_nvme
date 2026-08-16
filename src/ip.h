@@ -8,6 +8,7 @@
 
 #define IP_PROTO_ICMP 1u
 #define IP_PROTO_TCP  6u
+#define IP_PROTO_UDP  17u
 
 typedef struct __attribute__((packed)) {
     uint8_t  ver_ihl;      /* [7:4]version(4) [3:0]IHL(ワード数、オプション無しなら5) */

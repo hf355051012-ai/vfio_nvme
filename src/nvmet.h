@@ -46,6 +46,8 @@ typedef struct {
     uint8_t  ram_disk[NVMET_NS_LBA_COUNT * NVMET_LBA_SIZE] __attribute__((aligned(64)));
     uint8_t  id_ctrl[4096] __attribute__((aligned(64)));
     uint8_t  id_ns[4096]   __attribute__((aligned(64)));
+    /* Get Log Page 応答用。中身は常にゼロ(エラー情報も SMART も持たない)。 */
+    uint8_t  log_page[4096] __attribute__((aligned(64)));
 
     uint32_t write_incapsule_count;
     uint32_t write_h2c_count;

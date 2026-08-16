@@ -80,7 +80,9 @@ _Static_assert(sizeof(nvme_keyed_sgl_desc_t) == 16, "must match nvme_sqe_t.dptr[
 #define NVME_ADM_CMD_CREATE_SQ     0x01u
 #define NVME_ADM_CMD_DELETE_CQ     0x04u
 #define NVME_ADM_CMD_CREATE_CQ     0x05u
+#define NVME_ADM_CMD_GET_LOG_PAGE  0x02u
 #define NVME_ADM_CMD_IDENTIFY      0x06u
+#define NVME_ADM_CMD_ASYNC_EVENT   0x0Cu
 #define NVME_ADM_CMD_SET_FEATURES  0x09u
 #define NVME_ADM_CMD_GET_FEATURES  0x0Au
 #define NVME_ADM_CMD_KEEP_ALIVE    0x18u

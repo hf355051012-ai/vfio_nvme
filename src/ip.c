@@ -2,6 +2,7 @@
 #include "ip.h"
 #include "icmp.h"
 #include "tcp.h"
+#include "udp.h"
 #include "netif.h"
 #include "net_buf.h"
 #include "net.h"
@@ -80,6 +81,16 @@ void ip_handle_frame(const uint8_t *payload, size_t len, const uint8_t *src_mac)
         }
     }
 
+    /* 断片化されたデータグラムは再構成しない。ここで弾かないと、断片を
+     * 完全なデータグラムとして上位へ渡してしまい、TCP/ICMP が壊れたペイロード
+     * を読む(MTU が揃ったループバックでは起きないが実ネットワークでは起きる)。
+     * MF(bit13)が立っているか、フラグメントオフセット(bit12-0)が非 0 なら断片。 */
+    uint16_t flags_frag = rd16be(in + IP_OFF_FLAGS_FRAG);
+    if ((flags_frag & 0x2000u) != 0u || (flags_frag & 0x1FFFu) != 0u) {
+        uart_printf("[IP] 断片化データグラムは未対応 (flags_frag=0x%04X) 破棄\n", flags_frag);
+        return;
+    }
+
     uint16_t total_len = rd16be(in + IP_OFF_TOTAL_LEN);
     if ((size_t)total_len > len) {
         uart_printf("[IP] total_lengthがフレーム長を超過 (total_len=%u len=%u) 無視\n",
@@ -112,8 +123,33 @@ void ip_handle_frame(const uint8_t *payload, size_t len, const uint8_t *src_mac)
     } else if (protocol == IP_PROTO_TCP) {
         uint32_t src_ip_host = ip_from_octets(src_ip[0], src_ip[1], src_ip[2], src_ip[3]);
         tcp_input(ip_payload, (uint16_t)ip_payload_len, src_ip_host);
+    } else if (protocol == IP_PROTO_UDP) {
+        uint8_t dst_ip_oct[4];
+        dst_ip_oct[0] = in[IP_OFF_DST_IP + 0];
+        dst_ip_oct[1] = in[IP_OFF_DST_IP + 1];
+        dst_ip_oct[2] = in[IP_OFF_DST_IP + 2];
+        dst_ip_oct[3] = in[IP_OFF_DST_IP + 3];
+        if (udp_input(ip_payload, ip_payload_len, src_ip, dst_ip_oct, src_mac) == -1) {
+            /* 待ち受けの無いポート宛 -- Port Unreachable を返す。ただし RoCEv2
+             * (UDP 4791)は例外。RoCEv2 のフレームは HW が QP へ配送するのと
+             * 同時に catch-all フローステアリング経由で Ethernet RX にも複製
+             * されて来る(自分自身の RDMA トラフィックが毎パケットここへ落ちる)。
+             * これに ICMP エラーを返すと相手へ大量の無意味なエラーを送りつけ、
+             * TX スロットを浪費するだけなので黙って捨てる。 */
+            uint16_t dport = (ip_payload_len >= 4u)
+                                 ? rd16be((const volatile uint8_t *)ip_payload + 2)
+                                 : 0u;
+            if (dport != UDP_PORT_ROCEV2) {
+                icmp_send_dest_unreach(ICMP_CODE_PORT_UNREACH, payload, len, src_ip, src_mac);
+            }
+        }
     } else {
-        uart_printf("[IP] 未対応プロトコル (protocol=%u) 無視\n", protocol);
+        /* 上位が居ないプロトコルは Protocol Unreachable を返す。相手を無駄に
+         * 待たせないため。ICMP エラーに対して ICMP エラーは返さない(RFC 1812)
+         * が、ここへ来るのは ICMP/TCP/UDP 以外なのでその条件には当たらない。 */
+        uart_printf("[IP] 未対応プロトコル (protocol=%u)、Protocol Unreachable を返します\n",
+                    protocol);
+        icmp_send_dest_unreach(ICMP_CODE_PROTO_UNREACH, payload, len, src_ip, src_mac);
     }
 }
 

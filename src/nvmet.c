@@ -219,6 +219,32 @@ static int nvmet_admin_dispatch(nvmet_ctx_t *ctx, const nvme_sqe_t *sqe)
         return 0;
     }
 
+    if (opcode == NVME_ADM_CMD_GET_LOG_PAGE) {
+        /* NUMD は 0's based の dword 数(cdw10 の上位16bit + cdw11 の下位16bit)。
+         * このターゲットはエラー情報も SMART も持たないので、要求された長さの
+         * ゼロ埋めを返す。ホスト(nvme-cli / カーネル)はこれを正常応答として
+         * 扱う。返さないと接続後の Get Log Page でエラーになる。 */
+        uint32_t numdl = (rd32le(&sqe->cdw10) >> 16) & 0xFFFFu;
+        uint32_t numdu = rd32le(&sqe->cdw11) & 0xFFFFu;
+        uint32_t bytes = (((numdu << 16) | numdl) + 1u) * 4u;
+        if (bytes > sizeof(ctx->log_page)) bytes = sizeof(ctx->log_page);
+        for (uint32_t i = 0; i < bytes; i++) ctx->log_page[i] = 0;
+        nvmet_build_cqe(&cqe, ctx->admin.last_cid, 0u, 0);
+        nvmet_tcp_send_c2h(&ctx->admin, ctx->admin.last_cid, &cqe,
+                            ctx->log_page, bytes, 1);
+        return 0;
+    }
+
+    if (opcode == NVME_ADM_CMD_ASYNC_EVENT) {
+        /* 非同期イベント要求は「イベントが起きるまで完了させない」のが正しい
+         * 挙動(実コントローラも同じ)。ここで成功を返すとホストが即座に
+         * 再発行して無限ループになる。このターゲットはイベントを生成しない
+         * ので、受理だけして CQE を返さず放置する。切断時は接続ごと消える。 */
+        uart_printf("[nvmet:%s] Async Event Request を受理(イベント発生まで保留)\n",
+                    ctx->label);
+        return 0;
+    }
+
     uart_printf("[!] nvmet: 未対応のadminコマンド (opcode=0x%x)\n", opcode);
     nvmet_build_cqe(&cqe, ctx->admin.last_cid, 0u, (uint16_t)NVMET_SC_GENERIC_ERROR);
     nvmet_tcp_send_resp(&ctx->admin, &cqe);
@@ -848,6 +874,12 @@ static void nvmet_io_dispatch_cmd(nvmet_ctx_t *ctx, const uint8_t *hdr_buf,
                 }
             }
         }
+    } else if (opcode == NVME_IO_CMD_FLUSH) {
+        /* 名前空間の実体は RAM ディスクで揮発性キャッシュを持たないため、
+         * Flush は成功を返すだけでよい(仕様上も準拠)。返さないとホスト側で
+         * fsync/sync が失敗する。 */
+        nvmet_build_cqe(&cqe, cid, 0u, 0);
+        nvmet_tcp_send_resp(&ctx->io, &cqe);
     } else {
         uart_printf("[!] nvmet: 未対応のIOコマンド (opcode=0x%x)\n", opcode);
         nvmet_build_cqe(&cqe, cid, 0u, (uint16_t)NVMET_SC_GENERIC_ERROR);

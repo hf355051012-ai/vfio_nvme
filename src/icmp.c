@@ -26,6 +26,51 @@ static volatile uint16_t s_echo_reply_ident[SMP_MAX_CORES];
 static volatile uint16_t s_echo_reply_seq[SMP_MAX_CORES];
 
 /*=================================================================
+ * ICMP Destination Unreachable を返す。ペイロードは RFC 792 の規定どおり
+ * 「未使用 4 バイト + 元データグラムの IP ヘッダ + 続く 8 バイト」。
+ * これを返さないと、相手は届かない宛先へ延々と再送してタイムアウトを待つ
+ * ことになる。
+ *
+ * 引数:
+ *   code         - ICMP_CODE_PROTO_UNREACH / ICMP_CODE_PORT_UNREACH
+ *   orig_ip_hdr  - 元データグラムの IPv4 ヘッダ先頭
+ *   orig_len     - orig_ip_hdr から使える長さ
+ *   src_ip       - 元データグラムの送信元(= 返す相手)
+ *   src_mac      - 同上の MAC
+ * 戻り値:
+ *   0=送信完了、-1=失敗
+ * コール元:
+ *   ip_handle_frame()
+ * ===============================================================*/
+int icmp_send_dest_unreach(uint8_t code,
+                            const uint8_t *orig_ip_hdr, size_t orig_len,
+                            const uint8_t src_ip[4], const uint8_t *src_mac)
+{
+    /* 元データグラムから引用するのは IP ヘッダ(20)+ 8 バイト。 */
+    size_t quote = 20u + 8u;
+    if (quote > orig_len) quote = orig_len;
+
+    unsigned core = smp_core_index();
+    if (core >= SMP_MAX_CORES) core = 0;
+    static uint8_t msg[SMP_MAX_CORES][ICMP_HDR_LEN + 20u + 8u];
+
+    uint8_t *out = msg[core];
+    out[ICMP_OFF_TYPE] = ICMP_TYPE_DEST_UNREACH;
+    out[ICMP_OFF_CODE] = code;
+    wr16be(out + ICMP_OFF_CHECKSUM, 0);
+    wr16be(out + ICMP_OFF_IDENT, 0);   /* Destination Unreachable では未使用 */
+    wr16be(out + ICMP_OFF_SEQ,   0);
+    for (size_t i = 0; i < quote; i++) {
+        out[ICMP_HDR_LEN + i] = orig_ip_hdr[i];
+    }
+
+    uint16_t total = (uint16_t)(ICMP_HDR_LEN + quote);
+    wr16be(out + ICMP_OFF_CHECKSUM, inet_checksum(out, total));
+
+    return ip_send(src_ip, src_mac, IP_PROTO_ICMP, out, total);
+}
+
+/*=================================================================
  * 受信 ICMP メッセージを処理する。Echo Reply なら RTT 計測用に受信時刻と
  * id/seq を記録し(uart_printf より前に時刻を取る)、Echo Request なら
  * Echo Reply を返す。
@@ -69,6 +114,17 @@ void icmp_handle(const uint8_t *data, size_t len,
         s_echo_reply_ident[core] = ident;
         s_echo_reply_seq[core]   = seq;
         s_echo_reply_ready[core] = 1;
+        return;
+    }
+
+    if (type == ICMP_TYPE_DEST_UNREACH) {
+        /* 相手が「そのポート/プロトコルには誰も居ない」と返してきた。上位へ
+         * 通知する経路(接続の即時失敗など)はまだ持たないので記録のみ。 */
+        const char *what = (code == ICMP_CODE_PORT_UNREACH)  ? "Port Unreachable"
+                         : (code == ICMP_CODE_PROTO_UNREACH) ? "Protocol Unreachable"
+                                                             : "Destination Unreachable";
+        uart_printf("[ICMP] %s 受信 (code=%u) from %u.%u.%u.%u\n",
+                    what, code, src_ip[0], src_ip[1], src_ip[2], src_ip[3]);
         return;
     }
 

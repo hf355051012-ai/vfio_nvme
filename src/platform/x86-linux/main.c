@@ -8,6 +8,8 @@
 #include "net.h"
 #include "arp.h"
 #include "ip.h"
+#include "ipv6.h"
+#include "udp.h"
 #include "netif.h"
 #include "job.h"
 #include "nvme.h"
@@ -259,6 +261,137 @@ static int shell_ensure_tcp_session(uint8_t want_hdgst, uint8_t want_ddgst)
     s_shell_tcp_connected = 1;
     uart_printf("tcpbench: initiator 接続完了 (lba_size=%u)\n", s_nvme_ctx.lba_size);
     return 0;
+}
+
+/*=================================================================
+ * シェルの `ping6`。アクティブなインターフェースから ICMPv6 Echo Request を
+ * 全ノードマルチキャスト(ff02::1)へ送り、対向 PF からの Echo Reply を待つ。
+ * 2 ポートとも自作ドライバが握っているため Linux から ping6 できず、疎通は
+ * この内部往復で確認する。リンクローカルアドレスも表示する。
+ *
+ * コール元:
+ *   shell_dispatch()
+ * ===============================================================*/
+static void shell_ping6(void)
+{
+    unsigned core = smp_core_index();
+    if (core >= SMP_MAX_CORES) core = 0;
+
+    uint8_t ll[IPV6_ADDR_LEN];
+    ipv6_link_local_addr(ll);
+    uart_printf("ping6: 自分のリンクローカル = fe80::%02x%02x:%02x%02x:%02x%02x:%02x%02x\n",
+                ll[8], ll[9], ll[10], ll[11], ll[12], ll[13], ll[14], ll[15]);
+
+    uint32_t before = g_ipv6_echo_reply_count[core];
+    if (ipv6_send_echo_request(0x1234u, 1u, 32u) != 0) {
+        uart_printf("ping6: Echo Request 送信失敗\n");
+        return;
+    }
+    uart_printf("ping6: Echo Request 送信 (ff02::1 宛, データ32B)\n");
+
+    uint64_t t0 = timer_now();
+    while (!timeout_ms(t0, 2000u)) {
+        net_poll_all_and_dispatch();
+        job_scheduler_tick();
+        if (g_ipv6_echo_reply_count[core] != before) {
+            uart_printf("ping6: OK -- Echo Reply を受信 (%u us)\n",
+                        (unsigned)get_us_from(t0));
+            return;
+        }
+    }
+    uart_printf("ping6: タイムアウト(Echo Reply が返りませんでした)\n");
+}
+
+static volatile uint32_t s_udptest_rx;
+static volatile uint16_t s_udptest_len;
+
+/*=================================================================
+ * `udptest` が待ち受けるポートの受信ハンドラ。受信を記録するだけ。
+ *
+ * 引数:
+ *   data/len  - UDP ペイロード
+ *   src_ip    - 送信元 IPv4
+ *   src_port  - 送信元ポート
+ *   src_mac   - 送信元 MAC(未使用)
+ * コール元:
+ *   udp_input()
+ * ===============================================================*/
+static void shell_udptest_handler(const uint8_t *data, size_t len,
+                                   const uint8_t src_ip[4], uint16_t src_port,
+                                   const uint8_t *src_mac)
+{
+    (void)data; (void)src_mac;
+    s_udptest_len = (uint16_t)len;
+    s_udptest_rx++;
+    uart_printf("[udptest] 受信 %u バイト (from %u.%u.%u.%u:%u)\n",
+                (unsigned)len, src_ip[0], src_ip[1], src_ip[2], src_ip[3], src_port);
+}
+
+/*=================================================================
+ * シェルの `udptest`。対向 PF へ UDP を 1 発送り、受信ハンドラが呼ばれるかを
+ * 確認する。続けて待ち受けの無いポートへも送り、ICMP Port Unreachable が
+ * 返ることも確認する(RoCEv2 の 4791 は除外されるが、それ以外は返る)。
+ *
+ * コール元:
+ *   shell_dispatch()
+ * ===============================================================*/
+static void shell_udptest(void)
+{
+    const uint16_t port_ok = 7777u;
+    const uint16_t port_ng = 7778u;
+
+    if (udp_bind(port_ok, shell_udptest_handler) != 0) {
+        uart_printf("udptest: udp_bind 失敗\n");
+        return;
+    }
+
+    uint32_t peer_ip = (net_active_ip() == 0xC0A8650Au) ? 0xC0A8650Bu : 0xC0A8650Au;
+    uint8_t peer_mac[6];
+    if (arp_resolve(peer_ip, peer_mac) != 0) {
+        uart_printf("udptest: ARP 解決失敗 (%u.%u.%u.%u)\n",
+                    (peer_ip >> 24) & 0xFFu, (peer_ip >> 16) & 0xFFu,
+                    (peer_ip >> 8) & 0xFFu, peer_ip & 0xFFu);
+        udp_unbind(port_ok);
+        return;
+    }
+
+    uint8_t dst_ip[4] = { (uint8_t)(peer_ip >> 24), (uint8_t)(peer_ip >> 16),
+                          (uint8_t)(peer_ip >> 8), (uint8_t)peer_ip };
+    static uint8_t body[64];
+    for (unsigned i = 0; i < sizeof(body); i++) body[i] = (uint8_t)(0xA0u + i);
+
+    uint32_t before = s_udptest_rx;
+    if (udp_send(dst_ip, peer_mac, port_ok, port_ok, body, (uint16_t)sizeof(body)) != 0) {
+        uart_printf("udptest: udp_send 失敗\n");
+        udp_unbind(port_ok);
+        return;
+    }
+    uart_printf("udptest: %u バイトを %u.%u.%u.%u:%u へ送信\n",
+                (unsigned)sizeof(body), dst_ip[0], dst_ip[1], dst_ip[2], dst_ip[3], port_ok);
+
+    uint64_t t0 = timer_now();
+    while (!timeout_ms(t0, 1000u)) {
+        net_poll_all_and_dispatch();
+        job_scheduler_tick();
+        if (s_udptest_rx != before) break;
+    }
+    if (s_udptest_rx != before) {
+        uart_printf("udptest: OK -- 受信ハンドラが %u バイトで呼ばれました\n",
+                    (unsigned)s_udptest_len);
+    } else {
+        uart_printf("udptest: NG -- 受信ハンドラが呼ばれませんでした\n");
+    }
+
+    /* 待ち受けの無いポート -- 相手が Port Unreachable を返すはず。 */
+    uart_printf("udptest: 待ち受け無しポート %u へ送信(Port Unreachable 期待)\n", port_ng);
+    udp_send(dst_ip, peer_mac, port_ok, port_ng, body, 16u);
+    t0 = timer_now();
+    while (!timeout_ms(t0, 500u)) {
+        net_poll_all_and_dispatch();
+        job_scheduler_tick();
+    }
+
+    udp_unbind(port_ok);
 }
 
 /* ---- ベンチ引数パース + サマリ表示(bench/tcpbench 共通) ---- */
@@ -704,6 +837,10 @@ static void shell_dispatch(char *line, int s0, int s1)
         shell_ackthresh(line + 9);
     } else if (strncmp(line, "ts", 2) == 0 && (line[2] == 0 || line[2] == ' ')) {
         shell_ts(line + 2);
+    } else if (strncmp(line, "ping6", 5) == 0) {
+        shell_ping6();
+    } else if (strncmp(line, "udptest", 7) == 0) {
+        shell_udptest();
     } else if (strncmp(line, "jobs", 4) == 0) {
         job_list_dump();
     } else if (strncmp(line, "help", 4) == 0) {
@@ -716,6 +853,8 @@ static void shell_dispatch(char *line, int s0, int s1)
                     "                                        (指定が前回と変わるとセッションを張り直す)\n"
                     "  ts [core N] [num N] [mask M V] | ts pause|resume   ts_log ダンプ\n"
                     "  simdelay <core> <us> | simdelay show   律速切り分け(遅延注入)\n"
+                    "  ping6                                 対向PFへICMPv6 Echo(IPv6疎通確認)\n"
+                    "  udptest                               対向PFへUDP往復 + Port Unreachable確認\n"
                     "  nvmet [port] | jobs | help | quit    (↑↓で履歴呼び出し)\n"
                     "  例: bench 8,64,256 rw 8 / tcpbench 64,256 w digest / ts core 1 num 40\n");
     } else if (strncmp(line, "quit", 4) == 0 || strncmp(line, "exit", 4) == 0) {
@@ -863,6 +1002,8 @@ static void run_shell(int s0, int s1)
     /* Ethernet/TCP/nvmet 用の net_ctx を1回だけ登録(以後のコマンドで再利用)。 */
     arp_init();
     ip_init();
+    ipv6_init();
+    udp_init();
     mlx5_net_register_dual(&s_dev0, &s_dev1);
 
     int fl = fcntl(0, F_GETFL, 0);

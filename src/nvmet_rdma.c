@@ -186,6 +186,10 @@ static void nvmetr_parse_command(nvmet_rdma_ctx_t *ctx, const volatile uint8_t *
         p->need_data_move = 1;
         p->data_move_is_write = 1; // ターゲット->ホストへRDMA_WRITEで押し込む
     } else if (p->opcode == NVME_ADM_CMD_SET_FEATURES) {
+    } else if (p->opcode == NVME_ADM_CMD_KEEP_ALIVE) {
+        /* 応答するだけ(need_data_move=0 のまま成功 CQE を返す)。 */
+    } else if (p->opcode == NVME_IO_CMD_FLUSH) {
+        /* RAM ディスクなので揮発性キャッシュが無く、成功を返すだけでよい。 */
     } else if (p->opcode == NVME_IO_CMD_READ) {
         nvmetr_parse_ksgl_into(rb, &p->ksgl_addr, &p->ksgl_len, &p->ksgl_key);
         p->io_slba = (uint64_t)p->cdw10 | ((uint64_t)p->cdw11 << 32);
