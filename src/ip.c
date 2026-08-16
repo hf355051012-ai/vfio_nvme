@@ -12,7 +12,7 @@
 #include "ip.h"
 #include "icmp.h"
 #include "tcp.h"
-#include "netctx.h"
+#include "netif.h"
 #include "net_buf.h"
 #include "net.h"
 #include "uart.h"

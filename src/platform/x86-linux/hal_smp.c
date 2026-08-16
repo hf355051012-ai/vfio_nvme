@@ -18,7 +18,7 @@
 #include "smp.h"
 #include "timer.h"
 #include "job.h"
-#include "netctx.h"
+#include "netif.h"
 
 #include <pthread.h>
 #include <sched.h>

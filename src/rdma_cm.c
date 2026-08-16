@@ -14,7 +14,7 @@
 #include "rdma_cm.h"
 #include "mlx5.h"
 #include "ib_mad.h"
-#include "netctx.h"
+#include "netif.h"
 #include "net.h"
 #include "timer.h"
 #include "cache.h"
@@ -612,7 +612,7 @@ void rdma_cm_fill_addr(rdma_cm_ctx_t *ctx, mlx5_dev_t *dev, const char *self_lab
     // コメント参照)。
     ctx->gsi_qp = &ctx->gsi_qp_storage;
 
-    net_ctx_t *self_nc = net_ctx_find(self_label);
+    netif_t *self_nc = netif_find(self_label);
     if (self_nc != NULL) {
         ctx->own_ip = self_nc->ip;
         for (unsigned i = 0; i < 6; i++) ctx->own_mac[i] = self_nc->mac[i];
@@ -620,7 +620,7 @@ void rdma_cm_fill_addr(rdma_cm_ctx_t *ctx, mlx5_dev_t *dev, const char *self_lab
         ctx->own_ip = self_ip_fallback;
         for (unsigned i = 0; i < 6; i++) ctx->own_mac[i] = self_mac_fallback[i];
     }
-    net_ctx_t *peer_nc = net_ctx_find(peer_label);
+    netif_t *peer_nc = netif_find(peer_label);
     if (peer_nc != NULL) {
         ctx->peer_ip = peer_nc->ip;
         for (unsigned i = 0; i < 6; i++) ctx->peer_mac[i] = peer_nc->mac[i];

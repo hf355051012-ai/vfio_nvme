@@ -37,7 +37,7 @@
 // までに正しい値を確認・実装すること。
 //
 // GID/MAC等の相手アドレス知識は、フェーズ(b)/(c)/(d)の診断コードと同じ
-// net_ctx_find()+ハードコードされたフォールバック値のパターンを踏襲する
+// netif_find()+ハードコードされたフォールバック値のパターンを踏襲する
 // (固定トポロジのループバック検証が目的であり、ARP等の動的発見は範囲外)。
 // MACはIBTA CMメッセージ自体には一切含まれないため常に呼び出し元の
 // 事前設定値を使う。GIDはREQペイロードから学習した値で上書きする
@@ -164,7 +164,7 @@ job_result_t rdma_cm_job_step(job_t *self);
 // ロジックを再利用するため公開した。
 uint16_t rdma_cm_recv_attr_id(const volatile uint8_t *recv_buf);
 
-// ctxをゼロクリアした上でdev/own_*/peer_*を設定する(net_ctx_find()で
+// ctxをゼロクリアした上でdev/own_*/peer_*を設定する(netif_find()で
 // 見つかればそちらを優先、見つからなければfallback値を使う)。フェーズ
 // (f)まではrdma_cm.c内部のstatic関数だったが、フェーズ(g)のnvme_rdma.c/
 // nvmet_rdma.cが自前のrdma_cm_ctx_tインスタンスに対して同じ初期化ロジック

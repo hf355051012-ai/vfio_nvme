@@ -19,7 +19,7 @@ TARGET    := $(BUILD_DIR)/vfio_nvme
 PLATFORM_OBJS := console hal_timer hal_smp hal_dma vfio main
 
 # アーキ非依存コア: mlx5 ドライバ + RoCEv2/NVMe-oF + TCP/IP + 計測基盤。
-CORE_OBJS := crc32c timer mlx5 mlx5_qp timestamp netctx net_buf \
+CORE_OBJS := crc32c timer mlx5 mlx5_qp timestamp netif net_buf \
              job rdma_cm nvme_rdma nvmet_rdma \
              mlx5_net rxcopy tcp ip arp icmp \
              nvmet nvme nvmet_tcp nvme_tcp stateprof

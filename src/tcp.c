@@ -22,7 +22,7 @@
 #include <stddef.h>
 #include "tcp.h"
 #include "ip.h"
-#include "netctx.h"
+#include "netif.h"
 #include "arp.h"
 #include "net_buf.h"
 #include "net.h"
@@ -615,7 +615,7 @@ typedef struct {
 /* 【2026-08-08変更、job stepのctx経由リソース参照化】s_timewait[]は
  * tcp_close()(能動close、任意のコアのjob stepから呼ばれうる)が書き、
  * tcp_input()(常にそのSYN/FINを受信したNICのowner_coreだけが呼ぶ、
- * netctx.hのnet_ctx_t.owner_core参照)が読む。両者が同じコアとは限らない
+ * netif.hのnetif_t.owner_core参照)が読む。両者が同じコアとは限らない
  * ため、以前のようにコアごとに独立配列化していると、書いたコアと違う
  * コアが読むケースで一致するはずのエントリが見つからない(遅れてきた
  * FINへの応答が失われ、相手が無駄なRTO再送を繰り返す、上記コメントの
@@ -678,13 +678,13 @@ static void tcp_timewait_reap(void)
  * tcp_unlisten()(または次のtcp_listen())まで有効に保つ -- 複数回
  * tcp_accept()を同じlistenerで呼べるようにするため、NVMe/TCPのadmin
  * queue+IO queueのように2本のコネクションを順に受け付ける用途を想定。
- * bound_ctx!=NULLなら、そのnet_ctx_t(netctx.h)が受信したSYNのみに一致
+ * bound_ctx!=NULLなら、そのnetif_t(netif.h)が受信したSYNのみに一致
  * させる(tcp_input()参照) -- 複数のリスナーが同じportで異なる
  * インターフェースへそれぞれ独立にbindできるようにするため。 */
 typedef struct {
     int         in_use;
     uint16_t    port;
-    net_ctx_t  *bound_ctx;    /* NULL = インターフェースを問わず受け付ける */
+    netif_t  *bound_ctx;    /* NULL = インターフェースを問わず受け付ける */
     tcp_conn_t *accept_conn;  /* tcp_accept_begin()が渡してきたconn */
     volatile int accept_ready; /* ESTABLISHEDになった = 1 */
 } tcp_listener_slot_t;
@@ -959,7 +959,7 @@ static int tcp_send_segment(tcp_conn_t *conn, tcp_priv_t *priv, uint8_t flags,
 {
     unsigned core = smp_core_index();
 
-    // 複数ネットワークインターフェース(netctx.h、CLAUDE.md「TCP/IPスタック
+    // 複数ネットワークインターフェース(netif.h、CLAUDE.md「TCP/IPスタック
     // のConnectX統合」節参照)を同一プログラム内で並行運用する場合、
     // tcp_poll_once()がnet_poll_all_and_dispatch()経由でコンテキストを
     // 切り替えながらポーリングするため、この関数が呼ばれた時点で
@@ -968,11 +968,11 @@ static int tcp_send_segment(tcp_conn_t *conn, tcp_priv_t *priv, uint8_t flags,
     // conn->local_ip(接続確立時に固定)から所属コンテキストを逆引きし、
     // 以降のarp_cache_lookup()/eth_send_frags_async()が正しいMAC/IP/
     // ARPキャッシュ/送受信バックエンドを参照するよう明示的に切り替える
-    // (単一インターフェース運用時はnet_ctx_find_by_ip()が同じ
+    // (単一インターフェース運用時はnetif_find_by_ip()が同じ
     // コンテキストを返すだけで実害無し)。
-    net_ctx_t *conn_ctx = net_ctx_find_by_ip(conn->local_ip);
+    netif_t *conn_ctx = netif_find_by_ip(conn->local_ip);
     if (conn_ctx) {
-        net_ctx_activate(conn_ctx);
+        netif_activate(conn_ctx);
     }
 
     uint8_t dst_mac[ETH_ALEN];
@@ -1073,7 +1073,7 @@ static int tcp_send_segment(tcp_conn_t *conn, tcp_priv_t *priv, uint8_t flags,
      *
      * 2026-08-13、writeパイプライン化: リングエントリ数を固定の
      * ETH_RX_RING_SIZE(128、RP1 GEM)ではなく net_active_rx_ring_size()
-     * (アクティブインターフェースの実RXリング容量、netctx.h参照)から取る
+     * (アクティブインターフェースの実RXリング容量、netif.h参照)から取る
      * ように変更した。mlx5(ConnectX)のRQは256エントリありRP1の2倍の受信
      * フレームを吸収できるため、従来128決め打ちで計算していた広告ウィンドウ
      * (ジャンボで約573KB)が実容量の半分に抑えられ、NVMe/TCP writeの実効
@@ -1117,7 +1117,7 @@ static int tcp_send_segment(tcp_conn_t *conn, tcp_priv_t *priv, uint8_t flags,
         tcph[TCP_HDR_LEN + 1] = 4;
         // TCP_MSS_LOCAL(静的バッファの最大容量、ジャンボ前提)ではなく
         // net_active_mss_cap()(現在アクティブなバックエンドが実際に
-        // 安全に扱える上限、netctx.hのnet_ctx_t.mss_cap参照)を広告する
+        // 安全に扱える上限、netif.hのnetif_t.mss_cap参照)を広告する
         // -- ConnectX(標準MTU相当の1460)等、ジャンボ非対応のバックエンド
         // へジャンボサイズのセグメントを送ろうとして送信段で失敗するのを
         // 防ぐ。RP1はmss_cap=TCP_MSS_LOCALなので従来と同じ値になる。
@@ -1159,7 +1159,7 @@ static int tcp_send_segment(tcp_conn_t *conn, tcp_priv_t *priv, uint8_t flags,
     uint16_t hdr_bytes = (uint16_t)(IP_PAYLOAD_OFFSET + hdr_total);
 
     /* 2026-08-09、真のゼロコピー送信(net_active_tx_zerocopy()、
-     * netctx.hコメント参照)。従来は常にデータ本体をヘッダに続けて
+     * netif.hコメント参照)。従来は常にデータ本体をヘッダに続けて
      * seg_bufへコピーしてから単一ディスクリプタで送っていたが(RP1の
      * GEMがscatter-gather TXに対応しないための設計、下記else節に
      * そのまま残す)、mlx5(cs_flags経路と対、mlx5_net_post_frame()の
@@ -1266,9 +1266,9 @@ static int tcp_send_segment_lso(tcp_conn_t *conn, tcp_priv_t *priv,
     /* tcp_send_segment()冒頭と同じ理由(コメント参照) -- 複数ネットワーク
      * インターフェース運用時、この関数が呼ばれた時点でg_active_ctxが
      * conn自身の所属インターフェースとは限らない。 */
-    net_ctx_t *conn_ctx = net_ctx_find_by_ip(conn->local_ip);
+    netif_t *conn_ctx = netif_find_by_ip(conn->local_ip);
     if (conn_ctx) {
-        net_ctx_activate(conn_ctx);
+        netif_activate(conn_ctx);
     }
 
     uint8_t dst_mac[ETH_ALEN];
@@ -1363,9 +1363,9 @@ static void tcp_send_bare_ack(uint32_t local_ip, uint16_t local_port,
 {
     unsigned core = smp_core_index();
 
-    net_ctx_t *conn_ctx = net_ctx_find_by_ip(local_ip);
+    netif_t *conn_ctx = netif_find_by_ip(local_ip);
     if (conn_ctx) {
-        net_ctx_activate(conn_ctx);
+        netif_activate(conn_ctx);
     }
 
     uint8_t dst_mac[ETH_ALEN];
@@ -1658,7 +1658,7 @@ static void tcp_poll_once_ex(int check_ctrl_c)
     }
 
     // net_poll_all_and_dispatch(): 登録済みの全コンテキストをポーリング
-    // する(netctx.h、arp.c/icmp.cの待ちループと同じ理由 -- ConnectXの
+    // する(netif.h、arp.c/icmp.cの待ちループと同じ理由 -- ConnectXの
     // PF0/PF1のように複数インターフェースを並行運用する場合、片方の
     // コネクションの応答待ち中でも、もう片方が受信・自動応答できる
     // 必要があるため)。登録数が1つ(通常のRP1単体運用)でも従来と
@@ -1807,7 +1807,7 @@ static void tcp_parse_syn_options(tcp_conn_t *conn, tcp_priv_t *priv,
         if (kind == TCP_OPT_KIND_MSS && opt_len == 4) {
             uint16_t peer_mss = rd16be(opts + i + 2);
             /* 自分がこのコネクションで安全に送信できる上限(net_active_
-             * mss_cap()、netctx.hのnet_ctx_t.mss_cap参照)で上限する --
+             * mss_cap()、netif.hのnetif_t.mss_cap参照)で上限する --
              * 静的バッファ容量(TCP_MSS_LOCAL)ではなく、現在アクティブな
              * バックエンド(ConnectX等、ジャンボ非対応の可能性がある)の
              * 実際の送信能力を見る。 */
@@ -1873,8 +1873,8 @@ static tcp_async_slot_t *tcp_async_slot_at(tcp_priv_t *priv, unsigned core, unsi
     return NULL;  /* async_cap管理が正しければ到達しないはず */
 }
 
-/* local_ipの所属インターフェースがmlx5(hw_csum_offload、netctx.hの
- * net_ctx_t.hw_csum_offloadコメント参照 -- mlx5バックエンドのみ1)なら、
+/* local_ipの所属インターフェースがmlx5(hw_csum_offload、netif.hの
+ * netif_t.hw_csum_offloadコメント参照 -- mlx5バックエンドのみ1)なら、
  * 空きがある限りオーバーフロープールから1件割り当ててasync_capを
  * TCP_ASYNC_SLOTS+TCP_ASYNC_SLOTS_MLX5_EXTRAへ引き上げる。RP1、または
  * プール枯渇時はasync_cap=TCP_ASYNC_SLOTSのまま(安全側のフォール
@@ -1883,7 +1883,7 @@ static tcp_async_slot_t *tcp_async_slot_at(tcp_priv_t *priv, unsigned core, unsi
  * 参照)。 */
 static void tcp_priv_try_grant_mlx5_async_overflow(tcp_priv_t *priv, unsigned core, uint32_t local_ip)
 {
-    net_ctx_t *ctx = net_ctx_find_by_ip(local_ip);
+    netif_t *ctx = netif_find_by_ip(local_ip);
     if (!ctx || !ctx->hw_csum_offload) {
         return;  /* RP1、または未解決 -- TCP_ASYNC_SLOTSのまま */
     }
@@ -2621,7 +2621,7 @@ static int tcp_send_async_ex(tcp_conn_t *conn, const void *buf, uint16_t len, in
      * lso()の単発呼び出し(LSO対応)にするか、tcp_send_segment()のmss単位
      * 複数回呼び出し(LSO非対応、従来のRP1向け挙動を保つ)にするかを
      * チャンクごとに決める。 */
-    net_ctx_t *conn_ctx = net_ctx_find_by_ip(conn->local_ip);
+    netif_t *conn_ctx = netif_find_by_ip(conn->local_ip);
     uint32_t lso_cap = conn_ctx ? conn_ctx->hw_lso_max_bytes : 0u;
     if (lso_cap > TCP_ASYNC_MAX_LEN) lso_cap = TCP_ASYNC_MAX_LEN;
 
@@ -2960,7 +2960,7 @@ void tcp_close(tcp_conn_t *conn)
     }
 }
 
-int tcp_listen(uint16_t port, net_ctx_t *ctx)
+int tcp_listen(uint16_t port, netif_t *ctx)
 {
     /* 共有配列(上記s_listeners宣言コメント参照) -- 返す番号は
      * s_listeners[]内の生インデックス(コアをまたいでも一意)。 */

@@ -474,7 +474,7 @@ typedef struct {
     // (mlx5.cのmlx5_set_port_mtu())で実際に設定できたワイヤ上の最大
     // フレーム長(ETH_HLEN込み、admin_mtuと同じ規約)。実機ではHW上限
     // (max_mtu)がMLX5_JUMBO_MAX_LEN(10240)より小さい場合がある(実測
-    // 10000)ため、mlx5_net_ctx_setup()がnet_ctx_t.mss_capをこの値から
+    // 10000)ため、mlx5_netif_setup()がnetif_t.mss_capをこの値から
     // 逆算する -- 固定でTCP_MSS_LOCAL(10182)相当を使うと、実際のワイヤ
     // 上限を超えるTCPセグメントを送ってしまう(PMTUはRXだけでなくTXにも
     // 適用される可能性が高く未検証、安全側に倒す)。PMTU設定/クエリが
@@ -659,8 +659,8 @@ void mlx5_monitor_summary3(mlx5_dev_t *d0, mlx5_dev_t *d1,
 mlx5_dev_t *mlx5_monitor_saved_dev(unsigned pf);
 
 // mlx5_net.c: ConnectX(mlx5) PF0/PF1をTCP/IPスタック(arp.c/ip.c/icmp.c)の
-// nic_ops_tバックエンド(netctx.h参照)として使えるよう、PF0/PF1双方を
-// mlx5_hca_bringup()した上で、それぞれをnet_ctx_tとして構成・登録する。
+// nic_ops_tバックエンド(netif.h参照)として使えるよう、PF0/PF1双方を
+// mlx5_hca_bringup()した上で、それぞれをnetif_tとして構成・登録する。
 // mlx5_dual_port_bringup_and_test()(診断用の`mlx5`コマンド、一発の
 // テストフレーム送受信のみ)とは別物 -- こちらは継続的なRX/TXが可能な
 // 実運用バックエンドを用意する。現状はPF0<->PF1のループバックケーブル

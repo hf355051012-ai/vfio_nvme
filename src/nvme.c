@@ -15,7 +15,7 @@
 #include "job.h"
 #include "timestamp.h"
 #include "smp.h"
-#include "netctx.h"
+#include "netif.h"
 
 #define NVME_QSIZE               32u    /* admin/IO両queueのsqsize(Fabrics Connectで通知) */
 #define NVME_ADMIN_CMD_TIMEOUT_MS 5000u
@@ -709,7 +709,7 @@ typedef struct {
     nvme_ctx_t         *ctx;
     uint32_t             ip;
     uint16_t              port;
-    net_ctx_t            *src_ctx;  /* spawn時点のg_active_ctx、下記コメント参照 */
+    netif_t            *src_ctx;  /* spawn時点のg_active_ctx、下記コメント参照 */
     uint64_t              wait_started_ticks;  /* 直近の待ち(ICResp受信/CSTS.RDYポーリング)を
                                                  * 開始した時刻 -- timeout_ms()で判定する */
     nvme_tcp_xfer_t       xfer;
@@ -778,7 +778,7 @@ static job_result_t nvme_connect_job_step(job_t *self)
     switch ((nvme_connect_state_t)self->state) {
 
     case NCONN_ST_TCP_ADMIN_BEGIN:
-        if (jc->src_ctx) net_ctx_activate(jc->src_ctx);
+        if (jc->src_ctx) netif_activate(jc->src_ctx);
         tcp_connect_begin(&ctx->admin.tcp, jc->ip, jc->port);
         self->state = NCONN_ST_TCP_ADMIN_WAIT;
         return JOB_WAITING;
@@ -921,7 +921,7 @@ static job_result_t nvme_connect_job_step(job_t *self)
         if (jc->exec.result != 0) {
             return nvme_connect_job_fail(jc, 1, 0, "Set Features(Number of Queues)失敗");
         }
-        if (jc->src_ctx) net_ctx_activate(jc->src_ctx);
+        if (jc->src_ctx) netif_activate(jc->src_ctx);
         tcp_connect_begin(&ctx->io.tcp, jc->ip, jc->port);
         self->state = NCONN_ST_TCP_IO_WAIT;
         return JOB_WAITING;

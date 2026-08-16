@@ -13,10 +13,10 @@
 
 #include <stddef.h>
 #include "arp.h"
-#include "netctx.h"
+#include "netif.h"
 #include "net_buf.h"
 #include "net.h"
-#include "netctx.h"
+#include "netif.h"
 #include "uart.h"
 #include "timer.h"
 
@@ -36,12 +36,12 @@
 /* IP->MAC 簡易キャッシュ                                                */
 /* ------------------------------------------------------------------ */
 /* 以前はここに単一のファイル静的配列(s_arp_cache)を持っていたが、
- * ConnectX統合(複数ネットワークインターフェースの並行運用、netctx.h
+ * ConnectX統合(複数ネットワークインターフェースの並行運用、netif.h
  * 参照)により、ARPキャッシュは「現在アクティブなコンテキスト
  * (g_active_ctx)ごと」に持つ必要がある(RP1とmlx5-PF0/PF1がそれぞれ
  * 独立したARPキャッシュを持つべきであり、混ぜてはならないため)。
- * arp_cache_entry_t/ARP_CACHE_SIZEの定義自体はnetctx.hへ移した
- * (net_ctx_t.arp_cacheが埋め込むため)。 */
+ * arp_cache_entry_t/ARP_CACHE_SIZEの定義自体はnetif.hへ移した
+ * (netif_t.arp_cacheが埋め込むため)。 */
 
 #define ARP_RESOLVE_TIMEOUT_MS 300u /* 1回のrequestあたりのポーリング待ち */
 #define ARP_RESOLVE_MAX_ATTEMPTS 3u /* requestを再送する最大回数(合計最大約900ms) */
@@ -259,7 +259,7 @@ int arp_resolve(uint32_t ip, uint8_t out_mac[ETH_ALEN])
         uint64_t start = timer_now();
         do {
             // net_poll_all_and_dispatch(): 登録済みの全コンテキストを
-            // ポーリングする(netctx.h参照) -- ループバック構成
+            // ポーリングする(netif.h参照) -- ループバック構成
             // (ConnectX PF0/PF1)で相手側が独立に応答するには、待って
             // いる間も相手のコンテキストを一緒にポーリングし続ける
             // 必要があるため、eth_poll_recv()+eth_dispatch()の単発呼び

@@ -4,7 +4,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include "net_buf.h"
-#include "netctx.h"
+#include "netif.h"
 
 /* ================================================================
  * ip.h — IPv4ヘッダ処理 — フェーズ3

@@ -12,11 +12,11 @@
 #include <stddef.h>
 #include "icmp.h"
 #include "ip.h"
-#include "netctx.h"
+#include "netif.h"
 #include "arp.h"
 #include "net_buf.h"
 #include "net.h"
-#include "netctx.h"
+#include "netif.h"
 #include "uart.h"
 #include "timer.h"
 #include "smp.h"
@@ -168,7 +168,7 @@ int icmp_wait_echo_reply(uint16_t ident, uint16_t seq, uint32_t timeout_val_ms)
     uint64_t start = timer_now();
     do {
         // net_poll_all_and_dispatch(): arp_resolve()と同じ理由
-        // (netctx.h参照、ConnectXループバック構成での相互応答のため)。
+        // (netif.h参照、ConnectXループバック構成での相互応答のため)。
         net_poll_all_and_dispatch();
         if (s_echo_reply_ready[core] &&
             s_echo_reply_ident[core] == ident && s_echo_reply_seq[core] == seq) {

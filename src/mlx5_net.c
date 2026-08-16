@@ -1,7 +1,7 @@
 // mlx5_net.c
 //
 // ConnectX(mlx5) PF0/PF1を、既存のTCP/IPスタック(arp.c/ip.c/icmp.c、
-// netctx.hのnic_ops_t)向けの継続動作可能なNICバックエンドとして使うための
+// netif.hのnic_ops_t)向けの継続動作可能なNICバックエンドとして使うための
 // 送受信実装。mlx5.cが用意するRQ/SQ/CQ(mlx5_hca_bringup())をそのまま使う
 // が、診断用の一発テスト(mlx5.cのmlx5_sq_send_test_frame()/
 // mlx5_cq_poll_any())と違い、継続的な送受信に必要な2点を新たに実装する:
@@ -38,7 +38,7 @@
 //   ポストされても互いのデータを上書きしない。
 
 #include "mlx5.h"
-#include "netctx.h"
+#include "netif.h"
 #include "net.h"
 #include "net_buf.h"
 #include "uart.h"
@@ -188,8 +188,8 @@ static mlx5_net_state_t s_state_pf0;
 static mlx5_net_state_t s_state_pf1;
 static mlx5_dev_t       s_dev_pf0;
 static mlx5_dev_t       s_dev_pf1;
-static net_ctx_t        s_ctx_pf0;
-static net_ctx_t        s_ctx_pf1;
+static netif_t        s_ctx_pf0;
+static netif_t        s_ctx_pf1;
 
 /* 2026-08-08、ユーザー指示: 「TXタイムアウトが起きた瞬間に停止し、
  * その場でハード情報を採取する」ため追加。0=PF0, 1=PF1。一度でも
@@ -197,7 +197,7 @@ static net_ctx_t        s_ctx_pf1;
  * WQEポスト・1秒待ちを一切行わず即座に-1を返すようにする(既に壊れたと
  * 確定したSQへ延々とリトライを重ね、詳細情報が失われた古い状態の上に
  * さらに新しい詰まりが積み重なる、というこれまでの調査で繰り返し
- * 直面した問題を防ぐ)。mlx5_net_ctx_setup()(bring-upのたびに呼ばれる)
+ * 直面した問題を防ぐ)。mlx5_netif_setup()(bring-upのたびに呼ばれる)
  * でPFごとにクリアする。 */
 static volatile int s_sq_halted[2];
 
@@ -557,7 +557,7 @@ static int mlx5_net_post_frame(mlx5_net_state_t *st, const eth_frag_t *frags, un
      * wqe[16+4]=wqe[20]。MLX5_ETH_WQE_L3_CSUM(1<<6)|MLX5_ETH_WQE_L4_CSUM
      * (1<<7)を立てると、HWがIPヘッダ/TCPヘッダのチェックサムを実際に
      * 計算してフレームへ書き込む(en_tx.cのmlx5e_txwqe_build_eseg_csum()
-     * と同じ設定、CHECKSUM_PARTIAL相当)。tcp.c/ip.cはnet_ctx_t.
+     * と同じ設定、CHECKSUM_PARTIAL相当)。tcp.c/ip.cはnetif_t.
      * hw_csum_offload(このmlx5経路では常に1)を見て、送信前のソフト
      * ウェアチェックサム計算を省略する(送信するチェックサムフィールドの
      * 実際の値はHWが上書きするため0のままでよい)。 */
@@ -1226,7 +1226,7 @@ void mlx5_net_measure_bf_latency(int pf_index, unsigned iterations)
                 (unsigned)ticks_to_ns(max_ticks));
 }
 
-// nic_ops_t.send_lso()の実体(netctx.hのnic_ops_t.send_lso参照、RP1側は
+// nic_ops_t.send_lso()の実体(netif.hのnic_ops_t.send_lso参照、RP1側は
 // NULL)。mlx5_net_send_frags_async()と同じ非同期パイプライン方式
 // (SQリングに空きが無い時だけmlx5_net_sq_wait_room()で待つ、完了[CQE]は
 // 待たない)。呼び出し元(tcp.cのtcp_send_segment_lso())はこのWQE1個で
@@ -1673,7 +1673,7 @@ static const nic_ops_t s_mlx5_net_ops = {
     .poll_recv         = mlx5_net_poll_recv,
 };
 
-static void mlx5_net_ctx_setup(net_ctx_t *ctx, mlx5_net_state_t *st, mlx5_dev_t *dev,
+static void mlx5_netif_setup(netif_t *ctx, mlx5_net_state_t *st, mlx5_dev_t *dev,
                                 const char *name, uint32_t ip, uint8_t mac_low_octet)
 {
     ctx->name = name;
@@ -1721,7 +1721,7 @@ static void mlx5_net_ctx_setup(net_ctx_t *ctx, mlx5_net_state_t *st, mlx5_dev_t 
         mss = 9216;
         ctx->mss_cap = (uint16_t)mss;
     }
-    // 2026-08-13、writeパイプライン化(netctx.hのnet_ctx_t.rx_ring_size
+    // 2026-08-13、writeパイプライン化(netif.hのnetif_t.rx_ring_size
     // コメント参照)。mlx5のRQは256エントリ(MLX5_RQ_NUM_WQES、各
     // MLX5_JUMBO_MAX_LEN=10240バイト)あり、RP1 GEMのETH_RX_RING_SIZE(128)の
     // 2倍の受信フレームを吸収できる。tcp.cのsafe_window_capがこの実容量を
@@ -1729,16 +1729,16 @@ static void mlx5_net_ctx_setup(net_ctx_t *ctx, mlx5_net_state_t *st, mlx5_dev_t 
     // NVMe/TCP writeの実効パイプライン深度が上がる(従来は128決め打ちで
     // ウィンドウが半分に抑えられdepth~2に制限されていた)。
     ctx->rx_ring_size = (uint16_t)MLX5_RQ_NUM_WQES;
-    // 2026-08-09、ハードウェアチェックサムオフロード対応(netctx.hの
-    // net_ctx_t.hw_csum_offloadコメント参照)。mlx5_net_post_frame()が
+    // 2026-08-09、ハードウェアチェックサムオフロード対応(netif.hの
+    // netif_t.hw_csum_offloadコメント参照)。mlx5_net_post_frame()が
     // 常にSQ WQEのcs_flags(L3_CSUM|L4_CSUM)を立てるため、この
     // インターフェース経由の送信は常にHWがIP/TCPチェックサムを計算する。
     ctx->hw_csum_offload = 1;
-    // 2026-08-09、TCP送信の真のゼロコピー対応(netctx.hのnet_ctx_t.
+    // 2026-08-09、TCP送信の真のゼロコピー対応(netif.hのnetif_t.
     // tx_zerocopy_2fragコメント参照)。mlx5_net_post_frame()が
     // frag_count==2の専用経路(2 data_seg構成)を持つため有効化する。
     ctx->tx_zerocopy_2frag = 1;
-    // 2026-08-10、LSO対応(netctx.hのnet_ctx_t.hw_lso_max_bytesコメント
+    // 2026-08-10、LSO対応(netif.hのnetif_t.hw_lso_max_bytesコメント
     // 参照)。mlx5_hca_bringup()がQUERY_HCA_CAP(ETHERNET_OFFLOADS)から
     // 読み取り、MLX5_LSO_MAX_BYTES_CAPでクランプ済みの値をそのまま渡す
     // (0ならHWが非対応、またはクエリ失敗 -- tcp.cはこの場合LSOを使わない)。
@@ -1766,13 +1766,13 @@ static void mlx5_net_ctx_setup(net_ctx_t *ctx, mlx5_net_state_t *st, mlx5_dev_t 
  * (RPi5 の net init mlx5 と x86 は排他運用なので競合しない)。 */
 int mlx5_net_register_dual(mlx5_dev_t *dev0, mlx5_dev_t *dev1)
 {
-    mlx5_net_ctx_setup(&s_ctx_pf0, &s_state_pf0, dev0, "mlx5-pf0",
+    mlx5_netif_setup(&s_ctx_pf0, &s_state_pf0, dev0, "mlx5-pf0",
                         ip_from_octets(192, 168, 101, 10), 0x10);
-    mlx5_net_ctx_setup(&s_ctx_pf1, &s_state_pf1, dev1, "mlx5-pf1",
+    mlx5_netif_setup(&s_ctx_pf1, &s_state_pf1, dev1, "mlx5-pf1",
                         ip_from_octets(192, 168, 101, 11), 0x11);
-    net_ctx_register(&s_ctx_pf0);
-    net_ctx_register(&s_ctx_pf1);
-    net_ctx_activate(&s_ctx_pf0);
+    netif_register(&s_ctx_pf0);
+    netif_register(&s_ctx_pf1);
+    netif_activate(&s_ctx_pf0);
     mlx5_monitor_set_devs(dev0, dev1);
     uart_printf("[mlx5net] dual registered: pf0=192.168.101.10 pf1=192.168.101.11 (active=pf0)\n");
     return 0;
@@ -1832,14 +1832,14 @@ int mlx5_net_init_dual_loopback(void)
     // ループバックケーブル配線を前提に、PF0/PF1へ同一サブネット上の
     // 別々のIPを割り当てる(ユーザー指示: しばらくPCとは通信させず、
     // ループバック構成のままARP/ICMPの基本機能を確認する予定)。
-    mlx5_net_ctx_setup(&s_ctx_pf0, &s_state_pf0, &s_dev_pf0, "mlx5-pf0",
+    mlx5_netif_setup(&s_ctx_pf0, &s_state_pf0, &s_dev_pf0, "mlx5-pf0",
                         ip_from_octets(192, 168, 101, 10), 0x10);
-    mlx5_net_ctx_setup(&s_ctx_pf1, &s_state_pf1, &s_dev_pf1, "mlx5-pf1",
+    mlx5_netif_setup(&s_ctx_pf1, &s_state_pf1, &s_dev_pf1, "mlx5-pf1",
                         ip_from_octets(192, 168, 101, 11), 0x11);
 
-    net_ctx_register(&s_ctx_pf0);
-    net_ctx_register(&s_ctx_pf1);
-    net_ctx_activate(&s_ctx_pf0);
+    netif_register(&s_ctx_pf0);
+    netif_register(&s_ctx_pf1);
+    netif_activate(&s_ctx_pf0);
 
     // `mlx5stat`シェルコマンド(PPCNT physical port統計カウンタ・
     // QUERY_RQ/SQ/CQ)でこの2つのPFも診断できるようにする(CLAUDE.md

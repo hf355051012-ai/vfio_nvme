@@ -1,9 +1,9 @@
-// netctx.c
+// netif.c
 //
-// 複数ネットワークインターフェース(net_ctx_t)の切り替え・受信ポーリング
-// 巡回。設計意図はnetctx.hのコメント参照。
+// 複数ネットワークインターフェース(netif_t)の切り替え・受信ポーリング
+// 巡回。設計意図はnetif.hのコメント参照。
 
-#include "netctx.h"
+#include "netif.h"
 #include <stddef.h>
 #include "timestamp.h"   /* 同上 */
 #include "cache.h"
@@ -11,23 +11,23 @@
 
 // マルチコア化 Phase 4(~/.claude/plans/wondrous-baking-gadget.md参照):
 // 「現在アクティブなコンテキスト」(g_active_ctxマクロの実体)はコアごとに
-// 独立配列のまま維持する(netctx.hのg_active_ctxマクロコメント参照 --
+// 独立配列のまま維持する(netif.hのg_active_ctxマクロコメント参照 --
 // 「今このコアが何として振る舞うか」は本質的にコア固有の実行状態)。
-net_ctx_t *g_netctx_active_slots[SMP_MAX_CORES];
+netif_t *g_netif_active_slots[SMP_MAX_CORES];
 
 // 【2026-08-08変更、job stepのctx経由リソース参照化】登録簿自体は単一の
-// 共有配列へ戻した(netctx.hの上記コメント参照 -- job migrationで
-// コネクション生成コアと異なるコアがnet_ctx_find_by_ip()を呼んでも
+// 共有配列へ戻した(netif.hの上記コメント参照 -- job migrationで
+// コネクション生成コアと異なるコアがnetif_find_by_ip()を呼んでも
 // 正しく見つけられるようにするため)。総容量は従来のコアごとの容量
-// (NET_CTX_MAX_REGISTERED)×コア数のまま維持し、実質的な登録可能数を
+// (NETIF_MAX_REGISTERED)×コア数のまま維持し、実質的な登録可能数を
 // 減らさない。
-#define NET_CTX_MAX_TOTAL (NET_CTX_MAX_REGISTERED * SMP_MAX_CORES)
+#define NETIF_MAX_TOTAL (NETIF_MAX_REGISTERED * SMP_MAX_CORES)
 
-static net_ctx_t     *s_registered[NET_CTX_MAX_TOTAL];
+static netif_t     *s_registered[NETIF_MAX_TOTAL];
 static unsigned        s_registered_count;
 static smp_spinlock_t  s_registered_lock;
 
-void net_ctx_activate(net_ctx_t *ctx)
+void netif_activate(netif_t *ctx)
 {
     g_active_ctx = ctx;
 }
@@ -102,7 +102,7 @@ void eth_get_mac(uint8_t mac[ETH_ALEN])
 }
 
 /* 以下は g_active_ctx->nic 経由の間接呼び出し。実体は mlx5_net.c の
- * s_mlx5_net_ops(定義は netctx.h の nic_ops_t 参照)。 */
+ * s_mlx5_net_ops(定義は netif.h の nic_ops_t 参照)。 */
 int eth_send_frags(const eth_frag_t *frags, unsigned frag_count)
 {
     if (!g_active_ctx) {
@@ -155,7 +155,7 @@ int eth_send(net_buf_t *nb)
     return ret;
 }
 
-void net_ctx_register(net_ctx_t *ctx)
+void netif_register(netif_t *ctx)
 {
     smp_spin_lock(&s_registered_lock);
     for (unsigned i = 0; i < s_registered_count; i++) {
@@ -164,9 +164,9 @@ void net_ctx_register(net_ctx_t *ctx)
             return; // 既に登録済み
         }
     }
-    if (s_registered_count < NET_CTX_MAX_TOTAL) {
+    if (s_registered_count < NETIF_MAX_TOTAL) {
         /* このコンテキストの実ハードウェアを実際にポーリングして良いのは
-         * 登録した瞬間のコアだけに固定する(netctx.hのnet_ctx_t.owner_core
+         * 登録した瞬間のコアだけに固定する(netif.hのnetif_t.owner_core
          * コメント参照)。 */
         ctx->owner_core = smp_core_index();
         ctx->is_poll_owner = 1;
@@ -175,12 +175,12 @@ void net_ctx_register(net_ctx_t *ctx)
     smp_spin_unlock(&s_registered_lock);
 }
 
-void net_ctx_set_owner_core(net_ctx_t *ctx, unsigned core)
+void netif_set_owner_core(netif_t *ctx, unsigned core)
 {
     ctx->owner_core = core;
 }
 
-void net_ctx_register_alias(net_ctx_t *ctx, const net_ctx_t *primary)
+void netif_register_alias(netif_t *ctx, const netif_t *primary)
 {
     ctx->nic        = primary->nic;
     ctx->nic_priv   = primary->nic_priv;
@@ -193,15 +193,15 @@ void net_ctx_register_alias(net_ctx_t *ctx, const net_ctx_t *primary)
             return; // 既に登録済み
         }
     }
-    if (s_registered_count < NET_CTX_MAX_TOTAL) {
-        ctx->is_poll_owner = 0;  /* netctx.hのnet_ctx_register_alias()コメント参照 */
+    if (s_registered_count < NETIF_MAX_TOTAL) {
+        ctx->is_poll_owner = 0;  /* netif.hのnetif_register_alias()コメント参照 */
         s_registered[s_registered_count++] = ctx;
     }
     smp_spin_unlock(&s_registered_lock);
 }
 
-/* 検索(net_ctx_find()/net_ctx_find_by_ip())・巡回(net_poll_all_and_
- * dispatch())はs_registered_lockを取らずに読む。登録(net_ctx_register())
+/* 検索(netif_find()/netif_find_by_ip())・巡回(net_poll_all_and_
+ * dispatch())はs_registered_lockを取らずに読む。登録(netif_register())
  * は実運用上、起動シーケンス(platform_init.c等)でジョブ/メインループが
  * 走り出す前に完了しており、以後s_registered[]/s_registered_countは
  * 実質的に不変になる -- 将来登録と検索が本当に同時に起きても、
@@ -211,7 +211,7 @@ void net_ctx_register_alias(net_ctx_t *ctx, const net_ctx_t *primary)
  * heartbeat等と同じ、このプロジェクトが単純なカウンタ/フラグ共有に
  * 対して採用している規約に倣う)。 */
 
-net_ctx_t *net_ctx_find(const char *name)
+netif_t *netif_find(const char *name)
 {
     for (unsigned i = 0; i < s_registered_count; i++) {
         const char *a = s_registered[i]->name;
@@ -225,7 +225,7 @@ net_ctx_t *net_ctx_find(const char *name)
     return NULL;
 }
 
-net_ctx_t *net_ctx_find_by_ip(uint32_t ip)
+netif_t *netif_find_by_ip(uint32_t ip)
 {
     for (unsigned i = 0; i < s_registered_count; i++) {
         if (s_registered[i]->ip == ip) {
@@ -237,7 +237,7 @@ net_ctx_t *net_ctx_find_by_ip(uint32_t ip)
 
 /* 【2026-08-08追加、telnetのコアごと分離用】受信フレームの宛先IP
  * (ARPならtpa、IPv4ならdst_ip)を読み、pollerと同じ物理NIC(nic/nic_priv
- * が一致)を共有する別名ctx(net_ctx_register_alias()参照)の中にそのIPを
+ * が一致)を共有する別名ctx(netif_register_alias()参照)の中にそのIPを
  * 名乗るものがあればそれを返す。無ければpoller自身を返す(通常の単一IP
  * 運用、または一致無し=ARP/IPハンドラ側の既存の「自機宛でなければ無視」
  * チェックへそのまま委ねる)。
@@ -248,7 +248,7 @@ net_ctx_t *net_ctx_find_by_ip(uint32_t ip)
  * 値の再掲であり、独自に導出したものではない)。1バイトずつの読み出し
  * のみを行い、複数バイトを一度に読む多バイトアクセスは行わない(net.hの
  * 「多バイトフィールドアクセスはバイト単位で」という規約と同じ理由)。 */
-static net_ctx_t *net_ctx_resolve_frame_owner(net_ctx_t *poller, const net_buf_t *nb)
+static netif_t *netif_resolve_frame_owner(netif_t *poller, const net_buf_t *nb)
 {
     if (nb->len < 14u + 20u) return poller;  /* ARP/IPどちらの最小長にも満たない */
 
@@ -266,7 +266,7 @@ static net_ctx_t *net_ctx_resolve_frame_owner(net_ctx_t *poller, const net_buf_t
     if (target_ip == poller->ip) return poller;
 
     for (unsigned i = 0; i < s_registered_count; i++) {
-        net_ctx_t *c = s_registered[i];
+        netif_t *c = s_registered[i];
         if (c != poller && c->nic == poller->nic && c->nic_priv == poller->nic_priv &&
             c->ip == target_ip) {
             return c;
@@ -298,36 +298,36 @@ static net_ctx_t *net_ctx_resolve_frame_owner(net_ctx_t *poller, const net_buf_t
 int net_poll_all_and_dispatch(void)
 {
     unsigned core = smp_core_index();
-    net_ctx_t *prev = g_active_ctx;
+    netif_t *prev = g_active_ctx;
     int got_frame = 0;
 
     for (unsigned i = 0; i < s_registered_count; i++) {
-        net_ctx_t *ctx = s_registered[i];
+        netif_t *ctx = s_registered[i];
         if (ctx->owner_core != core || !ctx->is_poll_owner) {
             /* このコンテキストの実ハードウェアは別コアの担当、または
-             * 自分ではポーリングしない別名ctx(netctx.hのnet_ctx_t.
+             * 自分ではポーリングしない別名ctx(netif.hのnetif_t.
              * is_poll_ownerコメント参照)-- ここでは一切触らない。 */
             continue;
         }
-        net_ctx_activate(ctx);
+        netif_activate(ctx);
         for (unsigned n = 0; n < NET_POLL_BATCH_MAX; n++) {
             net_buf_t *nb = ctx->nic->poll_recv(ctx->nic_priv); // -> rp1_poll_recv / mlx5_net_poll_recv
             if (!nb) {
                 break;
             }
             got_frame = 1;
-            net_ctx_t *owner = net_ctx_resolve_frame_owner(ctx, nb);
+            netif_t *owner = netif_resolve_frame_owner(ctx, nb);
             if (owner != ctx) {
-                net_ctx_activate(owner);
+                netif_activate(owner);
             }
             eth_dispatch(nb);
             net_buf_free(nb);
             if (owner != ctx) {
-                net_ctx_activate(ctx);
+                netif_activate(ctx);
             }
         }
     }
 
-    net_ctx_activate(prev);
+    netif_activate(prev);
     return got_frame;
 }

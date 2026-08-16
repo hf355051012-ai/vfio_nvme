@@ -163,7 +163,7 @@
 //
 // 2026-08-08、マルチコア化 Phase 4(~/.claude/plans/wondrous-baking-
 // gadget.md参照)で96MB→128MBへ再移動: job.c以外の全モジュール
-// (net_buf.c/timestamp.c/ip.c/icmp.c/netctx.c/tcp.c)をper-core化した
+// (net_buf.c/timestamp.c/ip.c/icmp.c/netif.c/tcp.c)をper-core化した
 // ことで、コアごとに独立配列(`[SMP_MAX_CORES]`)を持つようになった --
 // 特にtcp.cの`s_priv[SMP_MAX_CORES][TCP_MAX_CONNS]`(1コネクションあたり
 // TCP_RX_BUF_SIZE=2MBのrx_bufを含む)が2倍化し、通常`.bss`の終端が

@@ -3,7 +3,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
-#include "netctx.h"
+#include "netif.h"
 #include "smp.h"
 
 /* ================================================================
@@ -251,11 +251,11 @@ typedef struct {
      * フィールド(=「このコネクションが実際に生成された/データを
      * 保持しているコア」)を使う -- job.cの共有スケジューラにより、
      * このconnを扱うjob stepが生成時と別のコアでtickされることがあり
-     * うるため(net_ctx_t.owner_coreと同じ設計方針)。
+     * うるため(netif_t.owner_coreと同じ設計方針)。
      * 【注意】これはあくまで「正しいスロットを見つけられる」ことだけを
      * 保証する -- 実際にNICハードウェア(eth.c/mlx5_net.c)へ送受信を
      * 発行する操作自体はコア間でスレッドセーフではないため、同じ
-     * net_ctx_tに属するjob群がowner_coreと異なるコアで*同時に*実行
+     * netif_tに属するjob群がowner_coreと異なるコアで*同時に*実行
      * されないことは、job.cのaffinity_key機構(job.h参照、nvmet.c/
      * nvme.cがbound_ctx/src_ctxをキーに設定する)側で別途保証する必要が
      * ある。 */
@@ -347,7 +347,7 @@ int  tcp_send(tcp_conn_t *conn, const void *buf, uint32_t len);
  *
  * 2026-08-10、LSO対応に伴い内部実装を拡張: len が conn->snd_mss を超える
  * 場合、従来は単純にtcp_send()(ブロッキング)へフォールバックしていたが、
- * 現在は接続先インターフェースのLSOケーパビリティ(net_ctx_t.
+ * 現在は接続先インターフェースのLSOケーパビリティ(netif_t.
  * hw_lso_max_bytes、conn->local_ipから解決)に応じて内部で自動的に
  * 使い分ける:
  * - LSO対応(ConnectX)かつlenがmssを超える: tcp_send_segment_lso()で
@@ -590,8 +590,8 @@ void tcp_input(const uint8_t *pkt, uint16_t len, uint32_t src_ip);
  * ポート番号(と、下記ctx)を覚えるだけ。
  *
  * ctx: このリスナーが受け付けるSYNを、特定のネットワークインターフェース
- * (netctx.hのnet_ctx_t、`net init mlx5`のConnectX PF0/PF1等)からのものに
- * 限定したい場合に渡す。net_poll_all_and_dispatch()(netctx.c)は登録済みの
+ * (netif.hのnetif_t、`net init mlx5`のConnectX PF0/PF1等)からのものに
+ * 限定したい場合に渡す。net_poll_all_and_dispatch()(netif.c)は登録済みの
  * 全インターフェースを順にg_active_ctxとしてactivateしてからpoll_recv()/
  * eth_dispatch()するため、tcp_input()がこのSYNを処理する時点のg_active_ctx
  * は「実際にこのフレームを受信したインターフェース」と一致する。ctxを
@@ -605,7 +605,7 @@ void tcp_input(const uint8_t *pkt, uint16_t len, uint32_t src_ip);
  * 呼び出し元向けの後方互換動作。
  * 戻り値: リスナーハンドル(0以上、以後のtcp_accept系関数やtcp_unlisten()
  *         へ渡す)、失敗時-1(TCP_MAX_LISTENERS個のスロットが全て使用中)。 */
-int tcp_listen(uint16_t port, net_ctx_t *ctx);
+int tcp_listen(uint16_t port, netif_t *ctx);
 
 /* リッスン中のポートへの新規TCP接続(3-way handshake)を待つ。
  * listener: tcp_listen()が返したハンドル。

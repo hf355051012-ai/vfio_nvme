@@ -84,7 +84,7 @@ extern volatile int      g_core3_alive;
 
 /* 今回はcore0/core1の2コアのみ対応(Phase 2でcore1のみPSCI CPU_ONで
  * 起動する設計、core2/3は未使用のまま)。per-coreモジュール(Phase 3の
- * net_buf.c/timestamp.c、Phase 4のnetctx.c/ip.c/icmp.c/tcp.c -- ただし
+ * net_buf.c/timestamp.c、Phase 4のnetif.c/ip.c/icmp.c/tcp.c -- ただし
  * job.cはユーザー指示によりper-core化を撤回し、下記smp_spinlock_tによる
  * 共有ジョブテーブル方式に変更した)はこの値を配列サイズとして使う。
  * 将来3コア目以降を起動する場合はこの値を増やすこと。
@@ -148,7 +148,7 @@ void sim_delay_tick(void);
  *
  * このプロジェクトの基本方針は「新規ロック機構を極力作らない」(コアごとに
  * 独立したメモリを持たせて競合そのものを無くす、net_buf.c/timestamp.c/
- * ip.c/icmp.c/netctx.c/tcp.c等のper-core化がこれ)だが、job.cのジョブ
+ * ip.c/icmp.c/netif.c/tcp.c等のper-core化がこれ)だが、job.cのジョブ
  * テーブルだけは例外 -- 「空いているコアが他コアのジョブを拾って処理
  * できる」という将来要件(work-stealing)は、ジョブテーブル自体が
  * コアをまたいで共有されていない限り実現できない。job.c以外の

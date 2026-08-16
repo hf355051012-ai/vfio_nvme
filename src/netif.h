@@ -1,5 +1,5 @@
-#ifndef NETCTX_H
-#define NETCTX_H
+#ifndef NETIF_H
+#define NETIF_H
 
 #include <stdint.h>
 #include <stddef.h>
@@ -26,7 +26,7 @@ typedef struct {
  * バッファ + 呼び出し元のデータバッファの2断片)を想定した値。 */
 #define ETH_TX_MAX_FRAGS 2
 
-/* RX/TX リング段数の既定値。バックエンドが net_ctx_t.rx_ring_size を
+/* RX/TX リング段数の既定値。バックエンドが netif_t.rx_ring_size を
  * 設定しない場合の受信ウィンドウ計算のフォールバック(ETH_RX_RING_SIZE)と、
  * tcp.c がスロット別送信バッファを確保する個数(ETH_TX_RING_SIZE)に使う。 */
 #define ETH_RX_RING_SIZE 128
@@ -82,7 +82,7 @@ void eth_dispatch(net_buf_t *nb);
 int eth_rx_hw_csum_ok(void);
 
 /* ================================================================
- * netctx.h — 複数NIC/複数ネットワークインターフェースの並行運用抽象化
+ * netif.h — 複数NIC/複数ネットワークインターフェースの並行運用抽象化
  *
  * 背景: 従来このプロジェクトのarp.c/ip.c/icmp.c/tcp.cは「自機のMAC/IP
  * アドレスはただ1つ、送受信バックエンドもRP1のGEMただ1つ」という前提の
@@ -96,7 +96,7 @@ int eth_rx_hw_csum_ok(void);
  * 設計方針: このプロジェクトはポーリング専用・単一スレッドの協調的
  * 実行モデル(割り込み無し)なので、真の並行動作ではなく「今どの
  * インターフェースとして振る舞うか」を頻繁に切り替える方式で複数
- * インターフェースを扱える。net_ctx_t が1つのインターフェースの識別情報
+ * インターフェースを扱える。netif_t が1つのインターフェースの識別情報
  * (MAC/IP/ARPキャッシュ)と送受信バックエンド(nic_ops_t)をまとめ、
  * g_active_ctx が「現在アクティブな」コンテキストを指す。
  *
@@ -120,7 +120,7 @@ typedef struct {
 
 /* NICバックエンドが実装すべき最小限の操作セット。eth.c(RP1)と
  * mlx5_net.c(ConnectX)がそれぞれ静的なテーブルとして実装し、
- * net_ctx_t.nic経由で呼ばれる。priv引数はバックエンドごとの内部状態
+ * netif_t.nic経由で呼ばれる。priv引数はバックエンドごとの内部状態
  * (RP1は単一グローバル実装のため常にNULL、mlx5はmlx5_net_state_t*)。
  * 意味・戻り値の規約はeth.hの同名公開関数(eth_send_frags()等)と同じ。 */
 /* [関数ポインタ登録先一覧 -- ctagsジャンプ補助] 各メンバに登録される具体関数:
@@ -137,7 +137,7 @@ typedef struct {
      * L2+L3+L4ヘッダ全体、ペイロード抜き)をテンプレートとして、payload
      * (payload_lenバイト、複数MSS分をまとめてよい)をHWがmss単位に自動
      * 分割・送出する。NULL許容 -- LSO非対応バックエンド(RP1のeth.c)は
-     * このフィールドをNULLのままにする(net_ctx_t.hw_lso_max_bytes=0と
+     * このフィールドをNULLのままにする(netif_t.hw_lso_max_bytes=0と
      * 対で、tcp.cはhw_lso_max_bytes>0の時だけこの関数ポインタを呼ぶため、
      * NULLを呼んでしまうことはない)。 */
     int (*send_lso)(void *priv, const void *hdr, uint16_t hdr_len,
@@ -146,7 +146,7 @@ typedef struct {
     net_buf_t *(*poll_recv)(void *priv);
 } nic_ops_t;
 
-typedef struct net_ctx {
+typedef struct netif {
     const char *name;   /* ログ/`net use`コマンド用の識別子("rp1","mlx5-pf0"等) */
     uint8_t     mac[ETH_ALEN];
     uint32_t    ip;      /* 自機IPv4(ホストバイトオーダー)。net.hのNET_SELF_IPが参照する */
@@ -178,7 +178,7 @@ typedef struct net_ctx {
      * tcpdumpで確認、CLAUDE.md該当節参照)。0の場合は net_active_rx_ring_
      * size() が ETH_RX_RING_SIZE(RP1既定)へフォールバックするため、RP1の
      * s_rp1_ctx(この値を設定しない)は従来通りの挙動になる。mlx5_net.cの
-     * mlx5_net_ctx_setup()のみMLX5_RQ_NUM_WQESを設定する。 */
+     * mlx5_netif_setup()のみMLX5_RQ_NUM_WQESを設定する。 */
     uint16_t    rx_ring_size;
     /* 2026-08-09、ハードウェアチェックサムオフロード対応。1ならこの
      * インターフェースの送受信経路がHWでL3(IP)/L4(TCP)チェックサムを
@@ -208,38 +208,38 @@ typedef struct net_ctx {
      * この値)なら非対応 -- tcp.cは従来通りMSS単位でtcp_send_segment()を
      * 呼ぶ。mlx5側はmlx5_hca_bringup()がQUERY_HCA_CAP(ETHERNET_OFFLOADS)
      * から読んだ値(mlx5.hのMLX5_LSO_MAX_BYTES_CAPでクランプ済み)を
-     * mlx5_net_ctx_setup()で設定する。 */
+     * mlx5_netif_setup()で設定する。 */
     uint32_t    hw_lso_max_bytes;
     /* このインターフェースの実ハードウェア(RXリング等)を実際に
      * ポーリングして良いコア(マルチコア化 Phase 6準備、
-     * ~/.claude/plans/wondrous-baking-gadget.md参照)。net_ctx_register()
+     * ~/.claude/plans/wondrous-baking-gadget.md参照)。netif_register()
      * が登録した瞬間のsmp_core_index()を記録する -- eth.c/mlx5_net.cの
      * NICドライバ実装はコアをまたいだ同時アクセスに対して一切スレッド
      * セーフでない(ロック無し)ため、あるインターフェースを実際に
      * poll_recv()して良いのは常にこの1コアだけに限定する(net_poll_all_
-     * and_dispatch()参照)。net_ctx_find()/net_ctx_find_by_ip()による
+     * and_dispatch()参照)。netif_find()/netif_find_by_ip()による
      * *検索*自体はowner_coreに関係なくどのコアからでも行える(job step
      * がctx経由で自分の担当リソースを見つける用途、下記コメント参照) --
      * 「見つける・activateする」ことと「実際にハードウェアへポーリング
      * しに行く」ことは別の話であり、後者だけがコア固定という制約を持つ。 */
     unsigned    owner_core;
-    /* 【2026-08-08追加、telnetのコアごと分離用】この net_ctx_t が実際に
+    /* 【2026-08-08追加、telnetのコアごと分離用】この netif_t が実際に
      * net_poll_all_and_dispatch()からpoll_recv()を呼ばれるべき「代表」
-     * かどうか。1(既定、net_ctx_register()が設定)なら通常通りポーリング
+     * かどうか。1(既定、netif_register()が設定)なら通常通りポーリング
      * 対象になる。0は「別名(alias)」を意味し、同じ物理NIC(nic/nic_priv
      * が代表と同一)を共有しつつ別のIPアドレスを名乗るだけの論理識別子
-     * であり、それ自体はポーリングされない(net_ctx_register_alias()
+     * であり、それ自体はポーリングされない(netif_register_alias()
      * 参照) -- 1個の物理NICを2回ポーリングして受信フレームを重複処理
      * してしまうのを防ぐため。 */
     int         is_poll_owner;
-} net_ctx_t;
+} netif_t;
 
 /* 現在「アクティブ」なコンテキスト。eth.c(eth_get_mac/eth_send_frags等の
  * ディスパッチ)とnet.h(NET_SELF_IPマクロ)が参照する。NULLの間は
  * まだどのインターフェースも初期化されていない(`net init`前)ことを表す。
  *
  * マルチコア化 Phase 4(~/.claude/plans/wondrous-baking-gadget.md参照):
- * 実体はnetctx.cで定義するg_netctx_active_slots[SMP_MAX_CORES]。
+ * 実体はnetif.cで定義するg_netif_active_slots[SMP_MAX_CORES]。
  * 「現在アクティブなコンテキスト」はコアごとに独立していなければ
  * ならない(Phase 6でcore0=PF0クライアント/core1=PF1サーバのように
  * 各コアが別々のインターフェースを並行してactivateする設計のため、
@@ -252,19 +252,19 @@ typedef struct net_ctx {
  * コアのスロットを指すポインタへのポインタを介したアクセス」を行う
  * マクロへ変更した(net.hのNET_SELF_IPマクロと同じ設計方針 -- 既存
  * コード側の見た目・挙動を変えず、内部実装だけ差し替える)。
- * netctx_active_slot()はstatic inlineなので、実際のオーバーヘッドは
+ * netif_active_slot()はstatic inlineなので、実際のオーバーヘッドは
  * MRS 1命令+シフト/マスク+配列インデックス計算だけで済む(smp.hの
  * smp_core_index()参照 -- volatileを付けていないため、同一関数内での
  * 複数回参照はコンパイラが正当にCSEできる)。 */
-extern net_ctx_t *g_netctx_active_slots[SMP_MAX_CORES];
+extern netif_t *g_netif_active_slots[SMP_MAX_CORES];
 
-static inline net_ctx_t **netctx_active_slot(void)
+static inline netif_t **netif_active_slot(void)
 {
-    return &g_netctx_active_slots[smp_core_index()];
+    return &g_netif_active_slots[smp_core_index()];
 }
-#define g_active_ctx (*netctx_active_slot())
+#define g_active_ctx (*netif_active_slot())
 
-void net_ctx_activate(net_ctx_t *ctx);
+void netif_activate(netif_t *ctx);
 
 /* net_poll_all_and_dispatch()が巡回する「受信ポーリング対象」の登録簿。
  * activate(「今どれとして送信/自機IP解決するか」)とは独立した別の
@@ -275,21 +275,21 @@ void net_ctx_activate(net_ctx_t *ctx);
  * 独立させていたが、これだと「あるコアで生成されたTCPコネクション/
  * job stepを、後から別のコアがctx経由で正しく見つけて処理する」
  * (job.hの「job stepのctx経由リソース参照化」)ことができなくなる --
- * net_ctx_find_by_ip()はtcp.cのtcp_send_segment()がconnのlocal_ipから
+ * netif_find_by_ip()はtcp.cのtcp_send_segment()がconnのlocal_ipから
  * 送信先インターフェースを逆引きするために使われるが、そのconnを
  * *生成した*コアと*今tickしている*コアが違えば(job.cが共有スケジューラ
  * で任意のコアにジョブを割り当てうる)、探す側のコアの登録簿にしか
  * 無いエントリを見つけられず壊れる。
  *
- * このため登録簿自体は単一の共有配列に戻し(netctx.c参照、s_registered_
- * lockで保護)、net_ctx_find()/net_ctx_find_by_ip()はどのコアからでも
+ * このため登録簿自体は単一の共有配列に戻し(netif.c参照、s_registered_
+ * lockで保護)、netif_find()/netif_find_by_ip()はどのコアからでも
  * 全登録済みコンテキストを検索できるようにした。一方、実ハードウェアへの
  * ポーリング(net_poll_all_and_dispatch())だけは、登録時に記録した
- * net_ctx_t.owner_coreと一致するコンテキストのみを対象にする(NICドライバ
+ * netif_t.owner_coreと一致するコンテキストのみを対象にする(NICドライバ
  * 自体はコア間で共有できないため、「見つけられる」ことと「ポーリングして
- * 良い」ことを分離した設計、net_ctx_t.owner_coreのコメント参照)。 */
-#define NET_CTX_MAX_REGISTERED 4u
-void net_ctx_register(net_ctx_t *ctx);
+ * 良い」ことを分離した設計、netif_t.owner_coreのコメント参照)。 */
+#define NETIF_MAX_REGISTERED 4u
+void netif_register(netif_t *ctx);
 
 /* 【2026-08-08追加】1つの物理NIC(RP1)を「論理的に」2つの識別子へ分ける
  * ための別名登録。telnetをコアごとに独立させる際、コア0向け/コア1向けの
@@ -300,22 +300,22 @@ void net_ctx_register(net_ctx_t *ctx);
  * (このプロジェクトのNICドライバはコア間排他を持たないため、それ自体は
  * 今回も変更しない)。
  *
- * ctx: 呼び出し元が用意した別名用の net_ctx_t(name/ip/mac/mss_capは
+ * ctx: 呼び出し元が用意した別名用の netif_t(name/ip/mac/mss_capは
  *      呼び出し元が設定してから渡す -- macはprimaryと同じ値を使うのが
  *      通常、mss_capはprimaryと揃えるのが通常)。
- * primary: 実体を共有する代表ctx(既にnet_ctx_register()済みであること)。
+ * primary: 実体を共有する代表ctx(既にnetif_register()済みであること)。
  *
  * 効果: ctx->nic/nic_priv/owner_coreをprimaryからコピーし、
  * ctx->is_poll_owner=0にしてから登録する。net_poll_all_and_dispatch()は
  * is_poll_owner==0のctxをポーリング対象から除外するが、受信フレームの
  * 宛先IPがこのctxのipと一致すれば、そのフレームの処理中だけこのctxを
- * activateする(netctx.cのnet_ctx_resolve_frame_owner()参照) -- IP
+ * activateする(netif.cのnetif_resolve_frame_owner()参照) -- IP
  * エイリアシング(1枚のNICに複数IPを持たせる一般的な手法)と同じ考え方。
- * net_ctx_find()/net_ctx_find_by_ip()からは通常のctxと同様に検索できる
+ * netif_find()/netif_find_by_ip()からは通常のctxと同様に検索できる
  * ため、tcp_send_segment()等の既存コードは変更不要。 */
-void net_ctx_register_alias(net_ctx_t *ctx, const net_ctx_t *primary);
+void netif_register_alias(netif_t *ctx, const netif_t *primary);
 
-/* 【マルチコア化 Phase 6】net_ctx_register()が記録したowner_coreを
+/* 【マルチコア化 Phase 6】netif_register()が記録したowner_coreを
  * 明示的に上書きする -- ConnectXブリングアップ自体は常にcore0が単独で
  * 行う(PCIeコンフィグ空間の同時競合を避けるため、~/.claude/plans/
  * wondrous-baking-gadget.md「Phase 6」節参照)ため、登録直後の
@@ -331,18 +331,18 @@ void net_ctx_register_alias(net_ctx_t *ctx, const net_ctx_t *primary);
  * まだ1つもspawnされていない/tickされていない間だけ -- 実行中の
  * ポーリング先を実行時に安全に切り替える機構ではない(単なるフィールド
  * 上書き、ロックは取らない)。 */
-void net_ctx_set_owner_core(net_ctx_t *ctx, unsigned core);
+void netif_set_owner_core(netif_t *ctx, unsigned core);
 
-/* 登録済みコンテキストをname(net_ctx_t.name、NUL終端)で検索する。
+/* 登録済みコンテキストをname(netif_t.name、NUL終端)で検索する。
  * `net use <name>`シェルコマンドから使う。どのコアからでも、登録した
  * コアに関わらず全コンテキストを検索できる(上記コメント参照)。
  * 見つからなければNULL。 */
-net_ctx_t *net_ctx_find(const char *name);
+netif_t *netif_find(const char *name);
 
-/* 登録済みコンテキストを自機IPv4(net_ctx_t.ip)で検索する。tcp.c
+/* 登録済みコンテキストを自機IPv4(netif_t.ip)で検索する。tcp.c
  * (tcp_send_segment())が、送信しようとしているconnのlocal_ipから
  * 「このコネクションが属するインターフェース」を逆引きし、送信直前に
- * net_ctx_activate()するために使う -- 複数コンテキスト(ConnectXの
+ * netif_activate()するために使う -- 複数コンテキスト(ConnectXの
  * PF0/PF1等)を同一プログラム内で並行運用する際、tcp_poll_once()
  * (net_poll_all_and_dispatch()経由)がコンテキストを切り替えながら
  * ポーリングする合間に、呼び出し元が意図しないコンテキストがアクティブ
@@ -350,7 +350,7 @@ net_ctx_t *net_ctx_find(const char *name);
  * 検索できる(上記コメント参照 -- job migrationでconn生成コアと異なる
  * コアがtcp_send_segment()を呼んでも正しく見つかる)。見つからなければ
  * NULL(呼び出し元は現在のg_active_ctxをそのまま使う)。 */
-net_ctx_t *net_ctx_find_by_ip(uint32_t ip);
+netif_t *netif_find_by_ip(uint32_t ip);
 
 /* 登録済みコンテキストのうち、呼び出し元(このコア)がowner_coreである
  * ものだけを順に1回ずつactivateしてpoll_recv()し、受信フレームがあれば
@@ -362,7 +362,7 @@ net_ctx_t *net_ctx_find_by_ip(uint32_t ip);
  * eth_dispatch()の代わりに使う -- 登録数が1つ(通常のRP1単体運用)でも
  * 従来と同じ動作になる。他コアがowner_coreのコンテキストは一切触らない
  * (NICドライバ自体がコアをまたいだ同時アクセスに対してスレッドセーフで
- * ないため、net_ctx_t.owner_coreのコメント参照)。
+ * ないため、netif_t.owner_coreのコメント参照)。
  *
  * 戻り値: 今回の呼び出しでいずれかのコンテキストから実際にフレームを
  * 1つ以上受信・処理していれば1、何も受信しなければ0(2026-08-07追加、
@@ -379,7 +379,7 @@ static inline uint32_t net_active_ip(void)
     return g_active_ctx ? g_active_ctx->ip : 0u;
 }
 
-/* g_active_ctxのTCP MSS上限を返す(tcp.cが使う、net_ctx_t.mss_capの
+/* g_active_ctxのTCP MSS上限を返す(tcp.cが使う、netif_t.mss_capの
  * コメント参照)。未初期化(g_active_ctx==NULL)なら安全側の小さい値
  * (1460、標準Ethernet MTU相当)を返す。 */
 static inline uint16_t net_active_mss_cap(void)
@@ -387,7 +387,7 @@ static inline uint16_t net_active_mss_cap(void)
     return g_active_ctx ? g_active_ctx->mss_cap : 1460u;
 }
 
-/* g_active_ctxのRXリングエントリ数を返す(net_ctx_t.rx_ring_sizeコメント
+/* g_active_ctxのRXリングエントリ数を返す(netif_t.rx_ring_sizeコメント
  * 参照、tcp.cのsafe_window_cap計算に使う)。フィールドが0(RP1のように
  * 明示設定しないインターフェース)、または未初期化(g_active_ctx==NULL)なら
  * ETH_RX_RING_SIZE(RP1 GEMのリング、従来の決め打ち値)へフォールバックする
@@ -399,7 +399,7 @@ static inline uint16_t net_active_rx_ring_size(void)
 }
 
 /* g_active_ctxがハードウェアチェックサムオフロードに対応しているかを
- * 返す(net_ctx_t.hw_csum_offloadコメント参照)。未初期化(g_active_ctx==
+ * 返す(netif_t.hw_csum_offloadコメント参照)。未初期化(g_active_ctx==
  * NULL)なら安全側の0(ソフトウェア計算を行う)を返す。 */
 static inline int net_active_hw_csum_offload(void)
 {
@@ -407,7 +407,7 @@ static inline int net_active_hw_csum_offload(void)
 }
 
 /* g_active_ctxがTCP送信の真のゼロコピー(2フラグメント)に対応している
- * かを返す(net_ctx_t.tx_zerocopy_2fragコメント参照)。未初期化なら
+ * かを返す(netif_t.tx_zerocopy_2fragコメント参照)。未初期化なら
  * 安全側の0(従来通りコピーする)を返す。 */
 static inline int net_active_tx_zerocopy(void)
 {
@@ -415,11 +415,11 @@ static inline int net_active_tx_zerocopy(void)
 }
 
 /* g_active_ctxがLSO(TCP Segmentation Offload)に対応しているかを返す
- * (net_ctx_t.hw_lso_max_bytesコメント参照)。0なら非対応。未初期化
+ * (netif_t.hw_lso_max_bytesコメント参照)。0なら非対応。未初期化
  * (g_active_ctx==NULL)なら安全側の0(従来通りMSS単位で送る)を返す。 */
 static inline uint32_t net_active_lso_max_bytes(void)
 {
     return g_active_ctx ? g_active_ctx->hw_lso_max_bytes : 0u;
 }
 
-#endif /* NETCTX_H */
+#endif /* NETIF_H */

@@ -735,14 +735,14 @@ static void nvmer_destroy_qp_if_valid(mlx5_dev_t *dev, mlx5_qp_t *qp)
  * ことが、実測で判明したボトルネックの直接原因だった -- targetをcore1
  * へ引き渡し、真に並行して進行できるようにする。
  *
- * nvmet.cのnvmet_job_start()と異なり、ここではnet_ctx_t.owner_coreは
+ * nvmet.cのnvmet_job_start()と異なり、ここではnetif_t.owner_coreは
  * 一切変更しない: mlx5_qp_post_send()/post_recv()/poll_cqe()等
- * (mlx5_qp.c)はnetctx.hのnic_ops_t/owner_core機構を一切経由せず、
+ * (mlx5_qp.c)はnetif.hのnic_ops_t/owner_core機構を一切経由せず、
  * mlx5_dev_t/mlx5_qp_tへ直接触れる設計のため(nvme_rdma.c/nvmet_
  * rdma.cはTCP/IPスタックのarp.c/ip.c/icmp.c/tcp.cとは独立した経路)。
  * このRC QPを実際に触るjobがtarget側の1つだけである限り、単純に
  * job_pin_to_core()だけで十分 -- 他のTCP/IPベースの機能(既存nvmet.c
- * のPF1インスタンス等)がowner_core経由で同じPF1のnet_ctx_tを使って
+ * のPF1インスタンス等)がowner_core経由で同じPF1のnetif_tを使って
  * いても、mlx5_qp_t(RC QP)自体は完全に別のDMA領域・別のFWオブジェクト
  * なので競合しない。
  *

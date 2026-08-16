@@ -298,7 +298,7 @@ struct nvmet_rdma_ctx {
      * 既存の`stop_requested`ベースの明示的終了フローが完全に無変更の
      * まま動作し続ける。 */
 
-    /* net_ctx_find()用のラベル(例: "mlx5-pf0")。切断検出後、rdma_cm_
+    /* netif_find()用のラベル(例: "mlx5-pf0")。切断検出後、rdma_cm_
      * fill_addr()を再度呼んでGSI/RC QPを作り直し、次のホスト接続を
      * 待てる状態へ戻すために必要(nvmet_rdma_run_standalone()が設定)。
      * NULL(既定)なら切断監視自体を行わない。 */

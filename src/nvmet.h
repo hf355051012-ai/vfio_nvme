@@ -3,7 +3,7 @@
 
 #include <stdint.h>
 #include "nvmet_tcp.h"
-#include "netctx.h"
+#include "netif.h"
 #include "board.h"
 #include "stateprof.h"
 
@@ -210,7 +210,7 @@ typedef struct {
      * インスタンスごとに1回だけ確保し、admin/IO両方のaccept段階で
      * 同じハンドルを使い回す。 */
     int         listener;    /* tcp_listen()ハンドル */
-    net_ctx_t  *bound_ctx;   /* 待ち受けるインターフェース、NULL=任意 */
+    netif_t  *bound_ctx;   /* 待ち受けるインターフェース、NULL=任意 */
     const char *label;       /* ログ用ラベル(例"rp1"、複数インスタンスの
                                * ログを区別するため) */
 
@@ -297,7 +297,7 @@ _Static_assert(NVMET_INSTANCES_BASE >= DMA_BSS_BASE + 0x200000ULL
  * 毎tick進める(旧nvmet_run()のような「イニシエーターが切断するまで
  * ブロックする」設計ではない、CLAUDE.md参照)。
  *
- * bound_ctx: このインスタンスが待ち受けるインターフェース(netctx.h、
+ * bound_ctx: このインスタンスが待ち受けるインターフェース(netif.h、
  * tcp_listen()へそのまま渡す) -- 複数インスタンスが同じport番号で異なる
  * インターフェースへ同時に待ち受けられるようにするため(CLAUDE.md
  * 「nvmet: 複数インターフェース同時待受」節参照)。NULLならインター
@@ -306,7 +306,7 @@ _Static_assert(NVMET_INSTANCES_BASE >= DMA_BSS_BASE + 0x200000ULL
  * label: `jobs`コマンド等のログでこのインスタンスを識別するための短い
  * 文字列(例"rp1"、呼び出し元が生存期間中保持する静的文字列を渡すこと)。
  * 戻り値: 0=spawn成功、-1=インスタンス上限/ジョブテーブル満杯等で失敗 */
-int nvmet_job_start(nvmet_ctx_t *ctx, uint16_t port, net_ctx_t *bound_ctx, const char *label);
+int nvmet_job_start(nvmet_ctx_t *ctx, uint16_t port, netif_t *bound_ctx, const char *label);
 
 /* NVMET_INSTANCES_BASE(board.h)全域を0クリアする。main.cの起動シーケンス
  * (mmu_init()直後、command_shell_run()より前)から一度呼ぶこと。

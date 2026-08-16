@@ -32,23 +32,23 @@
  *
  * 【解消済み(2026-08-08)】以前ここには「job stepがsmp_core_index()で
  * 『今実行しているコア』を暗黙に参照する設計のままなので、ジョブが
- * 別コアへ移動すると壊れる」という制約を記していた。tcp.c/netctx.cを
+ * 別コアへ移動すると壊れる」という制約を記していた。tcp.c/netif.cを
  * 「暗黙の実行コア」ではなく「リソース自身が覚えている生成時のowner」
  * ベースの参照に変更したことで解消した(詳細は~/.claude/plans/
  * wondrous-baking-gadget.md「job stepのctx経由リソース参照化」節、
- * tcp.hのtcp_conn_t.owner_core/netctx.hのnet_ctx_t.owner_coreコメント
+ * tcp.hのtcp_conn_t.owner_core/netif.hのnetif_t.owner_coreコメント
  * 参照)。
  *
  * 【新たに導入したaffinity_key機構】上記の「owner固定化」だけでは、
  * 同じインターフェース/リソースを扱う*複数の*ジョブ(例: nvmet-adminと
- * nvmet-io、どちらも同じnet_ctx_tへbindされる)が、job.cの共有スケジューラ
+ * nvmet-io、どちらも同じnetif_tへbindされる)が、job.cの共有スケジューラ
  * によって*同時に2つの異なるコアで*claimされてしまう可能性は残る --
  * 各ジョブのowner参照自体は正しくても、そのownerが指す先(TCP接続テーブル・
  * NICのTXリング等、tcp.c/eth.c/mlx5_net.c内部の非スレッドセーフな状態)を
  * 2つのコアが本当に同時に読み書きすれば競合する。job.hのjob_t.claimedは
  * 「同一ジョブの二重実行」しか防がない。
  * job_set_affinity()(下記)で、関連するジョブ群に同じaffinity_key
- * (典型的にはそのリソースを表すポインタ、例えばnet_ctx_t*)を設定すると、
+ * (典型的にはそのリソースを表すポインタ、例えばnetif_t*)を設定すると、
  * job_scheduler_tick()は「同じaffinity_keyを持つ*他の*ジョブが現在
  * claimed(実行中)であれば、このジョブもこのtickではclaimしない」という
  * 追加の排他を行う -- これにより、同じリソースに属するジョブ群が異なる
@@ -130,7 +130,7 @@ struct job {
      * ため。 */
     volatile int claimed;
     /* job_set_affinity()で設定する、このジョブが属するリソースの識別子
-     * (典型的にはnet_ctx_t*等のポインタをそのままキーとして使う、値の
+     * (典型的にはnetif_t*等のポインタをそのままキーとして使う、値の
      * 意味はjob.c自身は一切解釈せずポインタ比較のみ行う)。NULL(既定値、
      * job_spawn()直後)なら追加のグルーピング排他を受けない。job.h冒頭の
      * 「affinity_key機構」コメント参照。 */
@@ -155,14 +155,14 @@ job_t *job_spawn(job_step_fn step, void *ctx, const char *name);
  * claimされることがなくなる(job.h冒頭の「affinity_key機構」コメント
  * 参照)。job_spawn()直後、そのジョブがまだ一度もtickされていないうちに
  * 呼ぶこと(nvmet.cのnvmet_job_start()がadmin/ioジョブ両方に同じ
- * net_ctx_t*(bound_ctx)を設定する例を参照)。keyにNULLを渡すと解除
+ * netif_t*(bound_ctx)を設定する例を参照)。keyにNULLを渡すと解除
  * できる(通常は使わない)。 */
 void job_set_affinity(job_t *job, void *affinity_key);
 
 /* job(job_spawn()の戻り値)を明示的にcoreへピン止めする。既定では
  * job_spawn()を呼んだコアに既にピン止めされているので、そのコアで
  * 動かし続けたいだけなら呼ぶ必要はない -- 別コア(典型的にはNICの
- * net_ctx_t.owner_coreを引き渡した先)へ処理を移す場合にのみ呼ぶ
+ * netif_t.owner_coreを引き渡した先)へ処理を移す場合にのみ呼ぶ
  * (job.h冒頭の「core pinning機構」コメント、nvmet.cのnvmet_job_start()
  * 参照)。呼び出し後、次回以降のjob_scheduler_tick()はそのコアからしか
  * このジョブをclaimしない。 */

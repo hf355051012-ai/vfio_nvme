@@ -1883,7 +1883,7 @@ void nvmet_instances_zero_all(void)
     }
 }
 
-int nvmet_job_start(nvmet_ctx_t *ctx, uint16_t port, net_ctx_t *bound_ctx, const char *label)
+int nvmet_job_start(nvmet_ctx_t *ctx, uint16_t port, netif_t *bound_ctx, const char *label)
 {
     if (ctx->session_active) {
         /* 常駐サーバ化(CLAUDE.md「nvmet: 常駐サーバ化」節参照)により、
@@ -1898,7 +1898,7 @@ int nvmet_job_start(nvmet_ctx_t *ctx, uint16_t port, net_ctx_t *bound_ctx, const
      * 待ち改善の検討方針」節末尾の実装経緯参照): このctx自身は空いていても、
      * *別の*nvmet_ctx_t(異なるスロット、例えば`platform_init`が起動した
      * インスタンスと`test`コマンドの"manual"インスタンス)が既に同じ
-     * bound_ctx(同一の物理net_ctx_t、例: mlx5-pf1)へ紐付いたまま稼働中
+     * bound_ctx(同一の物理netif_t、例: mlx5-pf1)へ紐付いたまま稼働中
      * だと、同一インターフェースに対して2組のadmin/ioジョブが同時に
      * job_scheduler_tick()を取り合うことになる -- 両方とも同じbound_ctxの
      * TCP/NICを見に行くが実際のクライアント接続は片方にしか繋がらない
@@ -1999,9 +1999,9 @@ int nvmet_job_start(nvmet_ctx_t *ctx, uint16_t port, net_ctx_t *bound_ctx, const
         s_instance_owner[slot] = NULL;
         return -1;
     }
-    /* admin/ioジョブは同じbound_ctx(net_ctx_t、そのインターフェースの
+    /* admin/ioジョブは同じbound_ctx(netif_t、そのインターフェースの
      * NIC/TCP受信を実際にポーリングして良いのは常にbound_ctx->owner_core
-     * だけ、netctx.hのnet_ctx_t.owner_coreコメント参照)を共有するため、
+     * だけ、netif.hのnetif_t.owner_coreコメント参照)を共有するため、
      * job.cのaffinity_key機構(job.h参照)で紐付ける -- これにより
      * job_scheduler_tick()は、同じbound_ctxを共有するジョブが同時に
      * 異なるコアでclaimされないよう保証する(マルチコア化 Phase 4-6
@@ -2010,7 +2010,7 @@ int nvmet_job_start(nvmet_ctx_t *ctx, uint16_t port, net_ctx_t *bound_ctx, const
     /* 【Phase 6】さらにbound_ctx->owner_coreへ明示的にピン止めする
      * (job.h冒頭の「core pinning機構」参照) -- job_spawn()の既定
      * (spawnしたコア、通常はcore0のシェル)のままだと、bound_ctxが
-     * platform_init.cでcore1へ引き渡し済み(net_ctx_set_owner_core()
+     * platform_init.cでcore1へ引き渡し済み(netif_set_owner_core()
      * 呼び出し後)の場合にNICのowner_coreとjobの実行コアが食い違い、
      * core0にジョブが留まったままcore1側のNICへ触れない/一切進行しない
      * バグになる。bound_ctx==NULL(manualコマンド、test.c)の場合は
@@ -2049,17 +2049,17 @@ int nvmet_job_start(nvmet_ctx_t *ctx, uint16_t port, net_ctx_t *bound_ctx, const
 // bound_ctxがmlx5-pf0/pf1のインスタンスだけを対象に、`job stop`と同じ
 // cancel_requested(job_cancel_by_ctx)+ctx->stop_requested(admin ACCEPT_WAIT
 // が見る)で自己終了させる(実際のテーブルからの除去は呼び出し元の
-// job_scheduler_tickドレインループ)。net_ctx_find()がNULL(mlx5未初期化)
+// job_scheduler_tickドレインループ)。netif_find()がNULL(mlx5未初期化)
 // なら対象ゼロで何もしない。
 void nvmet_stop_connectx_instances(void)
 {
-    net_ctx_t *pf0 = net_ctx_find("mlx5-pf0");
-    net_ctx_t *pf1 = net_ctx_find("mlx5-pf1");
+    netif_t *pf0 = netif_find("mlx5-pf0");
+    netif_t *pf1 = netif_find("mlx5-pf1");
     if (pf0 == NULL && pf1 == NULL) return;
     for (unsigned slot = 0; slot < NVMET_MAX_INSTANCES; slot++) {
         nvmet_ctx_t *ctx = s_instance_owner[slot];
         if (ctx == NULL || !ctx->session_active) continue;
-        net_ctx_t *b = ctx->bound_ctx;
+        netif_t *b = ctx->bound_ctx;
         if (b == NULL || (b != pf0 && b != pf1)) continue;  // ConnectX bindのみ対象
         ctx->stop_requested = 1;                 // admin ACCEPT_WAIT(nvmet.c:546)が見る
         job_cancel_by_ctx(&s_admin_job_pool[slot]);

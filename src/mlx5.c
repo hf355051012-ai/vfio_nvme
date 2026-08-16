@@ -24,7 +24,7 @@
 #include "pcie1.h"
 #include "cache.h"
 #include "net.h"
-#include "netctx.h"
+#include "netif.h"
 #include "mlx5_qp.h"
 #include "rdma_cm.h"
 #include "nvme_rdma.h"
@@ -2547,7 +2547,7 @@ static int mlx5_query_port_max_mtu(mlx5_dev_t *dev, uint16_t *out_max_mtu) {
 // max_mtuへ切り詰める(黙って拒否されて意味不明な失敗になるより安全側)。
 // 成功時、実際に適用した値(切り詰め後)を*out_applied_mtuへ書く --
 // 呼び出し元(mlx5_hca_bringup())がdev->port_mtuへ保存し、mlx5_net.cが
-// net_ctx_t.mss_capをこの実際の値から逆算する(固定値のジャンボMSSを
+// netif_t.mss_capをこの実際の値から逆算する(固定値のジャンボMSSを
 // 使うと、実機のHW上限[本ソフトで実測10000]を超えるTCPセグメントを
 // 送ってしまう恐れがあるため)。
 static int mlx5_set_port_mtu(mlx5_dev_t *dev, uint16_t desired_mtu, uint16_t *out_applied_mtu) {
@@ -2803,8 +2803,8 @@ int mlx5_query_roce_address(mlx5_dev_t *dev, uint32_t index, uint8_t out_gid[16]
 // s_last_dev0/dev1(直近の`mlx5`または`net init mlx5`が初期化したPF0/PF1、
 // s_last_devs_validで有効性を確認)に対して動作する -- ENABLE_HCA等の
 // 非冪等なコマンドは一切実行しないため何度でも安全に呼べる。IPv4/MACは
-// net_ctx_find("mlx5-pf0"/"mlx5-pf1")(`net init mlx5`実行済みなら登録
-// されている、mlx5_net.cのmlx5_net_ctx_setup()参照)から取得する --
+// netif_find("mlx5-pf0"/"mlx5-pf1")(`net init mlx5`実行済みなら登録
+// されている、mlx5_net.cのmlx5_netif_setup()参照)から取得する --
 // 未登録(`mlx5`診断コマンドのみ実行、`net init mlx5`は未実行)の場合は
 // mlx5_net.cと同じ決め打ち値(IP=192.168.101.10/11、MAC=02:00:00:00:10:
 // 10/11)へフォールバックし、その旨を警告する。
@@ -2844,7 +2844,7 @@ void mlx5_roce_probe(int pf_index) {
     uint32_t ipv4 = 0;
     uint8_t mac[6];
     const char *name = (pf_index == 0) ? "mlx5-pf0" : "mlx5-pf1";
-    net_ctx_t *ctx = net_ctx_find(name);
+    netif_t *ctx = netif_find(name);
     if (ctx != NULL) {
         ipv4 = ctx->ip;
         for (unsigned i = 0; i < 6; i++) {

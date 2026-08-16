@@ -3,7 +3,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
-#include "netctx.h"
+#include "netif.h"
 #if defined(__x86_64__)
 #include <string.h>   /* volatile_fast_copy() の x86 高速パス(glibc memcpy) */
 #endif
@@ -38,14 +38,14 @@ static inline uint32_t ntohl(uint32_t x) { return htonl(x); }
 /*
  * 以前はここが唯一のコンパイル時固定値だったが、ConnectX統合
  * (RP1に加えmlx5の複数ポートを同一プログラム内で並行運用する、
- * netctx.h参照)に伴い、「自機IP」は実行時にアクティブなインター
- * フェース(net_ctx_t)ごとに異なりうる値へ変わった。
+ * netif.h参照)に伴い、「自機IP」は実行時にアクティブなインター
+ * フェース(netif_t)ごとに異なりうる値へ変わった。
  *
- * NET_SELF_IP_A〜Dは、eth_init()(RP1バックエンド)がnet_ctx_tを
+ * NET_SELF_IP_A〜Dは、eth_init()(RP1バックエンド)がnetif_tを
  * 作る際の既定IPとしてのみ使う(下記NET_RP1_DEFAULT_IP)。ConnectX側
- * (mlx5_net.c)は別のIPをnet_ctx_t.ipへ直接設定する。
+ * (mlx5_net.c)は別のIPをnetif_t.ipへ直接設定する。
  *
- * NET_SELF_IPマクロ自体はnet_active_ip()(netctx.h、g_active_ctx->ipを
+ * NET_SELF_IPマクロ自体はnet_active_ip()(netif.h、g_active_ctx->ipを
  * 読むだけ)を指すよう変更した -- arp.c/ip.c/tcp.c等の既存の参照側は
  * ソース上一切変更していない(マクロ定義を変えるだけで透過的に対応)。
  */
@@ -63,7 +63,7 @@ static inline uint32_t ntohl(uint32_t x) { return htonl(x); }
                               (uint32_t)NET_SELF_IP_D)
 
 /* コア1向けtelnetセッション(command.c/telnet.h参照)用のRP1別名IP
- * (netctx.hのnet_ctx_register_alias()参照)。下1桁だけNET_RP1_DEFAULT_IP
+ * (netif.hのnetif_register_alias()参照)。下1桁だけNET_RP1_DEFAULT_IP
  * と異なる値にすることで、コア0向け/コア1向けのセッションをIPアドレス
  * だけでも区別できるようにする(ユーザー指示)。物理NIC自体はRP1
  * 1枚のままで、実ハードウェアのポーリング/送信は引き続きowner_core
@@ -80,7 +80,7 @@ static inline uint32_t ntohl(uint32_t x) { return htonl(x); }
  * ことが前提のため)。 */
 #define NET_RP1_CORE1_IP    (NET_RP1_DEFAULT_IP + 2u)
 
-/* 現在アクティブなインターフェース(netctx.h)の自機IPv4。 */
+/* 現在アクティブなインターフェース(netif.h)の自機IPv4。 */
 #define NET_SELF_IP  (net_active_ip())
 
 /* オクテット4個 -> ホストバイトオーダーの32bit値 */

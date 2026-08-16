@@ -19,7 +19,7 @@
 #include "net.h"
 #include "arp.h"
 #include "ip.h"
-#include "netctx.h"
+#include "netif.h"
 #include "job.h"
 #include "nvme.h"
 #include "nvmet.h"
@@ -164,13 +164,13 @@ static int s_shell_tcp_connected = 0;
 static int shell_ensure_tcp_session(void)
 {
     if (s_shell_tcp_connected) return 0;
-    net_ctx_t *ctx0 = net_ctx_find("mlx5-pf0");
-    net_ctx_t *ctx1 = net_ctx_find("mlx5-pf1");
-    if (!ctx0 || !ctx1) { uart_printf("net_ctx 未登録\n"); return -1; }
+    netif_t *ctx0 = netif_find("mlx5-pf0");
+    netif_t *ctx1 = netif_find("mlx5-pf1");
+    if (!ctx0 || !ctx1) { uart_printf("netif 未登録\n"); return -1; }
 
     if (!s_shell_nvmet_started) {
-        if (smp_boot_core1() == 0) net_ctx_set_owner_core(ctx1, 1u);
-        net_ctx_activate(ctx1);
+        if (smp_boot_core1() == 0) netif_set_owner_core(ctx1, 1u);
+        netif_activate(ctx1);
         if (nvmet_job_start(&s_x86_nvmet, 4421u, ctx1, "manual") != 0) {
             uart_printf("tcpbench: ターゲット起動失敗\n"); return -1;
         }
@@ -178,7 +178,7 @@ static int shell_ensure_tcp_session(void)
         uart_printf("tcpbench: ターゲット常駐起動 (pf1, core1)\n");
     }
 
-    net_ctx_activate(ctx0);
+    netif_activate(ctx0);
     static char subnqn[128] = "nqn.2014-08.org.nvmexpress:uuid:deadbeef-cafe-babe-dead-beefcafebabe";
     nvme_connect_job_start(&s_nvme_ctx, ip_from_octets(192, 168, 101, 11), 4421u, subnqn);
     uint64_t t = timer_now();
@@ -391,9 +391,9 @@ static void shell_dispatch(char *line, int s0, int s1)
         const char *p = line + 5;
         while (*p == ' ') p++;
         if (*p >= '0' && *p <= '9') port = (uint16_t)atoi(p);
-        net_ctx_t *ctx1 = net_ctx_find("mlx5-pf1");
+        netif_t *ctx1 = netif_find("mlx5-pf1");
         if (!ctx1) { uart_printf("nvmet: mlx5-pf1 未登録\n"); return; }
-        if (smp_boot_core1() == 0) net_ctx_set_owner_core(ctx1, 1u);
+        if (smp_boot_core1() == 0) netif_set_owner_core(ctx1, 1u);
         if (nvmet_job_start(&s_x86_nvmet, port, ctx1, "manual") != 0) {
             uart_printf("nvmet: nvmet_job_start 失敗\n"); return;
         }

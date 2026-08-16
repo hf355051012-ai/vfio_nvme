@@ -11,7 +11,7 @@
 #include "timer.h"
 #include "uart.h"
 #include "cache.h"
-#include "netctx.h"
+#include "netif.h"
 #include "net.h"
 #include "ib_mad.h"
 #include "timestamp.h"
@@ -632,12 +632,12 @@ void mlx5_qp_pingpong_test(mlx5_dev_t *dev0, mlx5_dev_t *dev1) {
     }
 
     // 自分自身のGIDテーブル(index 0)へ登録する -- mlx5_roce_probe()と
-    // 同じロジック(net_ctx_find()で見つかれば実際のIP/MAC、無ければ
+    // 同じロジック(netif_find()で見つかれば実際のIP/MAC、無ければ
     // mlx5_net.cと同じ決め打ち値へフォールバック)。
     uint32_t ipv4_0, ipv4_1;
     uint8_t mac0[6], mac1[6];
-    net_ctx_t *ctx0 = net_ctx_find("mlx5-pf0");
-    net_ctx_t *ctx1 = net_ctx_find("mlx5-pf1");
+    netif_t *ctx0 = netif_find("mlx5-pf0");
+    netif_t *ctx1 = netif_find("mlx5-pf1");
     if (ctx0 != NULL) {
         ipv4_0 = ctx0->ip;
         for (unsigned i = 0; i < 6; i++) mac0[i] = ctx0->mac[i];
@@ -850,8 +850,8 @@ void mlx5_qp_rdma_test(mlx5_dev_t *dev0, mlx5_dev_t *dev1) {
 
     uint32_t ipv4_0, ipv4_1;
     uint8_t mac0[6], mac1[6];
-    net_ctx_t *ctx0 = net_ctx_find("mlx5-pf0");
-    net_ctx_t *ctx1 = net_ctx_find("mlx5-pf1");
+    netif_t *ctx0 = netif_find("mlx5-pf0");
+    netif_t *ctx1 = netif_find("mlx5-pf1");
     if (ctx0 != NULL) {
         ipv4_0 = ctx0->ip;
         for (unsigned i = 0; i < 6; i++) mac0[i] = ctx0->mac[i];
@@ -1055,7 +1055,7 @@ void mlx5_qp_loopback_test(mlx5_dev_t *dev, const char *label) {
 
     uint32_t ipv4;
     uint8_t mac[6];
-    net_ctx_t *ctx = net_ctx_find(label);
+    netif_t *ctx = netif_find(label);
     if (ctx != NULL) {
         ipv4 = ctx->ip;
         for (unsigned i = 0; i < 6; i++) mac[i] = ctx->mac[i];
@@ -1133,8 +1133,8 @@ void mlx5_gsi_mad_test(mlx5_dev_t *dev0, mlx5_dev_t *dev1, int use_gsi) {
     // GID/MAC登録(mlx5_qp_pingpong_test()と同じフォールバックパターン)。
     uint32_t ipv4_0, ipv4_1;
     uint8_t mac0[6], mac1[6];
-    net_ctx_t *ctx0 = net_ctx_find("mlx5-pf0");
-    net_ctx_t *ctx1 = net_ctx_find("mlx5-pf1");
+    netif_t *ctx0 = netif_find("mlx5-pf0");
+    netif_t *ctx1 = netif_find("mlx5-pf1");
     if (ctx0 != NULL) {
         ipv4_0 = ctx0->ip;
         for (unsigned i = 0; i < 6; i++) mac0[i] = ctx0->mac[i];
