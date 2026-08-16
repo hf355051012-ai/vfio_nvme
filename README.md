@@ -84,19 +84,148 @@ sudo ~/vfio_nvme/build/vfio_nvme 0000:01:00.0 0000:01:00.1
 | コマンド | 内容 |
 |---|---|
 | `bench [KB[,KB...]] [r\|w\|rw] [qd]` | NVMe-oF RDMA スループット |
-| `tcpbench [KB[,KB...]] [r\|w\|rw]` | NVMe/TCP スループット(qd は内部固定) |
+| `tcpbench [KB[,KB...]] [r\|w\|rw] [hdgst] [ddgst] [digest]` | NVMe/TCP スループット(qd は内部固定) |
 | `monitor` | 温度 / health / PCIe リンク / MAC・PHY エラーカウンタ |
+| `nvmet [port]` | NVMe/TCP ターゲットを常駐起動 |
+| `ts [core N] [num N] [mask M V]` / `ts pause\|resume` | `ts_log` ダンプ |
+| `simdelay <core> <us>` | 律速要因の切り分け(コアへ遅延注入) |
+| `ackthresh [n]` | TCP 遅延 ACK 閾値 |
+| `jobs` / `help` / `quit` | |
 
 `monitor` の温度表示 `temp 55/55C (peak 65/65, crit 105/105)` は MTMP
 レジスタ由来で、それぞれ **現在値 / これまでに記録された最高温度
 (`max_temperature`、Linux hwmon の `temp1_highest` 相当。`mtr` ビットで
 リセットできる履歴値であって上限ではない) / 許容最大
 (`temp_threshold_hi`、hwmon の `temp1_crit` 相当)**。
-| `nvmet [port]` | NVMe/TCP ターゲットを常駐起動 |
-| `ts [core N] [num N] [mask M V]` / `ts pause\|resume` | `ts_log` ダンプ |
-| `simdelay <core> <us>` | 律速要因の切り分け(コアへ遅延注入) |
-| `ackthresh [n]` | TCP 遅延 ACK 閾値 |
-| `jobs` / `help` / `quit` | |
+
+### ベンチの要約表
+
+`bench` / `tcpbench` の最後に出る要約表は、Linux 側の比較ベンチ
+`~/script/linux_loopback.sh` と**同じ書式・同じ列・同じ行順**(write を
+全ブロックサイズ分並べたあとに read)で出力する。両者を並べてそのまま
+比較できる。
+
+```
+スタック: vfio_nvme / トランスポート: rocev2 / qd=8 / runtime=3s
+
+rw         bs       qd            MiB/s         IOPS    avg latency
+---------- -------- ------ ------------ ------------ --------------
+write      8k       8           1936.09    247819.66       32.28 us
+write      64k      8           4747.41     75958.66      105.32 us
+write      256k     8           5603.83     22415.33      356.89 us
+read       8k       8           3957.12    506511.66       15.79 us
+read       64k      8           6761.20    108179.33       73.95 us
+read       256k     8           5895.33     23581.33      339.25 us
+```
+
+- **単位は MiB/s**(`linux_loopback.sh` に合わせた 1024 進)。後述の「性能」
+  節の表は切り出し時に **MB/s**(1000 進)で採取した値なので、約 4.9% ぶん
+  数字が食い違う。直接比較しないこと。
+- `avg latency` は fio のような実測ではなく、このベンチが qd 本を常時
+  outstanding に保つ設計であることから **Little の法則(qd ÷ IOPS)**で
+  求めた値。fio 側は iodepth が常に埋まるとは限らないぶん、同じ IOPS でも
+  数 % 小さめに出る。
+
+## PDU ダイジェスト(CRC32C)
+
+NVMe/TCP の **ヘッダダイジェスト / データダイジェスト**(いずれも CRC32C)に
+initiator・target 双方で対応している。`tcpbench` の引数に `hdgst` / `ddgst` /
+`digest`(両方)を足すと有効になる。位置引数ではなくキーワードなので、
+`tcpbench 256 rw digest` のように順序を気にせず書ける。
+
+```
+tcpbench 64 rw                # ダイジェスト無し
+tcpbench 64 rw hdgst          # ヘッダのみ
+tcpbench 64 rw digest         # ヘッダ + データ
+```
+
+ダイジェストは ICReq/ICResp でコネクション確立時に一度だけ合意するため、
+**前回と指定が変わると常駐セッションを自動で張り直す**。実際に合意できた値は
+要約表のトランスポート名(`tcp+hdgst+ddgst` 等)と ICResp のログに出る。
+
+**`bench`(NVMe-oF RDMA)には digest はない。** ダイジェストは NVMe-oF の
+TCP トランスポート束縛が定義する機能で、RDMA 束縛には対応する仕組みが無い
+(RoCE のパケット CRC が担う)。`bench` に指定しても警告を出して無視する。
+`~/script/linux_loopback.sh` の `--hdr-digest` / `--data-digest` も同じ理由で
+`--transport tcp` 専用で、`rocev2` と併用するとエラーになる。
+
+### 実測(PF0<->PF1 ループバック、qd=8、MiB/s)
+
+| 設定 | write 64k | read 64k | write 256k | read 256k |
+|---|---|---|---|---|
+| ダイジェスト無し | 3357 | 4889 | 3969 | 5259 |
+| `digest`(hdgst+ddgst) | 2992 | 4248 | 3985 | 4718 |
+
+**`hdgst` 単体のコストはほぼゼロ**(誤差範囲)。ヘッダダイジェストの CRC
+対象は PDU あたり 24〜72 バイトしかないので当然で、残りは 64KB 全バイトに
+対する CRC32C の実コスト。256k write に至ってはダイジェスト有無で差が無い。
+
+digest のコストがどこにあるかは、`crc32c()` を恒等関数に差し替えて
+(送受とも同じ関数になるのでダイジェストは自己無矛盾に一致する)測ると
+切り分けられる。**プロトコル側のコスト(相の追加・4 バイト余分な送受信)は
+約 3% しかなく、残り 86% は純粋に CRC の計算時間**だった。だから
+`crc32c()` 自体の速度がそのまま効く(下記)。
+
+当初はここが `hdgst` だけで write −31% / read −55% も落ちていた。原因は
+CRC ではなく、ダイジェストが有効だと target 側の高速パスが 2 つとも
+フォールバックしていたこと(いずれも「digest 時は使わない」という単純な
+ゲートで、実装が追いついていなかっただけ)。
+
+| 落ちていた経路 | 影響 | 対処 |
+|---|---|---|
+| 受信: push 型(inline upcall)→ pull 型 | write(target が受信側) | パーサに `PRX_HDGST`/`PRX_DDGST` 相を追加。データダイジェストは**受信ストリームから逐次 CRC を積む**ので、コピー先を読み直す 2 パス目は不要 |
+| 送信: ゼロコピー `send_c2h_async` → コピーする `send_c2h` | read(target が送信側) | ダイジェストを**送信元バッファから直接算出**して 4 バイトだけ追加でキュー。連続バッファは不要 |
+
+同じ手法を initiator 側(`nvme_read_rx_upcall` / `nvme_pipeline_h2c_pump`)
+にも使っており、両側とも digest 有効時にゼロコピー・push 型を維持する。
+
+### CRC32C 実装(`crc32c.c`)
+
+`crc32` 命令はレイテンシ 3・スループット 1/cycle なので、単一チェーンでは
+8B/3cycle = **2.67 B/cycle** が上限になる。独立した 3 本を交互に回して
+レイテンシを隠し、部分 CRC を PCLMULQDQ で畳み込んでいる。
+
+畳み込みは `crc32_u64(0, V) = V * x^64 mod P` という性質を使い、clmul の
+還元前 63bit 積をそのまま `crc32` 命令へ食わせて還元させる(定数は
+`K2 = x^(8*(BLK-8)) mod P`、`K1 = x^(8*(2*BLK-8)) mod P`)。大小 2 段の
+ブロック(1024B / 128B)にしてあるのは、大きいブロックだけだと端数が
+単一チェーンへ落ちて遅くなるため。
+
+i3-8100 @3.6GHz、**64KB を 8960B ずつ逐次計算**(push 型受信の実際の
+呼ばれ方)での実測:
+
+| 実装 | GB/s | B/cycle |
+|---|---|---|
+| 単一チェーン、先頭アライメント決め打ち(旧) | 9.56 | 2.66 |
+| 単一チェーン、アライメント非依存 | 9.60 | 2.67 |
+| **3 本 + PCLMULQDQ 合成(現行)** | **24.31** | **6.75** |
+| ISA-L `crc32_iscsi`(参考) | 28.50 | 7.92 |
+
+**PCLMULQDQ は本体の折り畳みではなく、合成を数命令に落とすために要る。**
+本体は crc32 命令が 8 B/cycle で頭打ちなので、pclmul 折り畳みにしても
+ISA-L と同じ天井に当たる(これを超えるには VPCLMULQDQ が必要だが、
+Coffee Lake には無い)。逆に合成を GF(2) 行列でやると 1 回あたり約 30us
+かかり、呼び出し長が変わるたびに作り直しになるため、逐次呼び出しでは
+0.94 GB/s まで落ちて本体の利得を食い潰す。
+
+正しさは起動時の `crc32c_selftest()` が担保する。既知ベクタ
+`CRC32C("123456789")=0xE3069283` に加え、**オフセット 0〜7 × 4096B で
+1 バイト単位の基準計算と一致すること**を確認している(3 本インタリーブ・
+2 段ブロック・端数の全経路を通る)。合成定数を間違えればここで落ちる。
+
+### Linux 側比較ベンチ
+
+`~/script/linux_loopback.sh`(このリポジトリ外)にも同じオプションを足してある。
+`--hdr-digest` / `--data-digest` / `--digest`。kernel スタックでは
+`nvme connect -g/-G`、SPDK スタックでは `spdk_nvme_perf -H/-I` へ渡る。
+kernel イニシエータは接続条件(トランスポート + ダイジェスト)を
+`/tmp/linux_loopback_initiator.state` に記録し、前回と違えば自動で
+`nvme disconnect` してから繋ぎ直す。
+
+| スタック | 64K read ダイジェスト無し | `--digest` |
+|---|---|---|
+| kernel | 1059 MiB/s | 905 |
+| spdk | 1613 | 1506 |
 
 ## 性能
 
