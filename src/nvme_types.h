@@ -97,6 +97,10 @@ _Static_assert(sizeof(nvme_keyed_sgl_desc_t) == 16, "must match nvme_sqe_t.dptr[
 #define NVME_FABRIC_FCTYPE_CONNECT       0x01u
 #define NVME_FABRIC_FCTYPE_PROPERTY_GET  0x04u
 
+/* Get Log Page の cdw10 下位バイト(LID: Log Page Identifier)。
+ * 値は Linux の include/linux/nvme.h の NVME_LOG_DISC と同じ。 */
+#define NVME_LOG_LID_DISCOVERY  0x70u
+
 /* Identify command の cdw10 下位バイト(CNS: Controller or Namespace Structure)。 */
 #define NVME_IDENTIFY_CNS_NAMESPACE   0x00u
 #define NVME_IDENTIFY_CNS_CONTROLLER  0x01u

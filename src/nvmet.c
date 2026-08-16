@@ -40,6 +40,91 @@ static void nvmet_copy_padded(volatile uint8_t *dst, const char *src, uint32_t f
 }
 
 /*=================================================================
+ * 16bit 値を 10 進 ASCII 文字列にする(Discovery Log Page の trsvcid 用)。
+ * 書き込み先はゼロ埋め済みである前提なので NUL 終端は書かない。
+ *
+ * 引数:
+ *   dst - 書き込み先(6 バイト以上)
+ *   v   - 変換する値
+ * コール元:
+ *   nvmet_build_disc_log()
+ * ===============================================================*/
+static void nvmet_u16_to_dec(uint8_t *dst, uint16_t v)
+{
+    char tmp[6];
+    unsigned n = 0;
+    if (v == 0) {
+        tmp[n++] = '0';
+    } else {
+        while (v > 0 && n < sizeof(tmp)) { tmp[n++] = (char)('0' + (v % 10u)); v /= 10u; }
+    }
+    for (unsigned i = 0; i < n; i++) dst[i] = (uint8_t)tmp[n - 1u - i];
+}
+
+/*=================================================================
+ * netaddr_t を Discovery Log Page の traddr に載せる ASCII 表記へ変換する
+ * (IPv4 は "192.168.101.11"、IPv6 は RFC 4291 の完全表記
+ * "fe80:0000:...:1010" -- "::" 省略はしない)。
+ *
+ * 省略しないのは、ホスト側(nvme-cli / カーネル)が inet_pton 相当で読むので
+ * 完全表記でも問題が無く、実装が単純で間違えにくいため。書き込み先は
+ * ゼロ埋め済みである前提なので NUL 終端は書かない。
+ *
+ * 引数:
+ *   dst  - 書き込み先(46 バイト以上)
+ *   addr - 変換するアドレス(NULL や未設定なら何も書かない)
+ * コール元:
+ *   nvmet_build_disc_log()
+ * ===============================================================*/
+static void nvmet_addr_to_str(uint8_t *dst, const netaddr_t *addr)
+{
+    static const char hex[] = "0123456789abcdef";
+    unsigned o = 0;
+    if (addr == NULL || netaddr_is_unset(addr)) return;
+
+    if (addr->family == NETADDR_V6) {
+        for (unsigned g = 0; g < 8; g++) {
+            if (g > 0) dst[o++] = ':';
+            dst[o++] = (uint8_t)hex[(addr->a[g * 2] >> 4) & 0xFu];
+            dst[o++] = (uint8_t)hex[addr->a[g * 2] & 0xFu];
+            dst[o++] = (uint8_t)hex[(addr->a[g * 2 + 1] >> 4) & 0xFu];
+            dst[o++] = (uint8_t)hex[addr->a[g * 2 + 1] & 0xFu];
+        }
+        return;
+    }
+    for (unsigned i = 0; i < 4; i++) {
+        if (i > 0) dst[o++] = '.';
+        uint8_t v = addr->a[i];
+        if (v >= 100u) dst[o++] = (uint8_t)('0' + (v / 100u));
+        if (v >= 10u)  dst[o++] = (uint8_t)('0' + ((v / 10u) % 10u));
+        dst[o++] = (uint8_t)('0' + (v % 10u));
+    }
+}
+
+/*=================================================================
+ * Fabrics Connect のデータに入っていた subnqn が Discovery NQN かを判定する。
+ *
+ * 比較対象は固定長 256 バイトのフィールドなので、NUL 終端されていない場合も
+ * 考慮して「期待文字列の長さぶん一致し、その次がフィールド終端か NUL」で見る。
+ *
+ * 引数:
+ *   nqn - Connect データの subsysnqn フィールド先頭(256 バイト)
+ * 戻り値:
+ *   1=Discovery NQN、0=それ以外
+ * コール元:
+ *   nvmet_admin_dispatch()
+ * ===============================================================*/
+static int nvmet_nqn_is_discovery(const uint8_t *nqn)
+{
+    const char *want = NVMET_DISCOVERY_NQN;
+    unsigned i = 0;
+    for (; want[i] != '\0'; i++) {
+        if (i >= 256u || nqn[i] != (uint8_t)want[i]) return 0;
+    }
+    return (i >= 256u) || (nqn[i] == 0u);
+}
+
+/*=================================================================
  * Identify Controller 応答(4096 バイト)を組み立てる。SN/MN/FR、MDTS、
  * IOCCSZ/IORCSZ(in-capsule 上限)、MAXCMD、CAP 相当の値を設定する。
  *
@@ -82,6 +167,107 @@ static void nvmet_build_id_ctrl(nvmet_ctx_t *ctx)
     wr32le(&ctx->id_ctrl[1792], (64u + NVMET_IOCCSZ_MAX_BYTES) / 16u);
     wr32le(&ctx->id_ctrl[1796], NVME_CQE_LEN / 16u);                   /* IORCSZ: CQE(16B)分のみ */
     ctx->id_ctrl[1803] = 1;                      /* MSDBD = 1 */
+}
+
+/*=================================================================
+ * Discovery コントローラ用の Identify Controller 応答を組み立てる。
+ *
+ * 通常のコントローラとの違いは 3 つだけ:
+ *  - CNTRLTYPE = 2(Discovery controller。Linux の enum nvme_ctrl_type の
+ *    NVME_CTRL_DISC)
+ *  - SUBNQN = Discovery NQN
+ *  - 名前空間を持たないので NN = 0(名前空間関連のフィールドも設定しない)
+ *
+ * MAXCMD / SGLS / IOCCSZ / IORCSZ は Fabrics に必須なので通常側と同じ値を
+ * 入れる(これらが 0 だとホストが接続を諦める)。
+ *
+ * 引数:
+ *   ctx - ターゲットコンテキスト
+ * コール元:
+ *   nvmet_job_start()
+ * ===============================================================*/
+static void nvmet_build_id_ctrl_disc(nvmet_ctx_t *ctx)
+{
+    nvmet_zero(ctx->id_ctrl_disc, sizeof(ctx->id_ctrl_disc));
+    wr16le(&ctx->id_ctrl_disc[0], 0x1AF4);                                   /* VID */
+    nvmet_copy_padded(&ctx->id_ctrl_disc[4],  "RPI5-NVMET", 20);             /* SN */
+    nvmet_copy_padded(&ctx->id_ctrl_disc[24], "RPi5 Discovery Controller", 40); /* MN */
+    nvmet_copy_padded(&ctx->id_ctrl_disc[64], "1.0", 8);                     /* FR */
+    ctx->id_ctrl_disc[77] = 6;                   /* MDTS */
+
+    wr16le(&ctx->id_ctrl_disc[78], 1);            /* CNTLID */
+    ctx->id_ctrl_disc[111] = 2;                  /* CNTRLTYPE = 2 (Discovery controller) */
+
+    wr16le(&ctx->id_ctrl_disc[320], 2);           /* KAS */
+    wr32le(&ctx->id_ctrl_disc[536], 1u);          /* SGLS bit0 = SGL Supported */
+
+    {
+        const char *nqn = NVMET_DISCOVERY_NQN;
+        uint32_t len = 0;
+        while (nqn[len] != '\0') len++;
+        volatile_fast_copy(&ctx->id_ctrl_disc[768], (const volatile uint8_t *)nqn, len);
+    }
+
+    /* NN = 0 のまま(Discovery コントローラは名前空間を持たない)。 */
+    ctx->id_ctrl_disc[512] = (6u << 4) | 6u;      /* SQES */
+    ctx->id_ctrl_disc[513] = (4u << 4) | 4u;      /* CQES */
+    wr16le(&ctx->id_ctrl_disc[514], 32);          /* MAXCMD */
+
+    wr32le(&ctx->id_ctrl_disc[1792], (64u + NVMET_IOCCSZ_MAX_BYTES) / 16u);
+    wr32le(&ctx->id_ctrl_disc[1796], NVME_CQE_LEN / 16u);
+    ctx->id_ctrl_disc[1803] = 1;                 /* MSDBD */
+}
+
+/*=================================================================
+ * Discovery Log Page(LID=0x70)を組み立てる。
+ *
+ * レイアウトは Linux の include/linux/nvme.h の
+ * struct nvmf_disc_rsp_page_hdr / struct nvmf_disc_rsp_page_entry
+ * (どちらも 1024 バイト)。**オフセットは推測ではなく
+ * tools/disc_log_check.c の offsetof で確認した値**を nvmet.h に定数化してある。
+ *
+ * このターゲットはサブシステムを 1 つしか持たないのでエントリは 1 個。
+ * 文字列フィールド(trsvcid / subnqn / traddr)はゼロ埋め済みの領域へ
+ * そのまま書くので NUL 終端される。
+ *
+ * 引数:
+ *   ctx  - ターゲットコンテキスト
+ *   addr - このターゲットが待ち受けているアドレス(traddr / adrfam に使う)
+ * コール元:
+ *   nvmet_admin_dispatch()
+ * ===============================================================*/
+static void nvmet_build_disc_log(nvmet_ctx_t *ctx, const netaddr_t *addr)
+{
+    nvmet_zero(ctx->disc_log, sizeof(ctx->disc_log));
+
+    /* ---- ヘッダ ---- */
+    wr64le(&ctx->disc_log[NVMET_DISC_OFF_GENCTR], 1u);            /* 変更のたびに増やす世代番号 */
+    wr64le(&ctx->disc_log[NVMET_DISC_OFF_NUMREC], NVMET_DISC_NUMREC);
+    wr16le(&ctx->disc_log[NVMET_DISC_OFF_RECFMT], 0u);            /* 0 固定 */
+
+    /* ---- エントリ 0 ---- */
+    uint8_t *e = &ctx->disc_log[NVMET_DISC_HDR_LEN];
+    e[NVMET_DISC_ENT_OFF_TRTYPE]  = 3u;   /* NVMF_TRTYPE_TCP */
+    e[NVMET_DISC_ENT_OFF_ADRFAM]  = (addr && addr->family == NETADDR_V6) ? 2u : 1u; /* IP6 : IP4 */
+    e[NVMET_DISC_ENT_OFF_SUBTYPE] = 2u;   /* NVME_NQN_NVME (NVMe subsystem) */
+    e[NVMET_DISC_ENT_OFF_TREQ]    = 0u;   /* NVMF_TREQ_NOT_SPECIFIED */
+    wr16le(&e[NVMET_DISC_ENT_OFF_PORTID], 1u);
+    wr16le(&e[NVMET_DISC_ENT_OFF_CNTLID], 0xFFFFu); /* dynamic controller */
+    wr16le(&e[NVMET_DISC_ENT_OFF_ASQSZ],  32u);     /* 32 以上でなければならない */
+
+    nvmet_u16_to_dec(&e[NVMET_DISC_ENT_OFF_TRSVCID], ctx->listen_port);
+
+    {
+        const char *nqn = NVMET_SUBNQN;
+        uint32_t len = 0;
+        while (nqn[len] != '\0') len++;
+        volatile_fast_copy(&e[NVMET_DISC_ENT_OFF_SUBNQN], (const volatile uint8_t *)nqn, len);
+    }
+
+    nvmet_addr_to_str(&e[NVMET_DISC_ENT_OFF_TRADDR], addr);
+
+    /* TSAS: TCP は先頭 1 バイトが sectype。0 = No Security。 */
+    e[NVMET_DISC_ENT_OFF_TSAS] = 0u;
 }
 
 /*=================================================================
@@ -128,7 +314,8 @@ static void nvmet_build_cqe(nvme_cqe_t *cqe, uint16_t cid,
  * コール元:
  *   nvmet_admin_job_step()
  * ===============================================================*/
-static int nvmet_admin_dispatch(nvmet_ctx_t *ctx, const nvme_sqe_t *sqe)
+static int nvmet_admin_dispatch(nvmet_ctx_t *ctx, const nvme_sqe_t *sqe,
+                                 const uint8_t *data, uint32_t dlen)
 {
     uint32_t   opcode = rd32le(&sqe->cdw0) & 0xFFu;
     nvme_cqe_t cqe;
@@ -145,8 +332,19 @@ static int nvmet_admin_dispatch(nvmet_ctx_t *ctx, const nvme_sqe_t *sqe)
             uint32_t qid = rd32le(&sqe->cdw10) >> 16;
             if (qid == 0) {
                 ctx->ctrlr_id = 1;
+                /* Connect のデータは struct nvmf_connect_data(1024 バイト)で、
+                 * offset 256 から subsysnqn[256]。ここが Discovery NQN なら
+                 * このセッションは Discovery コントローラになる。 */
+                ctx->is_discovery = 0;
+                if (data != NULL && dlen >= 512u) {
+                    ctx->is_discovery = nvmet_nqn_is_discovery(&data[256]);
+                }
+                /* 通常のサブシステムのときだけ IO キューの受け皿を用意する
+                 * (Discovery コントローラは admin のみ)。 */
+                if (!ctx->is_discovery) ctx->io_armed = 1;
                 nvmet_build_cqe(&cqe, ctx->admin.last_cid, 1u, 0);
-                uart_printf("[nvmet:%s] Fabrics Connect (qid=0, admin) 受理 (ctrlr_id=1)\n", ctx->label);
+                uart_printf("[nvmet:%s] Fabrics Connect (qid=0, admin) 受理 (ctrlr_id=1%s)\n",
+                            ctx->label, ctx->is_discovery ? ", Discovery コントローラ" : "");
             } else {
                 uart_printf("[!] nvmet: adminキューで想定外のqid=%u\n", qid);
                 nvmet_build_cqe(&cqe, ctx->admin.last_cid, 0u, (uint16_t)NVMET_SC_GENERIC_ERROR);
@@ -190,7 +388,9 @@ static int nvmet_admin_dispatch(nvmet_ctx_t *ctx, const nvme_sqe_t *sqe)
         uint32_t cns = rd32le(&sqe->cdw10) & 0xFFu;
         nvmet_build_cqe(&cqe, ctx->admin.last_cid, 0u, 0);
         if (cns == NVME_IDENTIFY_CNS_CONTROLLER) {
-            nvmet_tcp_send_c2h(&ctx->admin, ctx->admin.last_cid, &cqe, ctx->id_ctrl, sizeof(ctx->id_ctrl), 1);
+            /* Discovery コントローラは CNTRLTYPE / SUBNQN / NN が違う別の応答。 */
+            const uint8_t *idc = ctx->is_discovery ? ctx->id_ctrl_disc : ctx->id_ctrl;
+            nvmet_tcp_send_c2h(&ctx->admin, ctx->admin.last_cid, &cqe, idc, sizeof(ctx->id_ctrl), 1);
         } else if (cns == NVME_IDENTIFY_CNS_NAMESPACE) {
             nvmet_tcp_send_c2h(&ctx->admin, ctx->admin.last_cid, &cqe, ctx->id_ns, sizeof(ctx->id_ns), 1);
         } else {
@@ -221,12 +421,39 @@ static int nvmet_admin_dispatch(nvmet_ctx_t *ctx, const nvme_sqe_t *sqe)
 
     if (opcode == NVME_ADM_CMD_GET_LOG_PAGE) {
         /* NUMD は 0's based の dword 数(cdw10 の上位16bit + cdw11 の下位16bit)。
-         * このターゲットはエラー情報も SMART も持たないので、要求された長さの
-         * ゼロ埋めを返す。ホスト(nvme-cli / カーネル)はこれを正常応答として
-         * 扱う。返さないと接続後の Get Log Page でエラーになる。 */
+         * LPO(Log Page Offset)は cdw12(下位32bit)/cdw13(上位32bit)のバイト
+         * オフセット。 */
+        uint32_t lid   = rd32le(&sqe->cdw10) & 0xFFu;
         uint32_t numdl = (rd32le(&sqe->cdw10) >> 16) & 0xFFFFu;
         uint32_t numdu = rd32le(&sqe->cdw11) & 0xFFFFu;
         uint32_t bytes = (((numdu << 16) | numdl) + 1u) * 4u;
+        uint32_t lpo   = rd32le(&sqe->cdw12);  /* 上位 32bit(cdw13)は使わない -- ログは 2KB しかない */
+
+        if (lid == NVME_LOG_LID_DISCOVERY) {
+            /* **オフセット付きの読み出しに対応しないと `nvme discover` は動かない。**
+             * ホストはまずヘッダ(16 バイト)だけを読んで NUMREC を確認し、
+             * 続けて全体を読み直す(実装によってはエントリ部分だけを
+             * LPO=1024 で読む)。 */
+            nvmet_build_disc_log(ctx, (const netaddr_t *)&ctx->admin.tcp.local_ip);
+
+            uint32_t avail = (lpo < NVMET_DISC_LOG_LEN) ? (NVMET_DISC_LOG_LEN - lpo) : 0u;
+            uint32_t send  = (bytes < avail) ? bytes : avail;
+            uart_printf("[nvmet:%s] Get Log Page: Discovery (lpo=%u 要求=%u 返却=%u numrec=%u)\n",
+                        ctx->label, lpo, bytes, send, NVMET_DISC_NUMREC);
+            nvmet_build_cqe(&cqe, ctx->admin.last_cid, 0u, 0);
+            if (send == 0u) {
+                /* 範囲外 -- データ無しで正常完了させる(エラーにはしない)。 */
+                nvmet_tcp_send_resp(&ctx->admin, &cqe);
+            } else {
+                nvmet_tcp_send_c2h(&ctx->admin, ctx->admin.last_cid, &cqe,
+                                    &ctx->disc_log[lpo], send, 1);
+            }
+            return 0;
+        }
+
+        /* それ以外の LID はエラー情報も SMART も持たないので、要求された長さの
+         * ゼロ埋めを返す。ホスト(nvme-cli / カーネル)はこれを正常応答として
+         * 扱う。返さないと接続後の Get Log Page でエラーになる。 */
         if (bytes > sizeof(ctx->log_page)) bytes = sizeof(ctx->log_page);
         for (uint32_t i = 0; i < bytes; i++) ctx->log_page[i] = 0;
         nvmet_build_cqe(&cqe, ctx->admin.last_cid, 0u, 0);
@@ -372,13 +599,39 @@ static job_result_t nvmet_admin_job_step(job_t *self)
         if (nvmet_tcp_send_icresp(&ctx->admin, jc->icreq_buf) != 0) {
             return nvmet_admin_job_setup_fail(self, ctx);
         }
-        ctx->io_armed = 1;
+        /* **IO キューの arm はここではなく Fabrics Connect(qid=0)の受理後に行う。**
+         * この時点ではまだ subnqn を見ていないので、Discovery コントローラかどうかが
+         * 分からない。Discovery は admin キューだけで完結する(IO キューを作らない)
+         * ので、ここで arm すると **discovery の次に来た通常接続の admin 用 SYN を
+         * IO キューの accept が食べてしまう**。実機で踏んだ:
+         * discovery -> tcpbench の順で叩くと「IOキューで想定外のFabricsコマンド
+         * (fctype=0x0)」で接続に失敗した。 */
         nvmet_tcp_xfer_reset(&jc->xfer, jc->hdr_buf, NVME_TCP_HDR_LEN);
         self->state = NADM_ST_RECV_HDR;
         return JOB_WAITING;
 
     case NADM_ST_RECV_HDR: {
         if (ctx->session_done) { ctx->session_done = 0; self->state = NADM_ST_ARM; return JOB_WAITING; }  /* io jobがセッションを終了させた -- 常駐継続のためARMへ戻る */
+        /* Discovery セッションは IO キューを作らないので、切断を検出して次の
+         * 接続待ちへ戻す io job が居ない。admin 自身で面倒を見る。
+         *
+         * **CLOSE_WAIT を条件に含めること。** 相手の FIN を受けた側は CLOSE_WAIT で
+         * 止まり、自分が close するまで CLOSED にはならない。ここを
+         * CLOSED/TIME_WAIT だけで見ていたら、discovery の後 admin job が
+         * CLOSE_WAIT のまま固まり、**以後この listener が一切 SYN を受け付けなく
+         * なった**(実機で踏んだ。C1 で「リスナが居るポートには RST を返さない」
+         * ようにしてあるので、相手からは SYN が黙って捨てられるように見える)。 */
+        if (ctx->is_discovery &&
+            (ctx->admin.tcp.state == TCP_CLOSE_WAIT ||
+             ctx->admin.tcp.state == TCP_CLOSED ||
+             ctx->admin.tcp.state == TCP_TIME_WAIT)) {
+            uart_printf("[nvmet:%s] Discovery セッション終了、次のクライアントを待ちます\n",
+                        ctx->label);
+            nvmet_tcp_close(&ctx->admin);
+            ctx->is_discovery = 0;
+            self->state = NADM_ST_ARM;
+            return JOB_WAITING;
+        }
         if (ctx->admin.tcp.state != TCP_ESTABLISHED) return JOB_WAITING;  /* 静かに待機 */
 
         int r = nvmet_tcp_recv_poll(&ctx->admin, &jc->xfer);
@@ -484,7 +737,7 @@ static job_result_t nvmet_admin_job_step(job_t *self)
             ts_log_nvme_tcp_pdu(TS_MK(TS_FILE_NVMET, TS_FUNC_nvmet_admin_job_step, 1), &info);
         }
 
-        if (nvmet_admin_dispatch(ctx, &sqe)) {
+        if (nvmet_admin_dispatch(ctx, &sqe, jc->data_buf, jc->dlen)) {
             uart_printf("[nvmet:%s] Set Features(Number of Queues)応答完了\n", ctx->label);
         }
         nvmet_tcp_xfer_reset(&jc->xfer, jc->hdr_buf, NVME_TCP_HDR_LEN);
@@ -1637,7 +1890,10 @@ int nvmet_job_start(nvmet_ctx_t *ctx, uint16_t port, netif_t *bound_ctx, const c
     ctx->write_incapsule_count = 0;
     ctx->write_h2c_count       = 0;
 
+    ctx->listen_port  = port;   /* Discovery Log Page の trsvcid に載せる */
+    ctx->is_discovery = 0;
     nvmet_build_id_ctrl(ctx);
+    nvmet_build_id_ctrl_disc(ctx);
     nvmet_build_id_ns(ctx);
 
     uart_printf("[nvmet:%s] adminキュー接続待ち (port=%u)\n", label, (unsigned)port);

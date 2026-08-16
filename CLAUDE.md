@@ -614,3 +614,66 @@ byte9-11 に 24bit ID という同じ形なので `mlx5_destroy_obj24()` にま�
   電源断)になる。N は 4 → 8 → 16 → 32 … と段階的に増やす。
 - `qploop` は `qp_index=0`(admin QP)と DMA バッファを共有するので、
   **RDMA セッションが生きている間に叩くとそれを壊す**。`bench` の後には使わない。
+
+## NVMe-oF Discovery(`PLAN_protocol_gaps.md` 段階 4 = D1)
+
+Discovery コントローラ(固定 NQN `nqn.2014-08.org.nvmexpress.discovery`)に
+対応した。Fabrics Connect の subnqn を見て `nvmet_ctx_t.is_discovery` を立て、
+Identify Controller(CNTRLTYPE=2)と Get Log Page(LID=0x70)の応答を変える。
+イニシエータ側は `nvme_ctx_t.discovery_mode` を立てて接続する。
+
+### 実ホストの `nvme discover` では検証できない(経路が無い)
+
+- **2 つの PF は同じ IOMMU グループ**(`0000:01:00.0` / `0000:01:00.1` /
+  上流の `0000:00:01.0` が group 2)。VFIO はグループ単位でしか扱えないので
+  **片方だけ mlx5_core に残すことはできない**。CLAUDE.md 冒頭の
+  「どちらか一方にしかバインドできない」の根拠はこれ。
+- Linux 側の NIC はオンボード `enp2s0`(192.168.3.164/24)だけで、ConnectX の
+  2 ポートは DAC 直結。192.168.101.0/24 へ出る物理経路が無い。
+
+### 代わりに「相手側の構造体でパースさせる」で検証する
+
+`tools/disc_log_check.c` は**このリポジトリのコードを一切 include せず**、
+Linux カーネルの `include/linux/nvme.h` の構造体だけでバイト列を読む独立
+プログラム。`nvmediscover dump` の 16 進出力を食わせて PASS することを確認する。
+
+**これが「自作 initiator ↔ 自作 target だけで試すと両側が同じ間違い方をして
+絶対に検出できない」穴(CRC32C で踏んだやつ)への答え。** 構造体オフセットも
+`offsetof` で出力させ、それを `nvmet.h` / `nvme.h` の定数として写している
+(推測していない)。カーネルヘッダは OptiPlex の
+`/usr/src/linux-headers-*/include/linux/nvme.h` にある。
+
+```bash
+ssh rpi5-rdma-target 'cd ~/vfio_nvme/tools && gcc -O2 -o /tmp/disc_log_check disc_log_check.c'
+```
+
+### 実機で踏んだこと: discovery の後、ターゲットが一切 SYN を受け付けなくなった
+
+**2 件とも「Discovery は IO キューを作らない」ことの波及。**
+
+1. **IO キューの arm が早すぎた。** `io_armed = 1` を ICResp 送信直後に立てて
+   いたが、そこではまだ subnqn を見ていないので Discovery か分からない。
+   arm しっぱなしになり、**次に来た通常接続の admin 用 SYN を IO キューの
+   accept が食べた**(`[!] nvmet: IOキューで想定外のFabricsコマンド
+   (fctype=0x0)`)。arm を Fabrics Connect(qid=0)受理後へ移した。
+2. **CLOSE_WAIT で固まった。** Discovery には切断を検出して次の接続待ちへ戻す
+   io job が居ないので admin job 自身で見る必要がある。`TCP_CLOSED ||
+   TCP_TIME_WAIT` だけを見ていたが、**相手の FIN を受けた側は CLOSE_WAIT で
+   止まり、自分が close するまで CLOSED にならない**。admin job が CLOSE_WAIT の
+   まま固まり、以後 listener が一切 SYN を受け付けなくなった。**C1 で
+   「リスナが居るポートには RST を返さない」ようにしてあるため、相手からは
+   SYN が黙って捨てられるようにしか見えず、原因が分かりにくい。**
+
+**教訓**: セッションの後始末を別のジョブに任せている構造だと、そのジョブが
+動かない経路(ここでは Discovery)を足したときに後始末が誰の担当でもなくなる。
+新しいセッション種別を足したら「誰が ARM へ戻すのか」を必ず確認すること。
+
+### 検証コマンド
+
+- `nvmediscover [dump]` — Discovery コントローラへ接続し Discovery Log Page を
+  取得して表示する。`dump` を付けると 16 進も出力する(`disc_log_check` へ渡す用)。
+  **ホストの実際の手順どおり「ヘッダ 1024B だけ読む → NUMREC を見て全体を
+  読み直す」の 2 段で読む**ので、Get Log Page の LPO(オフセット)対応が
+  壊れているとここで落ちる。
+- **`nvmediscover` の後に `tcpbench` を必ず 1 回流すこと。** 上記 2 件の不具合は
+  どちらも「discovery 単体では成功するが、その次の通常接続が死ぬ」形で出た。

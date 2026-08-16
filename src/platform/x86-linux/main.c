@@ -1149,6 +1149,152 @@ static void shell_txdrop(char *args)
 }
 
 /*=================================================================
+ * Discovery Log Page を人が読める形で表示する。
+ *
+ * オフセットは nvme.h / nvmet.h の定数(tools/disc_log_check.c の offsetof で
+ * 確認済み)を使う。文字列フィールドは NUL 終端されていない可能性があるので
+ * 長さを見ながら出す。
+ *
+ * 引数:
+ *   log / len - Discovery Log Page の生バイト列と長さ
+ * コール元:
+ *   shell_nvmediscover()
+ * ===============================================================*/
+static void shell_disc_log_print_str(const char *label, const uint8_t *p, uint32_t max)
+{
+    uint32_t n = 0;
+    while (n < max && p[n] != 0) n++;
+    uart_printf("    %-8s = \"", label);
+    for (uint32_t i = 0; i < n; i++) uart_printf("%c", (char)p[i]);
+    uart_printf("\"\n");
+}
+
+static void shell_disc_log_print(const uint8_t *log, uint32_t len)
+{
+    if (len < NVME_DISC_HDR_BYTES) return;
+    uint64_t numrec = rd64le(&log[NVME_DISC_OFF_NUMREC]);
+    uart_printf("  genctr=%u numrec=%u recfmt=%u\n",
+                (unsigned)rd64le(&log[NVME_DISC_OFF_GENCTR]),
+                (unsigned)numrec,
+                rd16le(&log[NVME_DISC_OFF_RECFMT]));
+
+    uint32_t avail = (len - NVME_DISC_HDR_BYTES) / NVME_DISC_ENTRY_BYTES;
+    for (uint32_t i = 0; i < numrec && i < avail; i++) {
+        const uint8_t *e = &log[NVME_DISC_HDR_BYTES + i * NVME_DISC_ENTRY_BYTES];
+        static const char *trt[] = { "PCI", "RDMA", "FC", "TCP" };
+        static const char *afm[] = { "PCI", "IPv4", "IPv6", "IB", "FC" };
+        uint8_t trtype = e[NVMET_DISC_ENT_OFF_TRTYPE];
+        uint8_t adrfam = e[NVMET_DISC_ENT_OFF_ADRFAM];
+        uart_printf("  entry[%u]: trtype=%u(%s) adrfam=%u(%s) subtype=%u treq=%u\n",
+                    i, trtype, (trtype < 4u) ? trt[trtype] : "?",
+                    adrfam, (adrfam < 5u) ? afm[adrfam] : "?",
+                    e[NVMET_DISC_ENT_OFF_SUBTYPE], e[NVMET_DISC_ENT_OFF_TREQ]);
+        uart_printf("    portid=%u cntlid=0x%04x asqsz=%u\n",
+                    rd16le(&e[NVMET_DISC_ENT_OFF_PORTID]),
+                    rd16le(&e[NVMET_DISC_ENT_OFF_CNTLID]),
+                    rd16le(&e[NVMET_DISC_ENT_OFF_ASQSZ]));
+        shell_disc_log_print_str("trsvcid", &e[NVMET_DISC_ENT_OFF_TRSVCID], 32u);
+        shell_disc_log_print_str("subnqn",  &e[NVMET_DISC_ENT_OFF_SUBNQN], 256u);
+        shell_disc_log_print_str("traddr",  &e[NVMET_DISC_ENT_OFF_TRADDR], 256u);
+    }
+}
+
+/*=================================================================
+ * シェルの `nvmediscover`。Discovery コントローラ(固定 NQN)へ接続し、
+ * Discovery Log Page を取得して内容を表示する。`nvme discover` 相当。
+ *
+ * ホストの実際の手順を再現する: まずヘッダ 1024 バイトだけを LPO=0 で読み、
+ * NUMREC を見てから全体を読み直す。**ターゲットが Get Log Page のオフセット
+ * (LPO)に対応していないとここで破綻する。**
+ *
+ * 引数:
+ *   args - "dump" を付けると Discovery Log Page 全体を 16 進で出力する。
+ *          その出力を tools/disc_log_check.c(Linux カーネルの構造体だけを
+ *          使う独立したパーサ)へ食わせて妥当性を確認する。
+ * コール元:
+ *   shell_dispatch()
+ * ===============================================================*/
+static void shell_nvmediscover(char *args)
+{
+    while (*args == ' ') args++;
+    int want_dump = (args[0] == 'd' && args[1] == 'u' && args[2] == 'm' && args[3] == 'p');
+
+    netif_t *ctx0 = netif_find("mlx5-pf0");
+    netif_t *ctx1 = netif_find("mlx5-pf1");
+    if (!ctx0 || !ctx1) { uart_printf("nvmediscover: netif 未登録\n"); return; }
+
+    /* ターゲットが未起動なら起こす(tcpbench と同じ条件で 4421 番)。 */
+    if (!s_shell_nvmet_started) {
+        if (smp_boot_core1() == 0) netif_set_owner_core(ctx1, 1u);
+        netif_activate(ctx1);
+        if (nvmet_job_start(&s_x86_nvmet, 4421u, ctx1, "manual") != 0) {
+            uart_printf("nvmediscover: ターゲット起動失敗\n"); return;
+        }
+        s_shell_nvmet_started = 1;
+        uart_printf("nvmediscover: ターゲット常駐起動 (pf1, core1)\n");
+    }
+
+    /* discovery は通常セッションとは別のコントローラなので、既存の
+     * tcpbench セッションが張られていたら閉じてから繋ぎ直す。 */
+    if (s_shell_tcp_connected) {
+        uart_printf("nvmediscover: 既存の tcpbench セッションを閉じます\n");
+        nvme_tcp_close(&s_nvme_ctx.io);
+        nvme_tcp_close(&s_nvme_ctx.admin);
+        s_nvme_ctx.io_connected = 0;
+        s_shell_tcp_connected   = 0;
+        uint64_t t0 = timer_now();
+        while (!timeout_ms(t0, 1500u)) { job_scheduler_tick(); net_poll_all_and_dispatch(); }
+    }
+
+    netif_activate(ctx0);
+    s_nvme_ctx.req_hdgst     = 0;
+    s_nvme_ctx.req_ddgst     = 0;
+    s_nvme_ctx.discovery_mode = 1;
+
+    netaddr_t target = netaddr_v4(ip_from_octets(192, 168, 101, 11));
+    uart_printf("nvmediscover: 192.168.101.11:4421 へ discovery 接続 (subnqn=%s)\n",
+                NVMET_DISCOVERY_NQN);
+    nvme_connect_job_start_addr(&s_nvme_ctx, &target, 4421u, NVMET_DISCOVERY_NQN);
+
+    uint64_t t = timer_now();
+    while (s_nvme_ctx.busy) {
+        job_scheduler_tick();
+        net_poll_all_and_dispatch();
+        if (timeout_ms(t, 15000u)) {
+            uart_printf("nvmediscover: NG -- タイムアウト\n");
+            s_nvme_ctx.discovery_mode = 0;
+            return;
+        }
+    }
+    s_nvme_ctx.discovery_mode = 0;
+
+    if (s_nvme_ctx.disc_log_len == 0) {
+        uart_printf("nvmediscover: NG -- Discovery Log Page を取得できませんでした\n");
+    } else {
+        uart_printf("nvmediscover: PASS -- %u バイト取得 (numrec=%u)\n",
+                    s_nvme_ctx.disc_log_len, (unsigned)s_nvme_ctx.disc_numrec);
+        shell_disc_log_print(s_nvme_ctx.disc_log, s_nvme_ctx.disc_log_len);
+        if (want_dump) {
+            uart_printf("---- BEGIN DISCOVERY LOG HEX (%u バイト) ----\n",
+                        s_nvme_ctx.disc_log_len);
+            for (uint32_t i = 0; i < s_nvme_ctx.disc_log_len; i++) {
+                uart_printf("%02x", s_nvme_ctx.disc_log[i]);
+                if ((i % 32u) == 31u) uart_printf("\n");
+            }
+            if ((s_nvme_ctx.disc_log_len % 32u) != 0u) uart_printf("\n");
+            uart_printf("---- END DISCOVERY LOG HEX ----\n");
+        }
+    }
+
+    /* discovery セッションは admin だけ。閉じて通常の tcpbench が張り直せる
+     * 状態へ戻す。 */
+    nvme_tcp_close(&s_nvme_ctx.admin);
+    uint64_t t2 = timer_now();
+    while (!timeout_ms(t2, 1000u)) { job_scheduler_tick(); net_poll_all_and_dispatch(); }
+    netif_activate(ctx0);
+}
+
+/*=================================================================
  * シェルの `qploop`。RC QP の作成と破棄を N 回繰り返し、FW 側リソースが
  * 枯渇しないことを確認する。
  *
@@ -1247,6 +1393,8 @@ static void shell_dispatch(char *line, int s0, int s1)
         shell_txdrop(line + 6);
     } else if (strncmp(line, "qploop", 6) == 0) {
         shell_qploop(line + 6);
+    } else if (strncmp(line, "nvmediscover", 12) == 0) {
+        shell_nvmediscover(line + 12);
     } else if (strncmp(line, "ts", 2) == 0 && (line[2] == 0 || line[2] == ' ')) {
         shell_ts(line + 2);
     } else if (strncmp(line, "ping6", 5) == 0) {
@@ -1277,6 +1425,7 @@ static void shell_dispatch(char *line, int s0, int s1)
                     "  rsttest                               待ち受け無しポートへ接続しRSTで即失敗するか(v4/v6)\n"
                     "  txdrop [N]                            ロス注入(データN個に1個破棄、0=無効)+再送統計\n"
                     "  qploop [N]                            RC QPの作成/破棄をN回繰り返しFWリソース枯渇を見る\n"
+                    "  nvmediscover [dump]                   Discovery Log Pageを取得(dumpで16進出力)\n"
                     "  nvmet [port] | jobs | help | quit    (↑↓で履歴呼び出し)\n"
                     "  例: bench 8,64,256 rw 8 / tcpbench 64,256 w digest / ts core 1 num 40\n");
     } else if (strncmp(line, "quit", 4) == 0 || strncmp(line, "exit", 4) == 0) {

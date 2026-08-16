@@ -14,7 +14,7 @@
 | 1 | C1 TCP RST 送信 | **完了**(実機確認済み 2026-08-16) |
 | 2 | C2 高速再送/高速回復 | **完了**(実機確認済み 2026-08-16) |
 | 3 | E RDMA リソース解放 | **完了**(実機確認済み 2026-08-16) |
-| 4 | D1 NVMe-oF Discovery サービス | 未着手 |
+| 4 | D1 NVMe-oF Discovery サービス | **完了**(実機確認済み 2026-08-16) |
 | 5 | A1 ルーティング/ゲートウェイ | 未着手 |
 | 6 | A2 ARP/NDP キャッシュのエージング | 未着手 |
 | 7 | A3 重複アドレス検出(ARP Probe / IPv6 DAD) | 未着手 |
@@ -59,6 +59,7 @@
 | `rsttest` | 待ち受け無しポートへ v4/v6 で接続し RST で即失敗するか |
 | `txdrop [N]` | ロス注入(データ N 個に 1 個破棄、0=無効)+ 再送統計 |
 | `qploop [N]` | RC QP の作成/破棄を N 回繰り返し FW リソースの枯渇を見る |
+| `nvmediscover [dump]` | Discovery Log Page を取得(`dump` で 16 進出力)|
 | `ts mask <mask> <value>` | ts_log の絞り込みダンプ(タグは File#\|Func#\|info) |
 | `monitor` / `err` | HW 状態・エラーカウンタ |
 
@@ -439,9 +440,103 @@ QP を作り直すたびに FW 側のリソースが溜まる。**既に一度�
 
 ---
 
-# 段階 4: D1 — NVMe-oF Discovery サービス
+# 段階 4: D1 — NVMe-oF Discovery サービス 【完了】
 
-## 現状
+## 着手前の確認事項への答え(2026-08-16)
+
+計画が「最大の未確認事項」としていた**「Linux ホストから自作ターゲットへ到達
+する経路があるか」の答えは「無い」**だった。
+
+- **片方の PF を mlx5_core に残す → 不可能。** `0000:01:00.0` と `0000:01:00.1` は
+  **同じ IOMMU グループ 2**(上流の `0000:00:01.0` ごと)に入っている。VFIO は
+  IOMMU グループ単位でしか扱えないので、片方だけ vfio-pci にはできない。
+  `readlink /sys/bus/pci/devices/0000:01:00.{0,1}/iommu_group` で確認できる。
+- **別 NIC 経由 → 不可能。** Linux 側の NIC はオンボードの `enp2s0`
+  (192.168.3.164/24)だけで、ConnectX の 2 ポートは DAC で互いに直結されている。
+  192.168.101.0/24 へ出る物理経路が無い。
+
+そこで**「実装 + Linux 由来パーサで検証」**を選んだ(ユーザー判断)。
+
+## 検証手法: 相手側の構造体でパースさせる
+
+`tools/disc_log_check.c` を追加した。**このリポジトリのコードを一切 include
+せず**、Linux カーネルの `include/linux/nvme.h` の
+`struct nvmf_disc_rsp_page_hdr` / `nvmf_disc_rsp_page_entry` だけを使って
+バイト列をパースする独立プログラム。`nvmediscover dump` が出す 16 進を
+食わせて読めることを確認する。
+
+**これが「自作 initiator ↔ 自作 target だけで試すと両側が同じ間違い方をして
+絶対に検出できない」穴(CRC32C で実際に踏んだ)への答え**になる。相手側実装が
+使う構造体そのもので読めるなら、自作パーサの解釈が正しいかとは独立に妥当性が
+言える。オフセットも `offsetof` で機械的に出力させ、それを `nvmet.h` / `nvme.h`
+の定数として写した(推測していない)。
+
+確認できた値: hdr は genctr=0 / numrec=8 / recfmt=16 / entries=1024、
+entry は trsvcid=32 / subnqn=256 / traddr=512 / tsas=768、どちらも sizeof=1024。
+
+## 実装
+
+**ターゲット側(`nvmet.c`)**
+
+- `nvmet_ctx_t.is_discovery` — Fabrics Connect(qid=0)のデータ
+  (`struct nvmf_connect_data`、offset 256 から subsysnqn[256])が Discovery NQN
+  なら立てる。`nvmet_admin_dispatch()` に in-capsule データを渡すよう引数を追加した。
+- `nvmet_build_id_ctrl_disc()` — Discovery 用の Identify Controller。通常との
+  違いは **CNTRLTYPE=2** / SUBNQN=Discovery NQN / NN=0 の 3 つだけ。
+  MAXCMD / SGLS / IOCCSZ / IORCSZ は Fabrics に必須なので通常と同じ値を入れる。
+- `nvmet_build_disc_log()` — Discovery Log Page。エントリは 1 個
+  (trtype=TCP、adrfam は待ち受けアドレスの family、subtype=2、cntlid=0xFFFF、
+  asqsz=32、trsvcid=待ち受けポート、traddr=自分の IP)。
+- Get Log Page に **LID 分岐と LPO(オフセット)対応**を追加。
+
+**イニシエータ側(`nvme.c`)**
+
+- `nvme_ctx_t.discovery_mode` を立てて接続すると、Identify Controller の後に
+  Discovery Log Page を **2 回**読む(ヘッダ 1024B → NUMREC を見て全体)。
+  **IO キューは作らずに完了する。**
+- `nvme_build_get_log_page_sqe()` を追加(NUMD は 0's based で cdw10/cdw11 に
+  分割、LPO は cdw12/cdw13)。
+
+## 実機で踏んだこと: discovery の後、ターゲットが一切 SYN を受け付けなくなった
+
+**2 件とも「Discovery は IO キューを作らない」ことの波及だった。**
+
+1. **IO キューの arm が早すぎた。** `io_armed = 1` を ICResp 送信直後に立てて
+   いたが、その時点ではまだ subnqn を見ていないので Discovery かどうか分からない。
+   Discovery は IO キューを作らないので arm しっぱなしになり、**次に来た通常接続の
+   admin 用 SYN を IO キューの accept が食べた**(`[!] nvmet: IOキューで想定外の
+   Fabricsコマンド (fctype=0x0)`)。arm を Fabrics Connect(qid=0)受理後へ移し、
+   `is_discovery` なら arm しないようにした。
+2. **CLOSE_WAIT で固まった。** Discovery セッションには切断を検出して次の接続待ちへ
+   戻す io job が居ないので admin job 自身で面倒を見る必要がある。最初
+   `TCP_CLOSED || TCP_TIME_WAIT` だけを見ていたが、**相手の FIN を受けた側は
+   CLOSE_WAIT で止まり、自分が close するまで CLOSED にならない**。結果 admin job が
+   CLOSE_WAIT のまま固まり、以後 listener が一切 SYN を受け付けなくなった。
+   C1 で「リスナが居るポートには RST を返さない」ようにしてあるため、相手からは
+   SYN が黙って捨てられるように見え、原因が分かりにくかった。
+
+## 実機での確認結果
+
+`nvmediscover dump` → `tcpbench` → `nvmediscover` → `tcpbench` の 4 コマンドを
+連続実行し、**すべて成功・失敗ログゼロ**。
+
+- Fabrics Connect が「Discovery コントローラ」と判定
+- Identify Controller の **CNTRLTYPE=2**
+- Get Log Page が 2 回(`lpo=0 要求=1024 返却=1024` → `lpo=0 要求=2048 返却=2048`)
+- エントリ: trtype=3(TCP)/ adrfam=1(IPv4)/ subtype=2 / cntlid=0xffff /
+  asqsz=32 / trsvcid="4421" / subnqn=実サブシステム / traddr="192.168.101.11"
+- **`tools/disc_log_check`(Linux の構造体のみ)で PASS**
+- discovery を挟んだ後の `tcpbench` も無回帰(write 8k 1081/1076、read 8k 2430/2414)
+
+## 残っている限界
+
+- **実ホストの `nvme discover` では試せていない**(上記のとおり経路が無い)。
+  Linux の構造体でパースできることまでしか言えない。
+- エントリは常に 1 個(サブシステムが 1 つしかないため)。
+- Discovery NQN 以外の未知 subnqn を拒否していない(どの subnqn でも通常の
+  サブシステムとして受理する)。
+
+## 着手前の現状
 
 コード中に discovery 関連は**一切無い**。ホストは必ず subnqn を手打ちする
 必要があり、`nvme discover` が使えない。

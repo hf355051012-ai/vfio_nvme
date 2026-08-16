@@ -8,6 +8,19 @@
 
 #define NVME_SUBNQN_MAX 224u
 
+/* Discovery Log Page のレイアウト(struct nvmf_disc_rsp_page_hdr /
+ * nvmf_disc_rsp_page_entry。どちらも 1024 バイト)。オフセットは
+ * tools/disc_log_check.c の offsetof で確認済み。 */
+#define NVME_DISC_HDR_BYTES    1024u
+#define NVME_DISC_ENTRY_BYTES  1024u
+#define NVME_DISC_OFF_GENCTR      0u
+#define NVME_DISC_OFF_NUMREC      8u
+#define NVME_DISC_OFF_RECFMT     16u
+
+/* Discovery Log Page の受信バッファ上限。ヘッダ 1024 + エントリ 1024×4。
+ * このターゲットのエントリは 1 個だが、余裕を見て 4 個ぶん確保しておく。 */
+#define NVME_DISC_LOG_MAX (NVME_DISC_HDR_BYTES + 4u * NVME_DISC_ENTRY_BYTES)
+
 typedef struct {
     nvme_tcp_conn_t admin;
     nvme_tcp_conn_t io;
@@ -21,6 +34,15 @@ typedef struct {
      * ICReq 要求値へ配る。 */
     uint8_t  req_hdgst;
     uint8_t  req_ddgst;
+
+    /* 接続前に 1 にすると Discovery コントローラとして接続する。Identify
+     * Controller の後で Discovery Log Page を 2 回(ヘッダだけ → 全体)読み、
+     * **IO キューは作らずに完了する**(Discovery コントローラは admin のみ)。 */
+    uint8_t  discovery_mode;
+    /* 読み取った Discovery Log Page。1024(ヘッダ)+ 1024×N(エントリ)。 */
+    uint8_t  disc_log[NVME_DISC_LOG_MAX] __attribute__((aligned(64)));
+    uint32_t disc_log_len;   /* 実際に読めたバイト数 */
+    uint64_t disc_numrec;    /* ヘッダから読んだ NUMREC */
 
     volatile int busy;
 } nvme_ctx_t;
@@ -54,6 +76,7 @@ void nvme_exec_begin(nvme_exec_ctx_t *ec, nvme_tcp_conn_t *conn, const nvme_sqe_
 int nvme_exec_step(nvme_exec_ctx_t *ec);
 
 void nvme_build_identify_sqe(nvme_sqe_t *sqe, uint8_t cns, uint32_t nsid);
+void nvme_build_get_log_page_sqe(nvme_sqe_t *sqe, uint8_t lid, uint32_t lpo, uint32_t bytes);
 void nvme_build_read_sqe(nvme_sqe_t *sqe, uint32_t nsid, uint64_t slba, uint32_t nlb, uint32_t total_len);
 void nvme_build_write_sqe(nvme_sqe_t *sqe, uint32_t nsid, uint64_t slba, uint32_t nlb, uint32_t total_len);
 

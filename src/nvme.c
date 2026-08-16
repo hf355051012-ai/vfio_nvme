@@ -503,6 +503,36 @@ void nvme_build_identify_sqe(nvme_sqe_t *sqe, uint8_t cns, uint32_t nsid)
 }
 
 /*=================================================================
+ * Get Log Page コマンドの SQE を組み立てる。
+ *
+ * NUMD(返してほしい dword 数)は 0's based で cdw10 の上位 16bit(NUMDL)と
+ * cdw11 の下位 16bit(NUMDU)に分かれる。LPO(Log Page Offset)はバイト単位で
+ * cdw12(下位 32bit)/ cdw13(上位 32bit)。
+ *
+ * 引数:
+ *   sqe   - 対象 SQE
+ *   lid   - Log Page Identifier(Discovery なら NVME_LOG_LID_DISCOVERY)
+ *   lpo   - 読み出し開始バイトオフセット
+ *   bytes - 読みたいバイト数(4 の倍数へ切り上げて要求する)
+ * コール元:
+ *   nvme_connect_job_step()
+ * ===============================================================*/
+void nvme_build_get_log_page_sqe(nvme_sqe_t *sqe, uint8_t lid, uint32_t lpo, uint32_t bytes)
+{
+    uint32_t dwords = (bytes + 3u) / 4u;
+    uint32_t numd   = (dwords > 0u) ? (dwords - 1u) : 0u;  /* 0's based */
+
+    nvme_zero(sqe, sizeof(*sqe));
+    wr32le(&sqe->cdw0, NVME_ADM_CMD_GET_LOG_PAGE | ((uint32_t)NVME_PSDT_SGL_MPTR_CONTIGUOUS << 8));
+    wr32le(&sqe->nsid, 0xFFFFFFFFu);   /* 全体に対するログ */
+    nvme_set_sgl(sqe, dwords * 4u);
+    wr32le(&sqe->cdw10, (uint32_t)lid | ((numd & 0xFFFFu) << 16));
+    wr32le(&sqe->cdw11, (numd >> 16) & 0xFFFFu);
+    wr32le(&sqe->cdw12, lpo);
+    wr32le(&sqe->cdw13, 0u);
+}
+
+/*=================================================================
  * Identify Namespace 応答から LBA サイズ(flbas が指す LBAF の lbads)と
  * 総ブロック数(NSZE)を取り出してコンテキストへ記録する。
  *
@@ -552,6 +582,8 @@ typedef enum {
     NCONN_ST_CSTS_POLL_WAIT,
     NCONN_ST_CSTS_POLL_EXEC,
     NCONN_ST_EXEC_IDENTIFY_CTRL,
+    NCONN_ST_EXEC_DISC_HDR,   /* Discovery: ヘッダ 1024B だけ読んで NUMREC を見る */
+    NCONN_ST_EXEC_DISC_FULL,  /* Discovery: NUMREC ぶんを含めて全体を読み直す */
     NCONN_ST_EXEC_IDENTIFY_NS,
     NCONN_ST_EXEC_SET_FEATURES,
     NCONN_ST_TCP_IO_WAIT,
@@ -591,6 +623,29 @@ static job_result_t nvme_connect_job_fail(nvme_connect_job_ctx_t *jc, int close_
     }
     jc->ctx->io_connected = 0;
     jc->ctx->busy = 0;
+    return JOB_DONE;
+}
+
+/*=================================================================
+ * Discovery コントローラとの接続を正常終了させる。
+ *
+ * Discovery コントローラは **IO キューを作らない**(admin のみ)。ログを
+ * 読み終えたらそこで完了で、通常接続のように Set Features(Number of Queues)
+ * や 2 本目の TCP 接続へは進まない。admin 接続は呼び出し側がログを読んだ後に
+ * 閉じられるよう、ここでは閉じずに残す。
+ *
+ * 引数:
+ *   jc - 接続ジョブのコンテキスト
+ * 戻り値:
+ *   JOB_DONE
+ * コール元:
+ *   nvme_connect_job_step()
+ * ===============================================================*/
+static job_result_t nvme_connect_job_finish_discovery(nvme_connect_job_ctx_t *jc)
+{
+    jc->ctx->io_connected = 0;
+    jc->ctx->busy = 0;
+    uart_printf("[nvme] Discovery 完了 (IOキューは作らない)\n");
     return JOB_DONE;
 }
 
@@ -735,10 +790,76 @@ static job_result_t nvme_connect_job_step(job_t *self)
     case NCONN_ST_EXEC_IDENTIFY_CTRL: {
         if (!nvme_exec_step(&jc->exec)) return JOB_WAITING;
         if (jc->exec.result != 0) return nvme_connect_job_fail(jc, 1, 0, "Identify Controller失敗");
+
+        if (ctx->discovery_mode) {
+            /* CNTRLTYPE(byte 111)が 2 = Discovery controller であることを確認する。
+             * ここが 1(I/O controller)なら、相手が discovery NQN を見ずに通常の
+             * 応答を返しているということなので、その場で分かる。 */
+            uint8_t cntrltype = jc->id_buf[111];
+            uart_printf("[nvme] Identify Controller完了 (CNTRLTYPE=%u%s)\n", cntrltype,
+                        (cntrltype == 2u) ? " = Discovery controller" : " [!] 2 であるべき");
+
+            /* ホストの実際の手順と同じく、まずヘッダだけ読んで NUMREC を見る。
+             * ここで **LPO 付きの読み出しに対応していないターゲットは破綻する**。 */
+            ctx->disc_log_len = 0;
+            ctx->disc_numrec  = 0;
+            nvme_build_get_log_page_sqe(&jc->sqe, (uint8_t)NVME_LOG_LID_DISCOVERY,
+                                         0u, NVME_DISC_HDR_BYTES);
+            nvme_exec_begin(&jc->exec, &ctx->admin, &jc->sqe, NULL, 0,
+                             ctx->disc_log, NVME_DISC_HDR_BYTES);
+            self->state = NCONN_ST_EXEC_DISC_HDR;
+            return JOB_WAITING;
+        }
+
         nvme_build_identify_sqe(&jc->sqe, (uint8_t)NVME_IDENTIFY_CNS_NAMESPACE, 1u);
         nvme_exec_begin(&jc->exec, &ctx->admin, &jc->sqe, NULL, 0, jc->id_buf, sizeof(jc->id_buf));
         self->state = NCONN_ST_EXEC_IDENTIFY_NS;
         return JOB_WAITING;
+    }
+
+    case NCONN_ST_EXEC_DISC_HDR: {
+        if (!nvme_exec_step(&jc->exec)) return JOB_WAITING;
+        if (jc->exec.result != 0) {
+            return nvme_connect_job_fail(jc, 1, 0, "Get Log Page(Discovery, ヘッダ)失敗");
+        }
+        ctx->disc_numrec = rd64le(&ctx->disc_log[NVME_DISC_OFF_NUMREC]);
+        uint64_t genctr  = rd64le(&ctx->disc_log[NVME_DISC_OFF_GENCTR]);
+        uint16_t recfmt  = rd16le(&ctx->disc_log[NVME_DISC_OFF_RECFMT]);
+        uart_printf("[nvme] Discovery Log Page ヘッダ: genctr=%u numrec=%u recfmt=%u\n",
+                    (unsigned)genctr, (unsigned)ctx->disc_numrec, recfmt);
+
+        if (ctx->disc_numrec == 0) {
+            /* エントリが無い = 公開されているサブシステムが無い。異常ではない。 */
+            ctx->disc_log_len = NVME_DISC_HDR_BYTES;
+            uart_printf("[nvme] Discovery: 公開サブシステムなし (numrec=0)\n");
+            return nvme_connect_job_finish_discovery(jc);
+        }
+
+        uint32_t want = NVME_DISC_HDR_BYTES +
+                        (uint32_t)ctx->disc_numrec * NVME_DISC_ENTRY_BYTES;
+        if (want > NVME_DISC_LOG_MAX) {
+            uart_printf("[!] nvme: Discovery エントリが多すぎる (numrec=%u)、先頭 %u 個だけ読む\n",
+                        (unsigned)ctx->disc_numrec,
+                        (NVME_DISC_LOG_MAX - NVME_DISC_HDR_BYTES) / NVME_DISC_ENTRY_BYTES);
+            want = NVME_DISC_LOG_MAX;
+        }
+        /* 2 回目は全体を読み直す(ヘッダも含めて LPO=0)。 */
+        nvme_build_get_log_page_sqe(&jc->sqe, (uint8_t)NVME_LOG_LID_DISCOVERY, 0u, want);
+        nvme_exec_begin(&jc->exec, &ctx->admin, &jc->sqe, NULL, 0, ctx->disc_log, want);
+        ctx->disc_log_len = want;
+        self->state = NCONN_ST_EXEC_DISC_FULL;
+        return JOB_WAITING;
+    }
+
+    case NCONN_ST_EXEC_DISC_FULL: {
+        if (!nvme_exec_step(&jc->exec)) return JOB_WAITING;
+        if (jc->exec.result != 0) {
+            ctx->disc_log_len = 0;
+            return nvme_connect_job_fail(jc, 1, 0, "Get Log Page(Discovery, 全体)失敗");
+        }
+        uart_printf("[nvme] Discovery Log Page 全体を取得 (%u バイト, numrec=%u)\n",
+                    ctx->disc_log_len, (unsigned)ctx->disc_numrec);
+        return nvme_connect_job_finish_discovery(jc);
     }
 
     case NCONN_ST_EXEC_IDENTIFY_NS: {
