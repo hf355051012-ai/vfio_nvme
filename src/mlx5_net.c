@@ -1062,6 +1062,10 @@ static void mlx5_netif_setup(netif_t *ctx, mlx5_net_state_t *st, mlx5_dev_t *dev
         }
         mss = 9216;
         ctx->mss_cap = (uint16_t)mss;
+        /* IP 断片化の基準になる L3 MTU。mss_cap(TCP ペイロード)+ TCP ヘッダ
+         * + IP ヘッダ。フルサイズの TCP セグメントが実際に通っている値なので、
+         * この total_length までは確実に送れる。 */
+        ctx->mtu = (uint16_t)(mss + 20u + 20u);
     }
     ctx->rx_ring_size = (uint16_t)MLX5_RQ_NUM_WQES;
     ctx->hw_csum_offload = 1;

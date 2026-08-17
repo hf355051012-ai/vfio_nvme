@@ -24,6 +24,24 @@
 
 static uint16_t s_ip_id[SMP_MAX_CORES];  /* IP identification: 単純増加カウンタ(固定値でも可) */
 
+/* 受信した断片を観測するフック(検証専用、既定は無効)。ip.c は断片を
+ * 再構成しないので、これを登録しないと送信側の分割が正しいかを確かめられない。 */
+static ip_frag_observer_t s_frag_observer;
+
+/*=================================================================
+ * 受信断片の観測フックを登録する(NULL で解除)。登録中は断片ごとの
+ * 「未対応、破棄」ログを出さない(断片の数だけ行が出て読めなくなるため)。
+ *
+ * 引数:
+ *   fn - 断片ごとに呼ばれる関数。NULL で解除
+ * コール元:
+ *   shell_fragtest()
+ * ===============================================================*/
+void ip_set_frag_observer(ip_frag_observer_t fn)
+{
+    s_frag_observer = fn;
+}
+
 /*=================================================================
  * EtherType 0x0800(IPv4)のフレームハンドラを登録する。
  *
@@ -81,16 +99,6 @@ void ip_handle_frame(const uint8_t *payload, size_t len, const uint8_t *src_mac)
         }
     }
 
-    /* 断片化されたデータグラムは再構成しない。ここで弾かないと、断片を
-     * 完全なデータグラムとして上位へ渡してしまい、TCP/ICMP が壊れたペイロード
-     * を読む(MTU が揃ったループバックでは起きないが実ネットワークでは起きる)。
-     * MF(bit13)が立っているか、フラグメントオフセット(bit12-0)が非 0 なら断片。 */
-    uint16_t flags_frag = rd16be(in + IP_OFF_FLAGS_FRAG);
-    if ((flags_frag & 0x2000u) != 0u || (flags_frag & 0x1FFFu) != 0u) {
-        uart_printf("[IP] 断片化データグラムは未対応 (flags_frag=0x%04X) 破棄\n", flags_frag);
-        return;
-    }
-
     uint16_t total_len = rd16be(in + IP_OFF_TOTAL_LEN);
     if ((size_t)total_len > len) {
         uart_printf("[IP] total_lengthがフレーム長を超過 (total_len=%u len=%u) 無視\n",
@@ -99,6 +107,27 @@ void ip_handle_frame(const uint8_t *payload, size_t len, const uint8_t *src_mac)
     }
     if (total_len < sizeof(ip_header_t)) {
         uart_printf("[IP] total_lengthがヘッダ長未満 (total_len=%u) 無視\n", total_len);
+        return;
+    }
+
+    /* 断片化されたデータグラムは再構成しない。ここで弾かないと、断片を
+     * 完全なデータグラムとして上位へ渡してしまい、TCP/ICMP が壊れたペイロード
+     * を読む(MTU が揃ったループバックでは起きないが実ネットワークでは起きる)。
+     * MF(bit13)が立っているか、フラグメントオフセット(bit12-0)が非 0 なら断片。
+     * 破棄する前に観測フックへ渡す -- 再構成しないので、送信側の分割が
+     * RFC 791 どおりかを確かめる手段がこれしか無い(`fragtest`)。 */
+    uint16_t flags_frag = rd16be(in + IP_OFF_FLAGS_FRAG);
+    if ((flags_frag & 0x2000u) != 0u || (flags_frag & 0x1FFFu) != 0u) {
+        if (s_frag_observer) {
+            s_frag_observer(rd16be(in + IP_OFF_ID),
+                            (uint16_t)((flags_frag & 0x1FFFu) * 8u),
+                            (flags_frag & 0x2000u) != 0u,
+                            in[IP_OFF_PROTOCOL],
+                            payload + sizeof(ip_header_t),
+                            (uint16_t)(total_len - sizeof(ip_header_t)));
+            return;  /* 観測中はログを出さない(断片ごとに 1 行出ると読めない) */
+        }
+        uart_printf("[IP] 断片化データグラムは未対応 (flags_frag=0x%04X) 破棄\n", flags_frag);
         return;
     }
 
@@ -167,8 +196,9 @@ void ip_handle_frame(const uint8_t *payload, size_t len, const uint8_t *src_mac)
  *   ip_prepare_send_buf(), tcp_send_segment(), tcp_send_segment_lso(),
  *   tcp_send_bare_ack()
  * ===============================================================*/
-void ip_build_header(uint8_t *buf, const uint8_t dst_ip[4], const uint8_t dst_mac[6],
-                      uint8_t protocol, uint16_t payload_len)
+static void ip_build_header_frag(uint8_t *buf, const uint8_t dst_ip[4], const uint8_t dst_mac[6],
+                                  uint8_t protocol, uint16_t payload_len,
+                                  uint16_t id, uint16_t flags_frag)
 {
     uint8_t self_mac[ETH_ALEN];
     eth_get_mac(self_mac);
@@ -191,8 +221,8 @@ void ip_build_header(uint8_t *buf, const uint8_t dst_ip[4], const uint8_t dst_ma
     iph[IP_OFF_VER_IHL] = 0x45;  /* version=4, IHL=5(20バイト、オプション無し) */
     iph[IP_OFF_TOS]     = 0;
     wr16be(iph + IP_OFF_TOTAL_LEN, total_len);
-    wr16be(iph + IP_OFF_ID, s_ip_id[smp_core_index()]++);
-    wr16be(iph + IP_OFF_FLAGS_FRAG, 0);
+    wr16be(iph + IP_OFF_ID, id);
+    wr16be(iph + IP_OFF_FLAGS_FRAG, flags_frag);
     iph[IP_OFF_TTL]      = IP_DEFAULT_TTL;
     iph[IP_OFF_PROTOCOL] = protocol;
     wr16be(iph + IP_OFF_CHECKSUM, 0);  /* チェックサム計算前に0クリア */
@@ -201,6 +231,13 @@ void ip_build_header(uint8_t *buf, const uint8_t dst_ip[4], const uint8_t dst_ma
 
     uint16_t csum = inet_checksum(iph, sizeof(ip_header_t));
     wr16be(iph + IP_OFF_CHECKSUM, csum);
+}
+
+void ip_build_header(uint8_t *buf, const uint8_t dst_ip[4], const uint8_t dst_mac[6],
+                      uint8_t protocol, uint16_t payload_len)
+{
+    ip_build_header_frag(buf, dst_ip, dst_mac, protocol, payload_len,
+                          s_ip_id[smp_core_index()]++, 0u);
 }
 
 /*=================================================================
@@ -266,9 +303,83 @@ int ip_send_prepared(net_buf_t *nb, uint16_t payload_len)
  * コール元:
  *   icmp_handle()
  * ===============================================================*/
+/*=================================================================
+ * リンク MTU を超えるペイロードを RFC 791 の断片へ分割して送る。
+ *
+ * 断片化で間違えやすいのは 3 点で、いずれもここで面倒を見ている:
+ *  - **フラグメントオフセットは 8 バイト単位**なので、最後以外の断片長は
+ *    8 の倍数でなければならない(MTU をそのまま使うと端数が出る)。
+ *  - **全断片で IP ID を同じにする。** 受信側は (src, dst, protocol, id) で
+ *    束ねるので、断片ごとに ID を振ると再構成できない。
+ *  - **上位プロトコルのヘッダは先頭断片にしか入らない。** だから分割は
+ *    「UDP データグラム全体を IP ペイロードとして」行う(ここが正しい層)。
+ *
+ * 引数:
+ *   dst_ip / dst_mac / protocol - 全断片で共通
+ *   payload / payload_len       - 分割対象の IP ペイロード全体
+ *   max_payload                 - 1 断片に入れられる IP ペイロードの上限
+ * 戻り値:
+ *   0=全断片を送信できた、-1=いずれかで失敗
+ * コール元:
+ *   ip_send()
+ * ===============================================================*/
+static int ip_send_fragmented(const uint8_t dst_ip[4], const uint8_t dst_mac[6],
+                               uint8_t protocol, const uint8_t *payload,
+                               uint16_t payload_len, uint16_t max_payload)
+{
+    uint16_t chunk = (uint16_t)(max_payload & ~7u);  /* オフセットは 8 バイト単位 */
+    if (chunk == 0u) {
+        uart_printf("[!] IP: MTU が小さすぎて断片化できない (max_payload=%u)\n", max_payload);
+        return -1;
+    }
+
+    const uint16_t id = s_ip_id[smp_core_index()]++;  /* 全断片で共通 */
+    uint16_t off = 0;
+    unsigned count = 0;
+
+    while (off < payload_len) {
+        uint16_t remain = (uint16_t)(payload_len - off);
+        uint16_t this_len = (remain > chunk) ? chunk : remain;
+        int more = (uint16_t)(off + this_len) < payload_len;
+
+        net_buf_t *nb = net_buf_alloc();
+        if (!nb) {
+            uart_printf("[!] IP: 断片送信中に net_buf プール枯渇 (offset=%u)\n", off);
+            return -1;
+        }
+        uint16_t flags_frag = (uint16_t)((more ? 0x2000u : 0u) | (off / 8u));
+        ip_build_header_frag(nb->data, dst_ip, dst_mac, protocol, this_len, id, flags_frag);
+
+        const volatile uint8_t *vpayload = payload + off;
+        volatile uint8_t *body = nb->data + IP_PAYLOAD_OFFSET;
+        for (uint16_t i = 0; i < this_len; i++) body[i] = vpayload[i];
+        nb->len = (uint16_t)(IP_PAYLOAD_OFFSET + this_len);
+
+        if (eth_send(nb) != 0) {  /* eth_send() が net_buf を解放する */
+            uart_printf("[!] IP: 断片の送信失敗 (offset=%u len=%u)\n", off, this_len);
+            return -1;
+        }
+        off = (uint16_t)(off + this_len);
+        count++;
+    }
+
+    uart_printf("[IP] %u バイトを %u 個の断片へ分割して送信 (id=%u 断片長=%u)\n",
+                payload_len, count, id, chunk);
+    return 0;
+}
+
 int ip_send(const uint8_t dst_ip[4], const uint8_t dst_mac[6],
             uint8_t protocol, const uint8_t *payload, uint16_t payload_len)
 {
+    /* リンク MTU を超えるなら断片へ分割する。TCP は MSS で自分で収めるので
+     * ここへは来ない(来るのは UDP と ICMP)。 */
+    uint16_t ip_mtu = net_active_ip_mtu();
+    uint16_t max_payload = (ip_mtu > (uint16_t)sizeof(ip_header_t))
+                               ? (uint16_t)(ip_mtu - sizeof(ip_header_t)) : 0u;
+    if (payload_len > max_payload) {
+        return ip_send_fragmented(dst_ip, dst_mac, protocol, payload, payload_len, max_payload);
+    }
+
     net_buf_t *nb = ip_prepare_send_buf(dst_ip, dst_mac, protocol, payload_len);
     if (!nb) {
         return -1;

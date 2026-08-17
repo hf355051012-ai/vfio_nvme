@@ -126,6 +126,11 @@ typedef struct netif {
     arp_cache_entry_t arp_cache[ARP_CACHE_SIZE];
     ndp_cache_entry_t ndp_cache[NDP_CACHE_SIZE];
     uint16_t    mss_cap;
+    /* IPv4 の total_length として送ってよい上限(= L3 の MTU)。IP 送信側の
+     * 断片化がこの値を基準に分割する。mss_cap(TCP ペイロードの上限)+ TCP
+     * ヘッダ 20 + IP ヘッダ 20 で決めてある -- mss_cap はこのリンクで実際に
+     * 通ることが確認済みの値なので、そこから導けば新しい仮定を持ち込まない。 */
+    uint16_t    mtu;
     uint16_t    rx_ring_size;
     uint8_t     hw_csum_offload;
     uint8_t     tx_zerocopy_2frag;
@@ -230,6 +235,12 @@ static inline uint32_t net_active_ip(void)
 static inline uint16_t net_active_mss_cap(void)
 {
     return g_active_ctx ? g_active_ctx->mss_cap : 1460u;
+}
+
+/* IPv4 の total_length の上限(L3 MTU)。未設定なら Ethernet の既定 1500。 */
+static inline uint16_t net_active_ip_mtu(void)
+{
+    return (g_active_ctx && g_active_ctx->mtu) ? g_active_ctx->mtu : 1500u;
 }
 
 static inline uint16_t net_active_rx_ring_size(void)

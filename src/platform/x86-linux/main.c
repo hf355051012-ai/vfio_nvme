@@ -859,6 +859,268 @@ static void shell_route(char *args)
     }
 }
 
+/* ---- fragtest: 受信断片を観測して RFC 791 どおりかを確かめる ---- */
+#define FRAGTEST_MAX_FRAGS 16u
+#define FRAGTEST_BUF_SIZE  65536u
+
+static struct {
+    uint16_t id;
+    uint16_t off;
+    uint16_t len;
+    int      more;
+    uint8_t  protocol;
+} s_frag_seen[FRAGTEST_MAX_FRAGS];
+static unsigned s_frag_count;
+static unsigned s_frag_overflow;
+static uint8_t  s_frag_reasm[FRAGTEST_BUF_SIZE];
+static uint8_t  s_frag_dump;   /* 1=IP ヘッダ相当を 16 進で出す(tools/ip_frag_check 用) */
+
+/*=================================================================
+ * ip.c から断片ごとに呼ばれる観測フック。**再構成はここでテスト側が独自に
+ * 行う**(スタックは再構成しないので、これが送信側を確かめる唯一の手段)。
+ *
+ * 引数:
+ *   id / frag_off / more / protocol - 断片のヘッダから取り出した値
+ *   payload / len                   - その断片のペイロード
+ * コール元:
+ *   ip_handle_frame() から関数ポインタ経由
+ * ===============================================================*/
+static void shell_frag_observer(uint16_t id, uint16_t frag_off, int more,
+                                 uint8_t protocol, const uint8_t *payload, uint16_t len)
+{
+    if (s_frag_count >= FRAGTEST_MAX_FRAGS) { s_frag_overflow++; return; }
+    if ((uint32_t)frag_off + len > FRAGTEST_BUF_SIZE) { s_frag_overflow++; return; }
+
+    s_frag_seen[s_frag_count].id       = id;
+    s_frag_seen[s_frag_count].off      = frag_off;
+    s_frag_seen[s_frag_count].len      = len;
+    s_frag_seen[s_frag_count].more     = more;
+    s_frag_seen[s_frag_count].protocol = protocol;
+    s_frag_count++;
+
+    for (uint16_t i = 0; i < len; i++) s_frag_reasm[frag_off + i] = payload[i];
+}
+
+/*=================================================================
+ * 観測した断片列が RFC 791 どおりかを検査する。
+ *
+ * 引数:
+ *   label      - 表示用のラベル
+ *   want_total - 送信した IP ペイロードの総バイト数
+ *   want_frags - 期待する断片数(0 なら個数は判定しない)
+ * 戻り値:
+ *   1=すべて期待どおり、0=そうでない
+ * コール元:
+ *   shell_fragtest()
+ * ===============================================================*/
+static int shell_frag_verify(const char *label, uint32_t want_total, unsigned want_frags)
+{
+    int ok = 1;
+
+    if (s_frag_overflow) {
+        uart_printf("fragtest: NG %s -- 観測が溢れた (%u 個)\n", label, s_frag_overflow);
+        return 0;
+    }
+    if (s_frag_count == 0) {
+        uart_printf("fragtest: NG %s -- 断片が 1 つも観測されなかった\n", label);
+        return 0;
+    }
+    if (want_frags != 0u && s_frag_count != want_frags) {
+        uart_printf("fragtest: NG %s -- 断片数が %u(期待 %u)\n",
+                    label, s_frag_count, want_frags);
+        ok = 0;
+    }
+
+    /* 全断片で ID が同じか。違うと受信側が束ねられない。 */
+    for (unsigned i = 1; i < s_frag_count; i++) {
+        if (s_frag_seen[i].id != s_frag_seen[0].id) {
+            uart_printf("fragtest: NG %s -- 断片 %u の ID が %u(先頭は %u)\n",
+                        label, i, s_frag_seen[i].id, s_frag_seen[0].id);
+            ok = 0;
+        }
+    }
+
+    /* オフセットと長さが [0, want_total) を隙間も重複も無く覆うか。
+     * 送信順に届く前提は置かず、offset を足し合わせて確認する。 */
+    uint32_t covered = 0;
+    int last_seen = 0;
+    for (unsigned i = 0; i < s_frag_count; i++) {
+        covered += s_frag_seen[i].len;
+        /* 最後以外の断片長は 8 の倍数でなければならない
+         * (フラグメントオフセットが 8 バイト単位なので、端数が出ると
+         *  次の断片のオフセットを表現できない)。 */
+        if (s_frag_seen[i].more && (s_frag_seen[i].len % 8u) != 0u) {
+            uart_printf("fragtest: NG %s -- MF=1 の断片 %u の長さ %u が 8 の倍数でない\n",
+                        label, i, s_frag_seen[i].len);
+            ok = 0;
+        }
+        if (!s_frag_seen[i].more) {
+            last_seen++;
+            if ((uint32_t)s_frag_seen[i].off + s_frag_seen[i].len != want_total) {
+                uart_printf("fragtest: NG %s -- 最終断片の末尾が %u(期待 %u)\n", label,
+                            (unsigned)s_frag_seen[i].off + s_frag_seen[i].len,
+                            (unsigned)want_total);
+                ok = 0;
+            }
+        }
+        if ((s_frag_seen[i].off % 8u) != 0u) {
+            uart_printf("fragtest: NG %s -- 断片 %u のオフセット %u が 8 の倍数でない\n",
+                        label, i, s_frag_seen[i].off);
+            ok = 0;
+        }
+    }
+    if (last_seen != 1) {
+        uart_printf("fragtest: NG %s -- MF=0 の断片が %u 個(1 個であるべき)\n",
+                    label, (unsigned)last_seen);
+        ok = 0;
+    }
+    if (covered != want_total) {
+        uart_printf("fragtest: NG %s -- 断片長の合計が %u(期待 %u)\n",
+                    label, (unsigned)covered, (unsigned)want_total);
+        ok = 0;
+    }
+
+    uart_printf("fragtest: %s %s -- 断片 %u 個 / id=%u / 合計 %u バイト\n",
+                ok ? "OK" : "NG", label, s_frag_count, s_frag_seen[0].id, (unsigned)covered);
+    for (unsigned i = 0; i < s_frag_count; i++) {
+        uart_printf("    断片%u: offset=%u len=%u MF=%d protocol=%u\n",
+                    i, s_frag_seen[i].off, s_frag_seen[i].len,
+                    s_frag_seen[i].more, s_frag_seen[i].protocol);
+    }
+    if (s_frag_dump) {
+        /* tools/ip_frag_check が読む形式。Linux の struct iphdr で解釈させる
+         * ため、ワイヤ上の 20 バイトをそのまま復元できる値だけを出す。 */
+        uart_printf("FRAGDUMP total=%u count=%u\n", (unsigned)want_total, s_frag_count);
+        for (unsigned i = 0; i < s_frag_count; i++) {
+            uart_printf("FRAGDUMP frag id=%u off=%u len=%u mf=%d proto=%u\n",
+                        s_frag_seen[i].id, s_frag_seen[i].off, s_frag_seen[i].len,
+                        s_frag_seen[i].more, s_frag_seen[i].protocol);
+        }
+    }
+    return ok;
+}
+
+/*=================================================================
+ * シェルの `fragtest`。A4(送信側の IP フラグメント)の検証。
+ *
+ * **このスタックは受信側の再構成を実装していない**ので、素直な往復では
+ * 確かめられない。ip.c に観測フックを入れ、断片を捨てる直前にテスト側へ
+ * 渡してもらい、**テスト側が RFC 791 を見ながら独自に再構成する**。
+ * 送信側(ip.c)と検査側(main.c)が別のコードなので、「両側が同じ間違いを
+ * して検出できない」形にはならない。
+ *
+ * 3 パターン見る:
+ *  [1] MTU 以下 -- 分割されない(断片が 1 つも観測されない)
+ *  [2] MTU の 2 倍超 -- 中間断片(MF=1 かつ offset 非 0)が生じる
+ *  [3] UDP 経由 -- 計画が「実害があるのは UDP のみ」と書いている経路
+ *
+ * 引数:
+ *   args - "dump" を付けると tools/ip_frag_check 用の行も出す
+ * コール元:
+ *   shell_dispatch()
+ * ===============================================================*/
+static void shell_fragtest(char *args)
+{
+    /* RFC 3692 の実験・試験用プロトコル番号。上位ハンドラが居ないので、
+     * 断片でない [1] のケースは Protocol Unreachable が返るだけで済む。 */
+    const uint8_t test_proto = 253u;
+
+    while (*args == ' ') args++;
+    s_frag_dump = (strncmp(args, "dump", 4) == 0);
+
+    uint8_t peer_ll[16];  /* shell_peer_ll6() は必ず書き込むので NULL は渡せない */
+    netif_t *peer = shell_peer_ll6(peer_ll);
+    netif_t *self = g_active_ctx;
+    if (!peer || !self) {
+        uart_printf("fragtest: 対向インターフェースが見つかりません(net init mlx5 が必要)\n");
+        return;
+    }
+
+    uint16_t ip_mtu = net_active_ip_mtu();
+    uint16_t max_payload = (uint16_t)(ip_mtu - 20u);
+    uint16_t chunk = (uint16_t)(max_payload & ~7u);
+    uart_printf("fragtest: L3 MTU=%u -> 1 断片の IP ペイロード上限=%u(8 の倍数へ切り下げ %u)\n",
+                ip_mtu, max_payload, chunk);
+
+    uint32_t peer_ip = peer->ip;
+    uint8_t dst_ip[4] = { (uint8_t)(peer_ip >> 24), (uint8_t)(peer_ip >> 16),
+                          (uint8_t)(peer_ip >> 8), (uint8_t)peer_ip };
+    uint8_t dst_mac[6];
+    netaddr_t peer_addr = netaddr_v4(peer_ip);
+    if (net_resolve_mac(&peer_addr, dst_mac) != 0) {
+        uart_printf("fragtest: 対向 PF の MAC 解決に失敗\n");
+        return;
+    }
+
+    static uint8_t tx[FRAGTEST_BUF_SIZE];
+    for (unsigned i = 0; i < sizeof(tx); i++) tx[i] = (uint8_t)(i * 31u + 11u);
+
+    int ok = 1;
+    ip_set_frag_observer(shell_frag_observer);
+
+    /* ---- [1] MTU 以下は分割されない ---- */
+    s_frag_count = 0; s_frag_overflow = 0;
+    ip_send(dst_ip, dst_mac, test_proto, tx, (uint16_t)(max_payload));
+    for (uint64_t t0 = timer_now(); !timeout_ms(t0, 100u); ) net_poll_all_and_dispatch();
+    if (s_frag_count != 0) {
+        uart_printf("fragtest: NG [1] MTU ちょうど(%u バイト)なのに断片が %u 個出た\n",
+                    max_payload, s_frag_count);
+        ok = 0;
+    } else {
+        uart_printf("fragtest: OK [1] IP ペイロード %u バイト -- 分割されない\n", max_payload);
+    }
+
+    /* ---- [2] MTU の 2 倍超 -> 中間断片が生じる ---- */
+    const uint16_t big = (uint16_t)(chunk * 2u + 1000u);
+    unsigned want = 3u;
+    s_frag_count = 0; s_frag_overflow = 0;
+    if (ip_send(dst_ip, dst_mac, test_proto, tx, big) != 0) {
+        uart_printf("fragtest: NG [2] ip_send が失敗\n");
+        ok = 0;
+    } else {
+        for (uint64_t t0 = timer_now(); !timeout_ms(t0, 200u); ) net_poll_all_and_dispatch();
+        ok &= shell_frag_verify("[2] IP 直送(中間断片あり)", big, want);
+        /* 再構成した内容が送ったものと一致するか。 */
+        int match = 1;
+        for (uint32_t i = 0; i < big; i++) {
+            if (s_frag_reasm[i] != tx[i]) { match = 0; break; }
+        }
+        uart_printf("fragtest: %s [2] 再構成した %u バイトが送信内容と%s\n",
+                    match ? "OK" : "NG", big, match ? "一致" : "不一致");
+        if (!match) ok = 0;
+        /* 中間断片(MF=1 かつ offset 非 0)が実際に生じたか。ここを通らないと
+         * 「2 個に割れるだけ」のケースしか検証できていない。 */
+        int middle = 0;
+        for (unsigned i = 0; i < s_frag_count; i++) {
+            if (s_frag_seen[i].more && s_frag_seen[i].off != 0u) middle = 1;
+        }
+        uart_printf("fragtest: %s [2] 中間断片(MF=1 かつ offset 非 0)が%s\n",
+                    middle ? "OK" : "NG", middle ? "存在する" : "無い");
+        if (!middle) ok = 0;
+    }
+
+    /* ---- [3] UDP 経由(計画が実害ありとしている経路)---- */
+    const uint16_t udp_payload = 10000u;
+    s_frag_count = 0; s_frag_overflow = 0;
+    if (udp_send(dst_ip, dst_mac, 7777u, 7777u, tx, udp_payload) != 0) {
+        uart_printf("fragtest: NG [3] udp_send が失敗\n");
+        ok = 0;
+    } else {
+        for (uint64_t t0 = timer_now(); !timeout_ms(t0, 200u); ) net_poll_all_and_dispatch();
+        /* UDP ヘッダ 8 バイトぶん多い。断片数は 0 指定で個数判定を省く。 */
+        ok &= shell_frag_verify("[3] UDP 経由", (uint32_t)udp_payload + 8u, 0u);
+        if (s_frag_count > 0 && s_frag_seen[0].protocol != IP_PROTO_UDP) {
+            uart_printf("fragtest: NG [3] protocol が %u(UDP=%u であるべき)\n",
+                        s_frag_seen[0].protocol, IP_PROTO_UDP);
+            ok = 0;
+        }
+    }
+
+    ip_set_frag_observer(NULL);
+    s_frag_dump = 0;
+    uart_printf("fragtest: %s\n", ok ? "PASS" : "NG");
+}
+
 /*=================================================================
  * 重複アドレス検出 1 件の結果を表示し、期待どおりかを判定する。
  *
@@ -1988,6 +2250,8 @@ static void shell_dispatch(char *line, int s0, int s1)
         shell_arptest();
     } else if (strncmp(line, "dadtest", 7) == 0) {
         shell_dadtest();
+    } else if (strncmp(line, "fragtest", 8) == 0) {
+        shell_fragtest(line + 8);
     } else if (strncmp(line, "arpage", 6) == 0) {
         shell_arpage(line + 6);
     } else if (strncmp(line, "jobs", 4) == 0) {
@@ -2011,6 +2275,7 @@ static void shell_dispatch(char *line, int s0, int s1)
                     "  arpage [ms]                           ARP/NDPキャッシュの有効期間(既定60000ms)\n"
                     "  arptest                               キャッシュのエージング(失効→確認→延命/破棄)\n"
                     "  dadtest                               重複アドレス検出(ARP Probe / IPv6 DAD)\n"
+                    "  fragtest [dump]                       送信側IP断片化(MTU超のUDP/IPを分割)\n"
                     "  txdrop [N]                            ロス注入(データN個に1個破棄、0=無効)+再送統計\n"
                     "  qploop [N]                            RC QPの作成/破棄をN回繰り返しFWリソース枯渇を見る\n"
                     "  nvmediscover [dump]                   Discovery Log Pageを取得(dumpで16進出力)\n"

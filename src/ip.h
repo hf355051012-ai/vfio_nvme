@@ -29,6 +29,14 @@ void ip_init(void);
 
 void ip_handle_frame(const uint8_t *payload, size_t len, const uint8_t *src_mac);
 
+/* 受信した IP 断片を観測するためのフック(検証専用)。ip.c は断片を再構成
+ * しないので、送信側の分割が RFC 791 どおりかを外から確かめるのに使う。
+ * frag_off はバイト単位(ワイヤ上の 8 バイト単位から変換済み)。 */
+typedef void (*ip_frag_observer_t)(uint16_t id, uint16_t frag_off, int more,
+                                    uint8_t protocol,
+                                    const uint8_t *payload, uint16_t len);
+void ip_set_frag_observer(ip_frag_observer_t fn);
+
 void ip_build_header(uint8_t *buf, const uint8_t dst_ip[4], const uint8_t dst_mac[6],
                       uint8_t protocol, uint16_t payload_len);
 
