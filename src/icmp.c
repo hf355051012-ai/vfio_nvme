@@ -9,6 +9,8 @@
 #include "uart.h"
 #include "timer.h"
 #include "smp.h"
+#include "pmtu.h"
+#include "netaddr.h"
 
 #define ICMP_HDR_LEN     8u
 #define ICMP_OFF_TYPE    0u
@@ -117,6 +119,39 @@ void icmp_handle(const uint8_t *data, size_t len,
         return;
     }
 
+    if (type == ICMP_TYPE_DEST_UNREACH && code == ICMP_CODE_FRAG_NEEDED) {
+        /* 経路上のルータが「分割が必要だが DF が立っている」と返してきた。
+         * RFC 1191 の Path MTU Discovery。**MTU は未使用 4 バイトの下位 16bit**
+         * (byte 6-7)に入る -- byte 4-5 を含めた 32bit として読むと桁が狂う。 */
+        if (len < ICMP_HDR_LEN + sizeof(ip_header_t)) {
+            uart_printf("[ICMP] Fragmentation Needed だが引用が短い (len=%u) 無視\n",
+                        (unsigned)len);
+            return;
+        }
+        uint16_t mtu = rd16be(in + 6u);
+
+        /* 学習する宛先は「引用された元データグラムの宛先」。ICMP の送信元
+         * (= 文句を言ってきたルータ)ではない。 */
+        const volatile uint8_t *quoted = in + ICMP_HDR_LEN;
+        uint32_t orig_dst = rd32be(quoted + 16u);  /* IPv4 ヘッダの dst_ip */
+
+        uart_printf("[ICMP] Fragmentation Needed 受信 (次ホップ MTU=%u) from %u.%u.%u.%u"
+                    " -- 対象の宛先 %u.%u.%u.%u\n",
+                    mtu, src_ip[0], src_ip[1], src_ip[2], src_ip[3],
+                    (unsigned)((orig_dst >> 24) & 0xFFu), (unsigned)((orig_dst >> 16) & 0xFFu),
+                    (unsigned)((orig_dst >> 8) & 0xFFu), (unsigned)(orig_dst & 0xFFu));
+
+        if (mtu == 0u) {
+            /* RFC 1191 以前のルータは MTU を載せてこない。推測して下げる
+             * (次に小さい定番の MTU を試す)方法があるが、実装していない。 */
+            uart_printf("[ICMP] MTU=0(RFC 1191 非対応のルータ)-- 推測降下は未実装、無視\n");
+            return;
+        }
+        netaddr_t dst = netaddr_v4(orig_dst);
+        pmtu_learn(&dst, mtu);
+        return;
+    }
+
     if (type == ICMP_TYPE_DEST_UNREACH) {
         /* 相手が「そのポート/プロトコルには誰も居ない」と返してきた。上位へ
          * 通知する経路(接続の即時失敗など)はまだ持たないので記録のみ。 */
@@ -125,6 +160,19 @@ void icmp_handle(const uint8_t *data, size_t len,
                                                              : "Destination Unreachable";
         uart_printf("[ICMP] %s 受信 (code=%u) from %u.%u.%u.%u\n",
                     what, code, src_ip[0], src_ip[1], src_ip[2], src_ip[3]);
+        return;
+    }
+
+    if (type == ICMP_TYPE_TIME_EXCEEDED) {
+        /* **送る側は実装しない。** これを返すのは転送するノード(ルータ)で、
+         * このスタックは転送しないので出番が無い。受けた側は経路異常の
+         * 手掛かりになるので記録する(code=0 は TTL 切れ = ループか TTL が
+         * 小さすぎる、code=1 は断片の再構成タイムアウト)。 */
+        uart_printf("[ICMP] Time Exceeded 受信 (code=%u: %s) from %u.%u.%u.%u\n",
+                    code,
+                    (code == 0u) ? "転送中に TTL が 0 になった"
+                                 : (code == 1u) ? "断片の再構成がタイムアウト" : "不明",
+                    src_ip[0], src_ip[1], src_ip[2], src_ip[3]);
         return;
     }
 

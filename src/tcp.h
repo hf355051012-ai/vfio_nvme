@@ -144,6 +144,10 @@ int  tcp_accept_ready_poll(int listener);
 
 void tcp_unlisten(int listener);
 
+/* 経路 MTU を学習したとき、その宛先の確立済みコネクションの snd_mss を
+ * 切り下げる(pmtu_learn() から呼ばれる)。上げ直しはしない。 */
+void tcp_pmtu_update(const netaddr_t *dst, uint16_t pmtu);
+
 int tcp_window_scaling_enabled(const tcp_conn_t *conn);
 
 void tcp_debug_dump_rx(const tcp_conn_t *conn);

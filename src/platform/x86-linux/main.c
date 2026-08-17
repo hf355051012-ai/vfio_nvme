@@ -8,9 +8,11 @@
 #include "net.h"
 #include "arp.h"
 #include "ip.h"
+#include "icmp.h"
 #include "ipv6.h"
 #include "udp.h"
 #include "netif.h"
+#include "pmtu.h"
 #include "job.h"
 #include "nvme.h"
 #include "nvmet.h"
@@ -532,13 +534,14 @@ static void shell_udptest6(void)
  *   srv_if  - サーバ役インターフェース(listen をここに束縛する)
  *   dst     - クライアントが接続する宛先アドレス
  *   port    - 使用ポート
+ *   out_mss - NULL 可。確立したコネクションの snd_mss を返す(PMTU の検証用)
  * 戻り値:
  *   1=64KB が一致して往復した、0=失敗
  * コール元:
- *   shell_tcp6test(), shell_routetest()
+ *   shell_tcp6test(), shell_routetest(), shell_pmtutest()
  * ===============================================================*/
 static int shell_tcp_echo_once(const char *label, netif_t *self, netif_t *srv_if,
-                                const netaddr_t *dst, uint16_t port)
+                                const netaddr_t *dst, uint16_t port, uint16_t *out_mss)
 {
     static tcp_conn_t s_srv, s_cli;
 
@@ -573,6 +576,7 @@ static int shell_tcp_echo_once(const char *label, netif_t *self, netif_t *srv_if
         return 0;
     }
     uart_printf("%s: 接続確立 (MSS=%u)\n", label, (unsigned)s_cli.snd_mss);
+    if (out_mss) *out_mss = s_cli.snd_mss;
 
     /* フルサイズ(MSS)セグメントを何本も流す大きさにしておく。小さいままだと
      * 1 セグメントに収まってしまい、L3 ヘッダ 20 バイト増による MTU 超過
@@ -635,7 +639,7 @@ static void shell_tcp6test(void)
         return;
     }
     netaddr_t dst = netaddr_v6(peer_ll);
-    shell_tcp_echo_once("tcp6test", self, peer, &dst, 6000u);
+    shell_tcp_echo_once("tcp6test", self, peer, &dst, 6000u, NULL);
 }
 
 /*=================================================================
@@ -1121,6 +1125,309 @@ static void shell_fragtest(char *args)
     uart_printf("fragtest: %s\n", ok ? "PASS" : "NG");
 }
 
+/* ---- pmtutest: ICMP エラーを注入して PMTU の学習と適用を確かめる ---- */
+
+static uint8_t s_pmtu_dump;  /* 1=注入した ICMP を 16 進で出す(tools/icmp_mtu_check 用) */
+
+/*=================================================================
+ * ICMP Fragmentation Needed(type 3 / code 4)を 1 個組み立てて送る。
+ * ルータの役を対向インターフェースが務める。
+ *
+ * **MTU の置き場所が要点。** RFC 1191 では未使用 4 バイトのうち
+ * 「上位 16bit は 0、下位 16bit が次ホップ MTU」。byte 4-5 に書くと桁が狂う。
+ *
+ * 引数:
+ *   to_ip / to_mac - 送り先(ICMP エラーを受け取る側)
+ *   orig_src       - 引用する元データグラムの送信元(= 受け取る側)
+ *   orig_dst       - 引用する元データグラムの宛先(= PMTU を学習させたい宛先)
+ *   mtu            - 報告する次ホップ MTU
+ * 戻り値:
+ *   0=送信完了、-1=失敗
+ * コール元:
+ *   shell_pmtutest()
+ * ===============================================================*/
+static int shell_inject_frag_needed(const uint8_t to_ip[4], const uint8_t to_mac[6],
+                                     uint32_t orig_src, uint32_t orig_dst, uint16_t mtu)
+{
+    static uint8_t msg[8u + 20u + 8u];
+    for (unsigned i = 0; i < sizeof(msg); i++) msg[i] = 0;
+
+    msg[0] = ICMP_TYPE_DEST_UNREACH;
+    msg[1] = ICMP_CODE_FRAG_NEEDED;
+    /* msg[2..3] はチェックサム、msg[4..5] は 0 のまま(RFC 1191)。 */
+    msg[6] = (uint8_t)(mtu >> 8);
+    msg[7] = (uint8_t)mtu;
+
+    /* 引用する元 IPv4 ヘッダ(20 バイト)+ 続く 8 バイト。 */
+    uint8_t *q = msg + 8u;
+    q[0] = 0x45;                       /* version=4, IHL=5 */
+    q[2] = 0x25; q[3] = 0x00;          /* total_length: 何でもよい(9472) */
+    q[6] = 0x40;                       /* DF を立てる(Frag Needed の前提) */
+    q[8] = 64;                         /* TTL */
+    q[9] = IP_PROTO_TCP;
+    q[12] = (uint8_t)(orig_src >> 24); q[13] = (uint8_t)(orig_src >> 16);
+    q[14] = (uint8_t)(orig_src >> 8);  q[15] = (uint8_t)orig_src;
+    q[16] = (uint8_t)(orig_dst >> 24); q[17] = (uint8_t)(orig_dst >> 16);
+    q[18] = (uint8_t)(orig_dst >> 8);  q[19] = (uint8_t)orig_dst;
+
+    wr16be(msg + 2, inet_checksum(msg, (uint16_t)sizeof(msg)));
+
+    if (s_pmtu_dump) {
+        uart_printf("ICMPDUMP v4 len=%u", (unsigned)sizeof(msg));
+        for (unsigned i = 0; i < sizeof(msg); i++) uart_printf(" %02x", msg[i]);
+        uart_printf("\n");
+    }
+    return ip_send(to_ip, to_mac, IP_PROTO_ICMP, msg, (uint16_t)sizeof(msg));
+}
+
+/*=================================================================
+ * ICMPv6 Packet Too Big(type 2 / code 0)を 1 個組み立てて送る。
+ *
+ * **IPv4 と MTU の置き場所が違う。** ICMPv6 は byte 4-7 の 32bit 全体が MTU。
+ * IPv4 と同じつもりで下位 16bit だけに書くと 0 と読まれる。
+ *
+ * 引数:
+ *   to / to_mac - 送り先(ICMP エラーを受け取る側)
+ *   orig_src    - 引用する元パケットの送信元(= 受け取る側)
+ *   orig_dst    - 引用する元パケットの宛先(= PMTU を学習させたい宛先)
+ *   mtu         - 報告する MTU
+ * 戻り値:
+ *   0=送信完了、-1=失敗
+ * コール元:
+ *   shell_pmtutest()
+ * ===============================================================*/
+static int shell_inject_packet_too_big(const uint8_t to[16], const uint8_t to_mac[6],
+                                        const uint8_t orig_src[16], const uint8_t orig_dst[16],
+                                        uint32_t mtu)
+{
+    static uint8_t msg[8u + 40u + 8u];
+    for (unsigned i = 0; i < sizeof(msg); i++) msg[i] = 0;
+
+    msg[0] = ICMPV6_TYPE_PACKET_TOO_BIG;
+    msg[1] = 0;
+    /* msg[2..3] はチェックサム。msg[4..7] の 32bit 全体が MTU。 */
+    msg[4] = (uint8_t)(mtu >> 24); msg[5] = (uint8_t)(mtu >> 16);
+    msg[6] = (uint8_t)(mtu >> 8);  msg[7] = (uint8_t)mtu;
+
+    /* 引用する元 IPv6 ヘッダ(40 バイト)+ 続く 8 バイト。 */
+    uint8_t *q = msg + 8u;
+    q[0] = 0x60;                       /* version=6 */
+    q[4] = 0x24; q[5] = 0x00;          /* payload_length: 何でもよい */
+    q[6] = IPV6_NH_TCP;
+    q[7] = 64;                         /* hop limit */
+    for (unsigned i = 0; i < 16; i++) q[8 + i]  = orig_src[i];
+    for (unsigned i = 0; i < 16; i++) q[24 + i] = orig_dst[i];
+
+    /* ICMPv6 はチェックサムに疑似ヘッダが必須。送信元はアクティブな
+     * インターフェースのリンクローカル(ipv6_send() が使うものと同じ)。 */
+    uint8_t src[16];
+    ipv6_link_local_addr(src);
+    wr16be(msg + 2, ipv6_pseudo_checksum(src, to, IPV6_NH_ICMPV6, msg, (uint16_t)sizeof(msg)));
+
+    if (s_pmtu_dump) {
+        uart_printf("ICMPDUMP v6 len=%u", (unsigned)sizeof(msg));
+        for (unsigned i = 0; i < sizeof(msg); i++) uart_printf(" %02x", msg[i]);
+        uart_printf("\n");
+    }
+    return ipv6_send(to, to_mac, IPV6_NH_ICMPV6, msg, (uint16_t)sizeof(msg));
+}
+
+/*=================================================================
+ * シェルの `pmtutest`。A5/A6(Path MTU Discovery)の検証。
+ *
+ * **MTU の揃った DAC 直結では ICMP Frag Needed / Packet Too Big が誰からも
+ * 飛んでこない。** そこで対向インターフェースにルータの役をさせ、これらを
+ * 人為的に注入する。A5/A6 の実装範囲は「受信して学習し、送信へ反映する」側
+ * なので、注入側がテストコードでも検証の意味は失われない。
+ *
+ * ただし**注入する ICMP の形式そのものが自作**なので、そこを間違えると
+ * 「自分の間違いを自分で受け入れて PASS する」ことになる。`dump` を付けると
+ * 注入したメッセージを 16 進で出すので、`tools/icmp_mtu_check`(Linux の
+ * struct icmphdr / icmp6_hdr のみ)に食わせて形式を確かめられる。
+ *
+ * 引数:
+ *   args - "dump" で 16 進出力を有効化
+ * コール元:
+ *   shell_dispatch()
+ * ===============================================================*/
+static void shell_pmtutest(char *args)
+{
+    /* IPv4 側は routetest と同じ別名インターフェース(10.9.9.9)を宛先にする。
+     * **nvmet が使う 192.168.101.11 を宛先にすると、学習した PMTU が生きている
+     * セッションの snd_mss まで下げてしまう**(pmtu_clear() では戻らない)。 */
+    const uint32_t far_ip = ip_from_octets(10, 9, 9, 9);
+    const uint16_t port   = 6003u;
+    const uint16_t v4_mtu = 1500u;   /* 定番の Ethernet MTU */
+    const uint32_t v6_mtu = 1400u;   /* IPv6 の下限 1280 より上 */
+    static netif_t s_alias;
+
+    while (*args == ' ') args++;
+    s_pmtu_dump = (strncmp(args, "dump", 4) == 0);
+
+    uint8_t peer_ll[16];
+    netif_t *peer = shell_peer_ll6(peer_ll);
+    netif_t *self = g_active_ctx;
+    if (!peer || !self) {
+        uart_printf("pmtutest: 対向インターフェースが見つかりません(net init mlx5 が必要)\n");
+        return;
+    }
+    uint8_t self_ll[16];
+    ipv6_link_local_addr(self_ll);
+
+    const uint32_t self_ip = self->ip;
+    uint8_t self_ip_oct[4] = { (uint8_t)(self_ip >> 24), (uint8_t)(self_ip >> 16),
+                               (uint8_t)(self_ip >> 8), (uint8_t)self_ip };
+    uint8_t self_mac[6];
+    for (unsigned i = 0; i < 6u; i++) self_mac[i] = self->mac[i];
+
+    int ok = 1;
+    netaddr_t far_addr = netaddr_v4(far_ip);
+    netaddr_t peer6    = netaddr_v6(peer_ll);
+
+    /* 対向 PF を「別サブネットの相手」として実在させる(routetest と同じ手)。 */
+    s_alias = *peer;
+    s_alias.name    = "pmtu-far";
+    s_alias.ip      = far_ip;
+    s_alias.netmask = 0u;
+    s_alias.gateway = 0u;
+    s_alias.gateway6_set = 0u;
+    for (unsigned i = 0; i < ARP_CACHE_SIZE; i++) s_alias.arp_cache[i].valid = 0;
+    for (unsigned i = 0; i < NDP_CACHE_SIZE; i++) s_alias.ndp_cache[i].valid = 0;
+    netif_register(&s_alias);
+    s_alias.is_poll_owner = 0;
+    netif_activate(self);
+
+    /* ---- [1] 初期状態 ---- */
+    pmtu_clear();
+    if (pmtu_lookup(&far_addr) != 0u || pmtu_lookup(&peer6) != 0u) {
+        uart_printf("pmtutest: NG [1] クリア直後なのに学習済みの値がある\n");
+        ok = 0;
+    } else {
+        uart_printf("pmtutest: OK [1] 初期状態 -- 学習済みの PMTU なし\n");
+    }
+
+    /* ---- [2] IPv4: Frag Needed を注入して学習させる ----
+     * ルータ役として対向 PF から送る。引用する元データグラムは
+     * 「self -> 10.9.9.9」なので、self が 10.9.9.9 の PMTU を学習する。 */
+    netif_activate(peer);
+    int inj = shell_inject_frag_needed(self_ip_oct, self_mac, self_ip, far_ip, v4_mtu);
+    netif_activate(self);
+    for (uint64_t t0 = timer_now(); !timeout_ms(t0, 200u); ) net_poll_all_and_dispatch();
+
+    uint16_t got4 = pmtu_lookup(&far_addr);
+    uart_printf("pmtutest: %s [2] IPv4 Frag Needed(MTU=%u)-> 学習値=%u\n",
+                (inj == 0 && got4 == v4_mtu) ? "OK" : "NG", v4_mtu, got4);
+    if (inj != 0 || got4 != v4_mtu) ok = 0;
+
+    /* ---- [3] IPv4: 新規 TCP コネクションの MSS が下がる ---- */
+    uint16_t mss4 = 0;
+    if (shell_tcp_echo_once("pmtutest", self, &s_alias, &far_addr, port, &mss4)) {
+        uint16_t want = (uint16_t)(v4_mtu - 20u - 20u);
+        uart_printf("pmtutest: %s [3] IPv4 コネクションの MSS=%u(期待 %u)\n",
+                    (mss4 == want) ? "OK" : "NG", mss4, want);
+        if (mss4 != want) ok = 0;
+    } else {
+        uart_printf("pmtutest: NG [3] IPv4 の往復に失敗\n");
+        ok = 0;
+    }
+    netif_activate(self);
+
+    /* ---- [4] IPv4: ip_send が学習した PMTU で分割する ---- */
+    {
+        static uint8_t tx[4096];
+        for (unsigned i = 0; i < sizeof(tx); i++) tx[i] = (uint8_t)(i * 13u + 5u);
+        uint8_t far_oct[4] = { 10, 9, 9, 9 };
+        uint8_t far_mac[6];
+        for (unsigned i = 0; i < 6u; i++) far_mac[i] = s_alias.mac[i];
+
+        s_frag_count = 0; s_frag_overflow = 0;
+        ip_set_frag_observer(shell_frag_observer);
+        ip_send(far_oct, far_mac, 253u, tx, (uint16_t)sizeof(tx));
+        for (uint64_t t0 = timer_now(); !timeout_ms(t0, 200u); ) net_poll_all_and_dispatch();
+        ip_set_frag_observer(NULL);
+
+        /* PMTU 1500 -> IP ペイロード上限 1480(8 の倍数なのでそのまま)。
+         * 4096 バイトは 1480 + 1480 + 1136 の 3 断片になる。 */
+        uint16_t want_chunk = (uint16_t)((v4_mtu - 20u) & ~7u);
+        int good = (s_frag_count == 3u) && (s_frag_seen[0].len == want_chunk);
+        uart_printf("pmtutest: %s [4] ip_send が PMTU で分割 -- 断片 %u 個 / 先頭 %u バイト"
+                    "(期待 3 個 / %u バイト)\n",
+                    good ? "OK" : "NG", s_frag_count,
+                    s_frag_count ? s_frag_seen[0].len : 0u, want_chunk);
+        if (!good) ok = 0;
+    }
+
+    /* ---- [5] IPv6: Packet Too Big を注入して学習させる ---- */
+    netif_activate(peer);
+    int inj6 = shell_inject_packet_too_big(self_ll, self_mac, self_ll, peer_ll, v6_mtu);
+    netif_activate(self);
+    for (uint64_t t0 = timer_now(); !timeout_ms(t0, 200u); ) net_poll_all_and_dispatch();
+
+    uint16_t got6 = pmtu_lookup(&peer6);
+    uart_printf("pmtutest: %s [5] IPv6 Packet Too Big(MTU=%u)-> 学習値=%u\n",
+                (inj6 == 0 && got6 == (uint16_t)v6_mtu) ? "OK" : "NG",
+                (unsigned)v6_mtu, got6);
+    if (inj6 != 0 || got6 != (uint16_t)v6_mtu) ok = 0;
+
+    /* ---- [6] IPv6: 新規 TCP コネクションの MSS が下がる ---- */
+    uint16_t mss6 = 0;
+    if (shell_tcp_echo_once("pmtutest6", self, peer, &peer6, (uint16_t)(port + 1u), &mss6)) {
+        uint16_t want = (uint16_t)(v6_mtu - 40u - 20u);
+        uart_printf("pmtutest: %s [6] IPv6 コネクションの MSS=%u(期待 %u)\n",
+                    (mss6 == want) ? "OK" : "NG", mss6, want);
+        if (mss6 != want) ok = 0;
+    } else {
+        uart_printf("pmtutest: NG [6] IPv6 の往復に失敗\n");
+        ok = 0;
+    }
+    netif_activate(self);
+
+    /* ---- [7] 床: 下限未満の報告は採用しない ---- */
+    netif_activate(peer);
+    shell_inject_frag_needed(self_ip_oct, self_mac, self_ip, far_ip, 100u);   /* < 576 */
+    netif_activate(self);
+    for (uint64_t t0 = timer_now(); !timeout_ms(t0, 100u); ) net_poll_all_and_dispatch();
+    netif_activate(peer);
+    shell_inject_packet_too_big(self_ll, self_mac, self_ll, peer_ll, 1000u);  /* < 1280 */
+    netif_activate(self);
+    for (uint64_t t0 = timer_now(); !timeout_ms(t0, 100u); ) net_poll_all_and_dispatch();
+
+    int floor_ok = (pmtu_lookup(&far_addr) == v4_mtu) &&
+                   (pmtu_lookup(&peer6) == (uint16_t)v6_mtu);
+    uart_printf("pmtutest: %s [7] 床 -- v4 に 100 / v6 に 1000 を報告しても学習値は"
+                " %u / %u のまま\n", floor_ok ? "OK" : "NG",
+                pmtu_lookup(&far_addr), pmtu_lookup(&peer6));
+    if (!floor_ok) ok = 0;
+
+    /* ---- [8] 大きい値の報告は無視する(PMTU は下げる方向のみ)---- */
+    netif_activate(peer);
+    shell_inject_frag_needed(self_ip_oct, self_mac, self_ip, far_ip, 9000u);
+    netif_activate(self);
+    for (uint64_t t0 = timer_now(); !timeout_ms(t0, 100u); ) net_poll_all_and_dispatch();
+    int nogrow = (pmtu_lookup(&far_addr) == v4_mtu);
+    uart_printf("pmtutest: %s [8] MTU=9000 を報告しても学習値は %u のまま"
+                "(上げ直しは TTL 満了に任せる)\n",
+                nogrow ? "OK" : "NG", pmtu_lookup(&far_addr));
+    if (!nogrow) ok = 0;
+
+    uart_printf("pmtutest: 学習済みエントリ:\n");
+    pmtu_dump();
+
+    /* ---- [9] 後始末 ---- */
+    netif_unregister(&s_alias);
+    pmtu_clear();
+    netif_activate(self);
+    s_pmtu_dump = 0;
+
+    if (pmtu_lookup(&far_addr) != 0u || pmtu_lookup(&peer6) != 0u) {
+        uart_printf("pmtutest: NG [9] クリアしたのに学習値が残っている\n");
+        ok = 0;
+    }
+    uart_printf("pmtutest: %s(PMTU キャッシュはクリアしました。**IPv6 の生きた\n"
+                "  セッションがあれば snd_mss は下がったままなので張り直すこと**)\n",
+                ok ? "PASS" : "NG");
+}
+
 /*=================================================================
  * 重複アドレス検出 1 件の結果を表示し、期待どおりかを判定する。
  *
@@ -1548,7 +1855,7 @@ static void shell_routetest(void)
     s_alias.is_poll_owner = 0;
 
     netif_activate(self);
-    int e2e = shell_tcp_echo_once("routetest", self, &s_alias, &far_addr, port);
+    int e2e = shell_tcp_echo_once("routetest", self, &s_alias, &far_addr, port, NULL);
     if (!e2e) ok = 0;
 
     netif_unregister(&s_alias);
@@ -2252,6 +2559,8 @@ static void shell_dispatch(char *line, int s0, int s1)
         shell_dadtest();
     } else if (strncmp(line, "fragtest", 8) == 0) {
         shell_fragtest(line + 8);
+    } else if (strncmp(line, "pmtutest", 8) == 0) {
+        shell_pmtutest(line + 8);
     } else if (strncmp(line, "arpage", 6) == 0) {
         shell_arpage(line + 6);
     } else if (strncmp(line, "jobs", 4) == 0) {
@@ -2276,6 +2585,7 @@ static void shell_dispatch(char *line, int s0, int s1)
                     "  arptest                               キャッシュのエージング(失効→確認→延命/破棄)\n"
                     "  dadtest                               重複アドレス検出(ARP Probe / IPv6 DAD)\n"
                     "  fragtest [dump]                       送信側IP断片化(MTU超のUDP/IPを分割)\n"
+                    "  pmtutest [dump]                       経路MTU探索(ICMP Frag Needed/PTBを注入)\n"
                     "  txdrop [N]                            ロス注入(データN個に1個破棄、0=無効)+再送統計\n"
                     "  qploop [N]                            RC QPの作成/破棄をN回繰り返しFWリソース枯渇を見る\n"
                     "  nvmediscover [dump]                   Discovery Log Pageを取得(dumpで16進出力)\n"

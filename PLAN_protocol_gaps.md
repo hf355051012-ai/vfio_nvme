@@ -19,8 +19,8 @@
 | 6 | A2 ARP/NDP キャッシュのエージング | **完了**(実機確認済み 2026-08-17) |
 | 7 | A3 重複アドレス検出(ARP Probe / IPv6 DAD) | **完了**(実機確認済み 2026-08-17) |
 | 8 | A4 送信側 IP フラグメント | **完了**(実機確認済み 2026-08-17。IPv4 のみ、v6 は B4)|
-| 9 | A5 ICMP Time Exceeded / Frag Needed | 未着手 |
-| 10 | A6 ICMPv6 Packet Too Big + PMTUD | 未着手 |
+| 9 | A5 ICMP Time Exceeded / Frag Needed | **完了**(実機確認済み 2026-08-17。A6 と一体)|
+| 10 | A6 ICMPv6 Packet Too Big + PMTUD | **完了**(実機確認済み 2026-08-17)|
 | 11 | B1 RS/RA + SLAAC | 未着手 |
 | 12 | B2 MLD | 未着手 |
 | 13 | B3 NUD | 未着手 |
@@ -66,6 +66,7 @@
 | `arptest` | キャッシュのエージング(失効 → 確認要求 → 延命/破棄)|
 | `dadtest` | 重複アドレス検出(ARP Probe / IPv6 DAD、陰性 + 陽性対照)|
 | `fragtest [dump]` | 送信側 IP 断片化(`dump` で `tools/ip_frag_check` 用の行も出す)|
+| `pmtutest [dump]` | 経路 MTU 探索(ICMP Frag Needed / PTB を注入。`dump` で `tools/icmp_mtu_check` 用)|
 | `ts mask <mask> <value>` | ts_log の絞り込みダンプ(タグは File#\|Func#\|info) |
 | `monitor` / `err` | HW 状態・エラーカウンタ |
 
@@ -1038,34 +1039,142 @@ ssh rpi5-rdma-target 'cd ~/vfio_nvme && gcc -O2 -Wall -Wextra -o /tmp/ip_frag_ch
 
 ---
 
-# 段階 9〜10: A5〜A6 — 実 LAN へ出すための基盤
+# 段階 9〜10: A5 + A6 — Path MTU Discovery 【完了】
 
-**この群は現在の DAC 直結ループバックでは一切踏まない。** 実 LAN や別セグメント
-へ出す計画が具体化した時点で着手する。
+**A5 と A6 は一体で実装した。** 計画自身が A5 について「送信側は転送しないので
+実質不要、**受信して PMTU を学習する側が本命(A6 と対)**」と書いており、
+実際に作るものは「ICMP/ICMPv6 のエラーを受けて PMTU を学習し、送信へ反映する」
+という 1 つの機能だった。
 
-## A5: ICMP Time Exceeded / Fragmentation Needed
+## 実装結果(2026-08-17)
 
-- **Time Exceeded**: TTL が 0 になった転送時に返す。**このスタックはルータでは
-  ないので転送しない** → 実質不要。ただし受信側で「自分宛の Time Exceeded」を
-  ログに出す価値はある(経路異常の切り分け)。
-- **Fragmentation Needed(code 4)**: DF 付きで MTU を超えるパケットを転送する
-  ときに返す。これも転送しないので送信側は不要。**受信して PMTU を学習する側**
-  が本命(A6 と対)。
+新規に `src/pmtu.c` / `src/pmtu.h`。受信側は `icmp.c`(IPv4)と `ipv6.c`(IPv6)、
+反映側は `tcp.c` と `ip.c`。
 
-## A6: ICMPv6 Packet Too Big + Path MTU Discovery
+| 受け取るもの | 場所 | MTU の位置 |
+|---|---|---|
+| ICMP Destination Unreachable code 4(Fragmentation Needed)| `icmp_handle()` | **未使用 4 バイトの下位 16bit**(byte 6-7)|
+| ICMPv6 type 2(Packet Too Big)| `ipv6_handle_icmpv6()` | **byte 4-7 の 32bit 全体** |
 
-**IPv4 より深刻。** IPv6 は経路上で分割しない仕様なので、PMTUD が無いと
-MTU の小さい経路で**通信が完全に成立しない**(v4 なら経路が分割してくれる)。
+**この 2 つは MTU の置き場所が違う。** IPv4 は byte 4-5 が予約(0)で byte 6-7 が
+MTU、IPv6 は 32bit 全体が MTU。片方のつもりでもう片方を書くと、値が 0 になったり
+桁が狂ったりする。**自作の送信側と自作の受信側だけで試すと両方が同じ間違い方を
+して絶対に検出できない**種類の間違いなので、独立パーサで確かめた(下記)。
 
-- ICMPv6 type 2(Packet Too Big)を受信したら、報告された MTU を宛先ごとに
-  記憶し、以後その宛先への送信 MSS を下げる。
-- 記憶先は近隣キャッシュと同じ粒度で良い(`ndp_cache_entry_t` に `pmtu` を追加)。
-- TCP は `conn->snd_mss` を下げれば効く。`tcp_mss_cap_for()` に PMTU を
-  反映させる。
+学習する宛先は「**引用された元パケットの宛先**」であって、ICMP の送信元
+(= 文句を言ってきたルータ)ではない。ここも取り違えやすい。
 
-**落とし穴**: MSS を途中で下げると、既に送信済み・未確認のセグメントとの
-整合が要る。単純に「以後の新規セグメントから小さくする」で良い(TCP は
-セグメント境界を自由に変えてよい)。
+### 反映先
+
+- **TCP**: `tcp_mss_cap_for()` が PMTU で頭打ちにする(SYN を組むときだけ呼ばれる
+  冷たい経路なので、表を引くコストはホットパスに乗らない)。加えて
+  `tcp_pmtu_update()` が**確立済みコネクションの `snd_mss` を切り下げる**。
+  計画の落とし穴どおり「以後の新規セグメントから小さくする」だけでよく、
+  既に送信済み・未確認のセグメントとの整合は要らない。
+- **IPv4 の送信**: `ip_send()` が `min(リンク MTU, PMTU)` で断片化する(A4 と接続)。
+
+### 計画と変えた点: PMTU は近隣キャッシュに入れない
+
+計画は「記憶先は近隣キャッシュと同じ粒度で良い(`ndp_cache_entry_t` に `pmtu` を
+追加)」としていたが、**A1 でゲートウェイ経路を入れた結果、近隣キャッシュのキーは
+「次ホップ」になっている**。PMTU は経路の性質なので、サブネット外の宛先が全部
+1 つのゲートウェイのエントリを共有し、**別々の経路の PMTU が混ざる**。
+そこで `netaddr_t`(宛先)をキーにした専用の表(8 エントリ)にした。
+v4/v6 を 1 つの表で扱えるのは `netaddr_t` があるおかげ。
+
+### 安全側の作り
+
+- **床**: v4 は 576(RFC 791 の「全ホストが受け取れる最小」)、v6 は 1280
+  (RFC 8201 の IPv6 最小 MTU)。これ未満の報告は採用しない。壊れた/悪意ある
+  ICMP で MSS を潰されないため。
+- **下げる方向にしか動かさない**(RFC 1191 6.3)。学習済みより大きい報告は無視し、
+  上げ直しは TTL(10 分)の満了に任せる。そうしないと、偽の大きい値を送り込む
+  だけで学習を無効化できてしまう。
+- MTU=0(RFC 1191 非対応の古いルータ)は無視する。**推測降下**
+  (次に小さい定番の MTU を試す)は実装していない。
+
+### A5 の送信側は実装しない
+
+Time Exceeded と Fragmentation Needed を**返す**のは転送するノード(ルータ)の
+仕事で、このスタックは転送しないので出番が無い。受信側は経路異常の手掛かりに
+なるので、v4/v6 とも code 付きでログに出すだけにした(計画どおり)。
+
+## 検証: ルータ役を対向 PF にやらせて ICMP を注入する
+
+MTU の揃った DAC 直結では Frag Needed / Packet Too Big が誰からも飛んでこない。
+そこで対向インターフェースにルータ役をさせて人為的に注入する。A5/A6 の実装範囲は
+「受信して学習し、送信へ反映する」側なので、注入側がテストコードでも検証の意味は
+失われない。
+
+**ただし注入する ICMP の形式そのものが自作**なので、そこを間違えると「自分の
+間違いを自分で受け入れて PASS する」ことになる。そこで
+**`tools/icmp_mtu_check.c`** を追加した。このリポジトリのコードを一切 include せず、
+glibc の `struct icmphdr`(`un.frag.__glibc_reserved` / `un.frag.mtu`)と
+`struct icmp6_hdr`(`icmp6_mtu`)だけで読み直す。実際に glibc のヘッダを読んで
+確認したところ:
+
+```c
+struct { uint16_t __glibc_reserved; uint16_t mtu; } frag;  /* path mtu discovery */
+```
+
+つまり**IPv4 の MTU は byte 6-7** で確定。`tools/disc_log_check.c`(D1)/
+`tools/ip_frag_check.c`(A4)と同じ考え方。
+
+```bash
+ssh rpi5-rdma-target 'cd ~/vfio_nvme && gcc -O2 -Wall -Wextra -o /tmp/icmp_mtu_check tools/icmp_mtu_check.c'
+```
+
+IPv4 側の宛先には `routetest` と同じ別名インターフェース(10.9.9.9)を使う。
+**`nvmet` が使う 192.168.101.11 を宛先にすると、学習した PMTU が生きている
+セッションの `snd_mss` まで下げてしまう**(`pmtu_clear()` では戻らない)。
+
+## 実機での確認結果(2026-08-17)
+
+| 段階 | 結果 |
+|---|---|
+| [1] 初期状態 | **OK** 学習済みの PMTU なし |
+| [2] IPv4 Frag Needed(MTU=1500)| **OK** 学習値 1500 |
+| [3] IPv4 の新規コネクション | **OK** MSS=1460(= 1500 − 20 − 20)、64KB 往復も一致 |
+| [4] `ip_send` が PMTU で分割 | **OK** 4096 バイトが 3 断片、先頭 1480 バイト |
+| [5] IPv6 Packet Too Big(MTU=1400)| **OK** 学習値 1400 |
+| [6] IPv6 の新規コネクション | **OK** MSS=1340(= 1400 − 40 − 20)、64KB 往復も一致 |
+| [7] 床 | **OK** v4 に 100 / v6 に 1000 を報告しても学習値は変わらない |
+| [8] 上げ直さない | **OK** MTU=9000 を報告しても 1500 のまま |
+| `tools/icmp_mtu_check` | **5 件すべて PASS**(注入した形式が glibc の構造体で読める)|
+
+**[3] と [6] で v4/v6 の overhead が違うこと(20 対 40)まで確認しているのが
+要点。** 片方だけ通していると L3 ヘッダ長の取り違えを見逃す。
+
+後始末が効いていることも確認できた: `pmtutest` の後の `tcp6test` は MSS=9196、
+`routetest` は MSS=9216 に戻っている(PMTU キャッシュのクリアが効いている)。
+
+退行確認: `ping6` / `udptest` / `udptest6` / `fragtest` / `dadtest` / `arptest` /
+`tcp6test` / `rsttest` / `routetest` すべて PASS。`tcpbench`
+1039/3487/4101/2285/5035/5265 と 1037/3493/4124/2177/5047/5270、`bench`
+4341/5582/6002/4351/6763/6029 と 4340/5811/5783/4350/6762/6031。
+
+read 8k の 2 回目が 2177(−6.7%)と閾値を跨いだので、**同一セッションで 5 回
+測り直した: 2314/2319/2317/2317/2317**(基準 2334 比 −0.7%、ばらつき 0.2%)。
+2177 は外れ値。PMTU の追加は SYN 経路と ICMP 受信経路だけでセグメントごとの
+経路には乗らないので、機構としても説明がつかない。性能表は更新していない。
+
+## 残っている限界
+
+- **再送は再分割しない。** PMTU を下げた直後、既に送信済みで未確認のセグメントは
+  保存済みのまま送り直されるので、新しい PMTU を超えることがある。実際の
+  スタックは再分割するが、ここでは実装していない(`tcp_pmtu_update()` の
+  コメントに書いてある)。
+- **`pmtu_clear()` はコネクションの `snd_mss` を戻さない。** 下げるのは安全だが
+  上げ直すには相手の広告 MSS を覚え直す必要があり、そこまではやっていない。
+  `pmtutest` の後に生きた IPv6 セッションがあれば張り直すこと。
+- **推測降下が無い。** MTU=0 を返す RFC 1191 非対応のルータには対応できない。
+- **PMTU の増加方向の再探索をしない。** TTL 満了で忘れるだけで、能動的に
+  大きいパケットを試し直すことはしない(RFC 1191 の推奨どおりではある)。
+- **IPv6 の送信側は PMTU を使って分割しない。** IPv6 は経路上で分割しない仕様で、
+  送信元での分割は Fragment 拡張ヘッダになる(B4)。現状は TCP の MSS 経由で
+  しか効かないので、**IPv6 の大きい UDP は PMTU を学習しても縮まない。**
+- 転送しないので Time Exceeded / Frag Needed を**送る**側は実装していない
+  (計画どおり)。
 
 ---
 
@@ -1120,7 +1229,8 @@ nvmet が対応する admin opcode: Identify(CNS=Controller/Namespace のみ),
                                Async Event(保留), Keep Alive
 nvmet が対応する IO opcode   : Flush, Write, Read
 TCP オプション               : MSS, Window Scale, NOP, END(SACK/Timestamps 無し)
-ICMPv6 type                  : Echo Request/Reply, NS, NA(RS/RA/MLD/PTB 無し)
+ICMPv6 type                  : Echo Request/Reply, NS, NA(RS/RA/MLD 無し。
+                               PTB と Time Exceeded の受信は段階 10 = A6 で追加)
 mlx5 の解放コマンド          : DESTROY_QP のみ
 ルーティング                 : 概念なし(同一リンク前提。段階 5 = A1 で解消)
 ```

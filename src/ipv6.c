@@ -9,6 +9,7 @@
 #include "netaddr.h"
 #include "tcp.h"
 #include "udp.h"
+#include "pmtu.h"
 
 #define ICMPV6_OFF_TYPE     0u
 #define ICMPV6_OFF_CODE     1u
@@ -729,6 +730,40 @@ static void ipv6_handle_icmpv6(const uint8_t *msg, size_t len,
         } else {
             ipv6_send_icmpv6(src, src_mac, na, (uint16_t)(8u + NDP_BODY_LEN + 8u));
         }
+        return;
+    }
+
+    if (type == ICMPV6_TYPE_PACKET_TOO_BIG) {
+        /* IPv4 の Fragmentation Needed に相当。**MTU は 4-7 バイトの 32bit 全体**
+         * (IPv4 は未使用 4 バイトの下位 16bit だけ。layout が違う)。
+         * IPv6 は経路上で分割しないので、これを処理しないと MTU の小さい経路で
+         * 通信が完全に成立しない。 */
+        if (len < 8u + IPV6_HDR_LEN) {
+            uart_printf("[IPv6] Packet Too Big だが引用が短い (len=%u) 無視\n", (unsigned)len);
+            return;
+        }
+        uint32_t mtu = rd32be(in + 4u);
+
+        /* 学習する宛先は「引用された元パケットの宛先」。ICMPv6 の送信元
+         * (= 文句を言ってきたルータ)ではない。 */
+        uint8_t orig_dst[IPV6_ADDR_LEN];
+        for (unsigned i = 0; i < IPV6_ADDR_LEN; i++) {
+            orig_dst[i] = in[8u + offsetof(ipv6_header_t, dst) + i];
+        }
+        uart_printf("[IPv6] Packet Too Big 受信 (MTU=%u) -- 対象の宛先 ...%02x%02x:%02x%02x\n",
+                    (unsigned)mtu, orig_dst[12], orig_dst[13], orig_dst[14], orig_dst[15]);
+
+        netaddr_t dst = netaddr_v6(orig_dst);
+        pmtu_learn(&dst, mtu);
+        return;
+    }
+
+    if (type == ICMPV6_TYPE_TIME_EXCEEDED) {
+        /* **送る側は実装しない**(このスタックは転送しない)。受けた側は経路
+         * 異常の手掛かりになるので記録する。 */
+        uart_printf("[IPv6] Time Exceeded 受信 (code=%u: %s)\n", in[ICMPV6_OFF_CODE],
+                    (in[ICMPV6_OFF_CODE] == 0u) ? "転送中に hop limit が 0 になった"
+                                                : "断片の再構成がタイムアウト");
         return;
     }
 

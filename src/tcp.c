@@ -12,6 +12,7 @@
 #include "cache.h"
 #include "job.h"
 #include "smp.h"
+#include "pmtu.h"
 
 uint64_t g_tcp_copy2_ns = 0, g_tcp_copy2_bytes = 0;
 uint64_t g_tcp_copy3_ns = 0, g_tcp_copy3_bytes = 0;
@@ -590,6 +591,21 @@ static inline unsigned tcp_l4_off(const netaddr_t *a)
  * コール元:
  *   tcp_send_segment() 系(SYN の MSS オプション組み立て)
  * ===============================================================*/
+/*=================================================================
+ * 宛先の family に応じた L3 ヘッダ長を返す(IPv4=20、IPv6=40)。
+ *
+ * 引数:
+ *   a - アドレス(family だけ見る)
+ * 戻り値:
+ *   L3 ヘッダのバイト数
+ * コール元:
+ *   tcp_mss_cap_for(), tcp_pmtu_update()
+ * ===============================================================*/
+static inline unsigned tcp_l3_hdr_len(const netaddr_t *a)
+{
+    return (a->family == NETADDR_V6) ? IPV6_HDR_LEN : (unsigned)sizeof(ip_header_t);
+}
+
 static inline uint16_t tcp_mss_cap_for(const netaddr_t *remote)
 {
     uint16_t cap = net_active_mss_cap();
@@ -600,7 +616,54 @@ static inline uint16_t tcp_mss_cap_for(const netaddr_t *remote)
          * (CLAUDE.md「境界値ぴったりのサイズだけが失敗する」の再来になる)。 */
         cap = (cap > 20u) ? (uint16_t)(cap - 20u) : cap;
     }
+    /* 経路 MTU を学習済みならそちらで頭打ちにする。この関数は SYN を組む
+     * ときだけ呼ばれる冷たい経路なので、表を引くコストは問題にならない
+     * (セグメントごとの上限は conn->snd_mss 側で持っている)。 */
+    uint16_t pm = pmtu_lookup(remote);
+    if (pm != 0u) {
+        uint16_t overhead = (uint16_t)(tcp_l3_hdr_len(remote) + TCP_HDR_LEN);
+        if (pm > overhead) {
+            uint16_t pcap = (uint16_t)(pm - overhead);
+            if (pcap < cap) cap = pcap;
+        }
+    }
     return cap;
+}
+
+/*=================================================================
+ * 経路 MTU を学習したとき、その宛先の確立済みコネクションの snd_mss を
+ * 切り下げる。**全コアのスロットを走査する**(ICMP を受けたコアと
+ * コネクションを持つコアは違いうる)。
+ *
+ * 途中で MSS を下げても、既に送信済み・未確認のセグメントとの整合は要らない
+ * -- TCP はセグメント境界を自由に変えてよいので「以後の新規セグメントから
+ * 小さくする」で足りる。ただし**再送は保存済みのスロットをそのまま送り直す**
+ * ので、下げた直後の再送だけは新しい PMTU を超えることがある(再分割は
+ * 実装していない)。
+ *
+ * 引数:
+ *   dst  - PMTU を学習した宛先
+ *   pmtu - 学習した MTU
+ * コール元:
+ *   pmtu_learn()
+ * ===============================================================*/
+void tcp_pmtu_update(const netaddr_t *dst, uint16_t pmtu)
+{
+    uint16_t overhead = (uint16_t)(tcp_l3_hdr_len(dst) + TCP_HDR_LEN);
+    if (pmtu <= overhead) return;
+    uint16_t mss = (uint16_t)(pmtu - overhead);
+
+    for (unsigned c = 0; c < SMP_MAX_CORES; c++) {
+        for (unsigned i = 0; i < TCP_MAX_CONNS; i++) {
+            tcp_conn_t *cn = s_conns[c][i];
+            if (!cn || cn->state == TCP_CLOSED) continue;
+            if (!netaddr_eq((const netaddr_t *)&cn->remote_ip, dst)) continue;
+            if (cn->snd_mss <= mss) continue;
+            uart_printf("[PMTU] コネクション (port %u->%u) の snd_mss を %u -> %u へ切り下げ\n",
+                        cn->local_port, cn->remote_port, cn->snd_mss, mss);
+            cn->snd_mss = mss;
+        }
+    }
 }
 
 /*=================================================================

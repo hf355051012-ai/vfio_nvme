@@ -15,6 +15,13 @@
 #define IPV6_NH_ICMPV6  58u
 
 /* ICMPv6 type */
+/* Packet Too Big は IPv4 の「Fragmentation Needed」に相当するが、**MTU の
+ * 置き場所が違う**。ICMPv6 は 4-7 バイトの 32bit 全体が MTU で、IPv4 は
+ * 未使用 4 バイトの下位 16bit だけ。ここを取り違えやすい。
+ * IPv6 は経路上で分割しない仕様なので、これを処理しないと MTU の小さい経路で
+ * **通信が完全に成立しない**(IPv4 なら経路が分割してくれる)。 */
+#define ICMPV6_TYPE_PACKET_TOO_BIG 2u
+#define ICMPV6_TYPE_TIME_EXCEEDED  3u
 #define ICMPV6_TYPE_ECHO_REQUEST 128u
 #define ICMPV6_TYPE_ECHO_REPLY   129u
 #define ICMPV6_TYPE_NS           135u  /* Neighbor Solicitation */

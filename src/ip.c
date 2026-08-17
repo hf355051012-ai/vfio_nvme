@@ -8,6 +8,8 @@
 #include "net.h"
 #include "uart.h"
 #include "smp.h"
+#include "pmtu.h"
+#include "netaddr.h"
 
 #define IP_OFF_VER_IHL     offsetof(ip_header_t, ver_ihl)
 #define IP_OFF_TOS         offsetof(ip_header_t, tos)
@@ -372,8 +374,15 @@ int ip_send(const uint8_t dst_ip[4], const uint8_t dst_mac[6],
             uint8_t protocol, const uint8_t *payload, uint16_t payload_len)
 {
     /* リンク MTU を超えるなら断片へ分割する。TCP は MSS で自分で収めるので
-     * ここへは来ない(来るのは UDP と ICMP)。 */
+     * ここへは来ない(来るのは UDP と ICMP)。経路 MTU を学習済みなら、
+     * リンク MTU ではなくそちらに合わせる(Path MTU Discovery の反映先)。 */
     uint16_t ip_mtu = net_active_ip_mtu();
+    {
+        netaddr_t d = netaddr_v4(((uint32_t)dst_ip[0] << 24) | ((uint32_t)dst_ip[1] << 16) |
+                                  ((uint32_t)dst_ip[2] << 8) | (uint32_t)dst_ip[3]);
+        uint16_t pm = pmtu_lookup(&d);
+        if (pm != 0u && pm < ip_mtu) ip_mtu = pm;
+    }
     uint16_t max_payload = (ip_mtu > (uint16_t)sizeof(ip_header_t))
                                ? (uint16_t)(ip_mtu - sizeof(ip_header_t)) : 0u;
     if (payload_len > max_payload) {
