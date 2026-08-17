@@ -71,6 +71,10 @@ void ndp_cache_insert(const uint8_t addr[IPV6_ADDR_LEN], const uint8_t mac[6]);
 int  ndp_cache_lookup(const uint8_t addr[IPV6_ADDR_LEN], uint8_t out_mac[6]);
 int  ndp_resolve(const uint8_t addr[IPV6_ADDR_LEN], uint8_t out_mac[6]);
 
+/* キャッシュを引かずに寿命だけを見る(`arptest` の観測用)。
+ * 0=fresh、1=stale(猶予中)、-1=未登録。 */
+int  ndp_cache_peek(const uint8_t addr[IPV6_ADDR_LEN], uint32_t *remain_ms);
+
 /* 全ノードマルチキャスト(ff02::1)へ ICMPv6 Echo Request を 1 個送る。
  * 直結リンクなので相手の MAC 解決なしに疎通確認できる。 */
 int ipv6_send_echo_request(uint16_t ident, uint16_t seq, uint16_t payload_len);

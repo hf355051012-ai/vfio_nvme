@@ -52,6 +52,8 @@ typedef struct {
     uint32_t ip;
     uint8_t  mac[ETH_ALEN];
     int      valid;
+    uint64_t expires_at;  /* この時刻(timer_now() の ns)を過ぎたら stale */
+    uint64_t probe_at;    /* stale 中、次に確認要求を出してよい時刻 */
 } arp_cache_entry_t;
 
 /* IPv6 の近隣キャッシュ。ARP と役割は同じだが、解決手段が ARP ではなく
@@ -59,10 +61,39 @@ typedef struct {
 #define NDP_CACHE_SIZE 8u
 
 typedef struct {
-    uint8_t addr[16];
-    uint8_t mac[ETH_ALEN];
-    int     valid;
+    uint8_t  addr[16];
+    uint8_t  mac[ETH_ALEN];
+    int      valid;
+    uint64_t expires_at;
+    uint64_t probe_at;
 } ndp_cache_entry_t;
+
+/* ---- 近隣キャッシュ(ARP/NDP 共通)のエージング ----
+ *
+ * 一度入れたら永久に有効だと、相手の NIC 交換や IP 移動に追従できない。
+ * ただし **失効したエントリを即座に捨ててはいけない**。捨てると次の送信で
+ * arp_resolve()(最大 900ms のポーリング待ち)が tcp_send() のバルク送信
+ * ループの内側で走り、しかもその中の net_poll_all_and_dispatch() が
+ * tcp_input_addr() を再入させて別の送信 -> 再びキャッシュミス -> 入れ子の
+ * arp_resolve() という連鎖を作る(深さに上限が無い)。
+ *
+ * そこで Linux の NUD と同じく「失効しても確認が取れるまでは使い続ける」形に
+ * する。lookup は stale なエントリでも MAC を返し、代わりに確認要求
+ * (ARP request / NS)を probe 間隔で投げる。相手が応答すれば insert が
+ * 呼ばれて延命し、猶予時間ぶん応答が無ければそこで初めて破棄する。
+ * これで送信ホットパスがブロックすることは一度も無い。 */
+#define NEIGH_FRESH        0   /* 有効期限内 */
+#define NEIGH_STALE        1   /* 失効したが猶予中。使ってよい */
+#define NEIGH_STALE_PROBE  2   /* 同上。加えて今回は確認要求を出す番 */
+#define NEIGH_DEAD        -1   /* 猶予も尽きた。破棄する */
+
+/* 有効期間(ミリ秒)。猶予は TTL/6、確認要求の間隔は TTL/60 として連動する。
+ * シェルの `arpage` で変更できる(短くして検証するため)。 */
+extern volatile uint32_t g_neigh_cache_ttl_ms;
+#define NEIGH_CACHE_TTL_DEFAULT_MS 60000u
+
+int neigh_check_age(uint64_t now, uint64_t expires_at, uint64_t *probe_at);
+uint64_t neigh_expiry_from_now(void);
 
 typedef struct {
     int (*send_frags)(void *priv, const eth_frag_t *frags, unsigned frag_count);

@@ -860,6 +860,195 @@ static void shell_route(char *args)
 }
 
 /*=================================================================
+ * シェルの `arpage`。近隣キャッシュ(ARP/NDP 共通)の有効期間を変更する。
+ * 既定は 60 秒だが、それでは検証に 1 分以上かかるので短くできるようにして
+ * ある。猶予(TTL/6)と確認要求の間隔(TTL/60)もこれに連動する。
+ *
+ * 引数:
+ *   args - "" で現在値の表示、"<ms>" で設定
+ * コール元:
+ *   shell_dispatch()
+ * ===============================================================*/
+static void shell_arpage(char *args)
+{
+    while (*args == ' ') args++;
+    if (*args >= '0' && *args <= '9') {
+        uint32_t ms = (uint32_t)atoi(args);
+        if (ms < 60u) {
+            uart_printf("arpage: 短すぎます(確認要求の間隔が 1ms 未満になる)。60ms 以上を指定してください\n");
+            return;
+        }
+        g_neigh_cache_ttl_ms = ms;
+    }
+    uint32_t ttl = g_neigh_cache_ttl_ms;
+    uint32_t iv = ttl / 60u;
+    if (iv < 10u) iv = 10u;
+    uart_printf("arpage: TTL=%ums 猶予=%ums 確認要求の間隔=%ums\n", ttl, ttl / 6u, iv);
+}
+
+/*=================================================================
+ * 近隣キャッシュの状態を 1 行で表示する(arptest の観測用)。
+ *
+ * 引数:
+ *   label - 行頭のラベル
+ *   state - arp_cache_peek()/ndp_cache_peek() の戻り値
+ *   remain_ms - 同関数が返した残り時間
+ * コール元:
+ *   shell_arptest()
+ * ===============================================================*/
+static void shell_print_neigh(const char *label, int state, uint32_t remain_ms)
+{
+    if (state == 0) {
+        uart_printf("  %s: fresh(失効まで %ums)\n", label, remain_ms);
+    } else if (state == 1) {
+        uart_printf("  %s: stale -- 使いつつ確認要求中(破棄まで %ums)\n", label, remain_ms);
+    } else {
+        uart_printf("  %s: 未登録(破棄済み)\n", label);
+    }
+}
+
+/*=================================================================
+ * シェルの `arptest`。A2(ARP/NDP キャッシュのエージング)の検証。
+ *
+ * 見たいのは 3 つ。
+ *  (a) 失効しても即座には捨てず、猶予のあいだ MAC を返し続けること
+ *      (捨てると送信ホットパスで arp_resolve() がブロックする)
+ *  (b) 相手が応答すれば延命して fresh へ戻ること
+ *  (c) 応答が無ければ猶予切れで本当に破棄されること
+ *
+ * (c) は「応答が返ってこない相手」が要るので、誰も名乗っていない IP の
+ * エントリを arp_cache_insert() で直接仕込む。実際に居ない相手なので
+ * 確認要求への応答は永久に来ない。
+ *
+ * TTL は測定中だけ短くし、最後に必ず元へ戻す。
+ *
+ * コール元:
+ *   shell_dispatch()
+ * ===============================================================*/
+static void shell_arptest(void)
+{
+    const uint32_t test_ttl_ms = 600u;   /* 猶予 100ms、確認要求は 10ms 間隔 */
+    const uint32_t dead_ip = ip_from_octets(192, 168, 101, 99);  /* 誰も名乗っていない */
+    const uint8_t  dead_mac[6] = { 0x02, 0x00, 0x00, 0x00, 0x10, 0x99 };
+
+    uint8_t peer_ll[16];
+    netif_t *peer = shell_peer_ll6(peer_ll);
+    netif_t *self = g_active_ctx;
+    if (!peer || !self) {
+        uart_printf("arptest: 対向インターフェースが見つかりません(net init mlx5 が必要)\n");
+        return;
+    }
+    const uint32_t peer_ip = peer->ip;
+    const uint32_t saved_ttl = g_neigh_cache_ttl_ms;
+    g_neigh_cache_ttl_ms = test_ttl_ms;
+
+    int ok = 1;
+    uint8_t mac[6];
+    uint32_t remain = 0;
+
+    uart_printf("arptest: TTL=%ums 猶予=%ums で検証(終了時に %ums へ戻します)\n",
+                test_ttl_ms, test_ttl_ms / 6u, saved_ttl);
+
+    /* --- 実在する相手(対向 PF)--- */
+    netaddr_t peer_addr = netaddr_v4(peer_ip);
+    netaddr_t peer_addr6 = netaddr_v6(peer_ll);
+    if (net_resolve_mac(&peer_addr, mac) != 0 || net_resolve_mac(&peer_addr6, mac) != 0) {
+        uart_printf("arptest: NG -- 対向 PF の解決に失敗\n");
+        g_neigh_cache_ttl_ms = saved_ttl;
+        return;
+    }
+    /* peek の戻り値と remain は必ず別の文で受ける。同じ呼び出し式を
+     * uart_printf の引数に並べると、C は引数の評価順序を規定していないので
+     * remain が更新される前に読まれて 1 回ぶん古い値が出る(実際に踏んだ)。 */
+    uart_printf("arptest: [1] 解決直後\n");
+    int a1 = arp_cache_peek(peer_ip, &remain);
+    shell_print_neigh("ARP 対向PF", a1, remain);
+    int n1 = ndp_cache_peek(peer_ll, &remain);
+    shell_print_neigh("NDP 対向PF", n1, remain);
+    if (a1 != 0 || n1 != 0) {
+        uart_printf("arptest: NG [1] 解決直後なのに fresh ではない\n");
+        ok = 0;
+    }
+
+    /* 応答の来ない相手を仕込む。以後この 2 つを並べて追いかける。 */
+    arp_cache_insert(dead_ip, dead_mac);
+
+    /* --- TTL を過ぎるまで待つ(受信は回し続ける)--- */
+    uint64_t t0 = timer_now();
+    while (!timeout_ms(t0, test_ttl_ms + 20u)) {
+        net_poll_all_and_dispatch();
+        job_scheduler_tick();
+    }
+
+    uart_printf("arptest: [2] TTL 経過直後(まだ lookup していない)\n");
+    int a2 = arp_cache_peek(peer_ip, &remain);
+    shell_print_neigh("ARP 対向PF", a2, remain);
+    int d2 = arp_cache_peek(dead_ip, &remain);
+    shell_print_neigh("ARP 応答無し", d2, remain);
+    /* 対向 PF 側は、裏で NVMe セッションが動いていると待っている間に lookup
+     * されて延命されることがある(それ自体は正しい動作)。ここで stale を
+     * 断言できるのは、誰も触らない「応答の無い相手」のほうだけ。 */
+    if (d2 != 1) {
+        uart_printf("arptest: NG [2] TTL を過ぎても stale になっていない\n");
+        ok = 0;
+    }
+
+    /* --- (a)(b) stale なエントリを lookup する。MAC は返り、確認要求が出る。
+     *     実在する相手は応答するので fresh へ戻る。 --- */
+    int hit4 = (arp_cache_lookup(peer_ip, mac) == 0);
+    int hit6 = (ndp_cache_lookup(peer_ll, mac) == 0);
+    int hit_dead = (arp_cache_lookup(dead_ip, mac) == 0);
+    uart_printf("arptest: [3] stale なエントリの lookup -- 対向PF v4=%s v6=%s / 応答無し=%s\n",
+                hit4 ? "MAC を返した" : "失敗", hit6 ? "MAC を返した" : "失敗",
+                hit_dead ? "MAC を返した" : "失敗");
+    if (!hit4 || !hit6 || !hit_dead) {
+        uart_printf("arptest: NG [3] stale なのに MAC を返さなかった"
+                    "(送信ホットパスがブロックする)\n");
+        ok = 0;
+    }
+
+    /* 応答が届くまで少し回す。 */
+    t0 = timer_now();
+    while (!timeout_ms(t0, 50u)) {
+        net_poll_all_and_dispatch();
+        job_scheduler_tick();
+    }
+    uart_printf("arptest: [4] 確認要求への応答後\n");
+    int s4 = arp_cache_peek(peer_ip, &remain);
+    shell_print_neigh("ARP 対向PF", s4, remain);
+    int s6 = ndp_cache_peek(peer_ll, &remain);
+    shell_print_neigh("NDP 対向PF", s6, remain);
+    if (s4 != 0 || s6 != 0) {
+        uart_printf("arptest: NG [4] 応答があったのに fresh へ戻っていない\n");
+        ok = 0;
+    }
+
+    /* --- (c) 応答の来ない相手は猶予切れで破棄される --- */
+    t0 = timer_now();
+    while (!timeout_ms(t0, test_ttl_ms + test_ttl_ms / 6u + 50u)) {
+        net_poll_all_and_dispatch();
+        job_scheduler_tick();
+    }
+    int dead_hit = (arp_cache_lookup(dead_ip, mac) == 0);
+    uart_printf("arptest: [5] 応答の無い相手 -- lookup は %s\n",
+                dead_hit ? "まだ MAC を返した" : "未登録を返した(破棄された)");
+    if (dead_hit) {
+        uart_printf("arptest: NG [5] 猶予を過ぎても破棄されていない\n");
+        ok = 0;
+    }
+
+    g_neigh_cache_ttl_ms = saved_ttl;
+    /* 対向 PF のエントリを本来の TTL で入れ直す(短い TTL のまま残すと、
+     * 以後のベンチ中に無用な確認要求が飛ぶ)。lookup は stale なエントリの
+     * 期限を更新しないので、明示的に insert し直す必要がある。 */
+    uint8_t mac4[6], mac6[6];
+    if (arp_cache_lookup(peer_ip, mac4) == 0) arp_cache_insert(peer_ip, mac4);
+    if (ndp_cache_lookup(peer_ll, mac6) == 0) ndp_cache_insert(peer_ll, mac6);
+
+    uart_printf("arptest: %s(TTL は %ums へ戻しました)\n", ok ? "PASS" : "NG", saved_ttl);
+}
+
+/*=================================================================
  * シェルの `routetest`。A1(ルーティング/ゲートウェイ)の検証。
  *
  * DAC 直結の 2 ポートしか無いので「別セグメントの向こう側」を素直には作れ
@@ -1683,6 +1872,10 @@ static void shell_dispatch(char *line, int s0, int s1)
         shell_routetest();
     } else if (strncmp(line, "route", 5) == 0) {
         shell_route(line + 5);
+    } else if (strncmp(line, "arptest", 7) == 0) {
+        shell_arptest();
+    } else if (strncmp(line, "arpage", 6) == 0) {
+        shell_arpage(line + 6);
     } else if (strncmp(line, "jobs", 4) == 0) {
         job_list_dump();
     } else if (strncmp(line, "help", 4) == 0) {
@@ -1701,6 +1894,8 @@ static void shell_dispatch(char *line, int s0, int s1)
                     "  rsttest                               待ち受け無しポートへ接続しRSTで即失敗するか(v4/v6)\n"
                     "  route [<if> <netmask> <gateway>]      経路表示/設定(gateway 0.0.0.0 で解除)\n"
                     "  routetest                             サブネット外宛がゲートウェイのMACで送られるか(v4/v6)\n"
+                    "  arpage [ms]                           ARP/NDPキャッシュの有効期間(既定60000ms)\n"
+                    "  arptest                               キャッシュのエージング(失効→確認→延命/破棄)\n"
                     "  txdrop [N]                            ロス注入(データN個に1個破棄、0=無効)+再送統計\n"
                     "  qploop [N]                            RC QPの作成/破棄をN回繰り返しFWリソース枯渇を見る\n"
                     "  nvmediscover [dump]                   Discovery Log Pageを取得(dumpで16進出力)\n"

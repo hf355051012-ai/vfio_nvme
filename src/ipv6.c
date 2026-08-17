@@ -26,6 +26,9 @@
 #define NDP_RESOLVE_TIMEOUT_MS  200u
 #define NDP_RESOLVE_MAX_ATTEMPTS 3u
 
+/* ndp_cache_lookup() が stale なエントリの確認に使う(定義は下の方)。 */
+static int ndp_send_ns(const uint8_t target[IPV6_ADDR_LEN]);
+
 volatile uint32_t g_ipv6_echo_request_count[SMP_MAX_CORES];
 volatile uint32_t g_ipv6_echo_reply_count[SMP_MAX_CORES];
 volatile uint32_t g_ipv6_ns_count[SMP_MAX_CORES];
@@ -252,6 +255,7 @@ void ndp_cache_insert(const uint8_t addr[IPV6_ADDR_LEN], const uint8_t mac[ETH_A
 {
     ndp_cache_entry_t *cache = g_active_ctx->ndp_cache;
     unsigned free_slot = NDP_CACHE_SIZE;
+    uint64_t expiry = neigh_expiry_from_now();
 
     for (unsigned i = 0; i < NDP_CACHE_SIZE; i++) {
         if (!cache[i].valid) {
@@ -264,6 +268,8 @@ void ndp_cache_insert(const uint8_t addr[IPV6_ADDR_LEN], const uint8_t mac[ETH_A
         }
         if (same) {
             for (unsigned j = 0; j < ETH_ALEN; j++) cache[i].mac[j] = mac[j];
+            cache[i].expires_at = expiry;   /* NS/NA を受けるたびに延命する */
+            cache[i].probe_at   = 0;
             return;
         }
     }
@@ -271,33 +277,89 @@ void ndp_cache_insert(const uint8_t addr[IPV6_ADDR_LEN], const uint8_t mac[ETH_A
     unsigned slot = (free_slot < NDP_CACHE_SIZE) ? free_slot : 0u;
     for (unsigned j = 0; j < IPV6_ADDR_LEN; j++) cache[slot].addr[j] = addr[j];
     for (unsigned j = 0; j < ETH_ALEN; j++) cache[slot].mac[j] = mac[j];
-    cache[slot].valid = 1;
+    cache[slot].valid      = 1;
+    cache[slot].expires_at = expiry;
+    cache[slot].probe_at   = 0;
 }
 
 /*=================================================================
- * 近隣キャッシュを引く。
+ * 近隣キャッシュを引く。有効期限を過ぎたエントリは即座に捨てず、猶予の
+ * あいだは MAC を返しつつ Neighbor Solicitation を投げる(ARP 側の
+ * arp_cache_lookup() と同じ方針。理由は netif.h の説明にある)。
  *
  * 引数:
  *   addr    - 探す IPv6 アドレス
  *   out_mac - 見つかった MAC の格納先
  * 戻り値:
- *   0=見つかった、-1=無い
+ *   0=見つかった(fresh または stale)、-1=無い/寿命切れ
  * コール元:
- *   ndp_resolve()
+ *   ndp_resolve(), tcp_resolve_mac()
  * ===============================================================*/
 int ndp_cache_lookup(const uint8_t addr[IPV6_ADDR_LEN], uint8_t out_mac[ETH_ALEN])
 {
-    const ndp_cache_entry_t *cache = g_active_ctx->ndp_cache;
+    ndp_cache_entry_t *cache = g_active_ctx->ndp_cache;
     for (unsigned i = 0; i < NDP_CACHE_SIZE; i++) {
         if (!cache[i].valid) continue;
         int same = 1;
         for (unsigned j = 0; j < IPV6_ADDR_LEN; j++) {
             if (cache[i].addr[j] != addr[j]) { same = 0; break; }
         }
-        if (same) {
-            for (unsigned j = 0; j < ETH_ALEN; j++) out_mac[j] = cache[i].mac[j];
-            return 0;
+        if (!same) continue;
+
+        /* 時刻の読み出しは照合が当たったときだけ(1 回)。 */
+        int age = neigh_check_age(timer_now(), cache[i].expires_at, &cache[i].probe_at);
+        if (age == NEIGH_DEAD) {
+            cache[i].valid = 0;
+            return -1;
         }
+        for (unsigned j = 0; j < ETH_ALEN; j++) out_mac[j] = cache[i].mac[j];
+        if (age == NEIGH_STALE_PROBE) {
+            ndp_send_ns(addr);  /* NA が返れば ndp_cache_insert() が延命する */
+        }
+        return 0;
+    }
+    return -1;
+}
+
+/*=================================================================
+ * NDP エントリの寿命だけを観測する(arp_cache_peek() の IPv6 版)。
+ * キャッシュは書き換えない。
+ *
+ * 引数:
+ *   addr      - 探す IPv6 アドレス
+ *   remain_ms - NULL 可。fresh なら失効まで、stale なら破棄までの残り
+ * 戻り値:
+ *   0=fresh、1=stale(猶予中)、-1=未登録または猶予切れ
+ * コール元:
+ *   shell_arptest()
+ * ===============================================================*/
+int ndp_cache_peek(const uint8_t addr[IPV6_ADDR_LEN], uint32_t *remain_ms)
+{
+    const ndp_cache_entry_t *cache = g_active_ctx->ndp_cache;
+    uint64_t now = timer_now();
+
+    for (unsigned i = 0; i < NDP_CACHE_SIZE; i++) {
+        if (!cache[i].valid) continue;
+        int same = 1;
+        for (unsigned j = 0; j < IPV6_ADDR_LEN; j++) {
+            if (cache[i].addr[j] != addr[j]) { same = 0; break; }
+        }
+        if (!same) continue;
+
+        uint64_t grace_ns = (uint64_t)(g_neigh_cache_ttl_ms / 6u) * 1000000ull;
+        uint64_t deadline;
+        int state;
+        if ((int64_t)(now - cache[i].expires_at) < 0) {
+            deadline = cache[i].expires_at;
+            state = 0;
+        } else if ((int64_t)(now - (cache[i].expires_at + grace_ns)) >= 0) {
+            return -1;
+        } else {
+            deadline = cache[i].expires_at + grace_ns;
+            state = 1;
+        }
+        if (remain_ms) *remain_ms = (uint32_t)((deadline - now) / 1000000ull);
+        return state;
     }
     return -1;
 }

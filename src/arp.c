@@ -26,55 +26,109 @@
 
 /*=================================================================
  * 解決済みの IP -> MAC 対応をアクティブインターフェースの ARP キャッシュへ
- * 登録する。同じ IP のエントリがあれば上書き、空きが無ければ先頭を潰す。
+ * 登録する。同じ IP のエントリがあれば上書き(= 延命)、空きが無ければ
+ * 先頭を潰す。ARP reply が届くたびに呼ばれるので、これが stale なエントリを
+ * fresh へ戻す唯一の経路でもある。
  *
  * 引数:
  *   ip  - 対象の IPv4 アドレス(ホストバイトオーダー)
  *   mac - その IP の MAC アドレス(6 バイト)
  * コール元:
- *   arp_handle_frame()
+ *   arp_handle_frame(), shell_arptest()
  * ===============================================================*/
-static void arp_cache_insert(uint32_t ip, const uint8_t mac[ETH_ALEN])
+void arp_cache_insert(uint32_t ip, const uint8_t mac[ETH_ALEN])
 {
     arp_cache_entry_t *cache = g_active_ctx->arp_cache;
+    uint64_t expiry = neigh_expiry_from_now();
+
     for (unsigned i = 0; i < ARP_CACHE_SIZE; i++) {
         if (cache[i].valid && cache[i].ip == ip) {
             for (int j = 0; j < ETH_ALEN; j++) cache[i].mac[j] = mac[j];
+            cache[i].expires_at = expiry;
+            cache[i].probe_at   = 0;
             return;
         }
     }
+    unsigned slot = 0;  /* 空きが無ければ先頭を潰す */
     for (unsigned i = 0; i < ARP_CACHE_SIZE; i++) {
-        if (!cache[i].valid) {
-            cache[i].ip = ip;
-            for (int j = 0; j < ETH_ALEN; j++) cache[i].mac[j] = mac[j];
-            cache[i].valid = 1;
-            return;
-        }
+        if (!cache[i].valid) { slot = i; break; }
     }
-    cache[0].ip = ip;
-    for (int j = 0; j < ETH_ALEN; j++) cache[0].mac[j] = mac[j];
-    cache[0].valid = 1;
+    cache[slot].ip = ip;
+    for (int j = 0; j < ETH_ALEN; j++) cache[slot].mac[j] = mac[j];
+    cache[slot].valid      = 1;
+    cache[slot].expires_at = expiry;
+    cache[slot].probe_at   = 0;
 }
 
 /*=================================================================
- * ARP キャッシュを引く(ネットワークへは一切問い合わせない)。
+ * ARP キャッシュを引く。有効期限を過ぎたエントリは即座に捨てず、猶予の
+ * あいだは MAC を返しつつ確認要求(ARP request)を投げる。**送信ホット
+ * パスをブロックさせないため**で、理由の詳細は netif.h の説明にある。
+ * 猶予も尽きたら無効化して未登録として返す。
  *
  * 引数:
  *   ip      - 探す IPv4 アドレス(ホストバイトオーダー)
  *   out_mac - 見つかった MAC の格納先(6 バイト)
  * 戻り値:
- *   0=ヒット、-1=未登録
+ *   0=ヒット(fresh または stale)、-1=未登録/寿命切れ
  * コール元:
- *   arp_resolve(), tcp_send_segment(), tcp_send_segment_lso(), tcp_send_bare_ack()
+ *   arp_resolve(), tcp_resolve_mac()
  * ===============================================================*/
 int arp_cache_lookup(uint32_t ip, uint8_t out_mac[ETH_ALEN])
 {
     arp_cache_entry_t *cache = g_active_ctx->arp_cache;
     for (unsigned i = 0; i < ARP_CACHE_SIZE; i++) {
-        if (cache[i].valid && cache[i].ip == ip) {
-            for (int j = 0; j < ETH_ALEN; j++) out_mac[j] = cache[i].mac[j];
-            return 0;
+        if (!cache[i].valid || cache[i].ip != ip) continue;
+
+        /* 時刻の読み出しは照合が当たったときだけ(1 回)。 */
+        int age = neigh_check_age(timer_now(), cache[i].expires_at, &cache[i].probe_at);
+        if (age == NEIGH_DEAD) {
+            cache[i].valid = 0;
+            return -1;
         }
+        for (int j = 0; j < ETH_ALEN; j++) out_mac[j] = cache[i].mac[j];
+        if (age == NEIGH_STALE_PROBE) {
+            arp_send_request(ip);  /* 応答が来れば arp_cache_insert() が延命する */
+        }
+        return 0;
+    }
+    return -1;
+}
+
+/*=================================================================
+ * エントリの寿命だけを観測する。**キャッシュを一切書き換えない**ので、
+ * 確認要求も出さず失効もさせない(`arptest` が状態遷移を外から見るため)。
+ *
+ * 引数:
+ *   ip        - 探す IPv4 アドレス(ホストバイトオーダー)
+ *   remain_ms - NULL 可。fresh なら失効まで、stale なら破棄までの残り
+ * 戻り値:
+ *   0=fresh、1=stale(猶予中)、-1=未登録または猶予切れ
+ * コール元:
+ *   shell_arptest()
+ * ===============================================================*/
+int arp_cache_peek(uint32_t ip, uint32_t *remain_ms)
+{
+    const arp_cache_entry_t *cache = g_active_ctx->arp_cache;
+    uint64_t now = timer_now();
+
+    for (unsigned i = 0; i < ARP_CACHE_SIZE; i++) {
+        if (!cache[i].valid || cache[i].ip != ip) continue;
+
+        uint64_t grace_ns = (uint64_t)(g_neigh_cache_ttl_ms / 6u) * 1000000ull;
+        uint64_t deadline;
+        int state;
+        if ((int64_t)(now - cache[i].expires_at) < 0) {
+            deadline = cache[i].expires_at;
+            state = 0;
+        } else if ((int64_t)(now - (cache[i].expires_at + grace_ns)) >= 0) {
+            return -1;  /* 次の lookup で破棄される */
+        } else {
+            deadline = cache[i].expires_at + grace_ns;
+            state = 1;
+        }
+        if (remain_ms) *remain_ms = (uint32_t)((deadline - now) / 1000000ull);
+        return state;
     }
     return -1;
 }

@@ -5,6 +5,55 @@
 #include "uart.h"
 #include "arp.h"
 #include "ipv6.h"
+#include "timer.h"
+
+volatile uint32_t g_neigh_cache_ttl_ms = NEIGH_CACHE_TTL_DEFAULT_MS;
+
+/*=================================================================
+ * 近隣キャッシュへ新しく入れる(または延命する)エントリの有効期限を返す。
+ *
+ * 戻り値:
+ *   timer_now() と同じ単位(ns)の絶対時刻
+ * コール元:
+ *   arp_cache_insert(), ndp_cache_insert()
+ * ===============================================================*/
+uint64_t neigh_expiry_from_now(void)
+{
+    return timer_now() + (uint64_t)g_neigh_cache_ttl_ms * 1000000ull;
+}
+
+/*=================================================================
+ * 近隣キャッシュ 1 エントリの寿命を判定する(ARP/NDP 共通)。判定は
+ * 3 段階で、失効しても猶予のあいだは使い続けてよい(netif.h の説明を参照)。
+ *
+ * timer_now() が ns を返すので、除算の要る timeout_ms() ではなく絶対時刻の
+ * 差で比較する。送信 1 セグメントごとに通る経路なので除算は入れない。
+ *
+ * 引数:
+ *   now        - 現在時刻(呼び出し元が 1 回だけ読んで渡す)
+ *   expires_at - このエントリの有効期限
+ *   probe_at   - 次に確認要求を出してよい時刻。出す番なら更新して返す
+ * 戻り値:
+ *   NEIGH_FRESH / NEIGH_STALE / NEIGH_STALE_PROBE / NEIGH_DEAD
+ * コール元:
+ *   arp_cache_lookup(), ndp_cache_lookup()
+ * ===============================================================*/
+int neigh_check_age(uint64_t now, uint64_t expires_at, uint64_t *probe_at)
+{
+    if ((int64_t)(now - expires_at) < 0) return NEIGH_FRESH;
+
+    uint32_t ttl_ms = g_neigh_cache_ttl_ms;
+    uint64_t grace_ns = (uint64_t)(ttl_ms / 6u) * 1000000ull;
+    if ((int64_t)(now - (expires_at + grace_ns)) >= 0) return NEIGH_DEAD;
+
+    if ((int64_t)(now - *probe_at) >= 0) {
+        uint32_t interval_ms = ttl_ms / 60u;
+        if (interval_ms < 10u) interval_ms = 10u;
+        *probe_at = now + (uint64_t)interval_ms * 1000000ull;
+        return NEIGH_STALE_PROBE;
+    }
+    return NEIGH_STALE;
+}
 
 netif_t *g_netif_active_slots[SMP_MAX_CORES];
 

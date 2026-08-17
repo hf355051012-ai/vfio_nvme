@@ -27,7 +27,15 @@ void arp_handle_frame(const uint8_t *payload, size_t len, const uint8_t *src_mac
 
 int arp_send_request(uint32_t target_ip);
 
+/* 解決済みの IP -> MAC を登録する(= エントリの延命)。通常は ARP reply の
+ * 受信時に内部から呼ばれる。`arptest` が応答の来ない相手を仕込むのにも使う。 */
+void arp_cache_insert(uint32_t ip, const uint8_t mac[6]);
+
 int arp_cache_lookup(uint32_t ip, uint8_t out_mac[6]);
+
+/* キャッシュを引かずにエントリの寿命だけを見る(`arptest` の観測用)。
+ * 0=fresh、1=stale(猶予中)、-1=未登録。remain_ms は残り猶予/寿命。 */
+int arp_cache_peek(uint32_t ip, uint32_t *remain_ms);
 
 int arp_resolve(uint32_t ip, uint8_t out_mac[6]);
 

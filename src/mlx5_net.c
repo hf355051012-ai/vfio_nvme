@@ -1068,6 +1068,7 @@ static void mlx5_netif_setup(netif_t *ctx, mlx5_net_state_t *st, mlx5_dev_t *dev
     ctx->tx_zerocopy_2frag = 1;
     ctx->hw_lso_max_bytes = dev->max_lso_bytes;
     for (unsigned i = 0; i < ARP_CACHE_SIZE; i++) ctx->arp_cache[i].valid = 0;
+    for (unsigned i = 0; i < NDP_CACHE_SIZE; i++) ctx->ndp_cache[i].valid = 0;
 
     st->dev = dev;
     st->rq_cc = 0;
