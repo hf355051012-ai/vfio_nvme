@@ -488,6 +488,67 @@ int net_resolve_mac(const netaddr_t *dst, uint8_t out_mac[ETH_ALEN])
     return arp_resolve(netif_next_hop4(g_active_ctx, netaddr_v4_host(dst)), out_mac);
 }
 
+/*=================================================================
+ * インターフェースの IPv4 アドレスと IPv6 リンクローカルについて重複
+ * アドレス検出を行い、結果を netif_t へ記録する。IPv4 は RFC 5227 の
+ * ARP Probe、IPv6 は RFC 4862 の DAD。
+ *
+ * どちらも「応答が返ってこないこと」で空きと判断するので、衝突が無い場合は
+ * 待ち時間ぶん(既定で 1 アドレスあたり ARP_PROBE_NUM * ARP_PROBE_INTERVAL_MS)
+ * を必ず消費する。起動時に全インターフェースへ 1 回ずつ走らせるので、
+ * この値がそのまま起動時間に乗る。
+ *
+ * 引数:
+ *   ctx - 検査するインターフェース
+ * 戻り値:
+ *   0=どちらも衝突なし、-1=いずれかで衝突を検出した
+ * コール元:
+ *   run_shell(), shell_dadtest()
+ * ===============================================================*/
+int net_dup_addr_detect(netif_t *ctx)
+{
+    if (!ctx) return -1;
+
+    netif_t *prev = g_active_ctx;
+    netif_activate(ctx);
+
+    uint8_t mac[ETH_ALEN];
+    int conflict = 0;
+
+    int r4 = arp_probe(ctx->ip, ARP_PROBE_NUM, ARP_PROBE_INTERVAL_MS, mac);
+    if (r4 == 1) {
+        ctx->ipv4_dup = NETIF_DAD_CONFLICT;
+        for (unsigned i = 0; i < ETH_ALEN; i++) ctx->dup_mac4[i] = mac[i];
+        uart_printf("[!!] %s: IPv4 アドレス %u.%u.%u.%u は既に "
+                    "%02x:%02x:%02x:%02x:%02x:%02x が使用しています(RFC 5227 ARP Probe)\n",
+                    ctx->name,
+                    (ctx->ip >> 24) & 0xFFu, (ctx->ip >> 16) & 0xFFu,
+                    (ctx->ip >> 8) & 0xFFu, ctx->ip & 0xFFu,
+                    mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+        conflict = 1;
+    } else if (r4 == 0) {
+        ctx->ipv4_dup = NETIF_DAD_PASSED;
+    }
+
+    /* リンクローカルは MAC から導出するので、activate 後に取る必要がある。 */
+    uint8_t ll[16];
+    ipv6_link_local_addr(ll);
+    int r6 = ipv6_dad(ll, ARP_PROBE_NUM, ARP_PROBE_INTERVAL_MS, mac);
+    if (r6 == 1) {
+        ctx->dad_state = NETIF_DAD_CONFLICT;
+        for (unsigned i = 0; i < ETH_ALEN; i++) ctx->dup_mac6[i] = mac[i];
+        uart_printf("[!!] %s: IPv6 リンクローカルが既に "
+                    "%02x:%02x:%02x:%02x:%02x:%02x に使われています(RFC 4862 DAD)\n",
+                    ctx->name, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+        conflict = 1;
+    } else if (r6 == 0) {
+        ctx->dad_state = NETIF_DAD_PASSED;
+    }
+
+    netif_activate(prev);
+    return conflict ? -1 : 0;
+}
+
 #define NET_POLL_BATCH_MAX 64u
 
 /*=================================================================

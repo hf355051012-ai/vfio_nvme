@@ -115,6 +115,12 @@ typedef struct netif {
     uint32_t    gateway;        /* IPv4 デフォルトゲートウェイ。0=未設定 */
     uint8_t     gateway6[16];   /* IPv6 デフォルトルータ(通常はリンクローカル) */
     uint8_t     gateway6_set;   /* 1=gateway6 が有効。毎パケットの 16 バイト走査を避ける */
+    /* 重複アドレス検出の結果。IPv6 のリンクローカルは MAC から毎回導出して
+     * いて netif_t に持たないので、「検査したか」の状態はここに置くしかない。 */
+    uint8_t     dad_state;      /* NETIF_DAD_*(IPv6 リンクローカル) */
+    uint8_t     ipv4_dup;       /* NETIF_DAD_*(IPv4 アドレス) */
+    uint8_t     dup_mac6[ETH_ALEN];  /* IPv6 で衝突した相手の MAC(表示用) */
+    uint8_t     dup_mac4[ETH_ALEN];  /* IPv4 で衝突した相手の MAC(表示用) */
     const nic_ops_t *nic;
     void       *nic_priv;
     arp_cache_entry_t arp_cache[ARP_CACHE_SIZE];
@@ -201,6 +207,20 @@ static inline const uint8_t *netif_next_hop6(const netif_t *ni, const uint8_t ds
 /* dst への送信に使う宛先 MAC を解決する(必要ならゲートウェイの MAC を引く)。
  * IPv4 は ARP、IPv6 は NDP。0=解決できた、-1=失敗。 */
 int net_resolve_mac(const netaddr_t *dst, uint8_t out_mac[ETH_ALEN]);
+
+/* ---- 重複アドレス検出の結果(netif_t.dad_state / ipv4_dup)---- */
+#define NETIF_DAD_UNKNOWN   0   /* 未実施 */
+#define NETIF_DAD_PASSED    1   /* 衝突なし */
+#define NETIF_DAD_CONFLICT  2   /* 衝突を検出した */
+
+/* インターフェースの IPv4 アドレスと IPv6 リンクローカルの両方について
+ * 重複アドレス検出を行い、結果を netif_t へ記録する。0=どちらも衝突なし、
+ * -1=いずれかで衝突を検出した(ログに大きく出す)。
+ *
+ * **衝突を見つけてもアドレスの使用は止めない。** この装置は 2 ポートを同一
+ * プロセスで駆動しているので、誤検出でアドレスを封じると全部止まる。RFC の
+ * 要求は「検出して警告する」までを満たし、停止の判断は運用に委ねる。 */
+int net_dup_addr_detect(netif_t *ctx);
 
 static inline uint32_t net_active_ip(void)
 {

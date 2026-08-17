@@ -42,6 +42,18 @@ int ipv6_addr_is_ours(const uint8_t addr[IPV6_ADDR_LEN]);
 int ipv6_send(const uint8_t dst[IPV6_ADDR_LEN], const uint8_t dst_mac[6],
               uint8_t next_header, const uint8_t *payload, uint16_t payload_len);
 
+/* 送信元アドレスを指定する版。DAD の NS だけは送信元が未指定アドレス(::)で
+ * なければならないので要る。通常の送信は ipv6_send() を使う。 */
+int ipv6_send_from(const uint8_t src[IPV6_ADDR_LEN],
+                   const uint8_t dst[IPV6_ADDR_LEN], const uint8_t dst_mac[6],
+                   uint8_t next_header, const uint8_t *payload, uint16_t payload_len);
+
+/* 重複アドレス検出(RFC 4862)。target を使い始める前に呼ぶ。
+ * 0=空き、1=既に使われている(out_mac に相手の MAC)、-1=送信失敗。
+ * 「応答が返ってこないこと」で判定するので probes*interval_ms かかる。 */
+int ipv6_dad(const uint8_t target[IPV6_ADDR_LEN], unsigned probes, uint32_t interval_ms,
+             uint8_t out_mac[6]);
+
 /* Ethernet + IPv6 ヘッダを buf の先頭に組み立てる(ip_build_header の IPv6 版)。
  * 呼び出し元はペイロードを buf + ETH_HDR_LEN + IPV6_HDR_LEN から書き込む。 */
 void ipv6_build_header(uint8_t *buf, const uint8_t src[IPV6_ADDR_LEN],

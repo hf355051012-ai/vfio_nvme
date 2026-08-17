@@ -27,6 +27,18 @@ void arp_handle_frame(const uint8_t *payload, size_t len, const uint8_t *src_mac
 
 int arp_send_request(uint32_t target_ip);
 
+/* 重複アドレス検出(RFC 5227 の ARP Probe)。ip を使い始める前に呼ぶ。
+ * 0=空き、1=既に使われている(out_mac に相手の MAC)、-1=失敗。
+ * 「応答が返ってこないこと」で判定するので probes*interval_ms かかる。
+ *
+ * RFC 5227 は PROBE_NUM=3・1〜2 秒間隔を指定するが、あれは DHCP 規模の LAN で
+ * 相手の応答が遅い場合を見込んだ値。この装置は DAC 直結(応答まで実測 150us)
+ * なので既定はずっと短くしてある。**実 LAN へ出すときは RFC の値へ戻すこと。** */
+#define ARP_PROBE_NUM         2u
+#define ARP_PROBE_INTERVAL_MS 50u
+
+int arp_probe(uint32_t ip, unsigned probes, uint32_t interval_ms, uint8_t out_mac[6]);
+
 /* 解決済みの IP -> MAC を登録する(= エントリの延命)。通常は ARP reply の
  * 受信時に内部から呼ばれる。`arptest` が応答の来ない相手を仕込むのにも使う。 */
 void arp_cache_insert(uint32_t ip, const uint8_t mac[6]);

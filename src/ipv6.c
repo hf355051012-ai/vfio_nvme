@@ -29,6 +29,59 @@
 /* ndp_cache_lookup() が stale なエントリの確認に使う(定義は下の方)。 */
 static int ndp_send_ns(const uint8_t target[IPV6_ADDR_LEN]);
 
+/* ---- 重複アドレス検出(DAD、RFC 4862)の実行中状態 ----
+ *
+ * DAD は起動時とシェルからしか走らない冷たい直列処理なので、per-core では
+ * なく素のファイルスコープで持つ。受信ハンドラ(NA / DAD の NS)がここへ
+ * 衝突を書き、ipv6_dad() が読む。 */
+static volatile int s_dad_active;
+static volatile int s_dad_conflict;
+static uint8_t      s_dad_target[IPV6_ADDR_LEN];
+static uint8_t      s_dad_conflict_mac[ETH_ALEN];
+/* 検査を始めたインターフェースの MAC。この装置はマルチキャストを送信元へ
+ * ループバックする(ping6 の「Echo Request 受信」が 1 回の送信で 2 行出るのが
+ * 同じ現象)ので、自分が出した DAD NS と、それに自分が返した NA が自分に
+ * 戻ってくる。これを衝突と数えないための比較相手。受信時の eth_get_mac() は
+ * 処理側インターフェースの MAC を返すので代用にならない。 */
+static uint8_t      s_dad_self_mac[ETH_ALEN];
+
+/*=================================================================
+ * 16 バイトのアドレスが等しいか。
+ *
+ * 引数:
+ *   a / b - 比較する 2 つ
+ * 戻り値:
+ *   1=等しい、0=異なる
+ * コール元:
+ *   ipv6_handle_icmpv6(), ipv6_dad()
+ * ===============================================================*/
+static int ipv6_addr_eq(const uint8_t a[IPV6_ADDR_LEN], const volatile uint8_t *b)
+{
+    for (unsigned i = 0; i < IPV6_ADDR_LEN; i++) {
+        if (a[i] != b[i]) return 0;
+    }
+    return 1;
+}
+
+/*=================================================================
+ * その MAC が、いま DAD を実行しているインターフェース自身のものか。
+ * ループバックしてきた自分のフレームを衝突と数えないために使う。
+ *
+ * 引数:
+ *   mac - 判定する MAC
+ * 戻り値:
+ *   1=自分が出したもの、0=他ノード由来
+ * コール元:
+ *   ipv6_handle_icmpv6()
+ * ===============================================================*/
+static int dad_mac_is_prober(const volatile uint8_t *mac)
+{
+    for (unsigned i = 0; i < ETH_ALEN; i++) {
+        if (mac[i] != s_dad_self_mac[i]) return 0;
+    }
+    return 1;
+}
+
 volatile uint32_t g_ipv6_echo_request_count[SMP_MAX_CORES];
 volatile uint32_t g_ipv6_echo_reply_count[SMP_MAX_CORES];
 volatile uint32_t g_ipv6_ns_count[SMP_MAX_CORES];
@@ -227,17 +280,25 @@ void ipv6_build_header(uint8_t *buf, const uint8_t src[IPV6_ADDR_LEN],
  * コール元:
  *   ipv6_handle_icmpv6()
  * ===============================================================*/
+static int ipv6_send_icmpv6_from(const uint8_t src[IPV6_ADDR_LEN],
+                                  const uint8_t dst[IPV6_ADDR_LEN], const uint8_t dst_mac[6],
+                                  uint8_t *msg, uint16_t msg_len)
+{
+    /* チェックサムの疑似ヘッダには実際に送る送信元アドレスを使う。DAD の NS は
+     * :: で送るので、ここを自分のリンクローカルで計算すると相手が捨てる。 */
+    wr16be(msg + ICMPV6_OFF_CHECKSUM, 0);
+    uint16_t csum = ipv6_pseudo_checksum(src, dst, IPV6_NH_ICMPV6, msg, msg_len);
+    wr16be(msg + ICMPV6_OFF_CHECKSUM, csum);
+
+    return ipv6_send_from(src, dst, dst_mac, IPV6_NH_ICMPV6, msg, msg_len);
+}
+
 static int ipv6_send_icmpv6(const uint8_t dst[IPV6_ADDR_LEN], const uint8_t dst_mac[6],
                              uint8_t *msg, uint16_t msg_len)
 {
     uint8_t src[IPV6_ADDR_LEN];
     ipv6_link_local_addr(src);
-
-    wr16be(msg + ICMPV6_OFF_CHECKSUM, 0);
-    uint16_t csum = ipv6_pseudo_checksum(src, dst, IPV6_NH_ICMPV6, msg, msg_len);
-    wr16be(msg + ICMPV6_OFF_CHECKSUM, csum);
-
-    return ipv6_send(dst, dst_mac, IPV6_NH_ICMPV6, msg, msg_len);
+    return ipv6_send_icmpv6_from(src, dst, dst_mac, msg, msg_len);
 }
 
 /*=================================================================
@@ -407,6 +468,101 @@ static int ndp_send_ns(const uint8_t target[IPV6_ADDR_LEN])
 }
 
 /*=================================================================
+ * 重複アドレス検出用の Neighbor Solicitation を 1 個送る。通常の NS との
+ * 違いは 2 点で、どちらも RFC で決まっている:
+ *
+ *  - **送信元アドレスは未指定アドレス(::)。** まだそのアドレスを使って
+ *    よいと確定していないので、送信元に置けない(RFC 4862 5.4.2)。
+ *  - **Source Link-Layer Address オプションを付けてはいけない**
+ *    (RFC 4861 4.3: 送信元が :: のとき MUST NOT)。相手はこれで学習できない
+ *    ので、代わりに全ノードマルチキャストへ NA を返してくる。
+ *
+ * 引数:
+ *   target - 使う前に検査したいアドレス
+ * 戻り値:
+ *   0=送信完了、-1=失敗
+ * コール元:
+ *   ipv6_dad()
+ * ===============================================================*/
+static int ndp_send_dad_ns(const uint8_t target[IPV6_ADDR_LEN])
+{
+    unsigned core = smp_core_index();
+    if (core >= SMP_MAX_CORES) core = 0;
+    static uint8_t ns[SMP_MAX_CORES][8u + NDP_BODY_LEN];
+
+    uint8_t *m = ns[core];
+    for (unsigned i = 0; i < 8u + NDP_BODY_LEN; i++) m[i] = 0;
+    m[ICMPV6_OFF_TYPE] = ICMPV6_TYPE_NS;
+    m[ICMPV6_OFF_CODE] = 0;
+    for (unsigned i = 0; i < IPV6_ADDR_LEN; i++) m[8u + NDP_OFF_TARGET + i] = target[i];
+
+    /* 宛先は target の要請ノードマルチキャスト ff02::1:ffXX:XXXX */
+    uint8_t sol[IPV6_ADDR_LEN];
+    for (unsigned i = 0; i < IPV6_ADDR_LEN; i++) sol[i] = 0;
+    sol[0] = 0xFF; sol[1] = 0x02; sol[11] = 0x01; sol[12] = 0xFF;
+    sol[13] = target[13]; sol[14] = target[14]; sol[15] = target[15];
+
+    const uint8_t dst_mac[ETH_ALEN] = { 0x33, 0x33, 0xFF,
+                                        target[13], target[14], target[15] };
+
+    uint8_t unspec[IPV6_ADDR_LEN];
+    for (unsigned i = 0; i < IPV6_ADDR_LEN; i++) unspec[i] = 0;
+
+    return ipv6_send_icmpv6_from(unspec, sol, dst_mac, m, (uint16_t)(8u + NDP_BODY_LEN));
+}
+
+/*=================================================================
+ * 重複アドレス検出(RFC 4862)。target を使い始める前に、その address を
+ * 既に誰かが使っていないかを確かめる。DAD 用の NS を probes 個送り、
+ * 各回 interval_ms のあいだ受信を回して、
+ *
+ *  - target を target とする **NA** が返ってくる  -> 既に使われている
+ *  - 同じ target の **DAD NS** が返ってくる        -> 相手も同時に検査中(衝突)
+ *
+ * のどちらも衝突として扱う。何も返ってこなければ空きと判断する。
+ * **「返ってこないこと」で判定するので、待ち時間ぶんは必ずかかる。**
+ *
+ * 引数:
+ *   target      - 検査するアドレス
+ *   probes      - NS を送る回数
+ *   interval_ms - 1 回ごとに応答を待つ時間
+ *   out_mac     - NULL 可。衝突時に相手の MAC を入れる
+ * 戻り値:
+ *   0=空き、1=既に使われている、-1=送信失敗
+ * コール元:
+ *   net_dup_addr_detect(), shell_dadtest()
+ * ===============================================================*/
+int ipv6_dad(const uint8_t target[IPV6_ADDR_LEN], unsigned probes, uint32_t interval_ms,
+             uint8_t out_mac[ETH_ALEN])
+{
+    eth_get_mac(s_dad_self_mac);
+    for (unsigned i = 0; i < IPV6_ADDR_LEN; i++) s_dad_target[i] = target[i];
+    s_dad_conflict = 0;
+    s_dad_active = 1;
+
+    for (unsigned attempt = 0; attempt < probes && !s_dad_conflict; attempt++) {
+        if (ndp_send_dad_ns(target) != 0) {
+            s_dad_active = 0;
+            return -1;
+        }
+        uint64_t start = timer_now();
+        while (!timeout_ms(start, interval_ms)) {
+            net_poll_all_and_dispatch();
+            if (s_dad_conflict) break;
+        }
+    }
+
+    s_dad_active = 0;
+    if (s_dad_conflict) {
+        if (out_mac) {
+            for (unsigned i = 0; i < ETH_ALEN; i++) out_mac[i] = s_dad_conflict_mac[i];
+        }
+        return 1;
+    }
+    return 0;
+}
+
+/*=================================================================
  * IPv6 アドレスから MAC を得る。キャッシュに無ければ NS を送って NA を待つ。
  * arp_resolve() と同じ「送って待つ」同期解決。
  *
@@ -492,19 +648,47 @@ static void ipv6_handle_icmpv6(const uint8_t *msg, size_t len,
             uart_printf("[IPv6] NS 長不足 (len=%u)\n", (unsigned)len);
             return;
         }
+        /* 送信元が未指定アドレス(::)なら相手の DAD。通常の NS とは扱いが
+         * 3 点違う(RFC 4861 4.3 / RFC 4862 5.4.3):近隣キャッシュへ入れない、
+         * NA は全ノードマルチキャストへ返す、Solicited フラグを立てない。 */
+        uint8_t unspec[IPV6_ADDR_LEN];
+        for (unsigned i = 0; i < IPV6_ADDR_LEN; i++) unspec[i] = 0;
+        int src_unspec = ipv6_addr_eq(unspec, src);
+
+        /* 自分が DAD 中で、同じアドレスを相手も検査していたら衝突
+         * (同時 DAD、RFC 4862 5.4.5)。target が自分のものかを見る前に
+         * 判定する -- `dadtest` が自分以外のアドレスを検査することもある。 */
+        if (src_unspec && s_dad_active && !dad_mac_is_prober(src_mac) &&
+            ipv6_addr_eq(s_dad_target, in + 8u + NDP_OFF_TARGET)) {
+            for (unsigned i = 0; i < ETH_ALEN; i++) s_dad_conflict_mac[i] = src_mac[i];
+            s_dad_conflict = 1;
+        }
+
         /* 要請対象が自分のリンクローカルでなければ無視 */
         uint8_t ll[IPV6_ADDR_LEN];
         ipv6_link_local_addr(ll);
-        for (unsigned i = 0; i < IPV6_ADDR_LEN; i++) {
-            if (in[8u + NDP_OFF_TARGET + i] != ll[i]) return;
-        }
+        if (!ipv6_addr_eq(ll, in + 8u + NDP_OFF_TARGET)) return;
         g_ipv6_ns_count[core]++;
+
+        /* 自分が出したマルチキャストがループバックしてきたぶんには応答しない
+         * (ARP 側と同じ理由。ここで NA を返すと、その NA も自分に戻ってきて
+         * 自分の DAD が自分を衝突相手として検出する)。 */
+        {
+            uint8_t self_mac_now[ETH_ALEN];
+            eth_get_mac(self_mac_now);
+            int loopback = 1;
+            for (unsigned i = 0; i < ETH_ALEN; i++) {
+                if (src_mac[i] != self_mac_now[i]) { loopback = 0; break; }
+            }
+            if (loopback) return;
+        }
 
         /* 相手を近隣キャッシュへ入れておく。Source Link-Layer Address
          * オプションがあればそれを使う(無ければ Ethernet の送信元 MAC)。
          * これで「NS を受けた側」も相手の MAC を学習でき、以後の応答で
-         * こちらから NS を撃ち直さずに済む。 */
-        {
+         * こちらから NS を撃ち直さずに済む。**DAD の NS(送信元 ::)からは
+         * 学習してはいけない** -- :: は正当な送信元アドレスではない。 */
+        if (!src_unspec) {
             const uint8_t *learn_mac = src_mac;
             if (len >= 8u + NDP_BODY_LEN + 8u && in[8u + NDP_BODY_LEN] == NDP_OPT_SRC_LLADDR) {
                 static uint8_t opt_mac[SMP_MAX_CORES][ETH_ALEN];
@@ -522,7 +706,7 @@ static void ipv6_handle_icmpv6(const uint8_t *msg, size_t len,
         for (unsigned i = 0; i < 8u + NDP_BODY_LEN + 8u; i++) na[i] = 0;
         na[ICMPV6_OFF_TYPE] = ICMPV6_TYPE_NA;
         na[ICMPV6_OFF_CODE] = 0;
-        na[8] = 0x60;  /* S=1(bit30), O=1(bit29) */
+        na[8] = src_unspec ? 0x20u : 0x60u;  /* O=1(bit29)、S=1(bit30) は DAD 応答では立てない */
         for (unsigned i = 0; i < IPV6_ADDR_LEN; i++) na[8u + NDP_OFF_TARGET + i] = ll[i];
         uint8_t self_mac[ETH_ALEN];
         eth_get_mac(self_mac);
@@ -530,8 +714,21 @@ static void ipv6_handle_icmpv6(const uint8_t *msg, size_t len,
         na[8u + NDP_BODY_LEN + 1] = 1u;  /* 長さ(8バイト単位) */
         for (unsigned i = 0; i < ETH_ALEN; i++) na[8u + NDP_BODY_LEN + 2u + i] = self_mac[i];
 
-        uart_printf("[IPv6] Neighbor Solicitation 受信、Advertisement を返します\n");
-        ipv6_send_icmpv6(src, src_mac, na, (uint16_t)(8u + NDP_BODY_LEN + 8u));
+        /* DAD の NS には返信先アドレスが無い(送信元が ::)。全ノード
+         * マルチキャスト ff02::1 / L2 33:33:00:00:00:01 へ返す。 */
+        const uint8_t all_nodes_mac[ETH_ALEN] = { 0x33, 0x33, 0x00, 0x00, 0x00, 0x01 };
+        uint8_t all_nodes[IPV6_ADDR_LEN];
+        for (unsigned i = 0; i < IPV6_ADDR_LEN; i++) all_nodes[i] = 0;
+        all_nodes[0] = 0xFF; all_nodes[1] = 0x02; all_nodes[15] = 0x01;
+
+        uart_printf("[IPv6] %s 受信、Advertisement を返します\n",
+                    src_unspec ? "Neighbor Solicitation(DAD、送信元 ::)"
+                                : "Neighbor Solicitation");
+        if (src_unspec) {
+            ipv6_send_icmpv6(all_nodes, all_nodes_mac, na, (uint16_t)(8u + NDP_BODY_LEN + 8u));
+        } else {
+            ipv6_send_icmpv6(src, src_mac, na, (uint16_t)(8u + NDP_BODY_LEN + 8u));
+        }
         return;
     }
 
@@ -556,6 +753,13 @@ static void ipv6_handle_icmpv6(const uint8_t *msg, size_t len,
                 opt_mac[core][i] = in[8u + NDP_BODY_LEN + 2u + i];
             }
             mac = opt_mac[core];
+        }
+        /* DAD 中に検査対象への NA が来たら、そのアドレスは既に使われている
+         * (RFC 4862 5.4.4)。キャッシュへは通常どおり入れる -- 相手が実在する
+         * のは事実なので、覚えておいて損はない。 */
+        if (s_dad_active && !dad_mac_is_prober(mac) && ipv6_addr_eq(s_dad_target, target)) {
+            for (unsigned i = 0; i < ETH_ALEN; i++) s_dad_conflict_mac[i] = mac[i];
+            s_dad_conflict = 1;
         }
         ndp_cache_insert(target, mac);
         return;
@@ -624,19 +828,23 @@ void ipv6_handle_frame(const uint8_t *payload, size_t len, const uint8_t *src_ma
 }
 
 /*=================================================================
- * IPv6 データグラムを 1 個送信する。拡張ヘッダは付けない。
+ * IPv6 データグラムを 1 個送信する(送信元アドレス指定版)。拡張ヘッダは
+ * 付けない。DAD の NS だけは送信元を未指定アドレス(::)にする必要があるので、
+ * 送信元を引数に取る形をこちらに置き、ipv6_send() を薄いラッパにしてある。
  *
  * 引数:
+ *   src                   - 送信元アドレス(DAD なら ::)
  *   dst / dst_mac         - 宛先
  *   next_header           - 上位プロトコル番号
  *   payload / payload_len - 上位プロトコルのメッセージ
  * 戻り値:
  *   0=送信完了、-1=失敗
  * コール元:
- *   ipv6_send_icmpv6()
+ *   ipv6_send(), ipv6_send_icmpv6_from()
  * ===============================================================*/
-int ipv6_send(const uint8_t dst[IPV6_ADDR_LEN], const uint8_t dst_mac[6],
-              uint8_t next_header, const uint8_t *payload, uint16_t payload_len)
+int ipv6_send_from(const uint8_t src[IPV6_ADDR_LEN],
+                   const uint8_t dst[IPV6_ADDR_LEN], const uint8_t dst_mac[6],
+                   uint8_t next_header, const uint8_t *payload, uint16_t payload_len)
 {
     uint32_t frame_len = (uint32_t)ETH_HDR_LEN + IPV6_HDR_LEN + payload_len;
     if (frame_len > NET_BUF_SIZE) {
@@ -652,8 +860,6 @@ int ipv6_send(const uint8_t dst[IPV6_ADDR_LEN], const uint8_t dst_mac[6],
 
     uint8_t self_mac[ETH_ALEN];
     eth_get_mac(self_mac);
-    uint8_t src[IPV6_ADDR_LEN];
-    ipv6_link_local_addr(src);
 
     volatile uint8_t *out = nb->data;
     for (unsigned i = 0; i < ETH_ALEN; i++) out[i]            = dst_mac[i];
@@ -674,9 +880,30 @@ int ipv6_send(const uint8_t dst[IPV6_ADDR_LEN], const uint8_t dst_mac[6],
     }
 
     nb->len = (uint16_t)frame_len;
-    int rc = eth_send(nb);
-    net_buf_free(nb);
-    return rc;
+    /* eth_send() は成否によらず内部で net_buf_free() する。ここで重ねて
+     * 解放してはいけない(net_buf_free は冪等なので従来は無害だったが、
+     * 二重解放の形は残さない)。 */
+    return eth_send(nb);
+}
+
+/*=================================================================
+ * IPv6 データグラムを 1 個送信する。送信元は自分のリンクローカル。
+ *
+ * 引数:
+ *   dst / dst_mac         - 宛先
+ *   next_header           - 上位プロトコル番号
+ *   payload / payload_len - 上位プロトコルのメッセージ
+ * 戻り値:
+ *   0=送信完了、-1=失敗
+ * コール元:
+ *   ipv6_send_icmpv6(), udp_send6(), ipv6_send_echo_request()
+ * ===============================================================*/
+int ipv6_send(const uint8_t dst[IPV6_ADDR_LEN], const uint8_t dst_mac[6],
+              uint8_t next_header, const uint8_t *payload, uint16_t payload_len)
+{
+    uint8_t src[IPV6_ADDR_LEN];
+    ipv6_link_local_addr(src);
+    return ipv6_send_from(src, dst, dst_mac, next_header, payload, payload_len);
 }
 
 /*=================================================================

@@ -860,6 +860,118 @@ static void shell_route(char *args)
 }
 
 /*=================================================================
+ * 重複アドレス検出 1 件の結果を表示し、期待どおりかを判定する。
+ *
+ * 引数:
+ *   label     - 表示用のラベル
+ *   got       - arp_probe()/ipv6_dad() の戻り値(0=空き、1=使用中、-1=失敗)
+ *   want_used - 1=使用中を期待、0=空きを期待
+ *   mac       - got==1 のとき相手の MAC
+ *   want_mac  - 期待する MAC。NULL なら照合しない
+ * 戻り値:
+ *   1=期待どおり、0=そうでない
+ * コール元:
+ *   shell_dadtest()
+ * ===============================================================*/
+static int shell_dad_check(const char *label, int got, int want_used,
+                           const uint8_t mac[6], const uint8_t *want_mac)
+{
+    if (got < 0) {
+        uart_printf("dadtest: NG %s -- 検査の送信に失敗\n", label);
+        return 0;
+    }
+    if (got != want_used) {
+        uart_printf("dadtest: NG %s -- %s と判定されました(期待は%s)\n", label,
+                    got ? "使用中" : "空き", want_used ? "使用中" : "空き");
+        return 0;
+    }
+    if (got == 0) {
+        uart_printf("dadtest: OK %s -- 空き(応答なし)\n", label);
+        return 1;
+    }
+    int mac_ok = 1;
+    if (want_mac) {
+        for (unsigned i = 0; i < 6u; i++) if (mac[i] != want_mac[i]) mac_ok = 0;
+    }
+    uart_printf("dadtest: %s %s -- 使用中 %02x:%02x:%02x:%02x:%02x:%02x%s\n",
+                mac_ok ? "OK" : "NG", label,
+                mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
+                mac_ok ? "" : "(期待した MAC と不一致)");
+    return mac_ok;
+}
+
+/*=================================================================
+ * シェルの `dadtest`。A3(重複アドレス検出)の検証。
+ *
+ * **陰性だけを見ても意味が無い。** 「自分のアドレスは空き」は、検出が
+ * 一切動いていなくても成立してしまう(応答が来ないことで判定するため)。
+ * そこで対向 PF の実在するアドレスを検査する陽性対照を必ず組にする。
+ * 2 ポートを同一プロセスで駆動しているので、相手役は自分自身の対向
+ * インターフェースが務める。
+ *
+ * DAC 直結リンクはオンボード NIC(enp2s0)と物理的に繋がっていないので、
+ * ここで出す ARP Probe / DAD NS はユーザの LAN には 1 フレームも出ない。
+ *
+ * コール元:
+ *   shell_dispatch()
+ * ===============================================================*/
+static void shell_dadtest(void)
+{
+    uint8_t peer_ll[16];
+    netif_t *peer = shell_peer_ll6(peer_ll);
+    netif_t *self = g_active_ctx;
+    if (!peer || !self) {
+        uart_printf("dadtest: 対向インターフェースが見つかりません(net init mlx5 が必要)\n");
+        return;
+    }
+
+    uint8_t self_ll[16];
+    ipv6_link_local_addr(self_ll);
+
+    uint8_t mac[6];
+    int ok = 1;
+
+    uart_printf("dadtest: self=%s peer=%s (probes=%u interval=%ums)\n",
+                self->name, peer->name, ARP_PROBE_NUM, ARP_PROBE_INTERVAL_MS);
+
+    /* [1][2] IPv4: 自分のアドレスは空き、対向 PF のアドレスは使用中。 */
+    ok &= shell_dad_check("[1] IPv4 自分のアドレス",
+                          arp_probe(self->ip, ARP_PROBE_NUM, ARP_PROBE_INTERVAL_MS, mac),
+                          0, mac, NULL);
+    ok &= shell_dad_check("[2] IPv4 対向PFのアドレス(陽性対照)",
+                          arp_probe(peer->ip, ARP_PROBE_NUM, ARP_PROBE_INTERVAL_MS, mac),
+                          1, mac, peer->mac);
+
+    /* [3][4] IPv6 も同じ組み合わせ。 */
+    netif_activate(self);
+    ok &= shell_dad_check("[3] IPv6 自分のリンクローカル",
+                          ipv6_dad(self_ll, ARP_PROBE_NUM, ARP_PROBE_INTERVAL_MS, mac),
+                          0, mac, NULL);
+    netif_activate(self);
+    ok &= shell_dad_check("[4] IPv6 対向PFのリンクローカル(陽性対照)",
+                          ipv6_dad(peer_ll, ARP_PROBE_NUM, ARP_PROBE_INTERVAL_MS, mac),
+                          1, mac, peer->mac);
+    netif_activate(self);
+
+    /* [5] netif_t への記録。起動時に走らせているので、この時点で両方
+     *     PASSED になっているはず。念のため呼び直して同じ結果になることを見る。 */
+    int r = net_dup_addr_detect(self);
+    uart_printf("dadtest: [5] %s の記録 -- IPv4=%s IPv6=%s (戻り値=%d)\n", self->name,
+                self->ipv4_dup == NETIF_DAD_PASSED ? "衝突なし"
+                    : (self->ipv4_dup == NETIF_DAD_CONFLICT ? "衝突" : "未実施"),
+                self->dad_state == NETIF_DAD_PASSED ? "衝突なし"
+                    : (self->dad_state == NETIF_DAD_CONFLICT ? "衝突" : "未実施"),
+                r);
+    if (r != 0 || self->ipv4_dup != NETIF_DAD_PASSED || self->dad_state != NETIF_DAD_PASSED) {
+        uart_printf("dadtest: NG [5] 自分のアドレスなのに衝突が記録されました\n");
+        ok = 0;
+    }
+    netif_activate(self);
+
+    uart_printf("dadtest: %s\n", ok ? "PASS" : "NG");
+}
+
+/*=================================================================
  * シェルの `arpage`。近隣キャッシュ(ARP/NDP 共通)の有効期間を変更する。
  * 既定は 60 秒だが、それでは検証に 1 分以上かかるので短くできるようにして
  * ある。猶予(TTL/6)と確認要求の間隔(TTL/60)もこれに連動する。
@@ -1874,6 +1986,8 @@ static void shell_dispatch(char *line, int s0, int s1)
         shell_route(line + 5);
     } else if (strncmp(line, "arptest", 7) == 0) {
         shell_arptest();
+    } else if (strncmp(line, "dadtest", 7) == 0) {
+        shell_dadtest();
     } else if (strncmp(line, "arpage", 6) == 0) {
         shell_arpage(line + 6);
     } else if (strncmp(line, "jobs", 4) == 0) {
@@ -1896,6 +2010,7 @@ static void shell_dispatch(char *line, int s0, int s1)
                     "  routetest                             サブネット外宛がゲートウェイのMACで送られるか(v4/v6)\n"
                     "  arpage [ms]                           ARP/NDPキャッシュの有効期間(既定60000ms)\n"
                     "  arptest                               キャッシュのエージング(失効→確認→延命/破棄)\n"
+                    "  dadtest                               重複アドレス検出(ARP Probe / IPv6 DAD)\n"
                     "  txdrop [N]                            ロス注入(データN個に1個破棄、0=無効)+再送統計\n"
                     "  qploop [N]                            RC QPの作成/破棄をN回繰り返しFWリソース枯渇を見る\n"
                     "  nvmediscover [dump]                   Discovery Log Pageを取得(dumpで16進出力)\n"
@@ -2049,6 +2164,13 @@ static void run_shell(int s0, int s1)
     ipv6_init();
     udp_init();
     mlx5_net_register_dual(&s_dev0, &s_dev1);
+
+    /* アドレスを使い始める前に重複アドレス検出を行う(IPv4=RFC 5227 の
+     * ARP Probe、IPv6=RFC 4862 の DAD)。ハンドラ登録と netif 登録の両方が
+     * 済んでいないと応答を受け取れないので、必ずこの位置で呼ぶ。
+     * 衝突が無ければ待ち時間ぶん(4 アドレス x 100ms 程度)かかる。 */
+    net_dup_addr_detect(netif_find("mlx5-pf0"));
+    net_dup_addr_detect(netif_find("mlx5-pf1"));
 
     int fl = fcntl(0, F_GETFL, 0);
     if (fl != -1) (void)fcntl(0, F_SETFL, fl | O_NONBLOCK);

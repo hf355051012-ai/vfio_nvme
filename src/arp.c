@@ -24,6 +24,21 @@
 #define ARP_RESOLVE_TIMEOUT_MS 300u /* 1回のrequestあたりのポーリング待ち */
 #define ARP_RESOLVE_MAX_ATTEMPTS 3u /* requestを再送する最大回数(合計最大約900ms) */
 
+/* ---- 重複アドレス検出(ARP Probe、RFC 5227)の実行中状態 ----
+ *
+ * DAD と同じく起動時とシェルからしか走らない冷たい直列処理なので per-core に
+ * しない。arp_handle_frame() が衝突を書き、arp_probe() が読む。
+ * target が 0 のときは「検査中でない」を意味する(0.0.0.0 は検査できない)。 */
+static volatile uint32_t s_probe_target;
+static volatile int      s_probe_conflict;
+static uint8_t           s_probe_conflict_mac[ETH_ALEN];
+/* 検査を始めたインターフェースの MAC。**受信時の eth_get_mac() では代用でき
+ * ない。** probe への reply は tpa が 0.0.0.0(probe の spa をそのまま返す)
+ * なので netif_resolve_frame_owner() が宛先で振り分けられず、対向 PF 側の
+ * インターフェースで処理される。そこで eth_get_mac() を読むと検査した側とは
+ * 別の MAC が返り、自分の応答を他人の応答と誤認する(実機で踏んだ)。 */
+static uint8_t           s_probe_self_mac[ETH_ALEN];
+
 /*=================================================================
  * 解決済みの IP -> MAC 対応をアクティブインターフェースの ARP キャッシュへ
  * 登録する。同じ IP のエントリがあれば上書き(= 延命)、空きが無ければ
@@ -180,8 +195,29 @@ void arp_handle_frame(const uint8_t *payload, size_t len, const uint8_t *src_mac
         return;
     }
 
+    uint32_t sender_ip = rd32be(in + ARP_OFF_SPA);
+
+    /* 検査中のアドレスを送信元として名乗るフレームは、そのアドレスが既に
+     * 使われている証拠(RFC 5227 2.1.1)。reply だけでなく request でも成立する
+     * -- 相手が自分のアドレスとして ARP を出しているか、同じアドレスを同時に
+     * 検査しているかのどちらか。自分の probe は送信元 0.0.0.0 なので、
+     * target(非 0)と一致することはなく自己検出は起きない。 */
+    if (s_probe_target != 0u && sender_ip == s_probe_target) {
+        /* RFC 5227 2.1.1 は「sender hardware address が自ホストのインター
+         * フェースのものでない」ことを条件にしている。比較相手は
+         * **検査を開始したインターフェースの MAC**(s_probe_self_mac)で、
+         * 受信時の eth_get_mac() ではない(理由は宣言部のコメント)。 */
+        int from_self = 1;
+        for (int i = 0; i < ETH_ALEN; i++) {
+            if (in[ARP_OFF_SHA + i] != s_probe_self_mac[i]) { from_self = 0; break; }
+        }
+        if (!from_self) {
+            for (int i = 0; i < ETH_ALEN; i++) s_probe_conflict_mac[i] = in[ARP_OFF_SHA + i];
+            s_probe_conflict = 1;
+        }
+    }
+
     if (oper == ARP_OP_REPLY) {
-        uint32_t sender_ip = rd32be(in + ARP_OFF_SPA);
         uint8_t sender_mac[ETH_ALEN];
         for (int i = 0; i < ETH_ALEN; i++) sender_mac[i] = in[ARP_OFF_SHA + i];
         arp_cache_insert(sender_ip, sender_mac);
@@ -192,6 +228,21 @@ void arp_handle_frame(const uint8_t *payload, size_t len, const uint8_t *src_mac
 
     if (oper != ARP_OP_REQUEST || target_ip != NET_SELF_IP) {
         return;
+    }
+
+    /* この装置はマルチキャスト/ブロードキャストを送信元へループバックする
+     * (ping6 の「Echo Request 受信」が 1 回の送信で 2 行出るのが同じ現象)。
+     * 自分が出したブロードキャスト request が自分に戻ってくるので、送信元
+     * ハードウェアアドレスが自分なら応答しない。返しても相手は自分だけで、
+     * 重複アドレス検出に無駄なフレームを混ぜるだけになる。 */
+    {
+        uint8_t self_mac_now[ETH_ALEN];
+        eth_get_mac(self_mac_now);
+        int loopback = 1;
+        for (int i = 0; i < ETH_ALEN; i++) {
+            if (in[ARP_OFF_SHA + i] != self_mac_now[i]) { loopback = 0; break; }
+        }
+        if (loopback) return;
     }
 
     net_buf_t *nb = net_buf_alloc();
@@ -233,16 +284,20 @@ void arp_handle_frame(const uint8_t *payload, size_t len, const uint8_t *src_mac
 }
 
 /*=================================================================
- * target_ip の MAC を問う ARP request をブロードキャストする。
+ * target_ip の MAC を問う ARP request をブロードキャストする(送信元 IP
+ * 指定版)。sender_ip に 0 を渡すと RFC 5227 の **ARP Probe** になる。
+ * probe が送信元を 0.0.0.0 にするのは、まだ使ってよいと確定していない
+ * アドレスを名乗らないため(受け取った側のキャッシュも汚さない)。
  *
  * 引数:
  *   target_ip - 問い合わせたい IPv4 アドレス(ホストバイトオーダー)
+ *   sender_ip - 送信元として名乗る IPv4。0 なら ARP Probe
  * 戻り値:
  *   0=送信成功、-1=net_buf 枯渇/送信失敗
  * コール元:
- *   arp_resolve()
+ *   arp_send_request(), arp_probe()
  * ===============================================================*/
-int arp_send_request(uint32_t target_ip)
+static int arp_send_request_from(uint32_t target_ip, uint32_t sender_ip)
 {
     net_buf_t *nb = net_buf_alloc();
     if (!nb) {
@@ -253,7 +308,7 @@ int arp_send_request(uint32_t target_ip)
     uint8_t self_mac[ETH_ALEN];
     eth_get_mac(self_mac);
     uint8_t self_ip[4];
-    ip_to_octets(NET_SELF_IP, self_ip);
+    ip_to_octets(sender_ip, self_ip);
     uint8_t tpa[4];
     ip_to_octets(target_ip, tpa);
 
@@ -278,14 +333,84 @@ int arp_send_request(uint32_t target_ip)
 
     nb->len = ETH_HDR_LEN + sizeof(arp_packet_t);
 
-    uart_printf("[ARP] request 送信: who-has %u.%u.%u.%u tell %u.%u.%u.%u\n",
-                tpa[0], tpa[1], tpa[2], tpa[3],
-                self_ip[0], self_ip[1], self_ip[2], self_ip[3]);
+    if (sender_ip == 0u) {
+        uart_printf("[ARP] probe 送信: who-has %u.%u.%u.%u (送信元 0.0.0.0、RFC 5227)\n",
+                    tpa[0], tpa[1], tpa[2], tpa[3]);
+    } else {
+        uart_printf("[ARP] request 送信: who-has %u.%u.%u.%u tell %u.%u.%u.%u\n",
+                    tpa[0], tpa[1], tpa[2], tpa[3],
+                    self_ip[0], self_ip[1], self_ip[2], self_ip[3]);
+    }
 
     int ret = eth_send(nb);
     if (ret != 0)
         uart_printf("[!] ARP request 送信失敗\n");
     return ret;
+}
+
+/*=================================================================
+ * target_ip の MAC を問う通常の ARP request(送信元は自分の IPv4)。
+ *
+ * 引数:
+ *   target_ip - 問い合わせたい IPv4 アドレス(ホストバイトオーダー)
+ * 戻り値:
+ *   0=送信成功、-1=失敗
+ * コール元:
+ *   arp_resolve(), arp_cache_lookup()
+ * ===============================================================*/
+int arp_send_request(uint32_t target_ip)
+{
+    return arp_send_request_from(target_ip, NET_SELF_IP);
+}
+
+/*=================================================================
+ * 重複アドレス検出(RFC 5227 の ARP Probe)。ip を使い始める前に、その
+ * アドレスを既に誰かが使っていないかを確かめる。送信元 0.0.0.0 の ARP
+ * request を probes 個送り、各回 interval_ms のあいだ受信を回して、
+ * **そのアドレスを送信元として名乗るフレーム**(reply でも request でも)が
+ * 来たら衝突とみなす。
+ *
+ * IPv6 の ipv6_dad() と対になる関数で、判定の作りも同じ。「返ってこない
+ * こと」で空きと判断するので、待ち時間ぶんは必ずかかる。
+ *
+ * 引数:
+ *   ip          - 検査するアドレス(0 は検査できない)
+ *   probes      - probe を送る回数
+ *   interval_ms - 1 回ごとに応答を待つ時間
+ *   out_mac     - NULL 可。衝突時に相手の MAC を入れる
+ * 戻り値:
+ *   0=空き、1=既に使われている、-1=引数不正/送信失敗
+ * コール元:
+ *   net_dup_addr_detect(), shell_dadtest()
+ * ===============================================================*/
+int arp_probe(uint32_t ip, unsigned probes, uint32_t interval_ms, uint8_t out_mac[ETH_ALEN])
+{
+    if (ip == 0u) return -1;  /* 0.0.0.0 は「検査中でない」の目印に使っている */
+
+    eth_get_mac(s_probe_self_mac);
+    s_probe_conflict = 0;
+    s_probe_target = ip;
+
+    for (unsigned attempt = 0; attempt < probes && !s_probe_conflict; attempt++) {
+        if (arp_send_request_from(ip, 0u) != 0) {
+            s_probe_target = 0u;
+            return -1;
+        }
+        uint64_t start = timer_now();
+        while (!timeout_ms(start, interval_ms)) {
+            net_poll_all_and_dispatch();
+            if (s_probe_conflict) break;
+        }
+    }
+
+    s_probe_target = 0u;
+    if (s_probe_conflict) {
+        if (out_mac) {
+            for (unsigned i = 0; i < ETH_ALEN; i++) out_mac[i] = s_probe_conflict_mac[i];
+        }
+        return 1;
+    }
+    return 0;
 }
 
 /*=================================================================
