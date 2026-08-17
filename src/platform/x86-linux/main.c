@@ -373,7 +373,8 @@ static void shell_udptest(void)
 
     uint32_t peer_ip = (net_active_ip() == 0xC0A8650Au) ? 0xC0A8650Bu : 0xC0A8650Au;
     uint8_t peer_mac[6];
-    if (arp_resolve(peer_ip, peer_mac) != 0) {
+    netaddr_t peer_addr = netaddr_v4(peer_ip);
+    if (net_resolve_mac(&peer_addr, peer_mac) != 0) {
         uart_printf("udptest: ARP 解決失敗 (%u.%u.%u.%u)\n",
                     (peer_ip >> 24) & 0xFFu, (peer_ip >> 16) & 0xFFu,
                     (peer_ip >> 8) & 0xFFu, peer_ip & 0xFFu);
@@ -477,7 +478,8 @@ static void shell_udptest6(void)
     }
 
     uint8_t peer_mac[6];
-    if (ndp_resolve(peer_ll, peer_mac) != 0) {
+    netaddr_t peer_addr6 = netaddr_v6(peer_ll);
+    if (net_resolve_mac(&peer_addr6, peer_mac) != 0) {
         uart_printf("udptest6: NDP 解決失敗\n");
         udp_unbind(port);
         return;
@@ -514,40 +516,45 @@ static void shell_udptest6(void)
 }
 
 /*=================================================================
- * シェルの `tcp6test`。同一プロセス内の 2 つのインターフェースを
- * サーバ役/クライアント役にして、IPv6 上で TCP を確立しデータを 1 往復
- * させる。ポーリング専用・単一スレッドなので、接続待ちは
- * tcp_accept_begin()(ブロックしない受け皿準備)で用意しておき、
- * tcp_connect_poll() が内部で回すポーリングにサーバ側の処理も乗せる。
+ * 同一プロセス内の 2 つのインターフェースをサーバ役/クライアント役にして
+ * TCP を確立し、64KB を 1 往復させてバイト一致を確認する。ポーリング専用・
+ * 単一スレッドなので、接続待ちは tcp_accept_begin()(ブロックしない受け皿
+ * 準備)で用意しておき、tcp_connect_poll() が内部で回すポーリングに
+ * サーバ側の処理も乗せる。
  *
+ * dst の family は問わない(tcp_connect_begin_to() が吸収する)。宛先が
+ * サーバ側インターフェースの IP と違っていてもよいので、ゲートウェイ経由の
+ * 経路(routetest)もこの関数で検証できる。
+ *
+ * 引数:
+ *   label   - ログの先頭に出す呼び出し元名("tcp6test" 等)
+ *   self    - クライアント役インターフェース
+ *   srv_if  - サーバ役インターフェース(listen をここに束縛する)
+ *   dst     - クライアントが接続する宛先アドレス
+ *   port    - 使用ポート
+ * 戻り値:
+ *   1=64KB が一致して往復した、0=失敗
  * コール元:
- *   shell_dispatch()
+ *   shell_tcp6test(), shell_routetest()
  * ===============================================================*/
-static void shell_tcp6test(void)
+static int shell_tcp_echo_once(const char *label, netif_t *self, netif_t *srv_if,
+                                const netaddr_t *dst, uint16_t port)
 {
-    const uint16_t port = 6000u;
     static tcp_conn_t s_srv, s_cli;
 
-    uint8_t peer_ll[16];
-    netif_t *peer = shell_peer_ll6(peer_ll);
-    netif_t *self = g_active_ctx;
-    if (!peer || !self) {
-        uart_printf("tcp6test: 対向インターフェースが見つかりません(net init mlx5 が必要)\n");
-        return;
-    }
-    uart_printf("tcp6test: client=%s server=%s port=%u\n", self->name, peer->name, port);
+    uart_printf("%s: client=%s server=%s port=%u\n", label, self->name, srv_if->name, port);
 
-    /* サーバ役の受け皿を先に用意する(対向インターフェース宛に束縛)。 */
-    int listener = tcp_listen(port, peer);
+    /* サーバ役の受け皿を先に用意する(サーバ側インターフェース宛に束縛)。 */
+    int listener = tcp_listen(port, srv_if);
     if (listener < 0) {
-        uart_printf("tcp6test: tcp_listen 失敗\n");
-        return;
+        uart_printf("%s: tcp_listen 失敗\n", label);
+        return 0;
     }
     s_srv.state = TCP_CLOSED;
     tcp_accept_begin(listener, &s_srv);
 
     netif_activate(self);
-    tcp_connect_begin6(&s_cli, peer_ll, port);
+    tcp_connect_begin_to(&s_cli, dst, port);
 
     uint64_t t0 = timer_now();
     int established = 0;
@@ -559,12 +566,13 @@ static void shell_tcp6test(void)
         if (r < 0) break;
     }
     if (!established) {
-        uart_printf("tcp6test: NG -- 接続確立できず (client state=%d server state=%d)\n",
-                    (int)s_cli.state, (int)s_srv.state);
+        uart_printf("%s: NG -- 接続確立できず (client state=%d server state=%d)\n",
+                    label, (int)s_cli.state, (int)s_srv.state);
         tcp_unlisten(listener);
-        return;
+        netif_activate(self);
+        return 0;
     }
-    uart_printf("tcp6test: 接続確立 (MSS=%u)\n", (unsigned)s_cli.snd_mss);
+    uart_printf("%s: 接続確立 (MSS=%u)\n", label, (unsigned)s_cli.snd_mss);
 
     /* フルサイズ(MSS)セグメントを何本も流す大きさにしておく。小さいままだと
      * 1 セグメントに収まってしまい、L3 ヘッダ 20 バイト増による MTU 超過
@@ -576,16 +584,17 @@ static void shell_tcp6test(void)
     netif_activate(self);
     /* tcp_send() は送信できたバイト数を返す(失敗/中断で -1)。 */
     if (tcp_send(&s_cli, tx, sizeof(tx)) != (int)sizeof(tx)) {
-        uart_printf("tcp6test: NG -- 送信失敗\n");
+        uart_printf("%s: NG -- 送信失敗\n", label);
         tcp_close(&s_cli);
         tcp_unlisten(listener);
-        return;
+        netif_activate(self);
+        return 0;
     }
 
     uint32_t got = 0;
     t0 = timer_now();
     while (got < sizeof(tx) && !timeout_ms(t0, 3000u)) {
-        netif_activate(peer);
+        netif_activate(srv_if);
         int n = tcp_recv(&s_srv, rx + got, (uint32_t)sizeof(rx) - got, 20u);
         if (n > 0) got += (uint32_t)n;
         else if (n < 0) break;
@@ -596,16 +605,37 @@ static void shell_tcp6test(void)
     for (uint32_t i = 0; match && i < got; i++) {
         if (rx[i] != tx[i]) match = 0;
     }
-    uart_printf("tcp6test: 受信 %u/%u バイト -- %s\n",
-                (unsigned)got, (unsigned)sizeof(tx),
+    uart_printf("%s: 受信 %u/%u バイト -- %s\n",
+                label, (unsigned)got, (unsigned)sizeof(tx),
                 match ? "PASS(内容一致)" : "NG(内容不一致または不足)");
 
     netif_activate(self);
     tcp_close(&s_cli);
-    netif_activate(peer);
+    netif_activate(srv_if);
     tcp_close(&s_srv);
     tcp_unlisten(listener);
     netif_activate(self);
+    return match;
+}
+
+/*=================================================================
+ * シェルの `tcp6test`。対向 PF のリンクローカル宛に IPv6 で TCP を確立し、
+ * 64KB を往復させてバイト一致を確認する。
+ *
+ * コール元:
+ *   shell_dispatch()
+ * ===============================================================*/
+static void shell_tcp6test(void)
+{
+    uint8_t peer_ll[16];
+    netif_t *peer = shell_peer_ll6(peer_ll);
+    netif_t *self = g_active_ctx;
+    if (!peer || !self) {
+        uart_printf("tcp6test: 対向インターフェースが見つかりません(net init mlx5 が必要)\n");
+        return;
+    }
+    netaddr_t dst = netaddr_v6(peer_ll);
+    shell_tcp_echo_once("tcp6test", self, peer, &dst, 6000u);
 }
 
 /*=================================================================
@@ -704,6 +734,273 @@ static void shell_rsttest(void)
     uart_printf("rsttest: %s\n", (ok4 && ok6) ? "PASS" : "NG");
 }
 
+/*=================================================================
+ * 文字列を空白区切りで最大 n トークンに分割する(s を破壊する)。
+ *
+ * 引数:
+ *   s   - 分割対象(書き換えられる)
+ *   tok - 各トークン先頭の格納先
+ *   n   - tok の要素数
+ * 戻り値:
+ *   実際に得られたトークン数
+ * コール元:
+ *   shell_route(), bench_plan_parse(), shell_simdelay(), shell_ts()
+ * ===============================================================*/
+static unsigned shell_tokenize(char *s, char *tok[], unsigned n)
+{
+    unsigned c = 0;
+    while (*s && c < n) {
+        while (*s == ' ' || *s == '\t') s++;
+        if (!*s) break;
+        tok[c++] = s;
+        while (*s && *s != ' ' && *s != '\t') s++;
+        if (*s) *s++ = 0;
+    }
+    return c;
+}
+
+/*=================================================================
+ * "a.b.c.d" をホストバイトオーダーの IPv4 へ変換する。
+ *
+ * 引数:
+ *   s   - 変換元。オクテット 4 個が '.' 区切りである必要がある
+ *   out - 変換結果の格納先
+ * 戻り値:
+ *   0=変換できた、-1=書式が不正
+ * コール元:
+ *   shell_route()
+ * ===============================================================*/
+static int shell_parse_ipv4(const char *s, uint32_t *out)
+{
+    uint32_t v = 0;
+    for (unsigned oct = 0; oct < 4u; oct++) {
+        if (*s < '0' || *s > '9') return -1;
+        uint32_t b = 0;
+        while (*s >= '0' && *s <= '9') {
+            b = b * 10u + (uint32_t)(*s - '0');
+            if (b > 255u) return -1;
+            s++;
+        }
+        v = (v << 8) | b;
+        if (oct < 3u) {
+            if (*s != '.') return -1;
+            s++;
+        }
+    }
+    if (*s != '\0') return -1;
+    *out = v;
+    return 0;
+}
+
+/*=================================================================
+ * IPv4 をオクテット表記で 1 行に出す(uart_printf に %s 用の変換先が
+ * 無いので、呼び出しごとに 4 引数で展開する用のマクロ代わり)。
+ *
+ * 引数:
+ *   label - 行頭のラベル
+ *   ip    - 表示する IPv4(ホストバイトオーダー)
+ * コール元:
+ *   shell_route()
+ * ===============================================================*/
+static void shell_print_ipv4(const char *label, uint32_t ip)
+{
+    uart_printf("%s%u.%u.%u.%u", label,
+                (ip >> 24) & 0xFFu, (ip >> 16) & 0xFFu, (ip >> 8) & 0xFFu, ip & 0xFFu);
+}
+
+/*=================================================================
+ * シェルの `route`。引数なしで全インターフェースの IP / netmask /
+ * ゲートウェイを表示し、"<if> <netmask> <gateway>" で IPv4 の経路を設定する
+ * (gateway に 0.0.0.0 を渡すと解除 = 全ての宛先を同一リンク上として扱う)。
+ *
+ * 引数:
+ *   args - "" または "<ifname> <netmask> <gateway>"
+ * コール元:
+ *   shell_dispatch()
+ * ===============================================================*/
+static void shell_route(char *args)
+{
+    char *tok[3];
+    unsigned nt = shell_tokenize(args, tok, 3);
+
+    if (nt >= 3u) {
+        netif_t *ni = netif_find(tok[0]);
+        uint32_t mask = 0, gw = 0;
+        if (!ni) {
+            uart_printf("route: インターフェース %s が見つかりません\n", tok[0]);
+            return;
+        }
+        if (shell_parse_ipv4(tok[1], &mask) != 0 || shell_parse_ipv4(tok[2], &gw) != 0) {
+            uart_printf("route: netmask/gateway の書式が不正です(a.b.c.d)\n");
+            return;
+        }
+        ni->netmask = mask;
+        ni->gateway = gw;
+        uart_printf("route: %s を設定しました\n", ni->name);
+    } else if (nt != 0u) {
+        uart_printf("route: 使い方 -- route | route <ifname> <netmask> <gateway>\n");
+        return;
+    }
+
+    for (unsigned i = 0; i < NETIF_MAX_REGISTERED * SMP_MAX_CORES; i++) {
+        /* netif_find は名前でしか引けないので、既知の 2 本を直接見る。 */
+        static const char *names[] = { "mlx5-pf0", "mlx5-pf1" };
+        if (i >= sizeof(names) / sizeof(names[0])) break;
+        netif_t *ni = netif_find(names[i]);
+        if (!ni) continue;
+        shell_print_ipv4("  ", ni->ip);
+        shell_print_ipv4(" mask ", ni->netmask);
+        if (ni->gateway) {
+            shell_print_ipv4(" gw ", ni->gateway);
+        } else {
+            uart_printf(" gw なし(全て同一リンク扱い)");
+        }
+        uart_printf("  %s%s\n", ni->name, ni->gateway6_set ? " [gw6 設定あり]" : "");
+    }
+}
+
+/*=================================================================
+ * シェルの `routetest`。A1(ルーティング/ゲートウェイ)の検証。
+ *
+ * DAC 直結の 2 ポートしか無いので「別セグメントの向こう側」を素直には作れ
+ * ない。そこで対向 PF と同じ物理ポート(同じ nic/nic_priv/MAC)を共有する
+ * 別名インターフェースを 10.9.9.9 として一時登録する。既存の
+ * netif_resolve_frame_owner() が宛先 IP を見てフレームを別名側へ渡すので、
+ * **宛先 IP(10.9.9.9)と次ホップ IP(192.168.101.11)が異なる状態で実データを
+ * 流せる**。これが「ゲートウェイの MAC を引いている」ことの直接の証拠になる
+ * (アドレス演算だけの確認では、宛先とゲートウェイが同じでも通ってしまう)。
+ *
+ * コール元:
+ *   shell_dispatch()
+ * ===============================================================*/
+static void shell_routetest(void)
+{
+    /* 別サブネットの宛先。対向 PF の別名として一時的に実在させる。 */
+    const uint32_t far_ip = ip_from_octets(10, 9, 9, 9);
+    const uint16_t port   = 6002u;
+    static netif_t s_alias;   /* netif_t は登録表にポインタで載るので静的に置く */
+
+    uint8_t peer_ll[16];
+    netif_t *peer = shell_peer_ll6(peer_ll);
+    netif_t *self = g_active_ctx;
+    if (!peer || !self) {
+        uart_printf("routetest: 対向インターフェースが見つかりません(net init mlx5 が必要)\n");
+        return;
+    }
+
+    const uint32_t saved_mask = self->netmask;
+    const uint32_t saved_gw   = self->gateway;
+    const uint8_t  saved_gw6_set = self->gateway6_set;
+    uint8_t saved_gw6[16];
+    for (unsigned i = 0; i < 16; i++) saved_gw6[i] = self->gateway6[i];
+
+    int ok = 1;
+
+    /* [1] ゲートウェイ未設定なら、サブネット外でも宛先を直接解決する
+     *     (A1 を入れる前の挙動と同じ)。 */
+    self->netmask = ip_from_octets(255, 255, 255, 0);
+    self->gateway = 0u;
+    if (netif_next_hop4(self, far_ip) != far_ip) {
+        uart_printf("routetest: NG [1] gw 未設定なのに次ホップが宛先と違う\n");
+        ok = 0;
+    } else {
+        uart_printf("routetest: OK [1] gw 未設定 -- 次ホップ = 宛先(従来の挙動)\n");
+    }
+
+    /* [2] ゲートウェイを設定したときの次ホップ選択。 */
+    self->gateway = peer->ip;
+    struct { uint32_t dst; uint32_t want; const char *why; } cases[] = {
+        { peer->ip,             peer->ip,            "同一サブネット -> 宛先を直接" },
+        { far_ip,               peer->ip,            "サブネット外 -> ゲートウェイ" },
+        { 0xFFFFFFFFu,          0xFFFFFFFFu,         "限定ブロードキャスト -> 宛先" },
+        { ip_from_octets(224,0,0,1), ip_from_octets(224,0,0,1),
+                                                     "マルチキャスト -> 宛先" },
+    };
+    for (unsigned i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        uint32_t hop = netif_next_hop4(self, cases[i].dst);
+        if (hop != cases[i].want) {
+            shell_print_ipv4("routetest: NG [2] 宛先 ", cases[i].dst);
+            shell_print_ipv4(" の次ホップが ", hop);
+            shell_print_ipv4(" (期待 ", cases[i].want);
+            uart_printf(") -- %s\n", cases[i].why);
+            ok = 0;
+        }
+    }
+    if (ok) uart_printf("routetest: OK [2] 次ホップ選択 4 ケースすべて期待どおり\n");
+
+    /* [3] サブネット外の宛先を解決すると、ゲートウェイ(対向 PF)の MAC が
+     *     返ること。宛先 10.9.9.9 の MAC ではなく 192.168.101.11 の MAC を
+     *     引いている、というのがここの主張。 */
+    netaddr_t far_addr = netaddr_v4(far_ip);
+    uint8_t got_mac[6];
+    if (net_resolve_mac(&far_addr, got_mac) != 0) {
+        uart_printf("routetest: NG [3] サブネット外宛の MAC 解決に失敗\n");
+        ok = 0;
+    } else {
+        int same = 1;
+        for (unsigned i = 0; i < 6u; i++) if (got_mac[i] != peer->mac[i]) same = 0;
+        uart_printf("routetest: %s [3] 10.9.9.9 の次ホップ MAC = "
+                    "%02x:%02x:%02x:%02x:%02x:%02x (%s の MAC%s)\n",
+                    same ? "OK" : "NG",
+                    got_mac[0], got_mac[1], got_mac[2], got_mac[3], got_mac[4], got_mac[5],
+                    peer->name, same ? "" : " と不一致");
+        if (!same) ok = 0;
+    }
+
+    /* [4] IPv6。グローバルアドレス宛は gateway6 へ、リンクローカルと
+     *     マルチキャストは宛先へ。実データの往復は v6 のグローバルアドレスを
+     *     名乗る手段がまだ無いので(B1 SLAAC 待ち)、解決までを確認する。 */
+    for (unsigned i = 0; i < 16; i++) self->gateway6[i] = peer_ll[i];
+    self->gateway6_set = 1u;
+    uint8_t global6[16] = { 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01 };
+    uint8_t mcast6[16]  = { 0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01 };
+    int v6_ok = (netif_next_hop6(self, global6) == self->gateway6) &&
+                (netif_next_hop6(self, peer_ll) == peer_ll) &&
+                (netif_next_hop6(self, mcast6)  == mcast6);
+    netaddr_t g6 = netaddr_v6(global6);
+    if (v6_ok && net_resolve_mac(&g6, got_mac) == 0) {
+        for (unsigned i = 0; i < 6u; i++) if (got_mac[i] != peer->mac[i]) v6_ok = 0;
+    } else {
+        v6_ok = 0;
+    }
+    uart_printf("routetest: %s [4] IPv6 -- グローバル宛は gateway6(%s)へ、"
+                "リンクローカル/マルチキャストは宛先へ\n",
+                v6_ok ? "OK" : "NG", peer->name);
+    if (!v6_ok) ok = 0;
+
+    /* [5] エンドツーエンド。対向 PF の別名として 10.9.9.9 を一時的に実在させ、
+     *     ゲートウェイ経路で 64KB を往復させる。 */
+    s_alias = *peer;                /* MAC / nic / nic_priv / mss_cap 等を引き継ぐ */
+    s_alias.name    = "route-far";
+    s_alias.ip      = far_ip;
+    s_alias.netmask = 0u;           /* 戻りは従来どおり宛先を直接 ARP する */
+    s_alias.gateway = 0u;
+    s_alias.gateway6_set = 0u;
+    for (unsigned i = 0; i < ARP_CACHE_SIZE; i++) s_alias.arp_cache[i].valid = 0;
+    for (unsigned i = 0; i < NDP_CACHE_SIZE; i++) s_alias.ndp_cache[i].valid = 0;
+    netif_register(&s_alias);
+    /* 受信キューは対向 PF が持っている。別名を巡回対象にすると同じ RQ を
+     * 二重にポーリングしてしまうので、ポーリング主体からは外す。フレームは
+     * netif_resolve_frame_owner() が宛先 IP を見てこちらへ回してくれる。 */
+    s_alias.is_poll_owner = 0;
+
+    netif_activate(self);
+    int e2e = shell_tcp_echo_once("routetest", self, &s_alias, &far_addr, port);
+    if (!e2e) ok = 0;
+
+    netif_unregister(&s_alias);
+
+    /* [6] 設定を元に戻す。戻し忘れると以後の tcpbench/bench が全部
+     *     ゲートウェイ経路を通ることになる。 */
+    self->netmask = saved_mask;
+    self->gateway = saved_gw;
+    self->gateway6_set = saved_gw6_set;
+    for (unsigned i = 0; i < 16; i++) self->gateway6[i] = saved_gw6[i];
+    netif_activate(self);
+
+    uart_printf("routetest: %s(設定は元に戻しました)\n", ok ? "PASS" : "NG");
+}
+
 /* ---- ベンチ引数パース + サマリ表示(bench/tcpbench 共通) ---- */
 #define BENCH_MAX_CHUNKS 8u
 typedef struct {
@@ -721,31 +1018,6 @@ typedef struct {
     uint8_t  hdgst, ddgst;  /* NVMe/TCP のみ。RDMA には digest の概念が無い */
     uint8_t  ipv6;          /* NVMe/TCP のみ。1=対向のリンクローカルへ IPv6 で繋ぐ */
 } bench_plan_t;
-
-/*=================================================================
- * 文字列を空白区切りで最大 n トークンに分割する(s を破壊する)。
- *
- * 引数:
- *   s   - 分割対象(書き換えられる)
- *   tok - 各トークン先頭の格納先
- *   n   - tok の要素数
- * 戻り値:
- *   実際に得られたトークン数
- * コール元:
- *   bench_plan_parse(), shell_simdelay(), shell_ts()
- * ===============================================================*/
-static unsigned shell_tokenize(char *s, char *tok[], unsigned n)
-{
-    unsigned c = 0;
-    while (*s && c < n) {
-        while (*s == ' ' || *s == '\t') s++;
-        if (!*s) break;
-        tok[c++] = s;
-        while (*s && *s != ' ' && *s != '\t') s++;
-        if (*s) *s++ = 0;
-    }
-    return c;
-}
 
 /*=================================================================
  * ベンチ引数 "[KB[,KB...]] [r|w|rw] [qd] [hdgst] [ddgst] [ipv6]" を解析する。
@@ -1407,6 +1679,10 @@ static void shell_dispatch(char *line, int s0, int s1)
         shell_tcp6test();
     } else if (strncmp(line, "rsttest", 7) == 0) {
         shell_rsttest();
+    } else if (strncmp(line, "routetest", 9) == 0) {
+        shell_routetest();
+    } else if (strncmp(line, "route", 5) == 0) {
+        shell_route(line + 5);
     } else if (strncmp(line, "jobs", 4) == 0) {
         job_list_dump();
     } else if (strncmp(line, "help", 4) == 0) {
@@ -1423,6 +1699,8 @@ static void shell_dispatch(char *line, int s0, int s1)
                     "  udptest | udptest6                    対向PFへUDP往復(v4はPort Unreachableも確認)\n"
                     "  tcp6test                              対向PFとIPv6上でTCP確立+データ往復\n"
                     "  rsttest                               待ち受け無しポートへ接続しRSTで即失敗するか(v4/v6)\n"
+                    "  route [<if> <netmask> <gateway>]      経路表示/設定(gateway 0.0.0.0 で解除)\n"
+                    "  routetest                             サブネット外宛がゲートウェイのMACで送られるか(v4/v6)\n"
                     "  txdrop [N]                            ロス注入(データN個に1個破棄、0=無効)+再送統計\n"
                     "  qploop [N]                            RC QPの作成/破棄をN回繰り返しFWリソース枯渇を見る\n"
                     "  nvmediscover [dump]                   Discovery Log Pageを取得(dumpで16進出力)\n"

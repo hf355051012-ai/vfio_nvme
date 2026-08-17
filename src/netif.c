@@ -3,6 +3,8 @@
 #include "timestamp.h"   /* 同上 */
 #include "cache.h"
 #include "uart.h"
+#include "arp.h"
+#include "ipv6.h"
 
 netif_t *g_netif_active_slots[SMP_MAX_CORES];
 
@@ -252,6 +254,31 @@ void netif_register(netif_t *ctx)
 }
 
 /*=================================================================
+ * インターフェースを登録一覧から外す。別サブネットの別名インターフェースを
+ * 一時的に足して外す(`routetest`)ような用途のためのもので、常用の経路では
+ * 呼ばれない。登録されていなければ何もしない。
+ *
+ * 引数:
+ *   ctx - 外すインターフェース
+ * コール元:
+ *   shell_routetest()
+ * ===============================================================*/
+void netif_unregister(netif_t *ctx)
+{
+    smp_spin_lock(&s_registered_lock);
+    for (unsigned i = 0; i < s_registered_count; i++) {
+        if (s_registered[i] != ctx) continue;
+        for (unsigned j = i + 1; j < s_registered_count; j++) {
+            s_registered[j - 1] = s_registered[j];
+        }
+        s_registered_count--;
+        ctx->is_poll_owner = 0;
+        break;
+    }
+    smp_spin_unlock(&s_registered_lock);
+}
+
+/*=================================================================
  * インターフェースのポーリング担当コアを変更する(target を core1 へ移す等)。
  *
  * 引数:
@@ -386,6 +413,30 @@ static netif_t *netif_resolve_frame_owner(netif_t *poller, const net_buf_t *nb)
         }
     }
     return poller;
+}
+
+/*=================================================================
+ * 宛先アドレスから送信に使う宛先 MAC を解決する。宛先が自分のサブネット外
+ * なら「宛先の MAC」ではなく「ゲートウェイの MAC」を引くのが要点で、
+ * L3 の宛先アドレスはそのままにして L2 の宛先だけをルータへ向ける。
+ *
+ * TCP の送信ホットパスは同じ判定を tcp_resolve_mac() に持っており
+ * (キャッシュ照合を挟むため)、こちらは UDP/シェルなどの冷たい経路が使う。
+ *
+ * 引数:
+ *   dst     - 宛先アドレス(IPv4/IPv6)
+ *   out_mac - 解決した MAC の格納先
+ * 戻り値:
+ *   0=解決できた、-1=失敗
+ * コール元:
+ *   shell_udptest(), shell_udptest6(), shell_routetest()
+ * ===============================================================*/
+int net_resolve_mac(const netaddr_t *dst, uint8_t out_mac[ETH_ALEN])
+{
+    if (dst->family == NETADDR_V6) {
+        return ndp_resolve(netif_next_hop6(g_active_ctx, dst->a), out_mac);
+    }
+    return arp_resolve(netif_next_hop4(g_active_ctx, netaddr_v4_host(dst)), out_mac);
 }
 
 #define NET_POLL_BATCH_MAX 64u

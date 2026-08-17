@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include "net_buf.h"
+#include "netaddr.h"
 #include "smp.h"
 
 #define ETH_ALEN            6
@@ -76,6 +77,13 @@ typedef struct netif {
     const char *name;   /* ログ/`net use`コマンド用の識別子("rp1","mlx5-pf0"等) */
     uint8_t     mac[ETH_ALEN];
     uint32_t    ip;      /* 自機IPv4(ホストバイトオーダー)。net.hのNET_SELF_IPが参照する */
+    /* ルーティング(経路表は「デフォルトゲートウェイ 1 本」で足りる。宛先が
+     * 自分のサブネット外なら、L2 の解決先を宛先ではなくゲートウェイにする)。
+     * gateway=0 なら未設定で、全ての宛先を同一リンク上として扱う従来の挙動。 */
+    uint32_t    netmask;        /* IPv4 サブネットマスク(ホストバイトオーダー) */
+    uint32_t    gateway;        /* IPv4 デフォルトゲートウェイ。0=未設定 */
+    uint8_t     gateway6[16];   /* IPv6 デフォルトルータ(通常はリンクローカル) */
+    uint8_t     gateway6_set;   /* 1=gateway6 が有効。毎パケットの 16 バイト走査を避ける */
     const nic_ops_t *nic;
     void       *nic_priv;
     arp_cache_entry_t arp_cache[ARP_CACHE_SIZE];
@@ -110,7 +118,58 @@ netif_t *netif_find_by_ip(uint32_t ip);
 
 netif_t *netif_find_by_ip6(const uint8_t addr[16]);
 
+void netif_unregister(netif_t *ctx);
+
 int net_poll_all_and_dispatch(void);
+
+/*=================================================================
+ * dst へ送るとき、実際に L2 アドレスを解決すべき相手(次ホップ)の IPv4 を
+ * 返す。同一サブネットなら宛先そのもの、サブネット外ならゲートウェイ。
+ *
+ * 引数:
+ *   ni  - 送信元インターフェース(NULL 可)
+ *   dst - 宛先 IPv4(ホストバイトオーダー)
+ * 戻り値:
+ *   ARP を引くべき IPv4(ホストバイトオーダー)
+ * コール元:
+ *   tcp_resolve_mac(), net_resolve_mac(), shell_route()
+ * ===============================================================*/
+static inline uint32_t netif_next_hop4(const netif_t *ni, uint32_t dst)
+{
+    /* ゲートウェイ未設定なら従来どおり「宛先は必ず同一リンク上」。 */
+    if (!ni || ni->gateway == 0u || ni->netmask == 0u) return dst;
+    /* ブロードキャストとマルチキャストはルータへ渡さない。 */
+    if (dst == 0xFFFFFFFFu) return dst;
+    if ((dst & 0xF0000000u) == 0xE0000000u) return dst;
+    /* 同一サブネットなら宛先を直接解決する(サブネットブロードキャストも
+     * マスク内なのでこの判定に含まれる)。 */
+    if (((dst ^ ni->ip) & ni->netmask) == 0u) return dst;
+    return ni->gateway;
+}
+
+/*=================================================================
+ * netif_next_hop4() の IPv6 版。戻り値は dst か ni->gateway6 のどちらかを
+ * 指すポインタで、コピーは発生しない。
+ *
+ * 引数:
+ *   ni  - 送信元インターフェース(NULL 可)
+ *   dst - 宛先 IPv6(16 バイト)
+ * 戻り値:
+ *   NDP を引くべきアドレスへのポインタ
+ * コール元:
+ *   tcp_resolve_mac(), net_resolve_mac(), shell_route()
+ * ===============================================================*/
+static inline const uint8_t *netif_next_hop6(const netif_t *ni, const uint8_t dst[16])
+{
+    if (!ni || !ni->gateway6_set) return dst;
+    if (dst[0] == 0xFFu) return dst;                              /* ff00::/8 マルチキャスト */
+    if (dst[0] == 0xFEu && (dst[1] & 0xC0u) == 0x80u) return dst; /* fe80::/10 リンクローカル */
+    return ni->gateway6;
+}
+
+/* dst への送信に使う宛先 MAC を解決する(必要ならゲートウェイの MAC を引く)。
+ * IPv4 は ARP、IPv6 は NDP。0=解決できた、-1=失敗。 */
+int net_resolve_mac(const netaddr_t *dst, uint8_t out_mac[ETH_ALEN]);
 
 static inline uint32_t net_active_ip(void)
 {

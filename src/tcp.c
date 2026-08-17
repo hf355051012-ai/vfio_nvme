@@ -581,15 +581,14 @@ static inline unsigned tcp_l4_off(const netaddr_t *a)
 }
 
 /*=================================================================
- * 送信先 MAC を解決する。IPv4 は ARP、IPv6 は NDP。
+ * 相手の family に応じた広告 MSS の上限を返す。
  *
  * 引数:
- *   remote  - 相手のアドレス
- *   out_mac - 解決した MAC の格納先
+ *   remote - 相手のアドレス(family だけ見る)
  * 戻り値:
- *   0=解決できた、-1=失敗
+ *   広告してよい MSS の上限
  * コール元:
- *   tcp_send_segment(), tcp_send_segment_lso(), tcp_send_bare_ack()
+ *   tcp_send_segment() 系(SYN の MSS オプション組み立て)
  * ===============================================================*/
 static inline uint16_t tcp_mss_cap_for(const netaddr_t *remote)
 {
@@ -604,12 +603,27 @@ static inline uint16_t tcp_mss_cap_for(const netaddr_t *remote)
     return cap;
 }
 
+/*=================================================================
+ * 送信先 MAC を解決する。IPv4 は ARP、IPv6 は NDP。宛先が自分のサブネット
+ * 外ならゲートウェイの MAC を引く(netif_next_hop4/6)。
+ *
+ * 引数:
+ *   remote  - 相手のアドレス
+ *   out_mac - 解決した MAC の格納先
+ * 戻り値:
+ *   0=解決できた、-1=失敗
+ * コール元:
+ *   tcp_send_segment(), tcp_send_segment_lso(), tcp_send_bare_ack()
+ * ===============================================================*/
 static inline int tcp_resolve_mac(const netaddr_t *remote, uint8_t out_mac[ETH_ALEN])
 {
+    /* 解決する相手は「宛先」ではなく「次ホップ」。同一サブネットなら両者は
+     * 同じで、サブネット外ならゲートウェイになる(L3 の宛先は変えず、L2 の
+     * 宛先だけをルータへ向ける)。ゲートウェイ未設定なら分岐 1 個で素通りする。 */
     if (remote->family == NETADDR_V6) {
-        return ndp_resolve(remote->a, out_mac);
+        return ndp_resolve(netif_next_hop6(g_active_ctx, remote->a), out_mac);
     }
-    uint32_t ip = netaddr_v4_host(remote);
+    uint32_t ip = netif_next_hop4(g_active_ctx, netaddr_v4_host(remote));
     if (arp_cache_lookup(ip, out_mac) == 0) return 0;
     return arp_resolve(ip, out_mac);
 }

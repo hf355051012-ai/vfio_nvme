@@ -1044,6 +1044,13 @@ static void mlx5_netif_setup(netif_t *ctx, mlx5_net_state_t *st, mlx5_dev_t *dev
     ctx->mac[0] = 0x02; ctx->mac[1] = 0x00; ctx->mac[2] = 0x00;
     ctx->mac[3] = 0x00; ctx->mac[4] = 0x10; ctx->mac[5] = mac_low_octet;
     ctx->ip = ip;
+    /* 2 ポートは DAC 直結の同一リンクなので、ゲートウェイは未設定(=全ての
+     * 宛先を同一リンク上として扱う従来の挙動)。netmask だけ入れておけば、
+     * `route` でゲートウェイを設定した瞬間からサブネット判定が効く。 */
+    ctx->netmask = ip_from_octets(255, 255, 255, 0);
+    ctx->gateway = 0u;
+    for (unsigned i = 0; i < 16; i++) ctx->gateway6[i] = 0u;
+    ctx->gateway6_set = 0u;
     ctx->nic = &s_mlx5_net_ops;
     ctx->nic_priv = st;
     {
