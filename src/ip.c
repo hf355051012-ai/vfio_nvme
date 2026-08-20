@@ -11,6 +11,9 @@
 #include "pmtu.h"
 #include "netaddr.h"
 
+/* [切り分け] Ethernet RX へ複製されて来た RoCEv2(UDP 4791)を数える。 */
+volatile uint32_t g_roce_rx_seen;
+
 #define IP_OFF_VER_IHL     offsetof(ip_header_t, ver_ihl)
 #define IP_OFF_TOS         offsetof(ip_header_t, tos)
 #define IP_OFF_TOTAL_LEN   offsetof(ip_header_t, total_len)
@@ -172,6 +175,14 @@ void ip_handle_frame(const uint8_t *payload, size_t len, const uint8_t *src_mac)
                                  : 0u;
             if (dport != UDP_PORT_ROCEV2) {
                 icmp_send_dest_unreach(ICMP_CODE_PORT_UNREACH, payload, len, src_ip, src_mac);
+            } else if (g_roce_rx_seen < 12u) {
+                /* [切り分け] RoCEv2 が Ethernet RX に複製されて来ているか。
+                 * ここに出るなら「フレームは受信側 PF まで届いている」。 */
+                g_roce_rx_seen++;
+                uart_printf("[IP] RoCEv2 RX: %u.%u.%u.%u -> %u.%u.%u.%u len=%u\n",
+                            src_ip[0], src_ip[1], src_ip[2], src_ip[3],
+                            dst_ip_oct[0], dst_ip_oct[1], dst_ip_oct[2], dst_ip_oct[3],
+                            (unsigned)ip_payload_len);
             }
         }
     } else {

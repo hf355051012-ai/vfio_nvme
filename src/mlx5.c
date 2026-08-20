@@ -286,6 +286,17 @@ int mlx5_hca_bringup(mlx5_dev_t *dev, const char *label, int monitor_only) {
     uart_printf("mlx5: QUERY_HCA_CAP(general, cur) ok\n");
     uart_printf("mlx5: num_ports=%u lag_master=%u num_lag_ports=%u\n",
                 hca_cap[55], (uint8_t)((hca_cap[79] >> 4) & 0x1u), (uint8_t)(hca_cap[79] & 0xFu));
+    /* native_port_num = bit 0x608、num_vhca_ports = bit 0x610
+     * (struct mlx5_ifc_cmd_hca_cap_bits より)。**num_vhca_ports が 0 でない
+     * HCA では SET/QUERY_ROCE_ADDRESS に vhca_port_num を入れる必要がある**
+     * (Linux の mlx5_core_roce_gid_set() が同じ条件で入れている)。 */
+    dev->num_vhca_ports = hca_cap[194];
+    /* disable_local_lb_uc = bit 0x3e1、disable_local_lb_mc = bit 0x3e2
+     * (struct mlx5_ifc_cmd_hca_cap_bits より、byte 124 の 0x40 / 0x20)。 */
+    dev->can_disable_lb_uc = (uint8_t)((hca_cap[124] & 0x40u) ? 1u : 0u);
+    uart_printf("mlx5: native_port_num=%u num_vhca_ports=%u disable_local_lb(uc=%u mc=%u)\n",
+                hca_cap[193], hca_cap[194], dev->can_disable_lb_uc,
+                (unsigned)((hca_cap[124] & 0x20u) ? 1u : 0u));
 
     dev->clock_khz = ((uint32_t)hca_cap[156] << 24) | ((uint32_t)hca_cap[157] << 16) |
                       ((uint32_t)hca_cap[158] << 8) | (uint32_t)hca_cap[159];
@@ -2153,6 +2164,48 @@ int mlx5_set_roce_address(mlx5_dev_t *dev, uint32_t index, const uint8_t gid[16]
     return 0;
 }
 
+/*=================================================================
+ * QUERY_ROCE_ADDRESS で GID テーブルの中身を読み戻す(登録の検算用)。
+ *
+ * 引数:
+ *   dev       - 対象 HCA
+ *   index     - GID テーブルのインデックス
+ *   port_num  - vhca_port_num(0=指定しない)
+ *   out_gid   - 16 バイトの格納先
+ *   out_mac   - 6 バイトの格納先
+ *   out_l3    - roce_l3_type / out_ver - roce_version
+ * 戻り値:
+ *   0=成功、-1=コマンド失敗
+ * コール元:
+ *   rdma_cm_setup_gsi()
+ * ===============================================================*/
+int mlx5_query_roce_address(mlx5_dev_t *dev, uint32_t index, uint8_t port_num,
+                            uint8_t out_gid[16], uint8_t out_mac[6],
+                            uint8_t *out_l3, uint8_t *out_ver) {
+    uint8_t in[16] = {0};
+    in[0] = (uint8_t)(MLX5_CMD_OP_QUERY_ROCE_ADDRESS >> 8);
+    in[1] = (uint8_t)(MLX5_CMD_OP_QUERY_ROCE_ADDRESS & 0xffu);
+    in[8] = (uint8_t)(index >> 8);
+    in[9] = (uint8_t)(index & 0xffu);
+    in[11] = (uint8_t)(port_num & 0x0Fu);
+
+    uint8_t out[16 + 32] = {0};
+    int rc = mlx5_cmd_exec(dev, in, sizeof(in), out, sizeof(out));
+    if (rc != 0) return rc;
+    if (out[0] != 0) {
+        uint32_t syndrome = ((uint32_t)out[4] << 24) | ((uint32_t)out[5] << 16) |
+                             ((uint32_t)out[6] << 8) | out[7];
+        uart_printf("mlx5: QUERY_ROCE_ADDRESS(index=%u port=%u): status=0x%02x syndrome=0x%08x\n",
+                    (unsigned)index, (unsigned)port_num, out[0], syndrome);
+        return -1;
+    }
+    for (unsigned i = 0; i < 16; i++) out_gid[i] = out[16 + i];
+    for (unsigned i = 0; i < 6; i++)  out_mac[i] = out[34 + i];
+    if (out_l3)  *out_l3  = (uint8_t)(out[42] & 0x0Fu);
+    if (out_ver) *out_ver = out[43];
+    return 0;
+}
+
 #define MLX5_CMD_OP_CREATE_QP     0x500u
 #define MLX5_CMD_OP_DESTROY_QP    0x501u
 #define MLX5_CMD_OP_RST2INIT_QP   0x502u
@@ -2297,6 +2350,12 @@ static int mlx5_nic_vport_enable_roce(mlx5_dev_t *dev) {
     in[1] = (uint8_t)(MLX5_CMD_OP_MODIFY_NIC_VPORT_CONTEXT & 0xffu);
     in[15] |= 0x02u; // field_select.roce_en=1
     in[259] |= 0x01u; // nic_vport_context.roce_en=1
+
+    /* **ユニキャストのローカルループバックは切らない。** 一度
+     * field_select.disable_uc_local_lb(bit20 -> byte14 の 0x08)と
+     * nic_vport_context.disable_uc_local_lb(bit30 -> byte259 の 0x02)を
+     * 立てて試したが、RoCEv2 不通の症状は 1 ミリも変わらなかったので戻した。
+     * 同じことを繰り返さないための記録(cap は can_disable_lb_uc で見える)。 */
 
     uint8_t out[16];
     int rc = mlx5_cmd_exec(dev, in, sizeof(in), out, sizeof(out));

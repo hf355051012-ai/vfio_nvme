@@ -84,6 +84,8 @@ typedef struct {
     uint32_t sq_cqn; // SQ用CQ(RQ用とは別)
     uint32_t sqn;
     uint32_t port_mtu;
+    uint8_t  num_vhca_ports;  /* HCA cap bit 0x610。非0なら ROCE_ADDRESS に vhca_port_num が要る */
+    uint8_t  can_disable_lb_uc; /* HCA cap bit 0x3e1。vport のユニキャストloopbackを切れるか */
     uint32_t clock_khz;
     uint32_t max_lso_bytes;
     uint8_t log_max_ra_req_qp; // 自分がinitiatorとして持てる同時RDMA_READ/ATOMIC数
@@ -138,6 +140,9 @@ int mlx5_net_register_dual(mlx5_dev_t *dev0, mlx5_dev_t *dev1);
 void mlx5_build_roce_gid_v4(uint32_t ipv4_host_order, uint8_t out_gid[16]);
 
 int mlx5_set_roce_address(mlx5_dev_t *dev, uint32_t index, const uint8_t gid[16], const uint8_t mac[6]);
+int mlx5_query_roce_address(mlx5_dev_t *dev, uint32_t index, uint8_t port_num,
+                            uint8_t out_gid[16], uint8_t out_mac[6],
+                            uint8_t *out_l3, uint8_t *out_ver);
 
 typedef struct {
     int      in_use;

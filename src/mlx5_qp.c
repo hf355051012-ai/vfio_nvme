@@ -606,6 +606,17 @@ int mlx5_qp_poll_cqe_gsi(mlx5_dev_t *dev, mlx5_qp_t *qp, int *out_is_send,
         return 0;
     }
 
+    /* [切り分け] この CQE が本当に自分の QP のものか。sop_drop_qpn(byte56-59)の
+     * 下位 24bit が QPN、wqe_counter は byte60-61。 */
+    {
+        uint32_t cqe_qpn = (((uint32_t)cqe[57] << 16) | ((uint32_t)cqe[58] << 8) | cqe[59]);
+        uint32_t wqe_cnt = ((uint32_t)cqe[60] << 8) | cqe[61];
+        uint32_t bcnt    = ((uint32_t)cqe[44] << 24) | ((uint32_t)cqe[45] << 16) |
+                           ((uint32_t)cqe[46] << 8) | cqe[47];
+        uart_printf("mlx5qp: [DBG] GSI CQE op=%u own=%u qpn=%u(自qpn=%u) wqe_cnt=%u byte_cnt=%u\n",
+                    opcode, owner_bit, cqe_qpn, qp->qpn, wqe_cnt, bcnt);
+    }
+
     qp->cq_cc++;
     volatile uint8_t *dbr = (volatile uint8_t *)(uintptr_t)dev->gsi_cq_dbr_cpu;
     dbr[0] = (uint8_t)(qp->cq_cc >> 24);

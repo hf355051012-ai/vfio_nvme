@@ -214,6 +214,25 @@ static int rdma_cm_setup_gsi(rdma_cm_ctx_t *ctx) {
         uart_printf("rdma_cm: FAILED (SET_ROCE_ADDRESS)\n");
         return -1;
     }
+    /* [切り分け] 登録した GID テーブル index0 を読み戻す。vhca_port_num を
+     * 0 と 1 の両方で引いて、どちらの表に入ったのかを見る。 */
+    for (uint8_t vp = 0; vp <= 1u; vp++) {
+        uint8_t g[16], m[6], l3 = 0, ver = 0;
+        if (mlx5_query_roce_address(ctx->dev, 0, vp, g, m, &l3, &ver) == 0) {
+            uart_printf("rdma_cm: [DBG] GID[0] vhca_port=%u -> ipv4=%u.%u.%u.%u "
+                        "mac=%02x:%02x:%02x:%02x:%02x:%02x l3=%u ver=%u\n",
+                        vp, g[12], g[13], g[14], g[15],
+                        m[0], m[1], m[2], m[3], m[4], m[5], l3, ver);
+        }
+    }
+    uart_printf("rdma_cm: [DBG] 期待値 own=%u.%u.%u.%u/%02x:%02x:%02x:%02x:%02x:%02x "
+                "peer=%u.%u.%u.%u/%02x:%02x:%02x:%02x:%02x:%02x\n",
+                ctx->own_gid[12], ctx->own_gid[13], ctx->own_gid[14], ctx->own_gid[15],
+                ctx->own_mac[0], ctx->own_mac[1], ctx->own_mac[2],
+                ctx->own_mac[3], ctx->own_mac[4], ctx->own_mac[5],
+                ctx->peer_gid[12], ctx->peer_gid[13], ctx->peer_gid[14], ctx->peer_gid[15],
+                ctx->peer_mac[0], ctx->peer_mac[1], ctx->peer_mac[2],
+                ctx->peer_mac[3], ctx->peer_mac[4], ctx->peer_mac[5]);
     ctx->gsi_qp->local_gid_index = 0;
     if (mlx5_qp_modify_rst2init_ud(ctx->dev, ctx->gsi_qp, IB_QP1_QKEY) != 0 ||
         mlx5_qp_modify_init2rtr_ud(ctx->dev, ctx->gsi_qp) != 0 ||
@@ -353,6 +372,13 @@ job_result_t rdma_cm_job_step(job_t *self) {
                 return JOB_WAITING;
             }
             // REP以外(想定外)は無視して再度RECVを構える。
+            {
+                const volatile uint8_t *pp = &ctx->recv_buf[MLX5_GRH_BYTES + IB_MAD_HDR_LEN];
+                uart_printf("rdma_cm: [DBG] 想定外MAD attr_id=0x%04x local_comm=0x%08x "
+                            "remote_comm=0x%08x (自分の local_comm=0x%08x)\n",
+                            rdma_cm_recv_attr_id(ctx->recv_buf),
+                            rd32be_ib(&pp[0]), rd32be_ib(&pp[4]), ctx->local_comm_id);
+            }
             mlx5_qp_post_recv_gsi(ctx->dev, ctx->gsi_qp, (void *)(uintptr_t)ctx->recv_buf,
                                   sizeof(ctx->recv_buf));
             return JOB_WAITING;
