@@ -806,9 +806,42 @@ static int nvmer_conn_reusable(nvme_rdma_ctx_t *ctx, mlx5_dev_t *dev)
  * ===============================================================*/
 static void nvmer_destroy_qp_if_valid(mlx5_dev_t *dev, mlx5_qp_t *qp)
 {
-    if (dev != 0 && qp->qpn != 0) {
+    if (dev != 0 && qp != 0 && qp->qpn != 0) {
         mlx5_qp_destroy(dev, qp);
     }
+}
+
+/*=================================================================
+ * ctx を作り直す前に、それを参照しているジョブを止めて完全に抜けるまで待つ。
+ *
+ * **待たずにゼロクリアすると落ちる。** CM が失敗しても passive 側の CM ジョブ
+ * (ctx は `&s_*_ctx.cm`)は誰も止めないので core1 で回り続ける。その状態で
+ * ctx をゼロクリアすると `gsi_qp` が NULL になった瞬間を CM ジョブが踏み、
+ * `mlx5_qp_poll_cqe_gsi+0xf` で segfault する(実機で 3 回再現した)。
+ * `stop_requested` は nvmet_rdma のジョブしか見ないので、CM ジョブには
+ * cancel_requested を立てる必要がある。
+ *
+ * 引数:
+ *   ctx_a / ctx_b   - 止めたいジョブのコンテキスト(ctx_b は NULL 可)
+ *   timeout_ms_val  - 待ちの上限
+ * コール元:
+ *   nvme_rdma_run_bench()
+ * ===============================================================*/
+static void nvmer_quiesce_jobs(const void *ctx_a, const void *ctx_b, unsigned timeout_ms_val)
+{
+    job_cancel_by_ctx(ctx_a);
+    if (ctx_b != 0) job_cancel_by_ctx(ctx_b);
+
+    uint64_t t0 = timer_now();
+    while (!timeout_ms(t0, (uint64_t)timeout_ms_val)) {
+        if (job_count_by_ctx(ctx_a) == 0 &&
+            (ctx_b == 0 || job_count_by_ctx(ctx_b) == 0)) {
+            return;
+        }
+        job_scheduler_tick();   /* core0 に pin されたジョブはこちらで回す */
+    }
+    uart_printf("[!] nvme-rdma: ジョブが %u ms で止まらなかった(ctx を作り直せない)\n",
+                timeout_ms_val);
 }
 
 /*=================================================================
@@ -874,6 +907,8 @@ void nvme_rdma_run_bench(mlx5_dev_t *dev0, mlx5_dev_t *dev1, uint32_t duration_m
     int init_ok = target_ok && nvmer_conn_reusable(&s_init_ctx, dev0);
 
     if (!target_ok) {
+        /* 前回のターゲットジョブと CM ジョブ(core1)を先に止め切る。 */
+        nvmer_quiesce_jobs(&s_target_ctx, &s_target_ctx.cm, 2000u);
         nvmer_destroy_qp_if_valid(s_target_ctx.cm.dev, &s_target_ctx.cm.rc_qp);
         nvmer_destroy_qp_if_valid(s_target_ctx.cm.dev, s_target_ctx.cm.gsi_qp);
         for (uint32_t i = 0; i < sizeof(s_target_ctx); i++) ((uint8_t *)&s_target_ctx)[i] = 0;
@@ -913,6 +948,7 @@ void nvme_rdma_run_bench(mlx5_dev_t *dev0, mlx5_dev_t *dev1, uint32_t duration_m
         }
         init_job->state = nvmer_resume_state_after_identify(&s_init_ctx);
     } else {
+        nvmer_quiesce_jobs(&s_init_ctx, &s_init_ctx.cm, 2000u);
         nvmer_destroy_qp_if_valid(s_init_ctx.cm.dev, &s_init_ctx.cm.rc_qp);
         nvmer_destroy_qp_if_valid(s_init_ctx.cm.dev, s_init_ctx.cm.gsi_qp);
         for (uint32_t i = 0; i < sizeof(s_init_ctx); i++) ((uint8_t *)&s_init_ctx)[i] = 0;
@@ -952,6 +988,11 @@ void nvme_rdma_run_bench(mlx5_dev_t *dev0, mlx5_dev_t *dev1, uint32_t duration_m
     } else {
         s_target_ctx.stop_requested = 1;
         s_init_ctx.stop_requested = 1;
+        /* **CM ジョブは stop_requested を見ない。** ここで止めておかないと
+         * CM 失敗後も core1 で回り続け、次の bench が ctx を作り直すときに
+         * 事故になる。 */
+        job_cancel_by_ctx(&s_target_ctx.cm);
+        job_cancel_by_ctx(&s_init_ctx.cm);
         s_target_resident = 0;
     }
     {

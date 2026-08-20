@@ -37,6 +37,14 @@ void job_scheduler_tick(void);
 /* 現在アクティブなジョブ数。 */
 unsigned job_active_count(void);
 
+/* 指定の ctx を参照しているアクティブなジョブへ停止を要求する(戻り値=要求した数)。
+ * **ジョブの ctx を作り直したりゼロクリアする前に必ず呼ぶこと。** 他コアで
+ * 走っているジョブが古い ctx を触り続けると NULL を踏んで落ちる。 */
+unsigned job_cancel_by_ctx(const void *ctx);
+
+/* 指定の ctx を参照しているアクティブなジョブの数(0 になれば触ってよい)。 */
+unsigned job_count_by_ctx(const void *ctx);
+
 void job_list_dump(void);
 
 #endif /* JOB_H */

@@ -149,6 +149,56 @@ unsigned job_active_count(void)
 }
 
 /*=================================================================
+ * 指定の ctx を参照しているジョブへ停止を要求する。
+ *
+ * **ジョブの ctx をゼロクリア/再初期化する前にこれを呼び、job_count_by_ctx()
+ * が 0 になるまで待つこと。** RDMA の CM ジョブは他コア(core1)で走っている
+ * ので、待たずに ctx を潰すと gsi_qp が NULL になった瞬間を踏んで落ちる
+ * (実機で segfault: mlx5_qp_poll_cqe_gsi+0xf)。
+ *
+ * 引数:
+ *   ctx - job_spawn() に渡したコンテキストのアドレス
+ * 戻り値:
+ *   停止を要求したジョブ数
+ * コール元:
+ *   nvmer_quiesce_jobs()
+ * ===============================================================*/
+unsigned job_cancel_by_ctx(const void *ctx)
+{
+    smp_spin_lock(&s_job_lock);
+    unsigned n = 0;
+    for (unsigned i = 0; i < JOB_MAX; i++) {
+        if (s_jobs[i].in_use && s_jobs[i].ctx == ctx) {
+            s_jobs[i].cancel_requested = 1;
+            n++;
+        }
+    }
+    smp_spin_unlock(&s_job_lock);
+    return n;
+}
+
+/*=================================================================
+ * 指定の ctx を参照しているアクティブなジョブ数。
+ *
+ * 引数:
+ *   ctx - job_spawn() に渡したコンテキストのアドレス
+ * 戻り値:
+ *   まだ居るジョブ数(0 なら ctx を触ってよい)
+ * コール元:
+ *   nvmer_quiesce_jobs()
+ * ===============================================================*/
+unsigned job_count_by_ctx(const void *ctx)
+{
+    smp_spin_lock(&s_job_lock);
+    unsigned n = 0;
+    for (unsigned i = 0; i < JOB_MAX; i++) {
+        if (s_jobs[i].in_use && s_jobs[i].ctx == ctx) n++;
+    }
+    smp_spin_unlock(&s_job_lock);
+    return n;
+}
+
+/*=================================================================
  * アクティブなジョブの一覧(名前と state)を表示する。シェルの `jobs`。
  *
  * コール元:

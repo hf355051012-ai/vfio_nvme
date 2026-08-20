@@ -340,6 +340,9 @@ job_result_t rdma_cm_job_step(job_t *self) {
             self->state = RDMA_CM_ST_DONE_FAIL;
             return JOB_DONE;
         }
+        if (rc == 1 && is_send) {
+            uart_printf("rdma_cm: [DBG] REQ 送信完了CQE 取得 (synd=0x%02x)\n", synd);
+        }
         if (rc == 1 && !is_send) {
             dcache_invalidate_range((const void *)(uintptr_t)ctx->recv_buf, sizeof(ctx->recv_buf));
             if (rdma_cm_recv_attr_id(ctx->recv_buf) == CM_REP_ATTR_ID) {

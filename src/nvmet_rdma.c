@@ -301,7 +301,7 @@ static void nvmetr_build_resp_capsule(nvmet_rdma_ctx_t *ctx)
  * ===============================================================*/
 static void nvmetr_destroy_qp_if_valid(mlx5_dev_t *dev, mlx5_qp_t *qp)
 {
-    if (dev != NULL && qp->qpn != 0) {
+    if (dev != NULL && qp != NULL && qp->qpn != 0) {
         mlx5_qp_destroy(dev, qp);
     }
 }
@@ -393,7 +393,8 @@ static void nvmetr_reset_admin_for_reconnect(nvmet_rdma_ctx_t *ctx, job_t *self)
  * ===============================================================*/
 static int nvmetr_check_gsi_disconnect(nvmet_rdma_ctx_t *ctx, job_t *self)
 {
-    if (ctx->queue_id != 0 || ctx->self_label == NULL || !ctx->cm.rtu_phase_done) {
+    if (ctx->queue_id != 0 || ctx->self_label == NULL || !ctx->cm.rtu_phase_done ||
+        ctx->cm.gsi_qp == NULL) {
         return 0;
     }
 

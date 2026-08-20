@@ -185,6 +185,77 @@ RDMA_READ を投げた瞬間に **`REMOTE_INVAL_REQ_ERR`(syndrome=0x12)**にな�
 システムではロックが必要」と注記しているのと同じ理由で、**64bit CPU なら
 必ず単一の 64bit ストアで書くこと**。
 
+## 2 ノード構成(OptiPlex ↔ Raspberry Pi 5)と相互運用テスト
+
+**100GbE MCX456A は外され、25GbE ConnectX-4 Lx(MT27710 `15b3:1015`、
+FW 14.32.1900、PCIe Gen3 x8)に置き換わった。** 2 本の DAC は両方とも Pi5 へ
+行くので、**PF0↔PF1 の直結ループバックはもう存在しない**。
+
+| OptiPlex | | Pi5(`ssh fukud@192.168.3.135`)|
+|---|---|---|
+| PF0 `01:00.0` = 192.168.101.10 | ←DAC→ | `eth2` |
+| PF1 `01:00.1` = 192.168.101.11 | ←DAC→ | `eth1` |
+
+既存の「対向PF」前提のテスト群を生かすため、**Pi5 側で `eth1`+`eth2` を `br0`
+にブリッジする**(STP off / MTU 9500 / `192.168.101.20/24`)。この状態で
+`ping6`〜`pmtutest` と `bench`/`tcpbench` は従来どおり動く。
+
+- **MTU は 9500 が要る。** 自作側は MSS 9216 = フレーム 9270B を出すので、
+  9000 だと**フルサイズのセグメントだけが無言で落ちる**。
+- `eth1`/`eth2` は `nmcli device set <if> managed no` にすること。
+  **ブリッジ設定は再起動で消える**(非永続)。
+- **性能の天井が変わった。** PF0↔PF1 は Pi5 の PCIe Gen3 x1 を通るので
+  約 800 MiB/s で頭打ち。上の「最新の性能」の表(100G 直結)とは条件が違うので
+  **数字を比べてはいけない**。25G 直結へ戻しても線速上限は約 2980 MiB/s。
+- OptiPlex 側の常駐シェルは `~/script/vn_start.sh` / `vn_cmd.sh "<cmd>" [秒]` /
+  `vn_stop.sh` で操作する(FIFO を開いたままにするので EOF で死なない)。
+  **FIFO は読み手が居ないと書き込みがブロックする**ので `vn_cmd.sh` は先に
+  プロセスの生存を確認する。
+
+### 自己ループバックでは絶対に見えなかった不具合(Linux と繋いで判明)
+
+**どちらも「自作イニシエータがその手順を踏まないから見えなかった」形。**
+
+1. **IO キューの切断で admin キューまで能動 close していた。** Linux は
+   「IO キュー切断 → admin へ CC.SHN(Property Set offset 0x14)→ admin 切断」の
+   順に畳む。途中で admin を切ると CC.SHN が無応答になり、ホスト側で
+   **60 秒のコマンドタイムアウト**(`Property Set error: 881` =
+   `NVME_SC_HOST_ABORTED_CMD` = 0x371)。
+   - 直し方は「IO キューが切れても admin はこちらから閉じない。相手が閉じるか
+     `NVMET_ADMIN_LINGER_MS` 経過するまで応答を続ける」。
+   - **`session_done` を見て ARM へ戻るショートカットが admin の 6 つの state
+     全部にあった。** RECV_HDR だけ直しても、**CC.SHN の PDU ヘッダを読んだ
+     直後の RECV_SQE でコマンドを捨てる**ので症状が変わらない。linger の開始は
+     switch の外に置き、受信途中の state では「admin が切れた or 待ち切れ」の
+     ときだけ畳む。
+2. **CC.SHN を受けても CSTS.SHST を返していなかった。** ホストは CC を書いた
+   あと CSTS.SHST が 10b になるまで待つ(Linux は 5 秒)。返さないと
+   `Device not ready; aborting shutdown, CSTS=0x1` で毎回 5 秒待たされる。
+   1 と合わせて **disconnect が 61 秒 → 1 秒未満**になった。
+3. **RDMA CM が失敗すると次の `bench` で segfault した**
+   (`mlx5_qp_poll_cqe_gsi+0xf` で `gsi_qp` が NULL)。CM が失敗しても
+   **passive 側の CM ジョブは誰も止めない**(`stop_requested` を見るのは
+   nvmet_rdma のジョブだけで、CM ジョブは `cancel_requested` しか見ない)。
+   core1 で回り続けているところへ core0 が ctx をゼロクリアするので、
+   `gsi_qp` が NULL になった瞬間を踏む。**ジョブの ctx を作り直す前に
+   `job_cancel_by_ctx()` + `job_count_by_ctx()` が 0 になるまで待つこと。**
+
+**教訓**: 「相手も自分と同じ手順で喋る」という前提が、切断のような
+**成功パス以外**にこそ残っている。正規実装と繋ぐまで誰も踏まない。
+
+### 未解決: RoCEv2 が CX-4 Lx で動かない
+
+`bench` が `rdma_cm: FAILED (REP timeout, retries exhausted)` で必ず失敗する。
+切り分け済み: **CM REQ の送信完了 CQE は成功(`synd=0x00`)で返るのに、
+Pi5 側のカウンタが 1 つも動かない**(`ethtool -S` の非ゼロカウンタ 109 個が
+全て不変、PHY の受信カウンタも 0)。つまり**フレームがポートから出ていない**
+ので、配線でも相手側でもなく OptiPlex 側の問題。100G の MCX456A では動いて
+いたので CX-4 Lx 固有の差分が疑わしい。`rdma_cm.c` の
+`RDMA_CM_ST_ACTIVE_WAIT_REP` に切り分け用の `[DBG]` 表示を残してある。
+
+**nvmet_rdma.c 側には上記 1・2 の修正を入れていない**(RoCEv2 が動かないので
+検証できないため)。動くようになったら同じ手当てが要る。
+
 ## Linux 側比較ベンチ `~/script/linux_loopback.sh`
 
 **このリポジトリ外**(OptiPlex の `~/script/`、バージョン管理されていない)。
