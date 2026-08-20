@@ -11,6 +11,9 @@
 int g_nvmet_force_pull = 0;
 
 #define NVMET_ACCEPT_TIMEOUT_MS    30000u
+/* IO キューが切れてから admin キューを相手が閉じるのを待つ上限。Linux は
+ * 即座に CC.SHN を書いて閉じるので通常は数 ms しか使わない。 */
+#define NVMET_ADMIN_LINGER_MS      10000u
 
 #define NVMET_ADMIN_DATA_BUF_MAX NVME_TCP_INLINE_DATA_MAX
 
@@ -355,7 +358,17 @@ static int nvmet_admin_dispatch(nvmet_ctx_t *ctx, const nvme_sqe_t *sqe,
             if (offset == NVME_REG_CC) {
                 ctx->cc    = rd32le(&sqe->cdw12);
                 ctx->cc_en = (ctx->cc & NVME_CC_EN) ? 1 : 0;
-                uart_printf("[nvmet:%s] Property Set: CC=0x%x (EN=%d)\n", ctx->label, ctx->cc, ctx->cc_en);
+                /* **CC.SHN を受けたらシャットダウン完了を報告する。** ホストは CC を
+                 * 書いたあと CSTS.SHST が 10b になるまで待つ(Linux は 5 秒)。
+                 * 実装しないと切断のたびに
+                 * `Device not ready; aborting shutdown, CSTS=0x1` で待たされる。 */
+                if (ctx->cc & NVME_CC_SHN_MASK) {
+                    ctx->shutdown_complete = 1;
+                    ctx->cc_en             = 0;   /* シャットダウンしたので RDY は下ろす */
+                }
+                uart_printf("[nvmet:%s] Property Set: CC=0x%x (EN=%d SHN=%u)\n",
+                            ctx->label, ctx->cc, ctx->cc_en,
+                            (unsigned)((ctx->cc & NVME_CC_SHN_MASK) >> 14));
             }
             nvmet_build_cqe(&cqe, ctx->admin.last_cid, 0u, 0);
             nvmet_tcp_send_resp(&ctx->admin, &cqe);
@@ -371,7 +384,8 @@ static int nvmet_admin_dispatch(nvmet_ctx_t *ctx, const nvme_sqe_t *sqe,
                 if (offset == NVME_REG_CC) {
                     value = ctx->cc;
                 } else if (offset == NVME_REG_CSTS) {
-                    value = ctx->cc_en ? NVME_CSTS_RDY : 0u;
+                    value = (ctx->cc_en ? NVME_CSTS_RDY : 0u) |
+                            (ctx->shutdown_complete ? NVME_CSTS_SHST_CMPLT : 0u);
                 }
                 nvmet_build_cqe(&cqe, ctx->admin.last_cid, value, 0);
                 nvmet_tcp_send_resp(&ctx->admin, &cqe);
@@ -504,6 +518,8 @@ typedef struct {
     uint8_t           dgst_buf[4];
     uint32_t          dlen;
     uint8_t           data_buf[NVMET_ADMIN_DATA_BUF_MAX] __attribute__((aligned(64)));
+    int               linger_armed;   /* IOキュー切断後、相手がadminを閉じるのを待っている */
+    uint64_t          linger_ticks;   /* その待ち開始時刻(NVMET_ADMIN_LINGER_MS で打ち切る) */
 } nvmet_admin_job_ctx_t;
 
 static nvmet_admin_job_ctx_t s_admin_job_pool[NVMET_MAX_INSTANCES];
@@ -529,6 +545,36 @@ static job_result_t nvmet_admin_job_setup_fail(job_t *self, nvmet_ctx_t *ctx)
 }
 
 /*=================================================================
+ * admin キューのセッションを畳んで次のクライアント待ちへ戻す。
+ * **コントローラ状態(ctrlr_id/cc/cc_en)をリセットするのはここだけ。**
+ * io job 側で消してはいけない -- IO キューが切れたあとも相手は admin へ
+ * CC.SHN や Keep Alive を投げてくるので、それに答えるまで状態が要る。
+ *
+ * 引数:
+ *   self / jc / ctx - このジョブ、admin ジョブ状態、ターゲットコンテキスト
+ *   reason          - ログに出す終了理由
+ * 戻り値:
+ *   JOB_WAITING(常駐サーバとして継続。次 tick は NADM_ST_ARM)
+ * コール元:
+ *   nvmet_admin_job_step()
+ * ===============================================================*/
+static job_result_t nvmet_admin_session_finish(job_t *self, nvmet_admin_job_ctx_t *jc,
+                                               nvmet_ctx_t *ctx, const char *reason)
+{
+    uart_printf("[nvmet:%s] %s、次のクライアントを待ちます\n", ctx->label, reason);
+    nvmet_tcp_close(&ctx->admin);
+    ctx->is_discovery = 0;
+    ctx->session_done = 0;
+    ctx->ctrlr_id          = 0;
+    ctx->cc                = 0;
+    ctx->cc_en             = 0;
+    ctx->shutdown_complete = 0;
+    jc->linger_armed       = 0;
+    self->state = NADM_ST_ARM;
+    return JOB_WAITING;
+}
+
+/*=================================================================
  * admin queue のステートマシン 1 tick。accept 待ち -> ICReq 受信 -> ICResp
  * 送信(この時点で IO キューの受け皿を arm する)-> 以後はコマンド受信と
  * ディスパッチのループ。セッションが終わっても JOB_DONE にはせず、次の
@@ -545,6 +591,19 @@ static job_result_t nvmet_admin_job_step(job_t *self)
 {
     nvmet_admin_job_ctx_t *jc  = (nvmet_admin_job_ctx_t *)self->ctx;
     nvmet_ctx_t            *ctx = jc->ctx;
+
+    /* **io job が IO キューを畳んでも admin はこちらから閉じない。**
+     * 相手(Linux ホスト)は IO キューを切ったあと admin へ CC.SHN
+     * (Property Set offset 0x14)を書き、それから admin を閉じる。ここで
+     * すぐ ARM へ戻る(= admin を捨てる)と CC.SHN と Keep Alive が無応答に
+     * なり、ホスト側で 60 秒のコマンドタイムアウトになる。
+     * **どの受信 state に居ても linger を開始できるよう switch の外で見る**
+     * -- 受信途中で ARM へ戻ると PDU のヘッダだけ読んでコマンドを捨てること
+     * になり、まさにそれで CC.SHN を落としていた。 */
+    if (ctx->session_done && !jc->linger_armed) {
+        jc->linger_armed = 1;
+        jc->linger_ticks = timer_now();
+    }
 
     switch ((nvmet_admin_state_t)self->state) {
 
@@ -611,7 +670,6 @@ static job_result_t nvmet_admin_job_step(job_t *self)
         return JOB_WAITING;
 
     case NADM_ST_RECV_HDR: {
-        if (ctx->session_done) { ctx->session_done = 0; self->state = NADM_ST_ARM; return JOB_WAITING; }  /* io jobがセッションを終了させた -- 常駐継続のためARMへ戻る */
         /* Discovery セッションは IO キューを作らないので、切断を検出して次の
          * 接続待ちへ戻す io job が居ない。admin 自身で面倒を見る。
          *
@@ -621,16 +679,18 @@ static job_result_t nvmet_admin_job_step(job_t *self)
          * CLOSE_WAIT のまま固まり、**以後この listener が一切 SYN を受け付けなく
          * なった**(実機で踏んだ。C1 で「リスナが居るポートには RST を返さない」
          * ようにしてあるので、相手からは SYN が黙って捨てられるように見える)。 */
-        if (ctx->is_discovery &&
-            (ctx->admin.tcp.state == TCP_CLOSE_WAIT ||
-             ctx->admin.tcp.state == TCP_CLOSED ||
-             ctx->admin.tcp.state == TCP_TIME_WAIT)) {
-            uart_printf("[nvmet:%s] Discovery セッション終了、次のクライアントを待ちます\n",
-                        ctx->label);
-            nvmet_tcp_close(&ctx->admin);
-            ctx->is_discovery = 0;
-            self->state = NADM_ST_ARM;
-            return JOB_WAITING;
+        int peer_gone = (ctx->admin.tcp.state == TCP_CLOSE_WAIT ||
+                         ctx->admin.tcp.state == TCP_CLOSED ||
+                         ctx->admin.tcp.state == TCP_TIME_WAIT);
+        if ((ctx->is_discovery || jc->linger_armed) && peer_gone) {
+            return nvmet_admin_session_finish(self, jc, ctx,
+                                              ctx->is_discovery
+                                                  ? "Discovery セッション終了"
+                                                  : "セッション終了(adminキューも切断された)");
+        }
+        if (jc->linger_armed && timeout_ms(jc->linger_ticks, NVMET_ADMIN_LINGER_MS)) {
+            return nvmet_admin_session_finish(self, jc, ctx,
+                                              "adminキューを相手が閉じないので打ち切り");
         }
         if (ctx->admin.tcp.state != TCP_ESTABLISHED) return JOB_WAITING;  /* 静かに待機 */
 
@@ -648,7 +708,17 @@ static job_result_t nvmet_admin_job_step(job_t *self)
     }
 
     case NADM_ST_RECV_SQE: {
-        if (ctx->session_done) { ctx->session_done = 0; self->state = NADM_ST_ARM; return JOB_WAITING; }
+        /* io job がセッションを終わらせても、**受信中の admin コマンドは
+         * 最後まで処理する**。ここで ARM へ戻ると、相手が切断手順で送ってくる
+         * CC.SHN(Property Set)をヘッダだけ読んで捨てることになり、ホスト側で
+         * 60 秒のコマンドタイムアウトになる(実機で踏んだ)。畳むのは admin
+         * コネクション自体が切れたときだけにする。 */
+        if (jc->linger_armed &&
+            (ctx->admin.tcp.state != TCP_ESTABLISHED ||
+             timeout_ms(jc->linger_ticks, NVMET_ADMIN_LINGER_MS))) {
+            return nvmet_admin_session_finish(self, jc, ctx,
+                                              "セッション終了(adminキュー切断/待ち切れ)");
+        }
         int r = nvmet_tcp_recv_poll(&ctx->admin, &jc->xfer);
         if (r < 0 || r == 0) return JOB_WAITING;
 
@@ -673,7 +743,17 @@ static job_result_t nvmet_admin_job_step(job_t *self)
     }
 
     case NADM_ST_RECV_HDGST: {
-        if (ctx->session_done) { ctx->session_done = 0; self->state = NADM_ST_ARM; return JOB_WAITING; }
+        /* io job がセッションを終わらせても、**受信中の admin コマンドは
+         * 最後まで処理する**。ここで ARM へ戻ると、相手が切断手順で送ってくる
+         * CC.SHN(Property Set)をヘッダだけ読んで捨てることになり、ホスト側で
+         * 60 秒のコマンドタイムアウトになる(実機で踏んだ)。畳むのは admin
+         * コネクション自体が切れたときだけにする。 */
+        if (jc->linger_armed &&
+            (ctx->admin.tcp.state != TCP_ESTABLISHED ||
+             timeout_ms(jc->linger_ticks, NVMET_ADMIN_LINGER_MS))) {
+            return nvmet_admin_session_finish(self, jc, ctx,
+                                              "セッション終了(adminキュー切断/待ち切れ)");
+        }
         int r = nvmet_tcp_recv_poll(&ctx->admin, &jc->xfer);
         if (r < 0 || r == 0) return JOB_WAITING;
         if (nvmet_tcp_verify_hdgst(&ctx->admin, jc->hdr_buf, NVME_TCP_HDR_LEN,
@@ -692,7 +772,17 @@ static job_result_t nvmet_admin_job_step(job_t *self)
     }
 
     case NADM_ST_RECV_DATA: {
-        if (ctx->session_done) { ctx->session_done = 0; self->state = NADM_ST_ARM; return JOB_WAITING; }
+        /* io job がセッションを終わらせても、**受信中の admin コマンドは
+         * 最後まで処理する**。ここで ARM へ戻ると、相手が切断手順で送ってくる
+         * CC.SHN(Property Set)をヘッダだけ読んで捨てることになり、ホスト側で
+         * 60 秒のコマンドタイムアウトになる(実機で踏んだ)。畳むのは admin
+         * コネクション自体が切れたときだけにする。 */
+        if (jc->linger_armed &&
+            (ctx->admin.tcp.state != TCP_ESTABLISHED ||
+             timeout_ms(jc->linger_ticks, NVMET_ADMIN_LINGER_MS))) {
+            return nvmet_admin_session_finish(self, jc, ctx,
+                                              "セッション終了(adminキュー切断/待ち切れ)");
+        }
         int r = nvmet_tcp_recv_poll(&ctx->admin, &jc->xfer);
         if (r < 0 || r == 0) return JOB_WAITING;
         if (ctx->admin.ddgst) {
@@ -705,7 +795,17 @@ static job_result_t nvmet_admin_job_step(job_t *self)
     }
 
     case NADM_ST_RECV_DDGST: {
-        if (ctx->session_done) { ctx->session_done = 0; self->state = NADM_ST_ARM; return JOB_WAITING; }
+        /* io job がセッションを終わらせても、**受信中の admin コマンドは
+         * 最後まで処理する**。ここで ARM へ戻ると、相手が切断手順で送ってくる
+         * CC.SHN(Property Set)をヘッダだけ読んで捨てることになり、ホスト側で
+         * 60 秒のコマンドタイムアウトになる(実機で踏んだ)。畳むのは admin
+         * コネクション自体が切れたときだけにする。 */
+        if (jc->linger_armed &&
+            (ctx->admin.tcp.state != TCP_ESTABLISHED ||
+             timeout_ms(jc->linger_ticks, NVMET_ADMIN_LINGER_MS))) {
+            return nvmet_admin_session_finish(self, jc, ctx,
+                                              "セッション終了(adminキュー切断/待ち切れ)");
+        }
         int r = nvmet_tcp_recv_poll(&ctx->admin, &jc->xfer);
         if (r < 0 || r == 0) return JOB_WAITING;
         if (nvmet_tcp_verify_ddgst(&ctx->admin, jc->data_buf, jc->dlen, jc->dgst_buf) != 0) {
@@ -718,7 +818,17 @@ static job_result_t nvmet_admin_job_step(job_t *self)
     }
 
     case NADM_ST_DISPATCH: {
-        if (ctx->session_done) { ctx->session_done = 0; self->state = NADM_ST_ARM; return JOB_WAITING; }
+        /* io job がセッションを終わらせても、**受信中の admin コマンドは
+         * 最後まで処理する**。ここで ARM へ戻ると、相手が切断手順で送ってくる
+         * CC.SHN(Property Set)をヘッダだけ読んで捨てることになり、ホスト側で
+         * 60 秒のコマンドタイムアウトになる(実機で踏んだ)。畳むのは admin
+         * コネクション自体が切れたときだけにする。 */
+        if (jc->linger_armed &&
+            (ctx->admin.tcp.state != TCP_ESTABLISHED ||
+             timeout_ms(jc->linger_ticks, NVMET_ADMIN_LINGER_MS))) {
+            return nvmet_admin_session_finish(self, jc, ctx,
+                                              "セッション終了(adminキュー切断/待ち切れ)");
+        }
         nvme_sqe_t sqe;
         volatile_fast_copy((volatile uint8_t *)&sqe,
                             (const volatile uint8_t *)jc->sqe_buf, NVME_SQE_LEN);
@@ -916,11 +1026,16 @@ static job_result_t nvmet_io_job_end(job_t *self, nvmet_ctx_t *ctx, int close_io
         nvmet_tcp_close(&ctx->io);
     }
     ctx->io_connected = 0;
-    nvmet_tcp_close(&ctx->admin);
 
-    ctx->ctrlr_id = 0;
-    ctx->cc       = 0;
-    ctx->cc_en    = 0;
+    /* **admin キューはここで閉じない。** Linux ホストは切断時に
+     * 「IO キュー切断 -> admin へ CC.SHN(Property Set offset 0x14)-> admin 切断」
+     * の順で畳む。ここで能動 close すると CC.SHN の応答が返らず、ホスト側で
+     * **60 秒のコマンドタイムアウト**になる(実機で踏んだ:
+     * `Property Set error: 881` = NVME_SC_HOST_ABORTED_CMD = 0x371)。
+     * Keep Alive も同じ理由で取りこぼしていた。相手が閉じるまで admin を
+     * 生かして応答を続け、後始末は admin job(nvmet_admin_session_finish())が
+     * 行う。コントローラ状態(ctrlr_id/cc/cc_en)もそれまで応答に要るので
+     * ここではリセットしない。 */
     ctx->io_armed = 0;
     for (unsigned i = 0; i < NVMET_MAX_PENDING_WRITES; i++) {
         ctx->pending_writes[i].in_use = 0;
@@ -1871,11 +1986,12 @@ int nvmet_job_start(nvmet_ctx_t *ctx, uint16_t port, netif_t *bound_ctx, const c
         return -1;
     }
 
-    ctx->io_connected   = 0;
-    ctx->ctrlr_id       = 0;
-    ctx->cc             = 0;
-    ctx->cc_en          = 0;
-    ctx->io_armed       = 0;
+    ctx->io_connected      = 0;
+    ctx->ctrlr_id          = 0;
+    ctx->cc                = 0;
+    ctx->cc_en             = 0;
+    ctx->shutdown_complete = 0;
+    ctx->io_armed          = 0;
     ctx->admin_failed   = 0;
     ctx->session_done   = 0;
     ctx->session_active = 1;

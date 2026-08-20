@@ -69,11 +69,13 @@ _Static_assert(sizeof(nvme_keyed_sgl_desc_t) == 16, "must match nvme_sqe_t.dptr[
 #define NVME_CC_CSS_NVM  0x00000000u
 #define NVME_CC_AMS_RR   0x00000000u
 #define NVME_CC_SHN_NONE 0x00000000u
+#define NVME_CC_SHN_MASK 0x0000C000u  /* Shutdown Notification (bit 15:14) */
 #define NVME_CC_IOSQES   (6u << 16)  /* 2^6 = 64バイト、nvme_sqe_tと一致 */
 #define NVME_CC_IOCQES   (4u << 20)  /* 2^4 = 16バイト、nvme_cqe_tと一致 */
 
 #define NVME_CSTS_RDY 0x00000001u
 #define NVME_CSTS_CFS 0x00000002u  /* Controller Fatal Status */
+#define NVME_CSTS_SHST_CMPLT 0x00000008u  /* Shutdown Status = 10b (bit 3:2)、シャットダウン完了 */
 
 /* Admin Command Set オペコード(NVMe Base Spec)。 */
 #define NVME_ADM_CMD_DELETE_SQ     0x00u

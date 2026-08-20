@@ -63,6 +63,7 @@ typedef struct {
     uint16_t ctrlr_id;   /* 固定値1 */
     uint32_t cc;         /* CCレジスタ(Property Setで書き込まれる) */
     int      cc_en;      /* cc & NVME_CC_ENが立ったら1 */
+    int      shutdown_complete; /* CC.SHNを受けた=CSTS.SHSTに完了(10b)を返す */
 
     volatile int io_armed;
     volatile int admin_failed;
