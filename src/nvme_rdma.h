@@ -93,4 +93,6 @@ void nvme_rdma_run_bench(mlx5_dev_t *dev0, mlx5_dev_t *dev1, uint32_t duration_m
                          uint64_t *out_bytes, uint32_t *out_count,
                          uint32_t *out_elapsed_ms);
 
+void nvme_rdma_set_peer_override(int enable, uint32_t ip, const uint8_t mac[6]);
+
 #endif /* NVME_RDMA_H */

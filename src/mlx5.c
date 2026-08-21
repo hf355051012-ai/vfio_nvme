@@ -2147,6 +2147,18 @@ int mlx5_set_roce_address(mlx5_dev_t *dev, uint32_t index, const uint8_t gid[16]
     in[42] = (uint8_t)(MLX5_ROCE_L3_TYPE_IPV4 & 0x0Fu);
     in[43] = MLX5_ROCE_VERSION_2;
 
+    /* [調査用] GID を VLAN 付きで登録する。roce_addr_layout の
+     * reserved_at_80[0x3] / vlan_valid[0x1] / vlan_id[0xc] は roce_address の
+     * bit 0x80-0x8f = in[32..33](roce_address は in[16] から)。
+     * vlan_valid = bit0x83 -> in[32] の 0x10、vlan_id の上位4bitが in[32] の
+     * 下位ニブル、下位8bitが in[33]。 */
+    if (dev->roce_gid_vlan != 0) {
+        in[32] = (uint8_t)(0x10u | ((dev->roce_gid_vlan >> 8) & 0x0Fu));
+        in[33] = (uint8_t)(dev->roce_gid_vlan & 0xFFu);
+        uart_printf("mlx5: SET_ROCE_ADDRESS(index=%u): VLAN %u 付きで登録\n",
+                    (unsigned)index, (unsigned)dev->roce_gid_vlan);
+    }
+
     uint8_t out[16 + 32];
     int rc = mlx5_cmd_exec(dev, in, sizeof(in), out, sizeof(out));
     if (rc != 0) {

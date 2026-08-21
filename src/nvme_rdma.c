@@ -772,6 +772,22 @@ static nvme_rdma_ctx_t s_init_ctx;
 static nvmet_rdma_ctx_t s_target_ctx;
 static nvmet_rdma_ctrl_t s_target_ctrl;
 
+/* [調査用] bench の initiator が使う宛先の上書き。**宛先 MAC と宛先 GID を
+ * 独立に振れるようにするための仕掛け。** FW が「ローカル宛」をどちらで判定して
+ * いるのかを切り分けるのに使う(rocepeer シェルコマンド)。 */
+static int      s_peer_override;
+static uint32_t s_peer_ip_override;
+static uint8_t  s_peer_mac_override[6];
+
+void nvme_rdma_set_peer_override(int enable, uint32_t ip, const uint8_t mac[6])
+{
+    s_peer_override = enable;
+    s_peer_ip_override = ip;
+    if (mac) {
+        for (unsigned i = 0; i < 6; i++) s_peer_mac_override[i] = mac[i];
+    }
+}
+
 static int s_target_resident;
 static uint32_t s_target_resident_generation;
 
@@ -953,8 +969,21 @@ void nvme_rdma_run_bench(mlx5_dev_t *dev0, mlx5_dev_t *dev1, uint32_t duration_m
         nvmer_destroy_qp_if_valid(s_init_ctx.cm.dev, s_init_ctx.cm.gsi_qp);
         for (uint32_t i = 0; i < sizeof(s_init_ctx); i++) ((uint8_t *)&s_init_ctx)[i] = 0;
         dcache_clean_range((const void *)&s_init_ctx, sizeof(s_init_ctx));
-        rdma_cm_fill_addr(&s_init_ctx.cm, dev0, "mlx5-pf0", "mlx5-pf1", ip0_fallback, ip1_fallback,
-                          mac0_fallback, mac1_fallback);
+        if (s_peer_override) {
+            uart_printf("nvmermabench: [調査] 宛先を上書き ip=%u.%u.%u.%u "
+                        "mac=%02x:%02x:%02x:%02x:%02x:%02x\n",
+                        (unsigned)((s_peer_ip_override >> 24) & 0xFFu),
+                        (unsigned)((s_peer_ip_override >> 16) & 0xFFu),
+                        (unsigned)((s_peer_ip_override >> 8) & 0xFFu),
+                        (unsigned)(s_peer_ip_override & 0xFFu),
+                        s_peer_mac_override[0], s_peer_mac_override[1], s_peer_mac_override[2],
+                        s_peer_mac_override[3], s_peer_mac_override[4], s_peer_mac_override[5]);
+            rdma_cm_fill_addr(&s_init_ctx.cm, dev0, "mlx5-pf0", "__override__", ip0_fallback,
+                              s_peer_ip_override, mac0_fallback, s_peer_mac_override);
+        } else {
+            rdma_cm_fill_addr(&s_init_ctx.cm, dev0, "mlx5-pf0", "mlx5-pf1", ip0_fallback, ip1_fallback,
+                              mac0_fallback, mac1_fallback);
+        }
         s_init_ctx.bench_enabled = 1;
         s_init_ctx.bench_is_read = is_read ? 1 : 0;
         s_init_ctx.bench_chunk_bytes = chunk_bytes;

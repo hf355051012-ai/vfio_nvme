@@ -2506,6 +2506,52 @@ static void shell_dispatch(char *line, int s0, int s1)
         /* 再初期化なし: 既にブリングアップ済みの s_dev0/s_dev1 を読むだけ。 */
         mlx5_monitor_summary3(&s_dev0, &s_dev1, x86_cfg_rd,
                               (void *)(intptr_t)s0, (void *)(intptr_t)s1);
+    } else if (strncmp(line, "gidvlan", 7) == 0) {
+        /* gidvlan <vid> -- **PF1 の GID だけ** VLAN 付きで登録する(0 で解除)。
+         * FW の「自装置の GID 宛」判定が VLAN まで見ているかを切り分ける道具。
+         * PF0 は素のままなので、PF0 が出すフレームはタグ無しで観測できる。 */
+        const char *a = line + 7;
+        while (*a == ' ') a++;
+        unsigned v = 0;
+        while (*a >= '0' && *a <= '9') { v = v * 10u + (unsigned)(*a - '0'); a++; }
+        s_dev1.roce_gid_vlan = (uint16_t)v;
+        uart_printf("gidvlan: PF1 の GID VLAN = %u (0=無効)\n", v);
+    } else if (strncmp(line, "rocepeer", 8) == 0) {
+        /* rocepeer <a.b.c.d> <pf1|pi5|bogus> -- 次の bench の宛先 GID と宛先 MAC を
+         * 独立に指定する。**FW が「ローカル宛」を MAC で見ているのか GID で見て
+         * いるのかを切り分けるための道具。** 引数なしで解除。 */
+        const char *arg = line + 8;
+        while (*arg == ' ') arg++;
+        if (*arg == 0) {
+            nvme_rdma_set_peer_override(0, 0, 0);
+            uart_printf("rocepeer: 上書きを解除しました\n");
+        } else {
+            unsigned a = 0, b = 0, c = 0, d = 0;
+            const char *pmac = arg;
+            while (*pmac && *pmac != ' ') pmac++;
+            while (*pmac == ' ') pmac++;
+            {   /* a.b.c.d を手で読む(sscanf は使わない) */
+                const char *q = arg;
+                unsigned *slot[4] = { &a, &b, &c, &d };
+                for (unsigned i = 0; i < 4u; i++) {
+                    unsigned v = 0;
+                    while (*q >= '0' && *q <= '9') { v = v * 10u + (unsigned)(*q - '0'); q++; }
+                    *slot[i] = v;
+                    if (*q == '.') q++;
+                }
+            }
+            static const uint8_t mac_pf1[6]   = {0x02, 0x00, 0x00, 0x00, 0x10, 0x11};
+            static const uint8_t mac_pi5[6]   = {0xb8, 0xce, 0xf6, 0x73, 0xbf, 0x7e};
+            static const uint8_t mac_bogus[6] = {0x02, 0x00, 0x00, 0x00, 0xAA, 0xBB};
+            const uint8_t *m = mac_pf1;
+            if (strncmp(pmac, "pi5", 3) == 0)        m = mac_pi5;
+            else if (strncmp(pmac, "bogus", 5) == 0) m = mac_bogus;
+            nvme_rdma_set_peer_override(1, ip_from_octets((uint8_t)a, (uint8_t)b,
+                                                          (uint8_t)c, (uint8_t)d), m);
+            uart_printf("rocepeer: 次の bench は %u.%u.%u.%u / "
+                        "%02x:%02x:%02x:%02x:%02x:%02x へ送ります\n",
+                        a, b, c, d, m[0], m[1], m[2], m[3], m[4], m[5]);
+        }
     } else if (strncmp(line, "fdbprobe", 8) == 0) {
         /* FDB でも転送先を指定できるか。**ルートには設定しない**(FDB のルートを
          * 自前テーブルにすると全通信が落ちうる)。

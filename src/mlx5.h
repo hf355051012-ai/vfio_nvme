@@ -86,6 +86,7 @@ typedef struct {
     uint32_t port_mtu;
     uint8_t  num_vhca_ports;  /* HCA cap bit 0x610。非0なら ROCE_ADDRESS に vhca_port_num が要る */
     uint8_t  can_disable_lb_uc; /* HCA cap bit 0x3e1。vport のユニキャストloopbackを切れるか */
+    uint16_t roce_gid_vlan;    /* [調査用] 非0なら SET_ROCE_ADDRESS に vlan_valid/vlan_id を入れる */
     uint32_t clock_khz;
     uint32_t max_lso_bytes;
     uint8_t log_max_ra_req_qp; // 自分がinitiatorとして持てる同時RDMA_READ/ATOMIC数
