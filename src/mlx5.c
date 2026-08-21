@@ -519,6 +519,7 @@ int mlx5_hca_bringup(mlx5_dev_t *dev, const char *label, int monitor_only) {
     dev->sq_cqn = sq_cqn;
     dev->sqn = sqn;
 
+    mlx5_dump_nic_vport_context(dev, "bring-up 直後(未 MODIFY)");
     uart_printf("mlx5: ===== %s bringup complete =====\n", label);
     return 0;
 }
@@ -2212,6 +2213,7 @@ int mlx5_query_roce_address(mlx5_dev_t *dev, uint32_t index, uint8_t port_num,
 #define MLX5_CMD_OP_INIT2RTR_QP   0x503u
 #define MLX5_CMD_OP_RTR2RTS_QP    0x504u
 #define MLX5_CMD_OP_QUERY_QP      0x50bu
+#define MLX5_CMD_OP_QUERY_NIC_VPORT_CONTEXT  0x754u
 #define MLX5_CMD_OP_MODIFY_NIC_VPORT_CONTEXT 0x755u
 
 #define MLX5_QP_ST_RC          0x0u  // include/linux/mlx5/qp.hのenum(MLX5_QP_ST_RC)で確認済み
@@ -2341,6 +2343,49 @@ static int mlx5_create_mkey_pa_rw(mlx5_dev_t *dev, uint32_t pdn, uint32_t *out_m
  * コール元:
  *   mlx5_qp_create_rc(), mlx5_qp_create_ud_common()
  * ===============================================================*/
+/*=================================================================
+ * QUERY_NIC_VPORT_CONTEXT で vport の状態を読み戻して表示する。
+ *
+ * 見たいのは nic_vport_context の先頭 32bit(struct
+ * mlx5_ifc_nic_vport_context_bits より):
+ *   bit29 = disable_mc_local_lb / bit30 = disable_uc_local_lb / bit31 = roce_en
+ * 出力側は status(4) + syndrome(4) + reserved(8) の後ろから
+ * nic_vport_context なので、その 32bit は out[16..19]。
+ *
+ * 引数:
+ *   dev - 対象 HCA
+ *   tag - ログに出す文脈(いつ読んだのか)
+ * 戻り値:
+ *   0=成功、-1=コマンド失敗
+ * コール元:
+ *   mlx5_nic_vport_enable_roce(), mlx5_hca_bringup()
+ * ===============================================================*/
+int mlx5_dump_nic_vport_context(mlx5_dev_t *dev, const char *tag) {
+    uint8_t in[16] = {0};
+    in[0] = (uint8_t)(MLX5_CMD_OP_QUERY_NIC_VPORT_CONTEXT >> 8);
+    in[1] = (uint8_t)(MLX5_CMD_OP_QUERY_NIC_VPORT_CONTEXT & 0xffu);
+
+    uint8_t out[272] = {0};
+    int rc = mlx5_cmd_exec(dev, in, sizeof(in), out, sizeof(out));
+    if (rc != 0) {
+        uart_printf("mlx5: QUERY_NIC_VPORT_CONTEXT(%s): mlx5_cmd_exec failed rc=%d\n", tag, rc);
+        return rc;
+    }
+    if (out[0] != 0) {
+        uint32_t syndrome = ((uint32_t)out[4] << 24) | ((uint32_t)out[5] << 16) |
+                             ((uint32_t)out[6] << 8) | out[7];
+        uart_printf("mlx5: QUERY_NIC_VPORT_CONTEXT(%s): status=0x%02x syndrome=0x%08x\n",
+                    tag, out[0], syndrome);
+        return -1;
+    }
+    uint8_t w = out[19];
+    uart_printf("mlx5: [vport] %s: roce_en=%u disable_uc_local_lb=%u disable_mc_local_lb=%u "
+                "(word0=%02x%02x%02x%02x)\n",
+                tag, (unsigned)(w & 0x01u), (unsigned)((w >> 1) & 0x01u),
+                (unsigned)((w >> 2) & 0x01u), out[16], out[17], out[18], out[19]);
+    return 0;
+}
+
 static int mlx5_nic_vport_enable_roce(mlx5_dev_t *dev) {
     uint8_t in[516];
     for (unsigned i = 0; i < sizeof(in); i++) {
@@ -2351,11 +2396,13 @@ static int mlx5_nic_vport_enable_roce(mlx5_dev_t *dev) {
     in[15] |= 0x02u; // field_select.roce_en=1
     in[259] |= 0x01u; // nic_vport_context.roce_en=1
 
-    /* **ユニキャストのローカルループバックは切らない。** 一度
+    /* **ユニキャストのローカルループバックは切らない。**
      * field_select.disable_uc_local_lb(bit20 -> byte14 の 0x08)と
      * nic_vport_context.disable_uc_local_lb(bit30 -> byte259 の 0x02)を
-     * 立てて試したが、RoCEv2 不通の症状は 1 ミリも変わらなかったので戻した。
-     * 同じことを繰り返さないための記録(cap は can_disable_lb_uc で見える)。 */
+     * 立てると、QUERY_NIC_VPORT_CONTEXT の読み戻しで **確かに 1 になる**
+     * (word0=0x01000003)。しかし PF0 -> PF1 の RoCEv2 は相変わらずワイヤに
+     * 出ない。**書けているのに効かない**ので原因はここではない。
+     * 同じことを繰り返さないための記録。 */
 
     uint8_t out[16];
     int rc = mlx5_cmd_exec(dev, in, sizeof(in), out, sizeof(out));
@@ -2372,6 +2419,7 @@ static int mlx5_nic_vport_enable_roce(mlx5_dev_t *dev) {
         return -1;
     }
     uart_printf("mlx5: MODIFY_NIC_VPORT_CONTEXT(roce_en=1) ok\n");
+    mlx5_dump_nic_vport_context(dev, "roce_en 設定後");
     return 0;
 }
 

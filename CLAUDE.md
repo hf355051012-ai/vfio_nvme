@@ -320,8 +320,32 @@ BlueField 用も含む)を並べるだけなので、**そこに出ることは�
 | `mstconfig q MPFS_*_LOOPBACK_DISABLE_*` | 装置が非対応 |
 | `devlink dev param show` | 該当なし(`enable_roce` はあるが別物)|
 | `ethtool --show-priv-flags` | 該当なし |
-| vport の `disable_uc_local_lb` | cap は立つが症状不変(前述)|
+| vport の `disable_uc_local_lb` | **読み戻して 1 になることを確認した上で**症状不変 |
+| PPLR の `lb_en`(物理ループバック)| 両ポートとも **0**(`lb_cap=0x6` は対応可能なモードを示すだけ)|
 | `devlink dev eswitch show` | 両 PF とも `mode legacy` = 独立した eswitch |
+
+#### NIC vport context の実測値(`QUERY_NIC_VPORT_CONTEXT` = 0x754)
+
+`mlx5_dump_nic_vport_context()` で読める。`nic_vport_context` の先頭 32bit の
+bit29/30/31 が `disable_mc_local_lb` / `disable_uc_local_lb` / `roce_en`
+(出力側は status+syndrome+reserved の 16 バイト後ろから context なので
+`out[16..19]`)。
+
+| 時点 | word0 | roce_en | disable_uc_local_lb |
+|---|---|---|---|
+| bring-up 直後(未 MODIFY)| `0x01000000` | 0 | 0 |
+| `roce_en=1` を書いた後 | `0x01000001` | 1 | 0 |
+| `disable_uc_local_lb` も書いた後 | `0x01000003` | 1 | **1** |
+
+つまり **`disable_uc_local_lb` は確かに書けている。書けているのに RoCEv2 は
+相変わらずワイヤに出ない**(Pi5 の UDP/4791 カウンタは 0 のまま)。
+前回は書きっぱなしで読み戻していなかったので「効かない」と言い切れなかったが、
+今回で確定した。原因はこのビットではない。
+
+**`lb_en` は `mlx5_ifc_pplr_reg_bits`(PPLR レジスタ)にある別物**で、
+物理層のループバック。`mstreg -d 01:00.0 --reg_name PPLR --get` で読める。
+ほかに `self_lb_block`(TIR context、受信側の自己ループバック遮断)と
+`no_lb`(`register_loopback_control`)があるが、いずれも今回の症状とは別系統。
 
 **結論: この構成で PF0<->PF1 の RoCEv2 を通す手段は無い。** 相互運用の相手は
 Pi5 を使う。
