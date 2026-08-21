@@ -420,6 +420,16 @@ netif_t *netif_find_by_ip6(const uint8_t addr[16])
             if (ll[j] != addr[j]) { same = 0; break; }
         }
         if (same) return s_registered[i];
+
+        /* グローバルアドレスでも引けるようにする(リンクローカルは MAC から
+         * 導出できるがグローバルは導出できないので netif_t の状態を見る)。 */
+        if (s_registered[i]->ip6_global_set) {
+            int gsame = 1;
+            for (unsigned j = 0; j < 16; j++) {
+                if (s_registered[i]->ip6_global[j] != addr[j]) { gsame = 0; break; }
+            }
+            if (gsame) return s_registered[i];
+        }
     }
     return NULL;
 }

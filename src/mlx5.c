@@ -59,6 +59,7 @@ static int mlx5_create_tis(mlx5_dev_t *dev, uint32_t tdn, uint32_t *out_tisn);
 static int mlx5_create_rq(mlx5_dev_t *dev, unsigned rxq_idx, uint32_t cqn, uint32_t pdn, uint32_t uarn, uint32_t mkey, uint32_t *out_rqn);
 static int mlx5_modify_rq_to_rdy(mlx5_dev_t *dev, uint32_t rqn);
 static int mlx5_create_tir(mlx5_dev_t *dev, uint32_t rqn, uint32_t tdn, uint32_t *out_tirn);
+static int mlx5_nic_vport_enable_allmulti(mlx5_dev_t *dev);
 static int mlx5_create_flow_table_nic_rx(mlx5_dev_t *dev, uint32_t *out_table_id);
 static int mlx5_set_flow_table_root_nic_rx(mlx5_dev_t *dev, uint32_t table_id);
 static int mlx5_create_flow_group_catchall(mlx5_dev_t *dev, uint32_t table_id, uint32_t *out_group_id);
@@ -519,7 +520,8 @@ int mlx5_hca_bringup(mlx5_dev_t *dev, const char *label, int monitor_only) {
     dev->sq_cqn = sq_cqn;
     dev->sqn = sqn;
 
-    mlx5_dump_nic_vport_context(dev, "bring-up 直後(未 MODIFY)");
+    (void)mlx5_nic_vport_enable_allmulti(dev);
+    mlx5_dump_nic_vport_context(dev, "bring-up 直後");
     uart_printf("mlx5: ===== %s bringup complete =====\n", label);
     return 0;
 }
@@ -2395,6 +2397,52 @@ int mlx5_dump_nic_vport_context(mlx5_dev_t *dev, const char *tag) {
                 "(word0=%02x%02x%02x%02x)\n",
                 tag, (unsigned)(w & 0x01u), (unsigned)((w >> 1) & 0x01u),
                 (unsigned)((w >> 2) & 0x01u), out[16], out[17], out[18], out[19]);
+    return 0;
+}
+
+/*=================================================================
+ * vport のマルチキャスト受信を全許可(ALLMULTI)にする。
+ *
+ * **これが無いと外部ホストからの IPv6 が一切受け取れない。** NDP の
+ * Neighbor Solicitation は要請ノードマルチキャスト(L2 は 33:33:ff:XX:XX:XX)
+ * 宛で来るので、vport のマルチキャストフィルタに弾かれる。実機では
+ * 「Linux から IPv4 の ping は通るのに IPv6 は NS 段階で必ず失敗する」という
+ * 形で出た(自作同士の ping6 は自分で送って自分で poll する自己完結テスト
+ * なので、この穴を踏まなかった)。RA(ff02::1)と MLD も同じ経路なので、
+ * PLAN の B1/B2 はこれが前提になる。
+ *
+ * マルチキャストアドレスの一覧を登録する方式ではなく ALLMULTI にしてある。
+ * アドレスが増減するたびに vport を更新する仕組みを持っていないため。
+ *
+ * 引数:
+ *   dev - 対象 HCA
+ * 戻り値:
+ *   0=成功、-1=コマンド失敗
+ * コール元:
+ *   mlx5_hca_bringup()
+ * ===============================================================*/
+static int mlx5_nic_vport_enable_allmulti(mlx5_dev_t *dev) {
+    uint8_t in[516];
+    for (unsigned i = 0; i < sizeof(in); i++) in[i] = 0;
+    in[0] = (uint8_t)(MLX5_CMD_OP_MODIFY_NIC_VPORT_CONTEXT >> 8);
+    in[1] = (uint8_t)(MLX5_CMD_OP_MODIFY_NIC_VPORT_CONTEXT & 0xffu);
+    /* field_select.promisc = bit27 -> byte15 の 0x10
+     * (struct mlx5_ifc_modify_nic_vport_field_select_bits より) */
+    in[15] |= 0x10u;
+    /* nic_vport_context.promisc_mc = bit 0x781。context は in[256] からなので
+     * 0x780/8 = 240 -> in[496]、bit0x781 は MSB から 1 番目 = 0x40。 */
+    in[496] |= 0x40u;
+
+    uint8_t out[16];
+    int rc = mlx5_cmd_exec(dev, in, sizeof(in), out, sizeof(out));
+    if (rc != 0 || out[0] != 0) {
+        uint32_t syndrome = ((uint32_t)out[4] << 24) | ((uint32_t)out[5] << 16) |
+                             ((uint32_t)out[6] << 8) | out[7];
+        uart_printf("mlx5: MODIFY_NIC_VPORT_CONTEXT(promisc_mc): rc=%d status=0x%02x "
+                    "syndrome=0x%08x\n", rc, out[0], syndrome);
+        return -1;
+    }
+    uart_printf("mlx5: MODIFY_NIC_VPORT_CONTEXT(promisc_mc=1) ok -- マルチキャスト受信を有効化\n");
     return 0;
 }
 

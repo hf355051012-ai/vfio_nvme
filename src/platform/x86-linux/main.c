@@ -2506,6 +2506,90 @@ static void shell_dispatch(char *line, int s0, int s1)
         /* 再初期化なし: 既にブリングアップ済みの s_dev0/s_dev1 を読むだけ。 */
         mlx5_monitor_summary3(&s_dev0, &s_dev1, x86_cfg_rd,
                               (void *)(intptr_t)s0, (void *)(intptr_t)s1);
+    } else if (strncmp(line, "ip6addr", 7) == 0) {
+        /* ip6addr                        -- 各インターフェースの設定を表示
+         * ip6addr <if> <addr> [plen]     -- グローバル IPv6 アドレスを設定
+         * ip6addr <if> off               -- 解除
+         *
+         * **アドレスは RFC 4291 の完全表記(8 グループ)のみ受け付ける。**
+         * `::` の省略記法は展開しない(nvmet.c の IPv6 表記と同じ方針)。
+         * 例: ip6addr mlx5-pf0 2001:0db8:0000:0001:0000:0000:0000:0010 64
+         *
+         * B1(SLAAC)を入れるまでの間、グローバルアドレスを名乗る手段が無くて
+         * 保留になっていた A1 の IPv6 エンドツーエンドと A6 の IPv6 UDP 分割を
+         * 動かすための手動設定。SLAAC が入ったら同じ netif_t の状態を
+         * RA から埋めることになる。 */
+        char tok[3][80];
+        unsigned nt = 0;
+        const char *q = line + 7;
+        while (*q && nt < 3u) {
+            while (*q == ' ') q++;
+            if (!*q) break;
+            unsigned k = 0;
+            while (*q && *q != ' ' && k < 79u) tok[nt][k++] = *q++;
+            tok[nt][k] = 0;
+            nt++;
+        }
+        if (nt == 0) {
+            static const char *ifnames[] = { "mlx5-pf0", "mlx5-pf1" };
+            for (unsigned i = 0; i < 2u; i++) {
+                netif_t *ni = netif_find(ifnames[i]);
+                if (!ni) continue;
+                if (ni->ip6_global_set) {
+                    uart_printf("ip6addr: %-10s global=", ni->name);
+                    for (unsigned j = 0; j < 8u; j++) {
+                        uart_printf("%s%02x%02x", (j ? ":" : ""),
+                                    ni->ip6_global[j * 2u], ni->ip6_global[j * 2u + 1u]);
+                    }
+                    uart_printf("/%u\n", ni->ip6_prefix_len);
+                } else {
+                    uart_printf("ip6addr: %-10s global=(未設定、リンクローカルのみ)\n", ni->name);
+                }
+            }
+        } else if (nt >= 2u) {
+            netif_t *ni = netif_find(tok[0]);
+            if (!ni) {
+                uart_printf("ip6addr: インターフェース %s が見つかりません\n", tok[0]);
+            } else if (strncmp(tok[1], "off", 3) == 0) {
+                ni->ip6_global_set = 0;
+                uart_printf("ip6addr: %s のグローバルアドレスを解除しました\n", ni->name);
+            } else {
+                uint8_t a[16];
+                unsigned gi = 0, v = 0, ndig = 0;
+                const char *r = tok[1];
+                int bad = 0;
+                for (;; r++) {
+                    if (*r == ':' || *r == 0) {
+                        if (ndig == 0 || gi >= 8u) { bad = 1; break; }
+                        a[gi * 2u] = (uint8_t)(v >> 8); a[gi * 2u + 1u] = (uint8_t)v;
+                        gi++; v = 0; ndig = 0;
+                        if (*r == 0) break;
+                    } else {
+                        unsigned d;
+                        if (*r >= '0' && *r <= '9')      d = (unsigned)(*r - '0');
+                        else if (*r >= 'a' && *r <= 'f') d = (unsigned)(*r - 'a') + 10u;
+                        else if (*r >= 'A' && *r <= 'F') d = (unsigned)(*r - 'A') + 10u;
+                        else { bad = 1; break; }
+                        v = (v << 4) | d; ndig++;
+                        if (ndig > 4u) { bad = 1; break; }
+                    }
+                }
+                if (bad || gi != 8u) {
+                    uart_printf("ip6addr: 完全表記(8 グループ)で指定してください "
+                                "例 2001:0db8:0000:0001:0000:0000:0000:0010\n");
+                } else {
+                    for (unsigned j = 0; j < 16u; j++) ni->ip6_global[j] = a[j];
+                    ni->ip6_global_set = 1;
+                    ni->ip6_prefix_len = 64u;
+                    if (nt >= 3u) {
+                        unsigned pl = 0; const char *t = tok[2];
+                        while (*t >= '0' && *t <= '9') { pl = pl * 10u + (unsigned)(*t - '0'); t++; }
+                        if (pl > 0 && pl <= 128u) ni->ip6_prefix_len = (uint8_t)pl;
+                    }
+                    uart_printf("ip6addr: %s に設定しました(/%u)\n", ni->name, ni->ip6_prefix_len);
+                }
+            }
+        }
     } else if (strncmp(line, "gidvlan", 7) == 0) {
         /* gidvlan <vid> -- **PF1 の GID だけ** VLAN 付きで登録する(0 で解除)。
          * FW の「自装置の GID 宛」判定が VLAN まで見ているかを切り分ける道具。

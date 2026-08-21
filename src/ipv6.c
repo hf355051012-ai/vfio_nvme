@@ -18,8 +18,18 @@
 /* Neighbor Solicitation/Advertisement の本体レイアウト(ICMPv6 ヘッダの後)。
  * NS:  reserved[4] + target[16] + option...
  * NA:  flags[4]    + target[16] + option...  flags の bit31=R bit30=S bit29=O */
-#define NDP_OFF_TARGET  4u
-#define NDP_BODY_LEN    20u  /* reserved/flags 4 + target 16 */
+/* NS/NA のメッセージ配置(RFC 4861 4.3/4.4)。この 2 つは **`8u + ...` の形で
+ * 使う**。8 = ICMPv6 ヘッダ 4(type/code/checksum)+ reserved/flags 4。
+ *
+ * **以前は NDP_OFF_TARGET=4 / NDP_BODY_LEN=20 になっていて、reserved の 4 を
+ * 二重に数えていた**(target を offset 12 から読み書きし、メッセージ長も
+ * 32 ではなく 36 にしていた)。自作 <-> 自作では送信側も受信側も同じズレ方を
+ * するので `ping6`/`tcp6test`/`udptest6` は全部通り、**Linux から NS が来て
+ * 初めて露見した**(target が一致せず無言で捨てるので、相手からは IPv6 が
+ * 一切通らないようにしか見えない)。CRC32C で踏んだのと同じ形の穴。 */
+#define NDP_OFF_TARGET  0u   /* target は msg+8 から 16 バイト */
+#define NDP_BODY_LEN    16u  /* target 16。オプションは msg+8+16 = msg+24 から */
+#define NDP_OFF_FLAGS   4u   /* NA の R/S/O フラグは msg+4 の上位 3 ビット */
 
 #define NDP_OPT_SRC_LLADDR 1u
 #define NDP_OPT_TGT_LLADDR 2u
@@ -127,6 +137,42 @@ void ipv6_link_local_addr(uint8_t out[IPV6_ADDR_LEN])
 }
 
 /*=================================================================
+ * アクティブなインターフェースのグローバル IPv6 アドレスを返す。
+ *
+ * 引数:
+ *   out - 16 バイトの格納先(未設定なら触らない)
+ * 戻り値:
+ *   1=設定済み、0=未設定
+ * コール元:
+ *   ipv6_addr_is_ours(), ipv6_source_for()
+ * ===============================================================*/
+int ipv6_global_addr(uint8_t out[IPV6_ADDR_LEN])
+{
+    netif_t *ni = g_active_ctx;
+    if (!ni || !ni->ip6_global_set) return 0;
+    for (unsigned i = 0; i < IPV6_ADDR_LEN; i++) out[i] = ni->ip6_global[i];
+    return 1;
+}
+
+/*=================================================================
+ * 宛先に応じて送信元 IPv6 アドレスを選ぶ。リンクローカル宛とマルチキャスト
+ * 宛はリンクローカルから、それ以外はグローバルがあればグローバルから送る
+ * (RFC 6724 の簡略版。スコープを跨いだ送信元を使わないことだけが目的)。
+ *
+ * 引数:
+ *   dst - 宛先、out - 送信元の格納先
+ * コール元:
+ *   ipv6_send(), ipv6_send_icmpv6()
+ * ===============================================================*/
+void ipv6_source_for(const uint8_t dst[IPV6_ADDR_LEN], uint8_t out[IPV6_ADDR_LEN])
+{
+    int link_scope = (dst[0] == 0xFFu) ||                       /* マルチキャスト */
+                     (dst[0] == 0xFEu && (dst[1] & 0xC0u) == 0x80u); /* fe80::/10 */
+    if (!link_scope && ipv6_global_addr(out)) return;
+    ipv6_link_local_addr(out);
+}
+
+/*=================================================================
  * 受信アドレスが自ノード宛かを判定する。リンクローカル本体、そのアドレスの
  * 要請ノードマルチキャスト(ff02::1:ffXX:XXXX)、全ノードマルチキャスト
  * (ff02::1)の 3 つを受ける。
@@ -149,6 +195,16 @@ int ipv6_addr_is_ours(const uint8_t addr[IPV6_ADDR_LEN])
     }
     if (same) return 1;
 
+    /* グローバルアドレス(設定されていれば) */
+    uint8_t g[IPV6_ADDR_LEN];
+    if (ipv6_global_addr(g)) {
+        int gsame = 1;
+        for (unsigned i = 0; i < IPV6_ADDR_LEN; i++) {
+            if (addr[i] != g[i]) { gsame = 0; break; }
+        }
+        if (gsame) return 1;
+    }
+
     /* ff02::1 (全ノード) */
     if (addr[0] == 0xFF && addr[1] == 0x02) {
         int zero_mid = 1;
@@ -162,6 +218,13 @@ int ipv6_addr_is_ours(const uint8_t addr[IPV6_ADDR_LEN])
          * addr[13..15] が自分のリンクローカル下位 3 バイトと一致する。 */
         if (addr[11] == 0x01 && addr[12] == 0xFF &&
             addr[13] == ll[13] && addr[14] == ll[14] && addr[15] == ll[15]) {
+            return 1;
+        }
+        /* **グローバルアドレス由来の要請ノードマルチキャストも受ける。**
+         * 下位 3 バイトがリンクローカル(EUI-64 由来)と違うので、ここを
+         * 足さないと相手の NS が届かず、グローバルアドレスへは到達できない。 */
+        if (addr[11] == 0x01 && addr[12] == 0xFF && ipv6_global_addr(g) &&
+            addr[13] == g[13] && addr[14] == g[14] && addr[15] == g[15]) {
             return 1;
         }
     }
@@ -298,7 +361,7 @@ static int ipv6_send_icmpv6(const uint8_t dst[IPV6_ADDR_LEN], const uint8_t dst_
                              uint8_t *msg, uint16_t msg_len)
 {
     uint8_t src[IPV6_ADDR_LEN];
-    ipv6_link_local_addr(src);
+    ipv6_source_for(dst, src);
     return ipv6_send_icmpv6_from(src, dst, dst_mac, msg, msg_len);
 }
 
@@ -665,10 +728,17 @@ static void ipv6_handle_icmpv6(const uint8_t *msg, size_t len,
             s_dad_conflict = 1;
         }
 
-        /* 要請対象が自分のリンクローカルでなければ無視 */
+        /* 要請対象が自分のアドレス(リンクローカル or グローバル)でなければ無視 */
         uint8_t ll[IPV6_ADDR_LEN];
         ipv6_link_local_addr(ll);
-        if (!ipv6_addr_eq(ll, in + 8u + NDP_OFF_TARGET)) return;
+        int target_is_ours = ipv6_addr_eq(ll, in + 8u + NDP_OFF_TARGET);
+        if (!target_is_ours) {
+            uint8_t gg[IPV6_ADDR_LEN];
+            if (ipv6_global_addr(gg)) {
+                target_is_ours = ipv6_addr_eq(gg, in + 8u + NDP_OFF_TARGET);
+            }
+        }
+        if (!target_is_ours) return;
         g_ipv6_ns_count[core]++;
 
         /* 自分が出したマルチキャストがループバックしてきたぶんには応答しない
@@ -707,8 +777,15 @@ static void ipv6_handle_icmpv6(const uint8_t *msg, size_t len,
         for (unsigned i = 0; i < 8u + NDP_BODY_LEN + 8u; i++) na[i] = 0;
         na[ICMPV6_OFF_TYPE] = ICMPV6_TYPE_NA;
         na[ICMPV6_OFF_CODE] = 0;
-        na[8] = src_unspec ? 0x20u : 0x60u;  /* O=1(bit29)、S=1(bit30) は DAD 応答では立てない */
-        for (unsigned i = 0; i < IPV6_ADDR_LEN; i++) na[8u + NDP_OFF_TARGET + i] = ll[i];
+        na[NDP_OFF_FLAGS] = src_unspec ? 0x20u : 0x60u;  /* O=1、S=1 は DAD 応答では立てない */
+        /* **NA の Target Address は「要請された対象」をそのまま返す。**
+         * ここを自分のリンクローカル固定にすると、グローバルアドレス宛の NS に
+         * 対してリンクローカルを名乗る NA を返すことになり、相手(Linux)は
+         * solicited した対象と一致しないので捨てる。実機ではリンクローカルへの
+         * ping6 だけ通ってグローバルへの ping6 が通らない、という形で出た。 */
+        for (unsigned i = 0; i < IPV6_ADDR_LEN; i++) {
+            na[8u + NDP_OFF_TARGET + i] = in[8u + NDP_OFF_TARGET + i];
+        }
         uint8_t self_mac[ETH_ALEN];
         eth_get_mac(self_mac);
         na[8u + NDP_BODY_LEN + 0] = NDP_OPT_TGT_LLADDR;
@@ -937,7 +1014,7 @@ int ipv6_send(const uint8_t dst[IPV6_ADDR_LEN], const uint8_t dst_mac[6],
               uint8_t next_header, const uint8_t *payload, uint16_t payload_len)
 {
     uint8_t src[IPV6_ADDR_LEN];
-    ipv6_link_local_addr(src);
+    ipv6_source_for(dst, src);
     return ipv6_send_from(src, dst, dst_mac, next_header, payload, payload_len);
 }
 

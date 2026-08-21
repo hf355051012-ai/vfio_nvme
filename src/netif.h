@@ -118,6 +118,12 @@ typedef struct netif {
     /* 重複アドレス検出の結果。IPv6 のリンクローカルは MAC から毎回導出して
      * いて netif_t に持たないので、「検査したか」の状態はここに置くしかない。 */
     uint8_t     dad_state;      /* NETIF_DAD_*(IPv6 リンクローカル) */
+    /* **IPv6 で初めて netif_t が持つ状態。** リンクローカルは MAC から毎回
+     * 導出するが、グローバルアドレスは導出できないのでここに置く
+     * (B1 の SLAAC はここへプレフィックス+EUI-64 を書き込む形になる)。 */
+    uint8_t     ip6_global[16];
+    uint8_t     ip6_global_set; /* 1=ip6_global が有効 */
+    uint8_t     ip6_prefix_len; /* 表示用 */
     uint8_t     ipv4_dup;       /* NETIF_DAD_*(IPv4 アドレス) */
     uint8_t     dup_mac6[ETH_ALEN];  /* IPv6 で衝突した相手の MAC(表示用) */
     uint8_t     dup_mac4[ETH_ALEN];  /* IPv4 で衝突した相手の MAC(表示用) */

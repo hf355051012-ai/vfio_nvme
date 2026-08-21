@@ -45,6 +45,8 @@ void ipv6_link_local_addr(uint8_t out[IPV6_ADDR_LEN]);
 
 /* addr がこのノード宛か(リンクローカル / 要請ノードマルチキャスト / 全ノード)。 */
 int ipv6_addr_is_ours(const uint8_t addr[IPV6_ADDR_LEN]);
+int ipv6_global_addr(uint8_t out[IPV6_ADDR_LEN]);
+void ipv6_source_for(const uint8_t dst[IPV6_ADDR_LEN], uint8_t out[IPV6_ADDR_LEN]);
 
 int ipv6_send(const uint8_t dst[IPV6_ADDR_LEN], const uint8_t dst_mac[6],
               uint8_t next_header, const uint8_t *payload, uint16_t payload_len);
