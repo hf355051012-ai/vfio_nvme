@@ -281,6 +281,51 @@ PF のときだけフレームがワイヤに出ない」。
 いないか先に見る。ここでは REP 以外を無言で捨てていたので、相手が明確に
 REJ を返していることが 3 時間見えなかった。
 
+**これは自作ドライバの不具合ではない。Linux 純正の mlx5 でも同じように失敗する。**
+`rdma system set netns exclusive` + netns 分離(PF1 を `nsi` へ隔離)で
+`ib_send_bw -d rocep1s0f0/f1 -x 3` を回すと、**QP 情報の交換(ワイヤ経由の
+TCP)と ping は通るのに RDMA のデータ相が 1 バイトも進まず、Pi5 側の
+UDP/4791 カウンタは 0 のまま**になる。自作スタックの症状と完全に一致する。
+
+- **netns で分けない測定は無効。** 両方のIPがローカルだとカーネルが宛先を
+  ローカルと判定して lo で短絡し、NIC に一切出ない(`linux_loopback.sh` の
+  冒頭コメントに書いてあるとおり)。一度これで測って誤った結論を出しかけた。
+
+### 内部ループバックを抑止する設定は、このカードには無い(2026-08-21 確認)
+
+`mstconfig` に **`MPFS_UC_LOOPBACK_DISABLE_P1/P2`**(MPFS = Multi-Physical
+Function Switch)という、まさにこれを止めるためのパラメータが存在する:
+
+> When TRUE, UC traffic from PFs/Hosts will be sent to uplink regardless of
+> the destination address
+
+しかし **ConnectX-4 Lx / FW 14.32.1900 はこれをサポートしていない**:
+
+```
+$ sudo mstconfig -d 01:00.0 q MPFS_UC_LOOPBACK_DISABLE_P1
+-E- The Device doesn't support MPFS_UC_LOOPBACK_DISABLE_P1 parameter
+```
+
+`show_confs` は **mstconfig が知っている全 2568 項目**(ConnectX-5/6 や
+BlueField 用も含む)を並べるだけなので、**そこに出ることは対応の根拠に
+ならない**。この装置の対応項目は `mstconfig -d 01:00.0 q` の出力が正で、
+そこに `loopback` を含む行は **0 件**。14.32.1900 は CX-4 Lx の最終 FW
+なので、更新で増えることも無い。
+
+同じく効果が無い/存在しないことを確認したもの:
+
+| 探した場所 | 結果 |
+|---|---|
+| `mstconfig q`(この装置の対応項目)| loopback 系 0 件 |
+| `mstconfig q MPFS_*_LOOPBACK_DISABLE_*` | 装置が非対応 |
+| `devlink dev param show` | 該当なし(`enable_roce` はあるが別物)|
+| `ethtool --show-priv-flags` | 該当なし |
+| vport の `disable_uc_local_lb` | cap は立つが症状不変(前述)|
+| `devlink dev eswitch show` | 両 PF とも `mode legacy` = 独立した eswitch |
+
+**結論: この構成で PF0<->PF1 の RoCEv2 を通す手段は無い。** 相互運用の相手は
+Pi5 を使う。
+
 **次にやること**: Pi5 の Linux NVMe-oF RDMA ターゲットへ自作イニシエータを
 向ける(`bench` に宛先指定が要る)。Pi5 は `::ffff:192.168.101.20` の
 **RoCE v2 GID を持っている**(ブリッジ配下でも生える)ので、相互運用の
