@@ -347,6 +347,36 @@ bit29/30/31 が `disable_mc_local_lb` / `disable_uc_local_lb` / `roce_en`
 ほかに `self_lb_block`(TIR context、受信側の自己ループバック遮断)と
 `no_lb`(`register_loopback_control`)があるが、いずれも今回の症状とは別系統。
 
+#### フローテーブルで「必ずワイヤへ出す」ことはできるか(2026-08-22)
+
+`ftprobe` / `txuplink` / `fdbprobe` シェルコマンドで実測した。
+
+| テーブル型 | 作成 | 転送先の指定 |
+|---|---|---|
+| NIC_RX | (bring-up で作成済み)| TIR へ転送(既存)|
+| **NIC_TX** | 作れる。ルートにもできる | **不可**。UPLINK(0x8)は syndrome 0x006cdcfa、VPORT(0x0)は 0x0022a5af。通るのは ALLOW/DROP だけ |
+| **FDB** | 作れる | **`FWD -> VPORT(0x0) id=0xffff`(uplink vport)が通る** |
+| ESW_*_ACL / SNIFFER_* | 作れる | 未評価 |
+
+- NIC_TX に catch-all の ALLOW を入れてルートにしても通信は正常
+  (tcpbench 549/626 MiB/s)。**つまり NIC_TX ステアリング自体は使えるが、
+  「ワイヤへ出す」という宛先が無い** -- 内部折り返しの判断は NIC_TX より
+  下流(MPFS)で行われている。
+- **FDB は危険。** catch-all のエントリを置くと、**ルートに設定していなくても
+  転送が壊れる**(ARP の解決すら失敗するようになった)。FTE を消せば回復する
+  ので `fdbprobe` は後始末を入れてあるが、おかしくなったらプロセスを
+  再起動すること(vfio-pci がデバイスをリセットする)。
+- FDB を使うなら **`misc_parameters.source_port` で送信元 vport に絞る**必要が
+  ある。catch-all のままだと uplink から入ってきたフレームまで uplink へ
+  送り返すことになり、**ワイヤ上でループする**。
+
+#### 実在しなかった対策(調べた記録)
+
+| 案 | 結果 |
+|---|---|
+| ALLOC_TRANSPORT_DOMAIN の `disable_lb` ビット | **フィールドが存在しない**(`alloc_transport_domain_in_bits` は opcode/uid/op_mod/reserved のみ)。そもそも TD は TIS/TIR 用で RC/UD QP は通らない |
+| SQ context の `wire_prio` / eSwitch bypass | **`wire_prio` はヘッダに存在しない**(`bypass` は LAG の `port_select_flow_table_bypass` と FEC のみ)。RoCE QP は独立した SQ オブジェクトを持たない(SQ は QP コンテキスト内)ので設定箇所が無い |
+
 **結論: この構成で PF0<->PF1 の RoCEv2 を通す手段は無い。** 相互運用の相手は
 Pi5 を使う。
 

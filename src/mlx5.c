@@ -3230,12 +3230,17 @@ int mlx5_qp_modify_rtr2rts_ud(mlx5_dev_t *dev, mlx5_qp_t *qp) {
 
 #define MLX5_CMD_OP_SET_FLOW_TABLE_ROOT  0x92fu
 #define MLX5_CMD_OP_CREATE_FLOW_TABLE    0x930u
+#define MLX5_CMD_OP_DESTROY_FLOW_TABLE   0x931u
+#define MLX5_CMD_OP_DESTROY_FLOW_GROUP   0x934u
+#define MLX5_CMD_OP_DELETE_FLOW_TABLE_ENTRY 0x938u
 #define MLX5_CMD_OP_CREATE_FLOW_GROUP    0x933u
 #define MLX5_CMD_OP_SET_FLOW_TABLE_ENTRY 0x936u
 
 #define MLX5_FLOW_TABLE_TYPE_NIC_RX          0u
+#define MLX5_FLOW_TABLE_TYPE_NIC_TX          1u  /* enum mlx5_flow_table_type より */
 #define MLX5_IFC_FLOW_DESTINATION_TYPE_TIR   2u
 #define MLX5_FLOW_CONTEXT_ACTION_FWD_DEST    0x4u
+#define MLX5_FLOW_CONTEXT_ACTION_ALLOW       0x1u  /* enum より(素通し)*/
 
 /*=================================================================
  * CREATE_FLOW_TABLE で NIC RX のフローテーブルを作る。
@@ -3274,6 +3279,218 @@ static int mlx5_create_flow_table_nic_rx(mlx5_dev_t *dev, uint32_t *out_table_id
 
     if (out_table_id) {
         *out_table_id = ((uint32_t)out[9] << 16) | ((uint32_t)out[10] << 8) | out[11];
+    }
+    return 0;
+}
+
+/*=================================================================
+ * この装置がどのフローテーブル型を作れるかを実際に試して確かめる。
+ *
+ * **cap ビットのオフセットを手で数えるより、作ってみて FW の返事を見るほうが
+ * 確実。** table_type は create_flow_table_in の byte16(bit 0x80)の 1 バイト
+ * (struct mlx5_ifc_create_flow_table_in_bits より)。成功したものは
+ * DESTROY_FLOW_TABLE(0x931、table_type=byte16 / table_id=byte21-23)で返す。
+ *
+ * 引数:
+ *   dev / label - 対象 HCA とログ用の名前
+ * コール元:
+ *   shell_dispatch()(ftprobe)
+ * ===============================================================*/
+void mlx5_probe_flow_table_types(mlx5_dev_t *dev, const char *label) {
+    static const char *names[] = {"NIC_RX", "NIC_TX", "ESW_EGRESS_ACL",
+                                  "ESW_INGRESS_ACL", "FDB", "SNIFFER_RX", "SNIFFER_TX"};
+    for (unsigned t = 0; t < 7u; t++) {
+        uint8_t in[64] = {0};
+        in[0] = (uint8_t)(MLX5_CMD_OP_CREATE_FLOW_TABLE >> 8);
+        in[1] = (uint8_t)(MLX5_CMD_OP_CREATE_FLOW_TABLE & 0xffu);
+        in[16] = (uint8_t)t;
+
+        uint8_t out[16] = {0};
+        int rc = mlx5_cmd_exec(dev, in, sizeof(in), out, sizeof(out));
+        if (rc != 0) {
+            uart_printf("ftprobe[%s] type=%u %-16s cmd_exec 失敗 rc=%d\n", label, t, names[t], rc);
+            continue;
+        }
+        if (out[0] != 0) {
+            uint32_t syndrome = ((uint32_t)out[4] << 24) | ((uint32_t)out[5] << 16) |
+                                 ((uint32_t)out[6] << 8) | out[7];
+            uart_printf("ftprobe[%s] type=%u %-16s 非対応 status=0x%02x syndrome=0x%08x\n",
+                        label, t, names[t], out[0], syndrome);
+            continue;
+        }
+        uint32_t table_id = ((uint32_t)out[9] << 16) | ((uint32_t)out[10] << 8) | out[11];
+        uart_printf("ftprobe[%s] type=%u %-16s **作成できた** table_id=%u\n",
+                    label, t, names[t], table_id);
+
+        uint8_t din[64] = {0};
+        din[0] = (uint8_t)(MLX5_CMD_OP_DESTROY_FLOW_TABLE >> 8);
+        din[1] = (uint8_t)(MLX5_CMD_OP_DESTROY_FLOW_TABLE & 0xffu);
+        din[16] = (uint8_t)t;
+        din[21] = (uint8_t)(table_id >> 16);
+        din[22] = (uint8_t)(table_id >> 8);
+        din[23] = (uint8_t)table_id;
+        uint8_t dout[16] = {0};
+        if (mlx5_cmd_exec(dev, din, sizeof(din), dout, sizeof(dout)) != 0 || dout[0] != 0) {
+            uart_printf("ftprobe[%s] type=%u DESTROY_FLOW_TABLE 失敗(status=0x%02x)\n",
+                        label, t, dout[0]);
+        }
+    }
+}
+
+/*=================================================================
+ * NIC_TX のフローテーブルに「全部 UPLINK(ワイヤ)へ」の catch-all を入れて、
+ * 送信が内部で折り返されるのを止められるか試す。
+ *
+ * **ルートへの設定は FTE が成功したときだけ行う。** NIC_TX のルートを
+ * 空のテーブルにしてしまうと miss action 次第で全送信が落ちる恐れがある。
+ * 元に戻す手段は用意していない(プロセスを終了すると vfio-pci が
+ * デバイスをリセットするので、それで消える)。
+ *
+ * 引数:
+ *   dev / label - 対象 HCA とログ用の名前
+ * 戻り値:
+ *   0=ルートまで設定できた、-1=どこかで失敗(その場合ルートは触っていない)
+ * コール元:
+ *   shell_dispatch()(txuplink)
+ * ===============================================================*/
+int mlx5_force_tx_to_uplink(mlx5_dev_t *dev, const char *label,
+                            uint8_t table_type, int set_root) {
+    const uint8_t TT = table_type;
+    uint8_t out[16];
+    uint32_t table_id = 0, group_id = 0;
+
+    {   /* 1) NIC_TX のフローテーブル */
+        uint8_t in[64] = {0};
+        in[0] = (uint8_t)(MLX5_CMD_OP_CREATE_FLOW_TABLE >> 8);
+        in[1] = (uint8_t)(MLX5_CMD_OP_CREATE_FLOW_TABLE & 0xffu);
+        in[16] = TT;
+        for (unsigned i = 0; i < sizeof(out); i++) out[i] = 0;
+        if (mlx5_cmd_exec(dev, in, sizeof(in), out, sizeof(out)) != 0 || out[0] != 0) {
+            uart_printf("txuplink[%s] CREATE_FLOW_TABLE(NIC_TX) 失敗 status=0x%02x\n", label, out[0]);
+            return -1;
+        }
+        table_id = ((uint32_t)out[9] << 16) | ((uint32_t)out[10] << 8) | out[11];
+        uart_printf("txuplink[%s] NIC_TX テーブル作成 table_id=%u\n", label, table_id);
+    }
+
+    {   /* 2) catch-all グループ(match_criteria_enable=0) */
+        uint8_t in[1024] = {0};
+        in[0] = (uint8_t)(MLX5_CMD_OP_CREATE_FLOW_GROUP >> 8);
+        in[1] = (uint8_t)(MLX5_CMD_OP_CREATE_FLOW_GROUP & 0xffu);
+        in[16] = TT;
+        in[21] = (uint8_t)(table_id >> 16);
+        in[22] = (uint8_t)(table_id >> 8);
+        in[23] = (uint8_t)table_id;
+        for (unsigned i = 0; i < sizeof(out); i++) out[i] = 0;
+        if (mlx5_cmd_exec(dev, in, sizeof(in), out, sizeof(out)) != 0 || out[0] != 0) {
+            uart_printf("txuplink[%s] CREATE_FLOW_GROUP 失敗 status=0x%02x\n", label, out[0]);
+            return -1;
+        }
+        group_id = ((uint32_t)out[9] << 16) | ((uint32_t)out[10] << 8) | out[11];
+        uart_printf("txuplink[%s] グループ作成 group_id=%u\n", label, group_id);
+    }
+
+    {   /* 3) FTE。宛先の表し方を何通りか試す。**成功したものが 1 つも無ければ
+         *    ルートは触らない**(NIC_TX のルートを空テーブルにすると miss action
+         *    次第で全送信が落ちるため)。 */
+        struct { uint16_t action; uint8_t dtype; uint32_t did; const char *name; } cand[] = {
+            { MLX5_FLOW_CONTEXT_ACTION_FWD_DEST, 0x08u, 0xFFFFu, "FWD -> UPLINK(0x8)" },
+            { MLX5_FLOW_CONTEXT_ACTION_FWD_DEST, 0x00u, 0xFFFFu, "FWD -> VPORT(0x0) id=0xffff" },
+            { MLX5_FLOW_CONTEXT_ACTION_FWD_DEST, 0x00u, 0x0000u, "FWD -> VPORT(0x0) id=0" },
+            { MLX5_FLOW_CONTEXT_ACTION_ALLOW,    0x00u, 0x0000u, "ALLOW(素通し、対照)" },
+        };
+        int ok = 0;
+        for (unsigned c = 0; c < sizeof(cand) / sizeof(cand[0]); c++) {
+            uint8_t in[840] = {0};
+            in[0] = (uint8_t)(MLX5_CMD_OP_SET_FLOW_TABLE_ENTRY >> 8);
+            in[1] = (uint8_t)(MLX5_CMD_OP_SET_FLOW_TABLE_ENTRY & 0xffu);
+            in[16] = TT;
+            in[21] = (uint8_t)(table_id >> 16);
+            in[22] = (uint8_t)(table_id >> 8);
+            in[23] = (uint8_t)table_id;
+            in[68] = (uint8_t)(group_id >> 24);
+            in[69] = (uint8_t)(group_id >> 16);
+            in[70] = (uint8_t)(group_id >> 8);
+            in[71] = (uint8_t)group_id;
+            in[78] = (uint8_t)(cand[c].action >> 8);
+            in[79] = (uint8_t)(cand[c].action & 0xffu);
+            if (cand[c].action == MLX5_FLOW_CONTEXT_ACTION_FWD_DEST) {
+                in[83]  = 1;                        /* destination_list_size = 1 */
+                in[832] = cand[c].dtype;
+                in[833] = (uint8_t)(cand[c].did >> 16);
+                in[834] = (uint8_t)(cand[c].did >> 8);
+                in[835] = (uint8_t)cand[c].did;
+            }
+            for (unsigned i = 0; i < sizeof(out); i++) out[i] = 0;
+            if (mlx5_cmd_exec(dev, in, sizeof(in), out, sizeof(out)) == 0 && out[0] == 0) {
+                uart_printf("txuplink[%s] FTE **成功**: %s\n", label, cand[c].name);
+                ok = (cand[c].action == MLX5_FLOW_CONTEXT_ACTION_FWD_DEST) ? 2 : 1;
+                break;
+            }
+            uint32_t syndrome = ((uint32_t)out[4] << 24) | ((uint32_t)out[5] << 16) |
+                                 ((uint32_t)out[6] << 8) | out[7];
+            uart_printf("txuplink[%s] FTE 失敗: %-30s status=0x%02x syndrome=0x%08x\n",
+                        label, cand[c].name, out[0], syndrome);
+        }
+        if (!ok) {
+            uart_printf("txuplink[%s] どの宛先も通らなかった(ルートは触っていない)\n", label);
+            return -1;
+        }
+    }
+
+    if (!set_root) {
+        /* **調査モードでは必ず後始末する。** FDB に catch-all のエントリを
+         * 置いたままにすると、ルートへ設定していなくても転送が壊れる
+         * (実機で ARP の解決すら失敗するようになった)。 */
+        uint8_t z[64];
+        for (unsigned i = 0; i < sizeof(z); i++) z[i] = 0;
+        z[0] = (uint8_t)(MLX5_CMD_OP_DELETE_FLOW_TABLE_ENTRY >> 8);
+        z[1] = (uint8_t)(MLX5_CMD_OP_DELETE_FLOW_TABLE_ENTRY & 0xffu);
+        z[16] = TT; z[21] = (uint8_t)(table_id >> 16);
+        z[22] = (uint8_t)(table_id >> 8); z[23] = (uint8_t)table_id;
+        for (unsigned i = 0; i < sizeof(out); i++) out[i] = 0;
+        (void)mlx5_cmd_exec(dev, z, sizeof(z), out, sizeof(out));
+        uint8_t s1 = out[0];
+
+        for (unsigned i = 0; i < sizeof(z); i++) z[i] = 0;
+        z[0] = (uint8_t)(MLX5_CMD_OP_DESTROY_FLOW_GROUP >> 8);
+        z[1] = (uint8_t)(MLX5_CMD_OP_DESTROY_FLOW_GROUP & 0xffu);
+        z[16] = TT; z[21] = (uint8_t)(table_id >> 16);
+        z[22] = (uint8_t)(table_id >> 8); z[23] = (uint8_t)table_id;
+        z[33] = (uint8_t)(group_id >> 16); z[34] = (uint8_t)(group_id >> 8);
+        z[35] = (uint8_t)group_id;
+        for (unsigned i = 0; i < sizeof(out); i++) out[i] = 0;
+        (void)mlx5_cmd_exec(dev, z, sizeof(z), out, sizeof(out));
+        uint8_t s2 = out[0];
+
+        for (unsigned i = 0; i < sizeof(z); i++) z[i] = 0;
+        z[0] = (uint8_t)(MLX5_CMD_OP_DESTROY_FLOW_TABLE >> 8);
+        z[1] = (uint8_t)(MLX5_CMD_OP_DESTROY_FLOW_TABLE & 0xffu);
+        z[16] = TT; z[21] = (uint8_t)(table_id >> 16);
+        z[22] = (uint8_t)(table_id >> 8); z[23] = (uint8_t)table_id;
+        for (unsigned i = 0; i < sizeof(out); i++) out[i] = 0;
+        (void)mlx5_cmd_exec(dev, z, sizeof(z), out, sizeof(out));
+        uart_printf("txuplink[%s] 後始末(FTE/group/table 削除 status=%02x/%02x/%02x)\n",
+                    label, s1, s2, out[0]);
+        return 0;
+    }
+    {   /* 4) ここまで来たら NIC_TX のルートにする */
+        uint8_t in[64] = {0};
+        in[0] = (uint8_t)(MLX5_CMD_OP_SET_FLOW_TABLE_ROOT >> 8);
+        in[1] = (uint8_t)(MLX5_CMD_OP_SET_FLOW_TABLE_ROOT & 0xffu);
+        in[16] = TT;
+        in[21] = (uint8_t)(table_id >> 16);
+        in[22] = (uint8_t)(table_id >> 8);
+        in[23] = (uint8_t)table_id;
+        for (unsigned i = 0; i < sizeof(out); i++) out[i] = 0;
+        if (mlx5_cmd_exec(dev, in, sizeof(in), out, sizeof(out)) != 0 || out[0] != 0) {
+            uint32_t syndrome = ((uint32_t)out[4] << 24) | ((uint32_t)out[5] << 16) |
+                                 ((uint32_t)out[6] << 8) | out[7];
+            uart_printf("txuplink[%s] SET_FLOW_TABLE_ROOT(NIC_TX) 失敗 "
+                        "status=0x%02x syndrome=0x%08x\n", label, out[0], syndrome);
+            return -1;
+        }
+        uart_printf("txuplink[%s] NIC_TX のルートに設定した\n", label);
     }
     return 0;
 }

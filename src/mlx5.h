@@ -141,6 +141,9 @@ void mlx5_build_roce_gid_v4(uint32_t ipv4_host_order, uint8_t out_gid[16]);
 
 int mlx5_set_roce_address(mlx5_dev_t *dev, uint32_t index, const uint8_t gid[16], const uint8_t mac[6]);
 int mlx5_dump_nic_vport_context(mlx5_dev_t *dev, const char *tag);
+void mlx5_probe_flow_table_types(mlx5_dev_t *dev, const char *label);
+int mlx5_force_tx_to_uplink(mlx5_dev_t *dev, const char *label,
+                            uint8_t table_type, int set_root);
 int mlx5_query_roce_address(mlx5_dev_t *dev, uint32_t index, uint8_t port_num,
                             uint8_t out_gid[16], uint8_t out_mac[6],
                             uint8_t *out_l3, uint8_t *out_ver);

@@ -2506,6 +2506,22 @@ static void shell_dispatch(char *line, int s0, int s1)
         /* 再初期化なし: 既にブリングアップ済みの s_dev0/s_dev1 を読むだけ。 */
         mlx5_monitor_summary3(&s_dev0, &s_dev1, x86_cfg_rd,
                               (void *)(intptr_t)s0, (void *)(intptr_t)s1);
+    } else if (strncmp(line, "fdbprobe", 8) == 0) {
+        /* FDB でも転送先を指定できるか。**ルートには設定しない**(FDB のルートを
+         * 自前テーブルにすると全通信が落ちうる)。
+         * **ルートに設定しなくても、FDB に catch-all を置いた時点で転送が壊れる。**
+         * 後始末で消しているが、通信がおかしくなったら vn_start.sh から
+         * 立て直すこと(プロセス終了時に vfio-pci がデバイスをリセットする)。 */
+        uart_printf("[!] fdbprobe: FDB を触るので通信が壊れる場合がある"
+                    "(直らなければプロセスを再起動)\n");
+        mlx5_force_tx_to_uplink(&s_dev0, "pf0-fdb", 4u /* FDB */, 0);
+        mlx5_force_tx_to_uplink(&s_dev1, "pf1-fdb", 4u /* FDB */, 0);
+    } else if (strncmp(line, "txuplink", 8) == 0) {
+        mlx5_force_tx_to_uplink(&s_dev0, "pf0", 1u /* NIC_TX */, 1);
+        mlx5_force_tx_to_uplink(&s_dev1, "pf1", 1u /* NIC_TX */, 1);
+    } else if (strncmp(line, "ftprobe", 7) == 0) {
+        mlx5_probe_flow_table_types(&s_dev0, "pf0");
+        mlx5_probe_flow_table_types(&s_dev1, "pf1");
     } else if (strncmp(line, "nvmet", 5) == 0) {
         if (s_shell_nvmet_started) {
             uart_printf("nvmet: 既に常駐起動済み\n");
