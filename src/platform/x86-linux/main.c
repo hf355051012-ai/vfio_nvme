@@ -1858,9 +1858,39 @@ static void shell_routetest(void)
     int e2e = shell_tcp_echo_once("routetest", self, &s_alias, &far_addr, port, NULL);
     if (!e2e) ok = 0;
 
+    /* [6] IPv6 のエンドツーエンド。別名に「別プレフィックスのグローバル
+     *     アドレス」を名乗らせ、自分側にもグローバルアドレスを付けて、
+     *     ゲートウェイ経路で 64KB を往復させる。
+     *
+     *     **宛先(2001:db8:0:9::9)と次ホップ(対向 PF のリンクローカル)が
+     *     別物である状態で実データを流す**のがここの主張。別名側は
+     *     gateway6 を持たないので、戻りは宛先を直接 NDP で引く。 */
+    {
+        static const uint8_t self6[16] = { 0x20,0x01,0x0d,0xb8,0,0,0,0x01,0,0,0,0,0,0,0,0x10 };
+        static const uint8_t far6[16]  = { 0x20,0x01,0x0d,0xb8,0,0,0,0x09,0,0,0,0,0,0,0,0x09 };
+        for (unsigned i = 0; i < 16u; i++) {
+            self->ip6_global[i]    = self6[i];
+            s_alias.ip6_global[i]  = far6[i];
+        }
+        self->ip6_global_set   = 1u;
+        self->ip6_prefix_len   = 64u;
+        s_alias.ip6_global_set = 1u;
+        s_alias.ip6_prefix_len = 64u;
+
+        netif_activate(self);
+        netaddr_t far6_addr = netaddr_v6(far6);
+        int e2e6 = shell_tcp_echo_once("routetest6", self, &s_alias, &far6_addr,
+                                       (uint16_t)(port + 1u), NULL);
+        uart_printf("routetest: %s [6] IPv6 エンドツーエンド(宛先 2001:db8:0:9::9 / "
+                    "次ホップ %s)\n", e2e6 ? "OK" : "NG", peer->name);
+        if (!e2e6) ok = 0;
+
+        self->ip6_global_set = 0u;   /* 後始末(別名はこの後 unregister される) */
+    }
+
     netif_unregister(&s_alias);
 
-    /* [6] 設定を元に戻す。戻し忘れると以後の tcpbench/bench が全部
+    /* [7] 設定を元に戻す。戻し忘れると以後の tcpbench/bench が全部
      *     ゲートウェイ経路を通ることになる。 */
     self->netmask = saved_mask;
     self->gateway = saved_gw;

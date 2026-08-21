@@ -457,6 +457,30 @@ static netif_t *netif_resolve_frame_owner(netif_t *poller, const net_buf_t *nb)
         tgt = &nb->data[14u + 24u];  /* ARP: Target Protocol Address */
     } else if (etype == 0x0800u) {
         tgt = &nb->data[14u + 16u]; /* IPv4: Destination Address */
+    } else if (etype == 0x86DDu && nb->len >= 14u + 40u) {
+        /* IPv6: 宛先アドレス(ヘッダ先頭から 24 バイト目)を見て、グローバル
+         * アドレスを名乗っている別名インターフェースへ回す。**これが無いと
+         * A1 の IPv6 エンドツーエンドが組めない** -- 別名の netif_t を
+         * 一時登録しても、フレームは常にポーリング主体のものとして処理されて
+         * しまう(IPv4 は上の分岐で振り分けている)。
+         * リンクローカルとマルチキャストは対象外(下位 3 バイトが EUI-64 由来で
+         * 一意なので、従来どおりポーリング主体で処理すればよい)。 */
+        const uint8_t *d6 = &nb->data[14u + 24u];
+        if (d6[0] != 0xFFu && !(d6[0] == 0xFEu && (d6[1] & 0xC0u) == 0x80u)) {
+            for (unsigned i = 0; i < s_registered_count; i++) {
+                netif_t *c = s_registered[i];
+                if (!c->ip6_global_set || c->nic != poller->nic ||
+                    c->nic_priv != poller->nic_priv) {
+                    continue;
+                }
+                int same = 1;
+                for (unsigned j = 0; j < 16u; j++) {
+                    if (c->ip6_global[j] != d6[j]) { same = 0; break; }
+                }
+                if (same) return c;
+            }
+        }
+        return poller;
     } else {
         return poller;
     }

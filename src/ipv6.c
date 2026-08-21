@@ -528,7 +528,16 @@ static int ndp_send_ns(const uint8_t target[IPV6_ADDR_LEN])
     const uint8_t dst_mac[ETH_ALEN] = { 0x33, 0x33, 0xFF,
                                         target[13], target[14], target[15] };
 
-    return ipv6_send_icmpv6(sol, dst_mac, m, (uint16_t)(8u + NDP_BODY_LEN + 8u));
+    /* **送信元は「解決したい対象」のスコープに合わせる。** 宛先である要請ノード
+     * マルチキャストで選ぶと常にリンクローカルになり、相手の NA もこちらの
+     * リンクローカル宛に返ってくる。対向 PF と MAC(=リンクローカル)を共有する
+     * 別名インターフェースでは、その NA をどちらのものか区別できず近隣キャッシュ
+     * が別名に入らない。RFC 4861 4.3 も「その後のトラフィックで使う送信元を
+     * 選ぶ」ことを求めている。 */
+    uint8_t ns_src[IPV6_ADDR_LEN];
+    ipv6_source_for(target, ns_src);
+    return ipv6_send_icmpv6_from(ns_src, sol, dst_mac, m,
+                                 (uint16_t)(8u + NDP_BODY_LEN + 8u));
 }
 
 /*=================================================================

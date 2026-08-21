@@ -1748,17 +1748,25 @@ void tcp_connect_begin(tcp_conn_t *conn, uint32_t dst_ip, uint16_t dst_port)
 }
 
 /*=================================================================
- * 能動 open(IPv6)。自分側はアクティブなインターフェースのリンクローカル。
+ * 能動 open(IPv6)。自分側アドレスは宛先のスコープに合わせて選ぶ。
+ *
+ * **リンクローカル固定にしてはいけない。** グローバルアドレス宛の接続で
+ * 送信元をリンクローカルにすると、相手はリンクローカル宛に返してくる。
+ * 別名インターフェース(A1 の検証で使う、対向 PF と MAC を共有するもの)は
+ * リンクローカルが対向 PF と同一なので、その応答をどちらのインターフェースの
+ * ものか区別できず、近隣キャッシュが別名ではなく対向 PF 側に入って
+ * 解決に失敗する。実機で `routetest` の IPv6 エンドツーエンドが
+ * 「NA は届いているのに宛先MACの解決失敗」になる形で出た。
  *
  * 引数:
  *   conn / dst_ip / dst_port - コネクションと接続先(16 バイトアドレス)
  * コール元:
- *   shell_tcp6test()
+ *   shell_tcp6test(), tcp_connect_begin_to()
  * ===============================================================*/
 void tcp_connect_begin6(tcp_conn_t *conn, const uint8_t dst_ip[16], uint16_t dst_port)
 {
     uint8_t ll[16];
-    ipv6_link_local_addr(ll);
+    ipv6_source_for(dst_ip, ll);
     netaddr_t local = netaddr_v6(ll);
     netaddr_t dst   = netaddr_v6(dst_ip);
     tcp_connect_begin_addr(conn, &local, &dst, dst_port);
