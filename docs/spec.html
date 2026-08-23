@@ -1,0 +1,1827 @@
+<title>vfio_nvme 仕様書</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+JP:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap">
+<style>
+:root{
+  --ground:#f6f7f9;
+  --surface:#ffffff;
+  --rail:#eef1f5;
+  --ink:#101720;
+  --ink-2:#455160;
+  --ink-3:#78838f;
+  --line:#dde2e9;
+  --line-2:#c8d0da;
+  --accent:#0f4c81;
+  --accent-2:#1a6ba8;
+  --accent-wash:#e8eff6;
+  --ok:#1f7a4c;
+  --warn:#a15c05;
+  --off:#6b7480;
+  --code-bg:#eef1f5;
+  --quote-bg:#f0f3f7;
+  --shadow:0 1px 2px rgba(16,23,32,.06),0 8px 24px rgba(16,23,32,.05);
+  --measure:69ch;
+}
+@media (prefers-color-scheme:dark){
+  :root:not([data-theme="light"]){
+    --ground:#0d1218;
+    --surface:#121922;
+    --rail:#0f151d;
+    --ink:#e3e9f0;
+    --ink-2:#a7b3c1;
+    --ink-3:#7c8895;
+    --line:#202934;
+    --line-2:#2c3745;
+    --accent:#6aa9dd;
+    --accent-2:#8cc0ea;
+    --accent-wash:#16222e;
+    --ok:#4bb07c;
+    --warn:#d19a3e;
+    --off:#8b95a1;
+    --code-bg:#0b1016;
+    --quote-bg:#141c25;
+    --shadow:0 1px 2px rgba(0,0,0,.4),0 10px 28px rgba(0,0,0,.35);
+  }
+}
+:root[data-theme="dark"]{
+  --ground:#0d1218;
+  --surface:#121922;
+  --rail:#0f151d;
+  --ink:#e3e9f0;
+  --ink-2:#a7b3c1;
+  --ink-3:#7c8895;
+  --line:#202934;
+  --line-2:#2c3745;
+  --accent:#6aa9dd;
+  --accent-2:#8cc0ea;
+  --accent-wash:#16222e;
+  --ok:#4bb07c;
+  --warn:#d19a3e;
+  --off:#8b95a1;
+  --code-bg:#0b1016;
+  --quote-bg:#141c25;
+  --shadow:0 1px 2px rgba(0,0,0,.4),0 10px 28px rgba(0,0,0,.35);
+}
+
+*{box-sizing:border-box}
+body{
+  margin:0;
+  background:var(--ground);
+  color:var(--ink);
+  font-family:"IBM Plex Sans JP","Hiragino Kaku Gothic ProN","Yu Gothic",system-ui,sans-serif;
+  font-size:15.5px;
+  line-height:1.9;
+  -webkit-font-smoothing:antialiased;
+}
+.shell{display:flex;align-items:flex-start;min-height:100vh}
+
+/* ---------- 左ナビ ---------- */
+.rail{
+  position:sticky;top:0;flex:0 0 302px;width:302px;height:100vh;
+  background:var(--rail);border-right:1px solid var(--line);
+  display:flex;flex-direction:column;
+}
+.railhead{padding:20px 20px 12px;border-bottom:1px solid var(--line)}
+.doctitle{
+  font-size:15px;font-weight:700;letter-spacing:.01em;margin:0;line-height:1.45;
+}
+.docsub{
+  margin:5px 0 0;font-family:"IBM Plex Mono",ui-monospace,monospace;
+  font-size:10.5px;letter-spacing:.09em;text-transform:uppercase;color:var(--ink-3);
+}
+.filterwrap{padding:12px 16px 10px;border-bottom:1px solid var(--line)}
+#filter{
+  width:100%;padding:7px 10px;border:1px solid var(--line-2);border-radius:5px;
+  background:var(--surface);color:var(--ink);font:inherit;font-size:13px;
+}
+#filter::placeholder{color:var(--ink-3)}
+#filter:focus{outline:2px solid var(--accent);outline-offset:1px;border-color:transparent}
+
+.navscroll{overflow-y:auto;flex:1;padding:10px 10px 40px}
+.navscroll ul{list-style:none;margin:0;padding:0}
+.navpart{margin:0 0 4px}
+.navpartlink{
+  display:block;padding:9px 10px 5px;
+  font-family:"IBM Plex Mono",ui-monospace,monospace;
+  font-size:10.5px;font-weight:600;letter-spacing:.1em;text-transform:uppercase;
+  color:var(--ink-3);text-decoration:none;
+}
+.navpartlink:hover{color:var(--accent)}
+.navpart > ul > li > a{
+  display:flex;gap:9px;align-items:baseline;
+  padding:5px 10px;border-radius:5px;
+  color:var(--ink-2);text-decoration:none;font-size:13.2px;line-height:1.5;
+  border-left:2px solid transparent;
+}
+.navpart > ul > li > a:hover{background:var(--accent-wash);color:var(--ink)}
+.navpart > ul > li > a.active{
+  background:var(--accent-wash);color:var(--accent);font-weight:600;
+  border-left-color:var(--accent);
+}
+.num{
+  font-family:"IBM Plex Mono",ui-monospace,monospace;font-size:11px;
+  font-variant-numeric:tabular-nums;color:var(--ink-3);min-width:1.6em;text-align:right;flex:0 0 auto;
+}
+.navpart > ul > li > a.active .num{color:var(--accent)}
+.lbl{flex:1}
+
+/* ---------- 本文 ---------- */
+.main{flex:1;min-width:0;padding:0 0 120px}
+.progress{position:sticky;top:0;height:2px;background:transparent;z-index:5}
+.progress > span{display:block;height:100%;width:0;background:var(--accent)}
+.content{max-width:var(--measure);margin:0 auto;padding:44px 32px 0}
+
+h1{font-size:29px;line-height:1.4;font-weight:700;letter-spacing:-.01em;margin:0 0 18px;text-wrap:balance}
+.parthead{
+  font-size:12px;font-weight:600;letter-spacing:.14em;text-transform:uppercase;
+  font-family:"IBM Plex Mono",ui-monospace,monospace;
+  color:var(--accent);margin:64px 0 6px;padding-bottom:8px;border-bottom:2px solid var(--accent);
+}
+.chaphead{
+  font-size:22.5px;font-weight:700;line-height:1.5;margin:46px 0 14px;
+  letter-spacing:-.005em;text-wrap:balance;scroll-margin-top:24px;
+}
+h4{font-size:16.5px;font-weight:600;margin:32px 0 8px;line-height:1.6;text-wrap:balance}
+h5{font-size:14.5px;font-weight:600;margin:22px 0 6px;color:var(--ink-2)}
+p{margin:0 0 15px}
+a{color:var(--accent);text-decoration:none;border-bottom:1px solid color-mix(in srgb,var(--accent) 32%,transparent)}
+a:hover{border-bottom-color:var(--accent)}
+a:focus-visible,.navpart a:focus-visible{outline:2px solid var(--accent);outline-offset:2px;border-radius:3px}
+strong{font-weight:600;color:var(--ink)}
+hr{border:0;border-top:1px solid var(--line);margin:38px 0}
+ul,ol{margin:0 0 15px;padding-left:1.5em}
+li{margin:0 0 6px}
+li::marker{color:var(--ink-3)}
+
+code{
+  font-family:"IBM Plex Mono",ui-monospace,monospace;font-size:.875em;
+  background:var(--code-bg);padding:.12em .38em;border-radius:3px;
+  border:1px solid color-mix(in srgb,var(--line) 70%,transparent);
+}
+.codewrap{overflow-x:auto;margin:0 0 18px;background:var(--code-bg);border:1px solid var(--line);border-radius:6px}
+.codewrap pre{margin:0;padding:15px 17px;line-height:1.62}
+.codewrap code{background:none;border:0;padding:0;font-size:12.6px;white-space:pre}
+
+blockquote{
+  margin:0 0 18px;padding:13px 17px;background:var(--quote-bg);
+  border-left:3px solid var(--accent);border-radius:0 5px 5px 0;
+}
+blockquote p{margin:0 0 8px}
+blockquote p:last-child{margin:0}
+
+.tablewrap{overflow-x:auto;margin:0 0 20px;border:1px solid var(--line);border-radius:6px;background:var(--surface)}
+table{border-collapse:collapse;width:100%;font-size:13.4px;line-height:1.72}
+th,td{padding:9px 13px;text-align:left;vertical-align:top;border-bottom:1px solid var(--line)}
+th{
+  background:var(--accent-wash);font-weight:600;font-size:11.5px;letter-spacing:.05em;
+  text-transform:uppercase;color:var(--ink-2);white-space:nowrap;
+  font-family:"IBM Plex Mono",ui-monospace,monospace;
+}
+tbody tr:last-child td{border-bottom:0}
+td code{font-size:12.2px}
+td:first-child{white-space:normal}
+
+/* 実装状況の表に出る語を色で拾う(意味を形にする) */
+td strong{color:var(--ink)}
+
+.topbar{display:none}
+.railtoggle{display:none}
+
+@media (max-width:900px){
+  .shell{display:block}
+  .rail{
+    position:fixed;z-index:20;left:0;top:0;height:100vh;width:290px;flex:none;
+    transform:translateX(-100%);transition:transform .22s ease;box-shadow:var(--shadow);
+  }
+  .rail.open{transform:none}
+  .topbar{
+    display:flex;align-items:center;gap:12px;position:sticky;top:0;z-index:10;
+    background:var(--surface);border-bottom:1px solid var(--line);padding:10px 14px;
+  }
+  .railtoggle{
+    display:inline-flex;align-items:center;gap:7px;background:none;border:1px solid var(--line-2);
+    color:var(--ink);border-radius:6px;padding:6px 11px;font:inherit;font-size:13px;cursor:pointer;
+  }
+  .topbar .tt{font-size:13.5px;font-weight:600}
+  .content{padding:26px 18px 0}
+  h1{font-size:24px}
+  .chaphead{font-size:20px;scroll-margin-top:60px}
+}
+@media (prefers-reduced-motion:reduce){
+  *{transition:none !important;scroll-behavior:auto !important}
+}
+html{scroll-behavior:smooth}
+</style>
+
+<div class="topbar">
+  <button class="railtoggle" id="toggle" aria-label="章の一覧を開閉">目次</button>
+  <span class="tt">vfio_nvme 仕様書</span>
+</div>
+
+<div class="shell">
+  <nav class="rail" id="rail" aria-label="章の一覧">
+    <div class="railhead">
+      <p class="doctitle">vfio_nvme 仕様書</p>
+      <p class="docsub">29 chapters &middot; 3 appendices</p>
+    </div>
+    <div class="filterwrap">
+      <input id="filter" type="search" placeholder="章を絞り込む" autocomplete="off">
+    </div>
+    <div class="navscroll">
+      <ul id="navroot">
+<li class="navpart"><a class="navpartlink" href="#part-0">第 I 部 はじめに</a><ul>
+<li><a href="#ch1" data-target="ch1"><span class="num">1</span><span class="lbl">このソフトは何か</span></a></li>
+<li><a href="#ch2" data-target="ch2"><span class="num">2</span><span class="lbl">なぜカーネルを通さないのか</span></a></li>
+</ul></li>
+<li class="navpart"><a class="navpartlink" href="#part-1">第 II 部 ハードウェアを直接動かす</a><ul>
+<li><a href="#ch3" data-target="ch3"><span class="num">3</span><span class="lbl">PC とデバイスはどう繋がっているか</span></a></li>
+<li><a href="#ch4" data-target="ch4"><span class="num">4</span><span class="lbl">VFIO — ユーザ空間からデバイスを掴む</span></a></li>
+<li><a href="#ch5" data-target="ch5"><span class="num">5</span><span class="lbl">ネットワークカードの動かし方</span></a></li>
+</ul></li>
+<li class="navpart"><a class="navpartlink" href="#part-2">第 III 部 ネットワークの基礎と、この実装</a><ul>
+<li><a href="#ch6" data-target="ch6"><span class="num">6</span><span class="lbl">パケットは入れ子の箱</span></a></li>
+<li><a href="#ch7" data-target="ch7"><span class="num">7</span><span class="lbl">隣の機械を見つける(ARP / NDP)</span></a></li>
+<li><a href="#ch8" data-target="ch8"><span class="num">8</span><span class="lbl">IP — 住所と道案内</span></a></li>
+<li><a href="#ch9" data-target="ch9"><span class="num">9</span><span class="lbl">ICMP — 「届かなかった」を伝える</span></a></li>
+<li><a href="#ch10" data-target="ch10"><span class="num">10</span><span class="lbl">TCP — 信頼できるバイトの流れを作る</span></a></li>
+<li><a href="#ch11" data-target="ch11"><span class="num">11</span><span class="lbl">UDP と IPv6</span></a></li>
+</ul></li>
+<li class="navpart"><a class="navpartlink" href="#part-3">第 IV 部 NVMe と NVMe over Fabrics</a><ul>
+<li><a href="#ch12" data-target="ch12"><span class="num">12</span><span class="lbl">NVMe の考え方</span></a></li>
+<li><a href="#ch13" data-target="ch13"><span class="num">13</span><span class="lbl">ネットワーク越しの NVMe</span></a></li>
+<li><a href="#ch14" data-target="ch14"><span class="num">14</span><span class="lbl">NVMe/TCP</span></a></li>
+<li><a href="#ch15" data-target="ch15"><span class="num">15</span><span class="lbl">RDMA と RoCEv2</span></a></li>
+<li><a href="#ch16" data-target="ch16"><span class="num">16</span><span class="lbl">このターゲットが答えるコマンド</span></a></li>
+</ul></li>
+<li class="navpart"><a class="navpartlink" href="#part-4">第 V 部 ソフトウェアの構造</a><ul>
+<li><a href="#ch17" data-target="ch17"><span class="num">17</span><span class="lbl">全体アーキテクチャ</span></a></li>
+<li><a href="#ch18" data-target="ch18"><span class="num">18</span><span class="lbl">協調ジョブスケジューラ</span></a></li>
+<li><a href="#ch19" data-target="ch19"><span class="num">19</span><span class="lbl">主要なデータ構造</span></a></li>
+<li><a href="#ch20" data-target="ch20"><span class="num">20</span><span class="lbl">1 つの I/O を最後まで追う</span></a></li>
+<li><a href="#ch21" data-target="ch21"><span class="num">21</span><span class="lbl">マルチコアの使い方</span></a></li>
+</ul></li>
+<li class="navpart"><a class="navpartlink" href="#part-5">第 VI 部 性能</a><ul>
+<li><a href="#ch22" data-target="ch22"><span class="num">22</span><span class="lbl">何をどう測っているか</span></a></li>
+<li><a href="#ch23" data-target="ch23"><span class="num">23</span><span class="lbl">速い理由</span></a></li>
+<li><a href="#ch24" data-target="ch24"><span class="num">24</span><span class="lbl">測って初めて分かったこと</span></a></li>
+</ul></li>
+<li class="navpart"><a class="navpartlink" href="#part-6">第 VII 部 使い方</a><ul>
+<li><a href="#ch25" data-target="ch25"><span class="num">25</span><span class="lbl">ビルドと起動</span></a></li>
+<li><a href="#ch26" data-target="ch26"><span class="num">26</span><span class="lbl">シェルコマンド一覧</span></a></li>
+<li><a href="#ch27" data-target="ch27"><span class="num">27</span><span class="lbl">自己検査コマンド</span></a></li>
+</ul></li>
+<li class="navpart"><a class="navpartlink" href="#part-7">第 VIII 部 実装状況</a><ul>
+<li><a href="#ch28" data-target="ch28"><span class="num">28</span><span class="lbl">何がどこまで確かめられているか</span></a></li>
+<li><a href="#ch29" data-target="ch29"><span class="num">29</span><span class="lbl">検証の考え方</span></a></li>
+</ul></li>
+<li class="navpart"><a class="navpartlink" href="#part-8">付録</a><ul>
+<li><a href="#appendix-a" data-target="appendix-a"><span class="num">A</span><span class="lbl">用語集</span></a></li>
+<li><a href="#appendix-b" data-target="appendix-b"><span class="num">B</span><span class="lbl">ファイル索引</span></a></li>
+<li><a href="#appendix-c" data-target="appendix-c"><span class="num">C</span><span class="lbl">参考にした仕様と実装</span></a></li>
+</ul></li>
+      </ul>
+    </div>
+  </nav>
+
+  <main class="main">
+    <div class="progress"><span id="bar"></span></div>
+    <div class="content">
+<h1>vfio_nvme 仕様書</h1>
+<p>このリポジトリは、<strong>PC に挿さっているネットワークカードを OS に任せず自分の プログラムから直接動かし、その上に通信の仕組みとストレージの仕組みを全部 自前で実装して、Linux 標準の実装とどちらが速いかを測る実験装置</strong>です。</p>
+<h3 class="chaphead">この文書について</h3>
+<h4>誰のための文書か</h4>
+<p><strong>C 言語は読み書きできるが、ネットワークとデバイスドライバの知識は無い人</strong>を 想定しています。具体的には、</p>
+<ul><li>ポインタ・構造体・ビット演算は分かる</li><li><code>malloc()</code> は知っているが、ハードウェアがメモリを直接読み書きする話は知らない</li><li>ソケット通信は書いたことがあるかもしれないが、通信路の上を実際にどんな バイト列が流れているかは知らない</li><li>SSD やネットワークカードの「中の人」が何をしているかは知らない</li></ul>
+<p>という人が、<strong>最初から順番に読んで、途中で知らない言葉に出会わずに</strong> 最後まで到達できることを目標にしています。</p>
+<h4>読み方</h4>
+<ul><li><strong>最初から順に読むこと</strong>を前提に書いています。専門用語は必ず「初めて出て くる場所」で説明し、それ以降は説明済みのものとして使います。</li><li>略語や専門用語には、各章の最初の 1 回だけ <a href="#appendix-a">用語集</a> への リンクを張ってあります。忘れたら飛んでください。</li><li>各章の終わりに <strong>「ソースのどこを読むか」</strong> という節があります。文書と 実際のコードを行き来するための道しるべです。</li><li><strong>左に章の一覧を出したいときは <code>docs/spec.html</code></strong>(この文書から生成した HTML 版)。 章の絞り込みと、いま読んでいる章のハイライトが付きます。</li><li>急いでいる人は、<a href="#ch1">第 1 章</a>(何をするソフトか)と <a href="#ch17">第 17 章</a>(全体アーキテクチャ)と <a href="#ch20">第 20 章</a>(1 つの I/O を 最後まで追う)だけでも全体像がつかめます。</li></ul>
+<h4>関連する文書</h4>
+<p>このリポジトリには 4 つの文書があります。役割が違います。</p>
+<div class="tablewrap"><table><thead><tr><th>文書</th><th>誰のためか</th><th>何が書いてあるか</th></tr></thead><tbody><tr><td><strong><code>SPEC.md</code>(この文書)</strong></td><td><strong>前提知識の無い読者</strong></td><td><strong>仕組みの説明。前提知識から順に積み上げる</strong></td></tr><tr><td><code>README.md</code></td><td>このソフトを使う人</td><td>構成の要約、ビルド手順、最新の性能値</td></tr><tr><td><code>CLAUDE.md</code></td><td>開発を引き継ぐ人</td><td>作業手順と、実機で実際に踏んだ落とし穴</td></tr><tr><td><code>PLAN_protocol_gaps.md</code></td><td>開発を引き継ぐ人</td><td>未実装項目の計画と、各段階の実装記録</td></tr></tbody></table></div>
+<p><strong>性能の数値はこの文書には載せていません。</strong> 測定条件が変わるたびに 書き直す必要があり、二重管理になるからです。数値は <code>README.md</code> を見て ください。この文書には「その数値をどう読むか」を書いてあります。</p>
+<hr>
+<h2 class="parthead" id="part-0">第 I 部 はじめに</h2>
+<h3 class="chaphead" id="ch1">第 1 章 このソフトは何か</h3>
+<h4>1.1 まず 10 個だけ</h4>
+<p>この文書を読むのに最低限必要な言葉を、先に 10 個だけ説明します。 <strong>ここから先は、この 10 個を知っているものとして話を進めます。</strong></p>
+<p><strong>(1) カーネルとユーザ空間</strong></p>
+<p><a href="#term-kernel">カーネル</a>とは OS の中核部分のことです。メモリの管理、 プロセスの切り替え、ハードウェアの操作といった「特権が要る仕事」を担当し、 CPU の特権モードで動きます。</p>
+<p>一方、私たちが普段書くプログラム(<code>main()</code> があるあれ)は <a href="#term-userspace">ユーザ空間</a>で動きます。ユーザ空間のプログラムは ハードウェアを直接触れません。触りたければカーネルにお願いします。 このお願いが<a href="#term-syscall">システムコール</a>です(<code>read()</code>、<code>write()</code>、 <code>send()</code> など)。</p>
+<p><strong>(2) デバイスドライバ</strong></p>
+<p><a href="#term-driver">デバイスドライバ</a>は、特定のハードウェアの操作方法を知って いるプログラムです。普通はカーネルの一部として動きます。「このカードに データを送らせるには、この番地にこの値を書いて…」という手順を全部知って いるのがドライバです。</p>
+<p><strong>(3) NIC(ネットワークカード)</strong></p>
+<p><a href="#term-nic">NIC</a>(Network Interface Card)は、LAN ケーブルや光ファイバに 繋がる部品です。PC の中では PCI Express というスロットに挿さっています。 このリポジトリが相手にするのは <strong>Mellanox(現 NVIDIA)の ConnectX-4</strong> と いう製品で、25 ギガビット/秒の速度が出ます。</p>
+<p><strong>(4) SSD</strong></p>
+<p><a href="#term-ssd">SSD</a>はフラッシュメモリを使った記憶装置です。この文書で重要な のは中身の物理ではなく、<strong>SSD と会話する手順</strong>のほうです。</p>
+<p><strong>(5) NVMe</strong></p>
+<p><a href="#term-nvme">NVMe</a>(Non-Volatile Memory Express)は、SSD と会話するための 決まりごとです。「読め」「書け」といった命令をどんなバイト列で表すか、 それをどうやって SSD に渡すかが決められています。</p>
+<p><strong>(6) NVMe-oF(ネットワーク越しのストレージ)</strong></p>
+<p>普通、SSD は自分の PC の中に挿さっています。これを<strong>ネットワークの向こう側に 置いて、あたかも手元にあるかのように使う</strong>のが <a href="#term-nvmeof">NVMe-oF</a>(NVMe over Fabrics)です。「読め」という命令を ネットワークに乗せて送り、データを送り返してもらいます。</p>
+<p><strong>(7) TCP</strong></p>
+<p><a href="#term-tcp">TCP</a>は、ネットワーク越しに<strong>バイトの列を、順番どおりに、 欠けずに</strong>届けるための決まりごとです。インターネットのほとんどの通信が これを使っています。</p>
+<p><strong>(8) RDMA</strong></p>
+<p><a href="#term-rdma">RDMA</a>(Remote Direct Memory Access)は、<strong>相手のコンピュータの CPU を働かせずに、相手のメモリを直接読み書きする</strong>技術です。TCP より速い 代わりに、専用のネットワークカードが要ります。この文書では <a href="#term-rocev2">RoCEv2</a> という方式を扱います。</p>
+<p><strong>(9) スループットとレイテンシ</strong></p>
+<p><a href="#term-throughput">スループット</a>は「1 秒間に何バイト運べるか」、 <a href="#term-latency">レイテンシ</a>は「1 回の要求に何秒かかるか」です。 この 2 つは別物で、片方が良くても片方が悪いことがあります。</p>
+<p><strong>(10) ターゲットとイニシエータ</strong></p>
+<p>ストレージの世界では、<strong>命令を出す側</strong>を<a href="#term-initiator">イニシエータ</a>、 <strong>命令を受けて実行する側</strong>を<a href="#term-target">ターゲット</a>と呼びます。 普通のクライアント/サーバと同じ関係です。SSD を貸す側がターゲット、 借りる側がイニシエータです。</p>
+<h4>1.2 このソフトがやること</h4>
+<p>一言でいうと、</p>
+<blockquote><p><strong>NIC を OS に任せず自分のプログラムから直接動かし、その上に通信の仕組み (Ethernet / IP / TCP)とストレージの仕組み(NVMe-oF)を全部自前で実装 して、Linux 標準の実装とどちらが速いかを測る。</strong></p></blockquote>
+<p>です。特徴的なのは、<strong>イニシエータとターゲットの両方が同じプログラムの中に いる</strong>ことです。1 つのプロセスの中に「SSD を貸す側」と「借りる側」が同居して いて、実際のネットワークケーブルを通してお互いに通信します。</p>
+<div class="codewrap"><pre><code>   ┌──────────────────────────────────────────────┐
+   │      1 個のプロセス(vfio_nvme)              │
+   │                                              │
+   │   イニシエータ            ターゲット         │
+   │   (借りる側)            (貸す側)         │
+   │       │                      ↑              │
+   │       │  NVMe-oF のコマンド  │              │
+   │       ↓                      │              │
+   │   自作 TCP/IP            自作 TCP/IP         │
+   │       │                      ↑              │
+   │   自作 NIC ドライバ      自作 NIC ドライバ   │
+   └───────┼──────────────────────┼───────────────┘
+           │                      │
+       ┌───┴───┐              ┌───┴───┐
+       │ PF0   │              │ PF1   │   ← 1 枚の NIC の 2 つのポート
+       └───┬───┘              └───┬───┘
+           │                      │
+           └──── ネットワーク ────┘</code></pre></div>
+<p>「同じプロセスの中で通信して意味があるのか」と思うかもしれませんが、 <strong>フレームは本当に物理的にケーブルを通って往復します</strong>。ソフトウェア的な 近道はしていません。</p>
+<h4>1.3 実際に動かすとこう見える</h4>
+<p>このプログラムを起動すると、対話シェルが立ち上がります。</p>
+<div class="codewrap"><pre><code>==== x86 常駐シェル(bring-up 済み、再初期化なし、↑↓で履歴呼び出し) ====
+commands: monitor | bench [KB[,KB..]] [r|w|rw] [qd] | tcpbench [..] | ts [..]
+        | nvmet [port] | jobs | help | quit
+&gt;</code></pre></div>
+<p>ここで <code>tcpbench</code> と打つと、自分の中のイニシエータが自分の中のターゲットへ NVMe/TCP で接続し、読み書きの速度を測ります。</p>
+<div class="codewrap"><pre><code>&gt; tcpbench 8,64,256 rw 8
+
+rw         bs       qd            MiB/s         IOPS    avg latency
+---------- -------- ------ ------------ ------------ --------------
+write      8k       8            240.85     30829.33      259.49 us
+write      64k      8            549.95      8799.33      909.15 us
+write      256k     8            673.10      2692.43        2.97 ms
+read       8k       8            418.88     53617.66      149.20 us
+read       64k      8            639.56     10233.00      781.78 us
+read       256k     8            774.06      3096.26        2.58 ms</code></pre></div>
+<p><code>bs</code> はひとかたまりのサイズ、<code>qd</code> は「同時に何個の命令を投げっぱなしに するか」です。<code>IOPS</code> は 1 秒あたりの命令数、<code>avg latency</code> は 1 命令あたりの 平均所要時間です。</p>
+<p>外部の Linux マシンから繋ぐこともできます。ターゲットだけ立ち上げておくと、 向こうの Linux からは<strong>普通の NVMe SSD が 1 台生えたように見えます</strong>。</p>
+<div class="codewrap"><pre><code>(Linux 側)
+$ sudo nvme connect -t tcp -a 192.168.101.11 -s 4421 -n nqn.2014-08...
+$ sudo nvme list
+Node          SN           Model                        Namespace  Usage
+------------- ------------ ---------------------------- ---------- -------------
+/dev/nvme0n1  RPI5-NVMET   RPi5 Bare-Metal NVMe Target  0x1        268.44 MB
+$ sudo mkfs.ext4 /dev/nvme0n1     # ファイルシステムだって作れる</code></pre></div>
+<p>つまり<strong>Linux から見て本物のストレージと区別がつかない</strong>ところまで実装されて います。</p>
+<h4>1.4 何をしないか(目的外のこと)</h4>
+<p>これは<strong>実験装置</strong>であって、製品ではありません。次のことは目的にしていません。</p>
+<ul><li><strong>汎用性</strong>: ConnectX-4 系の NIC でしか動きません。他社製カードは対象外です。</li><li><strong>堅牢性</strong>: 想定外の入力に対して落ちないことは保証していません。</li><li><strong>セキュリティ</strong>: 認証も暗号化もありません(誰でも接続できます)。 ネットワークから隔離された実験用の配線でのみ使います。</li><li><strong>永続性</strong>: 「SSD」の中身は<strong>メモリ上の配列</strong>です。プロセスを終了すると 消えます。本物のフラッシュメモリは繋がっていません。</li><li><strong>複数プロセスからの共有</strong>: NIC を 1 プロセスが占有します。</li></ul>
+<p>「SSD の中身がメモリ」というのは重要な点です。<strong>このプロジェクトが測って いるのは通信の速さであって、記憶装置の速さではありません。</strong> 記憶装置を 本物にすると、そちらが遅くて通信の性能差が見えなくなるからです。</p>
+<h4>1.5 ソースのどこを読むか</h4>
+<div class="tablewrap"><table><thead><tr><th>知りたいこと</th><th>見るファイル</th></tr></thead><tbody><tr><td>起動してシェルが出るまで</td><td><code>src/platform/x86-linux/main.c</code></td></tr><tr><td>シェルのコマンド</td><td>同上(<code>shell_exec_line()</code> 付近)</td></tr><tr><td>全体のファイル構成</td><td>この文書の <a href="#appendix-b">付録 B</a></td></tr></tbody></table></div>
+<hr>
+<h3 class="chaphead" id="ch2">第 2 章 なぜカーネルを通さないのか</h3>
+<h4>2.1 普通のプログラムがデータを送るとき</h4>
+<p>C でネットワークプログラムを書くと、こうなります。</p>
+<div class="codewrap"><pre><code>send(sock, buf, len, 0);</code></pre></div>
+<p>この 1 行の裏側で何が起きているかを追うと、こうです。</p>
+<div class="codewrap"><pre><code>  あなたのプログラム(ユーザ空間)
+        │  buf にデータがある
+        │
+        │ ① send() を呼ぶ = システムコール
+        ▼
+  ┌─────────────────────────────────────┐
+  │ カーネル                            │
+  │                                     │
+  │ ② buf の中身をカーネルのメモリへ    │  ← メモリコピー 1 回目
+  │    コピーする                       │
+  │                                     │
+  │ ③ TCP の処理(順番の管理、再送の    │
+  │    ための保存、確認応答の待ち…)   │
+  │                                     │
+  │ ④ IP のヘッダを付ける               │
+  │ ⑤ Ethernet のヘッダを付ける         │
+  │                                     │
+  │ ⑥ ドライバに渡す                    │
+  └──────────────┬──────────────────────┘
+                 │ ⑦ NIC に「送れ」と伝える
+                 ▼
+              NIC がケーブルへ送出</code></pre></div>
+<p>ここで 2 種類のコストが発生します。</p>
+<p><strong>(a) <a href="#term-memcopy">メモリコピー</a></strong></p>
+<p>②で、あなたのバッファからカーネルのバッファへデータを丸ごと写します。 1 バイトも減っていないのに、CPU がわざわざ全部読んで全部書きます。 64 キロバイトのデータなら 64 キロバイト読んで 64 キロバイト書きます。</p>
+<p>なぜコピーが要るかというと、カーネルは<strong>ユーザ空間のメモリを信用できない</strong> からです。<code>send()</code> を呼んだ直後にあなたのプログラムが <code>buf</code> を書き換えたら、 送信中のデータが化けてしまいます。だから安全な場所に写します。</p>
+<p><strong>(b) <a href="#term-ctxswitch">コンテキストスイッチ</a></strong></p>
+<p>①でユーザ空間からカーネルへ、処理が終わったらカーネルからユーザ空間へ、 CPU の動作モードが切り替わります。この切り替えにはレジスタの退避・復帰、 場合によってはキャッシュの入れ替えが伴います。1 回あたりのコストは小さい (数百ナノ秒程度)のですが、<strong>1 秒間に何万回も起きると効いてきます</strong>。</p>
+<p>前章のベンチマークで <code>IOPS 53617</code> という数字がありました。1 秒に 5 万回の 命令です。1 命令が 2 回の切り替えを伴うと 10 万回。仮に 1 回 500 ナノ秒なら 合計 50 ミリ秒 — 1 秒のうち 5% をモード切り替えだけで使う計算になります。</p>
+<h4>2.2 このプロジェクトのやり方</h4>
+<p>このプロジェクトは、<strong>上の図のカーネルの部分を全部ユーザ空間に持ってきます</strong>。</p>
+<div class="codewrap"><pre><code>  vfio_nvme(ユーザ空間の 1 プロセス)
+        │
+        │ 自前の TCP 処理
+        │ 自前の IP ヘッダ付け
+        │ 自前の Ethernet ヘッダ付け
+        │ 自前の NIC ドライバ
+        │
+        │ NIC のレジスタに直接書く
+        ▼
+     NIC がケーブルへ送出</code></pre></div>
+<ul><li><strong>システムコールが無い</strong>ので、モードの切り替えが起きません。</li><li><strong>コピーが減らせます。</strong> データの置き場所を自分で決められるので、 「最初から NIC が読める場所に置いておく」ことができます (これを<a href="#term-zerocopy">ゼロコピー</a>と呼びます)。</li></ul>
+<p>この考え方自体は珍しいものではなく、<strong>DPDK</strong>(ネットワーク用)や <strong>SPDK</strong>(ストレージ用)という有名なフレームワークが同じことをしています。 このプロジェクトはそれらを使わず、同じことを一から書いているわけです。</p>
+<h4>2.3 代償</h4>
+<p>いいことばかりではありません。</p>
+<p><strong>(a) OS の保護が効かない</strong></p>
+<p>カーネルは「不正なアドレスを NIC に教えてしまう」ようなミスから守って くれていました。それが無くなります。<strong>間違ったアドレスを NIC に渡すと、 NIC が無関係なメモリを書き換えます。</strong> これを防ぐ仕組みが <a href="#term-iommu">IOMMU</a> で、<a href="#ch3">第 3 章</a>で説明します。</p>
+<p><strong>(b) NIC を独占する</strong></p>
+<p>カーネルのドライバは 1 枚の NIC を全プロセスで共有させてくれますが、 この方式では 1 プロセスが丸ごと占有します。同じマシンの他のプログラムは、 その NIC を使えません。</p>
+<p><strong>(c) 全部自分で書く必要がある</strong></p>
+<p>ARP も、IP も、TCP の再送も、輻輳制御も、全部自分で書きます。 このリポジトリが約 33,000 行あるのはそのためです。しかも 「<strong>普通に通信できる</strong>」だけでは足りません。ケーブルが抜けた、相手が 落ちた、パケットが失われた、といった<strong>異常系</strong>も全部自分で面倒を見ます。</p>
+<p><strong>(d) デバッグが難しい</strong></p>
+<p><code>tcpdump</code> も <code>netstat</code> も使えません。カーネルが知らないところで通信して いるからです。だからこのプロジェクトには、<strong>自分で自分を観測するための 仕組み</strong>(<code>ts_log</code> というリングバッファや、たくさんの検査コマンド)が 組み込まれています(<a href="#ch27">第 27 章</a>)。</p>
+<h4>2.4 どのくらい速いのか</h4>
+<p><code>README.md</code> に Linux 標準実装との比較表があります。ここでは傾向だけ 述べると、<strong>NVMe/TCP では Linux カーネル実装の 3〜8 倍</strong>の速度が出ています。</p>
+<p>ただし<strong>この比較は対等ではありません</strong>。Linux 側はネットワーク名前空間を 経由した本物の TCP スタックを通っているのに対し、こちらは同一プロセス内で 折り返しています。<strong>順位そのものより「変更の前後で同じ列を比べる」ことに 意味がある</strong>、という位置づけです。詳しくは <a href="#ch22">第 22 章</a> で説明します。</p>
+<h4>2.5 ソースのどこを読むか</h4>
+<div class="tablewrap"><table><thead><tr><th>知りたいこと</th><th>見るファイル</th></tr></thead><tbody><tr><td>ユーザ空間から NIC を掴む部分</td><td><code>src/platform/x86-linux/vfio.c</code></td></tr><tr><td>DMA 用メモリの確保</td><td><code>src/platform/x86-linux/hal_dma.c</code></td></tr><tr><td>自前の TCP</td><td><code>src/tcp.c</code></td></tr><tr><td>自前の NIC ドライバ</td><td><code>src/mlx5.c</code>、<code>src/mlx5_net.c</code></td></tr></tbody></table></div>
+<hr>
+<h2 class="parthead" id="part-1">第 II 部 ハードウェアを直接動かす</h2>
+<p>この部が、前提知識の無い読者にとって一番の山場です。<strong>C プログラマの直観に 橋渡しできるところは、そうやって説明します。</strong></p>
+<h3 class="chaphead" id="ch3">第 3 章 PC とデバイスはどう繋がっているか</h3>
+<h4>3.1 PCI Express — 部品を挿す口</h4>
+<p>PC のマザーボードには、部品を挿すための細長いスロットがあります。 グラフィックスカードや NIC を挿すあれです。この規格が <a href="#term-pcie">PCI Express</a>(略して PCIe)です。</p>
+<p>PCIe に挿さった部品(<strong>デバイス</strong>と呼びます)は、<code>01:00.0</code> のような <strong>アドレス</strong>を持ちます。これは「バス番号 01、デバイス番号 00、機能番号 0」の 意味です。Linux では次のように一覧できます。</p>
+<div class="codewrap"><pre><code>$ lspci
+01:00.0 Ethernet controller: Mellanox Technologies MT27710 Family [ConnectX-4 Lx]
+01:00.1 Ethernet controller: Mellanox Technologies MT27710 Family [ConnectX-4 Lx]</code></pre></div>
+<p>このプロジェクトが使う NIC は、<strong>1 枚のカードで 2 つのポート</strong>を持っています。 だから <code>01:00.0</code> と <code>01:00.1</code> の 2 つに見えます。この 1 つ 1 つを <a href="#term-pf">PF</a>(Physical Function、物理機能)と呼び、この文書では <strong>PF0</strong>、<strong>PF1</strong> と書きます。</p>
+<h4>3.2 レジスタと MMIO — 番地に代入するとハードが動く</h4>
+<p>デバイスを操作するとは、具体的には何をすることでしょうか。</p>
+<p>答えは、<strong>デバイスが持っている「レジスタ」に値を書いたり読んだりすること</strong> です。<a href="#term-register">レジスタ</a>とは、デバイスの中にある小さな記憶場所で、 「ここに 1 を書いたら送信開始」「ここを読むと今の状態が分かる」といった 役割が製品ごとに決められています。</p>
+<p>問題は「どうやってそのレジスタに書くのか」です。仕組みはこうです。</p>
+<blockquote><p><strong>デバイスのレジスタを、CPU から見たメモリの番地に割り当ててしまう。</strong></p></blockquote>
+<p>これを <a href="#term-mmio">MMIO</a>(Memory-Mapped I/O、メモリマップド I/O)と 言います。C で書くとこうなります。</p>
+<div class="codewrap"><pre><code>volatile uint32_t *reg = (volatile uint32_t *)0xf7200000;  /* デバイスの番地 */
+*reg = 1;                     /* ← この代入がデバイスへの命令になる */
+uint32_t status = *reg;       /* ← この読み出しがデバイスへの問い合わせになる */</code></pre></div>
+<p><strong>代入文がハードウェアへの命令になります。</strong> ここが、普通のプログラミングと デバイス操作の一番の違いです。</p>
+<p><code>volatile</code> が付いているのが重要です。コンパイラは「同じ番地に 2 回書いたら 1 回にまとめよう」「さっき読んだ値を使い回そう」といった最適化をしますが、 <strong>MMIO ではその最適化が命取り</strong>になります。<code>volatile</code> はそれを禁じます。</p>
+<p>この「デバイスのレジスタが割り当てられたアドレスの範囲」を <a href="#term-bar">BAR</a>(Base Address Register)と呼びます。1 つのデバイスが 複数の BAR を持つこともあります。</p>
+<h4>3.3 3 種類のアドレス</h4>
+<p>ここからが混乱しやすいところです。<strong>同じ 1 バイトのメモリを指すのに、 見る立場によって 3 つの違う番号が使われます。</strong></p>
+<div class="codewrap"><pre><code>   あなたのプログラムから見た番地       [仮想アドレス]
+              |
+              |  CPU の MMU(メモリ管理ユニット)が変換
+              v
+   メモリチップ上の実際の位置           [物理アドレス]
+              ^
+              |  IOMMU が変換
+              |
+   デバイスから見た番地                 [IOVA]</code></pre></div>
+<p><strong>(1) <a href="#term-vaddr">仮想アドレス</a></strong></p>
+<p><code>malloc()</code> が返すポインタの値です。プロセスごとに独立していて、別のプロセス の同じ番地は別の場所を指します。CPU の中の <strong>MMU</strong>(Memory Management Unit) という回路が、これを物理アドレスに変換しています。普段プログラムを書くとき、 私たちはこれしか見ていません。</p>
+<p><strong>(2) <a href="#term-paddr">物理アドレス</a></strong></p>
+<p>メモリチップ上の本当の位置です。OS だけが知っています。</p>
+<p><strong>(3) <a href="#term-iova">IOVA</a></strong></p>
+<p>デバイスから見た番地です。「IO Virtual Address」の略です。 なぜ 3 つ目が要るのかは、次の節で説明します。</p>
+<h4>3.4 DMA — デバイスがメモリを直接読み書きする</h4>
+<p>NIC が 1 ギガバイトのデータを送るとき、CPU がそのデータを 1 バイトずつ レジスタに書いていたら、CPU の時間が全部それに消えてしまいます。</p>
+<p>そこで実際には逆のことをします。</p>
+<blockquote><p><strong>CPU は「このアドレスから 1500 バイト送れ」とだけ NIC に教える。 NIC が自分でメモリを読みに行く。</strong></p></blockquote>
+<p>これが <a href="#term-dma">DMA</a>(Direct Memory Access)です。デバイスがメモリバスに 直接アクセスして、CPU を介さずにデータを読み書きします。受信のときは逆に、 NIC が受け取ったデータを勝手にメモリへ書き込みます。</p>
+<p><strong>ここで問題が起きます。</strong> CPU に教えるアドレスは仮想アドレスですが、 <strong>NIC は MMU の外側にいる</strong>ので仮想アドレスを理解できません。かといって 物理アドレスを直接教えると、危険なことになります。</p>
+<blockquote><p>ユーザ空間のプログラムが「物理アドレス 0 番地に受信データを書け」と NIC に命じたら、<strong>OS のカーネルが上書きされて PC が壊れます。</strong></p></blockquote>
+<h4>3.5 IOMMU — デバイス用の MMU</h4>
+<p>この危険を防ぐのが <a href="#term-iommu">IOMMU</a>(Input/Output MMU)です。 名前のとおり、<strong>デバイス専用の MMU</strong> です。</p>
+<div class="codewrap"><pre><code>  デバイスが「IOVA = 0x1000 を読め」と言う
+              |
+              v
+      +---------------+
+      |    IOMMU      |  &lt;- 「このデバイスは IOVA 0x1000 を
+      |  (変換表)   |      物理 0x8a3f2000 として使ってよい」
+      +-------+-------+      という表を OS が事前に作っておく
+              v
+      物理アドレス 0x8a3f2000 を読む</code></pre></div>
+<p>IOMMU があると、</p>
+<ul><li><strong>表に載っていない番地にはアクセスできません。</strong> 間違ったアドレスを渡して も、他人のメモリは壊せません(アクセスが失敗するだけです)。</li><li>デバイスごとに別の表を持てるので、<strong>デバイスを 1 つのプロセスに安全に 貸し出せます。</strong></li></ul>
+<p>この「安全に貸し出せる」という性質が、ユーザ空間からデバイスを操作できる 根拠になっています。次章の <a href="#term-vfio">VFIO</a> はこの仕組みの上に乗っています。</p>
+<h4>3.6 hugepage — なぜ普通のメモリでは困るのか</h4>
+<p>CPU のメモリ管理は <strong>4 キロバイト</strong>を 1 単位(<strong>ページ</strong>)として行います。 <code>malloc()</code> で 1 メガバイト取ると、それは物理的には 4KB の断片 256 個に 散らばっているかもしれません。仮想アドレス上は連続に見えても、です。</p>
+<p>DMA でこれを使おうとすると、<strong>256 個の断片それぞれについて IOMMU の表に 登録する</strong>必要が出てきます。しかも断片の物理アドレスは連続していないので、 「ここから 1 メガバイト読め」と一言で NIC に伝えられません。</p>
+<p>そこで <a href="#term-hugepage">hugepage</a> を使います。これは <strong>2 メガバイト</strong>(または 1 ギガバイト)を 1 ページとする仕組みで、Linux では事前に確保しておきます。</p>
+<div class="codewrap"><pre><code>$ echo 1024 | sudo tee /proc/sys/vm/nr_hugepages    # 2MB × 1024 = 2GB を予約</code></pre></div>
+<p>2MB が物理的に連続していることが保証されるので、<strong>大きな DMA 用バッファを 少ない登録回数で作れます。</strong></p>
+<p>このプロジェクトは「SSD の中身」をメモリ上に持つので、<strong>それだけで 268 メガバイト</strong>使います。加えて各種のバッファがあるため、hugepage を 1024 ページ(2 ギガバイト)確保して動かしています。</p>
+<h4>3.7 割り込みとポーリング</h4>
+<p>デバイスが「仕事が終わりました」と知らせる方法は 2 つあります。</p>
+<p><strong><a href="#term-interrupt">割り込み</a></strong>: デバイスが CPU に信号を送り、CPU が今の 仕事を中断して対応する。暇なときに CPU を消費しない代わりに、 1 回あたりの反応が遅い(数マイクロ秒)。</p>
+<p><strong><a href="#term-polling">ポーリング</a></strong>: CPU が「終わった?」と繰り返し見に行く。 CPU を食い続ける代わりに、反応が速い。</p>
+<p><strong>このプロジェクトは全面的にポーリングを使っています。</strong> 理由は速度です。 1 秒に 5 万回の I/O を処理する場面では、割り込みの遅延と処理コストが 無視できません。CPU を 1 コア丸ごと「見張り」に使うほうが速いのです。</p>
+<p>DPDK や SPDK も同じ選択をしています。<strong>「CPU がもったいない」のではなく、 「速度のために CPU を投資している」</strong>と考えてください。</p>
+<h4>3.8 ソースのどこを読むか</h4>
+<div class="tablewrap"><table><thead><tr><th>知りたいこと</th><th>見るファイル</th></tr></thead><tbody><tr><td>MMIO の読み書き</td><td><code>src/mmio.h</code>(<code>mmio_read32()</code> / <code>mmio_write32()</code> / <code>mmio_write64()</code>)</td></tr><tr><td>DMA 用メモリの確保と IOVA 変換</td><td><code>src/platform/x86-linux/hal_dma.c</code></td></tr><tr><td>HAL(ハードウェア抽象層)の契約</td><td><code>include/platform.h</code></td></tr></tbody></table></div>
+<p><strong>補足</strong>: <code>mmio_write64()</code> が独立して存在するのには理由があります。 <strong>64 ビットの値は 1 回の命令で書かなければならない</strong>場面があり、 32 ビット × 2 回に分けると壊れます。実際にこのプロジェクトでは、 32 ビット 2 回に分けていたせいで<strong>数十万コマンドに 1 回エラーが出る</strong> という不具合を踏んでいます(<code>CLAUDE.md</code> に記録があります)。</p>
+<hr>
+<h3 class="chaphead" id="ch4">第 4 章 VFIO — ユーザ空間からデバイスを掴む</h3>
+<h4>4.1 VFIO とは</h4>
+<p><a href="#term-vfio">VFIO</a>(Virtual Function I/O)は、<strong>Linux が用意している 「デバイスをユーザ空間のプログラムに貸し出す」仕組み</strong>です。もともとは 仮想マシンにデバイスをそのまま見せる用途(PCI パススルー)のために 作られましたが、DPDK や SPDK のようなユーザ空間ドライバもこれを使います。</p>
+<p>VFIO が提供するのは次の 4 つです。</p>
+<ol><li>デバイスの<strong>レジスタ領域(BAR)を <code>mmap()</code> でプロセスのメモリ空間に貼る</strong></li><li><strong>設定情報(コンフィグ空間)の読み書き</strong></li><li><strong>IOMMU の表への登録</strong>(このメモリをこのデバイスに見せてよい、の宣言)</li><li><strong>割り込みの受け取り</strong>(このプロジェクトはポーリングなので使いません)</li></ol>
+<h4>4.2 デバイスをカーネルから取り上げる</h4>
+<p>普通、NIC はカーネルのドライバ(<code>mlx5_core</code>)が握っています。 これを VFIO に渡すには、<strong>バインドを付け替えます</strong>。</p>
+<div class="codewrap"><pre><code># 今どのドライバが握っているか
+$ lspci -nnks 01:00.0
+    Kernel driver in use: mlx5_core
+
+# vfio-pci に付け替える
+$ echo vfio-pci | sudo tee /sys/bus/pci/devices/0000:01:00.0/driver_override
+$ echo 0000:01:00.0 | sudo tee /sys/bus/pci/devices/0000:01:00.0/driver/unbind
+$ echo 0000:01:00.0 | sudo tee /sys/bus/pci/drivers_probe</code></pre></div>
+<p><strong>このカードは <code>mlx5_core</code> か <code>vfio-pci</code> のどちらか一方にしかバインドでき ません。</strong> VFIO に渡している間は、Linux から見て NIC が消えます (<code>ip link</code> に出てきません)。実験が終わったら戻す必要があります。</p>
+<h4>4.3 IOMMU グループ — まとめてしか貸せない</h4>
+<p>VFIO は<strong>デバイス単位ではなくグループ単位</strong>で貸し出します。 <a href="#term-iommugroup">IOMMU グループ</a>とは、「IOMMU が互いを区別できない デバイスの集まり」です。</p>
+<p>区別できないものを別々のプロセスに貸すと、片方がもう片方のメモリを 覗けてしまいます。だから<strong>グループ全体を 1 つの借り手に貸す</strong>という 規則になっています。</p>
+<p>このプロジェクトの NIC は、<strong>2 つの PF が同じグループ</strong>に入っています。</p>
+<div class="codewrap"><pre><code>$ ls /sys/kernel/iommu_groups/2/devices/
+0000:00:01.0  0000:01:00.0  0000:01:00.1</code></pre></div>
+<p>このため、<strong>PF0 だけを VFIO に、PF1 をカーネルに、という分け方ができません。</strong> 「2 ポートとも自作ドライバが握る」か「2 ポートともカーネルが握る」かの 2 択です。この制約が、後の章で出てくる検証方法の選択に影響します。</p>
+<h4>4.4 使う手順</h4>
+<p>C のコードから見ると、おおよそ次の順序です。</p>
+<div class="codewrap"><pre><code>(1) /dev/vfio/vfio を開く                      -&gt; コンテナができる
+(2) /dev/vfio/&lt;グループ番号&gt; を開く            -&gt; グループの取っ手
+(3) グループをコンテナに入れる
+(4) コンテナに IOMMU の種類を設定する
+(5) グループからデバイスの取っ手をもらう
+(6) デバイスの BAR の情報を問い合わせる
+(7) BAR を mmap() する                         -&gt; レジスタが触れるようになる
+(8) DMA 用のメモリを確保して IOMMU に登録する  -&gt; デバイスが読み書きできる</code></pre></div>
+<p>(8) が <a href="#ch3">第 3 章</a> で説明した IOMMU への登録です。「この仮想アドレスの 領域を、この IOVA としてデバイスに見せてよい」という宣言をします。</p>
+<p>このプロジェクトでは、<strong>IOVA の値を物理アドレスと同じにする</strong>という単純な 方針を採っています(<strong>アイデンティティマッピング</strong>と呼びます)。変換表が 単純になり、デバッグしやすくなります。</p>
+<h4>4.5 このプロジェクトでの実装</h4>
+<p>VFIO を触る部分は<strong>プラットフォーム依存</strong>なので、<code>src/platform/x86-linux/</code> に隔離されています。上位のコード(<code>mlx5.c</code> など)は、 <code>include/platform.h</code> で決められた少数の関数だけを使います。</p>
+<div class="codewrap"><pre><code>上位のコード(アーキテクチャ非依存)
+   |   dma_alloc()      … DMA できるメモリをください
+   |   dma_cpu_to_dev() … このポインタをデバイス用の番地に直して
+   v
+include/platform.h(契約)
+   ^
+   |  実装
+src/platform/x86-linux/hal_dma.c  … VFIO / hugepage を使った実装
+src/platform/x86-linux/vfio.c     … VFIO そのものの操作</code></pre></div>
+<p>この分離のおかげで、元は Raspberry Pi 5 のベアメタル環境(OS 無し)で 動いていたコードを、x86 の Linux ユーザ空間に移植できています。</p>
+<h4>4.6 実際に起きた問題</h4>
+<p><strong>プロセスが残っているとデバイスを返せません。</strong> VFIO はプロセスが デバイスを掴んでいる間、<code>unbind</code> を待たせます。プログラムが異常終了して 残っていると、<code>unbind</code> が<strong>無期限にブロックします</strong>。実際に 15 分以上 止まった記録があります。</p>
+<div class="codewrap"><pre><code>$ dmesg
+vfio-pci 0000:01:00.0: No device request channel registered,
+                       blocked until released by user</code></pre></div>
+<p>対処は、残っているプロセスを探して落とすことです。詳しい手順は <code>CLAUDE.md</code> にあります。</p>
+<h4>4.7 ソースのどこを読むか</h4>
+<div class="tablewrap"><table><thead><tr><th>知りたいこと</th><th>見るファイル</th></tr></thead><tbody><tr><td>VFIO の初期化、BAR の mmap</td><td><code>src/platform/x86-linux/vfio.c</code></td></tr><tr><td>DMA メモリの確保と IOMMU 登録</td><td><code>src/platform/x86-linux/hal_dma.c</code></td></tr><tr><td>上位に見せている契約</td><td><code>include/platform.h</code></td></tr></tbody></table></div>
+<hr>
+<h3 class="chaphead" id="ch5">第 5 章 ネットワークカードの動かし方</h3>
+<p>前章までで「デバイスのレジスタを触れる」「デバイスにメモリを見せられる」 状態になりました。この章では、<strong>実際に NIC を目覚めさせてフレームを やりとりできるようにするまで</strong>を説明します。</p>
+<p>対象は Mellanox ConnectX-4 です。この系統のカードは <a href="#term-hca">HCA</a>(Host Channel Adapter)と呼ばれます。</p>
+<h4>5.1 レジスタを直接叩くだけでは動かない</h4>
+<p><a href="#ch3">第 3 章</a> で「レジスタに書けばデバイスが動く」と説明しましたが、 現代の高機能な NIC はそこまで単純ではありません。</p>
+<p>このカードの中には<strong>ファームウェア</strong>(<a href="#term-firmware">FW</a>)という 小さなプログラムが動いています。カードを設定するには、レジスタを直接 叩くのではなく、<strong>FW にコマンドを送って依頼します</strong>。</p>
+<div class="codewrap"><pre><code>   あなたのプログラム
+        |
+        |  ① コマンドをメモリ上に書く(例: 「送信キューを作れ」)
+        |  ② レジスタを叩いて「置いたよ」と知らせる
+        v
+   +--------------------------+
+   |  NIC の中のファームウェア |  ③ DMA でコマンドを読む
+   |                          |  ④ 実行する
+   +--------------------------+  ⑤ 結果をメモリに書き戻す
+        |
+        |  ⑥ 完了したかどうかをポーリングで確認する
+        v
+   あなたのプログラム</code></pre></div>
+<p>この①〜⑥のやりとりの場を <strong>コマンドキュー</strong>(<a href="#term-cmdq">cmdq</a>)と 呼びます。<strong>NIC の設定はすべてこのコマンドキュー経由</strong>で行います。</p>
+<p>コマンドには番号(オペコード)が振られています。たとえば、</p>
+<div class="tablewrap"><table><thead><tr><th>オペコード</th><th>名前</th><th>意味</th></tr></thead><tbody><tr><td>0x100</td><td>ENABLE_HCA</td><td>カードを目覚めさせる</td></tr><tr><td>0x800</td><td>ALLOC_UAR</td><td>doorbell 用の領域をください</td></tr><tr><td>0x400</td><td>CREATE_CQ</td><td>完了通知キューを作って</td></tr><tr><td>0x500</td><td>CREATE_QP</td><td>通信の口を作って</td></tr></tbody></table></div>
+<p>このプロジェクトは、これらのコマンドの中身(何バイト目に何を書くか)を <strong>Linux カーネルのヘッダファイル <code>mlx5_ifc.h</code> を実際に読んで確認</strong>しながら 実装しています。推測で書くと、数バイトずれただけで動かなくなります。</p>
+<h4>5.2 キューとリングバッファ</h4>
+<p>NIC とのデータのやりとりは、<strong>キュー</strong>を通して行います。キューの実体は <strong><a href="#term-ringbuffer">リングバッファ</a></strong>です。C プログラマにはおなじみの、 配列と 2 つの添字でできた構造です。</p>
+<div class="codewrap"><pre><code>     配列(実体はメモリ上の連続領域)
+   +----+----+----+----+----+----+----+----+
+   | 0  | 1  | 2  | 3  | 4  | 5  | 6  | 7  |
+   +----+----+----+----+----+----+----+----+
+          ^              ^
+          |              |
+      consumer       producer
+      (読む側)       (書く側)</code></pre></div>
+<p>書く側が <code>producer</code> を進め、読む側が <code>consumer</code> を進めます。末尾まで 行ったら先頭に戻る(だから「リング」)。<strong>片方が CPU、もう片方が NIC</strong> に なります。</p>
+<p>このカードには 4 種類のキューがあります。</p>
+<div class="tablewrap"><table><thead><tr><th>略語</th><th>正式名</th><th>向き</th><th>何を入れるか</th></tr></thead><tbody><tr><td><a href="#term-sq">SQ</a></td><td>Send Queue</td><td>CPU → NIC</td><td>「これを送れ」という指示</td></tr><tr><td><a href="#term-rq">RQ</a></td><td>Receive Queue</td><td>CPU → NIC</td><td>「受信したらここに入れて」という空きバッファ</td></tr><tr><td><a href="#term-cq">CQ</a></td><td>Completion Queue</td><td>NIC → CPU</td><td>「終わったよ」という通知</td></tr><tr><td><a href="#term-eq">EQ</a></td><td>Event Queue</td><td>NIC → CPU</td><td>「異常が起きたよ」という通知</td></tr></tbody></table></div>
+<p><strong>RQ の向きに注意してください。</strong> 受信キューに入れるのは「受信データ」では なく、「<strong>受信データを入れるための空のバッファの場所</strong>」です。NIC はフレームを 受け取ると、RQ から空きバッファを 1 つ取り出して、そこに DMA で書き込みます。</p>
+<h4>5.3 WQE と CQE</h4>
+<p>キューに入れる 1 個 1 個の要素にも名前があります。</p>
+<ul><li><strong><a href="#term-wqe">WQE</a></strong>(Work Queue Element、「ウィッキー」と読む人が多い): SQ や RQ に入れる<strong>作業指示書</strong>。「このアドレスから 1500 バイトを送れ」 といった内容が、決められたバイト配置で書かれています。</li><li><strong><a href="#term-cqe">CQE</a></strong>(Completion Queue Entry): CQ に入る<strong>完了報告</strong>。 「さっきの作業は成功した」「エラーコード 0x12 で失敗した」といった情報が 入っています。</li></ul>
+<p>送信の流れを具体的に書くと、こうなります。</p>
+<div class="codewrap"><pre><code>① 送りたいデータを DMA できるメモリに用意する
+② SQ の空きスロットに WQE を書く
+     - 「送信」という種別
+     - データのアドレス(IOVA)と長さ
+     - Ethernet ヘッダ(短いものは WQE に直接埋め込める)
+③ doorbell を鳴らす(次節)
+④ 別のタイミングで CQ をポーリングして、完了を確認する</code></pre></div>
+<h4>5.4 doorbell — 「置いたよ」の伝え方</h4>
+<p>WQE をメモリに書いただけでは NIC は気付きません。<strong>「新しい指示を置いた」 と教える</strong>必要があります。これが <a href="#term-doorbell">doorbell</a>(呼び鈴)です。</p>
+<p>doorbell の正体は MMIO への書き込みです。専用に割り当てられたレジスタ領域 (<a href="#term-uar">UAR</a>、User Access Region と言います)の特定の番地に、 「今 SQ のどこまで書いたか」を示す番号を書きます。</p>
+<div class="codewrap"><pre><code>/* イメージ(実際のコードとは異なります) */
+sq-&gt;wqe[index] = ...;          /* ① WQE を書く */
+__asm__ volatile("" ::: "memory");  /* ② 順序を守らせる */
+mmio_write64(uar + DOORBELL_OFFSET, packed_value);  /* ③ 鳴らす */</code></pre></div>
+<p>②の<strong>メモリバリア</strong>が重要です。CPU は性能のために書き込みの順序を入れ替える ことがありますが、<strong>doorbell が WQE より先に届くと、NIC は書きかけの WQE を 読んでしまいます</strong>。バリアはそれを禁じます。</p>
+<p>このカードには <strong>BlueFlame</strong> という高速化の仕組みもあり、小さなデータなら doorbell と一緒に WQE そのものを MMIO で書き込めます。DMA の往復が減るぶん 速くなります。</p>
+<blockquote><p><strong>実際に踏んだ不具合</strong>: この doorbell を「32 ビット × 2 回」で書いていた ために、<strong>数十万コマンドに 1 回だけエラーが出る</strong>という問題がありました。 8 バイトはアトミックに(1 回の 64 ビット書き込みで)書かなければ なりません。<a href="#ch3">第 3 章</a> の補足で触れたのがこれです。</p></blockquote>
+<h4>5.5 bring-up の順序</h4>
+<p>カードを使える状態にすることを <strong>bring-up</strong> と呼びます。順序には <strong>依存関係</strong>があり、飛ばすと失敗します。このプロジェクトの順序は次のとおりです。</p>
+<div class="codewrap"><pre><code> 1. コマンドキューの初期化          … これが無いと何も依頼できない
+ 2. ENABLE_HCA                      … カードを目覚めさせる
+ 3. 能力の問い合わせ(QUERY_HCA_CAP)… 何ができるカードかを聞く
+ 4. 初期化ページの供給              … FW が使う作業用メモリを渡す
+ 5. INIT_HCA                        … 初期化
+ 6. UAR の確保                      … doorbell を書く場所
+ 7. EQ の作成                       … 異常通知の受け皿
+ 8. PD の確保                       … 「保護ドメイン」(次節)
+ 9. MKey の作成                     … メモリの使用許可証(次節)
+10. CQ の作成                       … 完了通知の受け皿
+11. TIS / TIR の作成                … 送受信の「型」を決めるオブジェクト
+12. SQ / RQ の作成                  … 実際の送受信キュー
+13. フローステアリングの設定        … 届いたフレームをどこへ送るか(5.7)
+14. ポートを up にする</code></pre></div>
+<p><strong>なぜこの順序か</strong>は、後のものが前のものを参照するからです。たとえば CQ を作るコマンドには「どの UAR を使うか」を書く欄があるので、UAR が先です。</p>
+<h4>5.6 PD と MKey — メモリの使用許可証</h4>
+<p><a href="#term-pd">PD</a>(Protection Domain、保護ドメイン)と <a href="#term-mkey">MKey</a>(Memory Key)は、<strong>NIC にメモリを使わせるための許可証</strong>です。</p>
+<p><a href="#ch3">第 3 章</a> で IOMMU の話をしました。IOMMU は「OS がデバイスに許した 範囲」を決めますが、MKey は<strong>その内側で、さらにカードの中で使う許可証</strong>です。</p>
+<div class="codewrap"><pre><code>  MKey = 「このアドレスから この長さ の範囲を、読み書きしてよい」
+         という登録。番号(キー)が発行される。
+
+  WQE には「このデータは MKey 番号 X の中の、オフセット Y にある」と書く。</code></pre></div>
+<p>なぜ二重になっているかというと、<strong><a href="#term-rdma">RDMA</a> では相手にこの番号を 教える</strong>からです(<a href="#ch15">第 15 章</a>)。「私のメモリのここを読んでいいですよ、 鍵はこれです」と渡す仕組みなので、鍵という概念が要ります。</p>
+<p>PD はその MKey たちをまとめるグループです。異なる PD の資源は互いに アクセスできません。</p>
+<h4>5.7 フローステアリング — 届いたフレームをどこへ入れるか</h4>
+<p>NIC に 1 本のケーブルから色々なフレームが届きます。それを 「どの受信キューに入れるか」を決める仕組みが <strong><a href="#term-flowsteering">フローステアリング</a></strong>です。</p>
+<p>高性能な NIC は受信キューを何本も持てるので、たとえば 「宛先ポート 80 番のパケットはキュー 0 へ、それ以外はキュー 1 へ」 といった振り分けができます。CPU コアごとにキューを分ければ、 複数コアで並列に処理できます。</p>
+<p>このプロジェクトは単純で、<strong>全部を 1 本のキューに入れる</strong>規則 (catch-all、キャッチオール)を 1 つ登録しているだけです。振り分けは ソフトウェア側(<a href="#ch6">第 6 章</a> 以降)で行います。</p>
+<blockquote><p><strong>副作用</strong>: この catch-all のせいで、<strong><a href="#term-rdma">RDMA</a> 用のフレームまで 通常の受信キューに複製されて届きます。</strong> これは長らく 「未対応プロトコル、無視」というログとして無害に流れていたのですが、 あとで UDP を実装したときに「待ち受けていないポート宛」と判定され、 <strong>エラー応答を大量に送り返す</strong>という問題を引き起こしました (<a href="#ch9">第 9 章</a> で詳述)。</p></blockquote>
+<h4>5.8 QP — RDMA 用の「通信の口」</h4>
+<p>ここまでの SQ / RQ / CQ は Ethernet フレームをやりとりするための仕組み でした。<a href="#term-rdma">RDMA</a> を使うときは、別の道具立てになります。</p>
+<p><a href="#term-qp">QP</a>(Queue Pair、キューペア)は、その名のとおり <strong>送信キューと受信キューを 1 組にしたもの</strong>で、RDMA の通信単位です。 TCP のソケットに相当すると考えると分かりやすいでしょう。</p>
+<p>QP には状態があり、決められた順に遷移させます。</p>
+<div class="codewrap"><pre><code>  RESET  →  INIT  →  RTR  →  RTS
+  (初期)  (初期化) (受信可) (送受信可)
+                    Ready     Ready
+                    To Receive To Send</code></pre></div>
+<p><strong>どのパラメータをどの遷移で設定するかが決まっています。</strong> たとえば 「相手から同時に何個の RDMA 読み出しを受け付けるか」という設定は <strong>INIT→RTR でしか反映されません</strong>。RTR→RTS で書いても FW は保持しません。</p>
+<blockquote><p><strong>実際に踏んだ不具合</strong>: この設定を間違った遷移で書いていたため、 相手が 2 個目の読み出しを投げた瞬間にエラーになる、という問題が ありました。これを直したことで<strong>書き込み性能が 2.3 倍</strong>になっています (<a href="#ch15">第 15 章</a> で詳述)。</p></blockquote>
+<h4>5.9 ソースのどこを読むか</h4>
+<div class="tablewrap"><table><thead><tr><th>知りたいこと</th><th>見るファイル</th></tr></thead><tbody><tr><td>bring-up の全体、コマンドキュー</td><td><code>src/mlx5.c</code>(約 4,300 行。<code>mlx5_hca_bringup()</code> が入口)</td></tr><tr><td>QP の作成・状態遷移・WQE 組み立て</td><td><code>src/mlx5_qp.c</code></td></tr><tr><td>Ethernet の送受信(上位から見た口)</td><td><code>src/mlx5_net.c</code></td></tr><tr><td>MMIO の補助関数</td><td><code>src/mmio.h</code></td></tr></tbody></table></div>
+<p><code>mlx5.c</code> だけは最適化を切って(<code>-O0</code> で)コンパイルされています。 <strong>理由は未解明です。</strong> <code>-O2</code> にすると bring-up の途中(ENABLE_HCA の直後の QUERY_ISSI というコマンド)が実機で毎回失敗し、<code>-O0</code> なら確実に成功する、 という現象があるためです。Makefile にその旨のコメントが残されています。</p>
+<hr>
+<h2 class="parthead" id="part-2">第 III 部 ネットワークの基礎と、この実装</h2>
+<p>ここからはソフトウェアの話です。<strong>ケーブルの上を流れるバイト列がどんな形を していて、それをこのプログラムがどう組み立て、どう解釈するか</strong>を説明します。</p>
+<h3 class="chaphead" id="ch6">第 6 章 パケットは入れ子の箱</h3>
+<h4>6.1 一番大事な図</h4>
+<p>ネットワークの話で最初に理解すべきなのは、<strong>データが入れ子の箱に入って 運ばれる</strong>ということです。この 1 枚の図が第 III 部と第 IV 部の土台になります。</p>
+<div class="codewrap"><pre><code> ケーブルの上を流れる 1 個のかたまり([フレーム] と呼ぶ)
+
+ +----------------+------------+-------------+---------------------------+
+ | Ethernet ヘッダ | IP ヘッダ  | TCP ヘッダ  |  中身(アプリのデータ)   |
+ |    14 バイト    | 20 バイト  |  20 バイト  |                           |
+ +----------------+------------+-------------+---------------------------+
+ |&lt;-- どの機械へ -&gt;|&lt;-- どの  -&gt;|&lt;-- どのプロ-&gt;|                          |
+ |    (MAC)      |   IP へ    |  グラムへ    |                          |
+ +----------------+------------+-------------+---------------------------+
+                  |&lt;--------------- IP から見た「中身」  ---------------&gt;|
+                               |&lt;------ TCP から見た「中身」  ----------&gt;|</code></pre></div>
+<ul><li><strong>一番外側の <a href="#term-ethernet">Ethernet</a> ヘッダ</strong>は「同じケーブルに繋がって いる機械のうち、どれ宛か」を書きます。宛先は <a href="#term-mac">MAC アドレス</a>(48 ビットの機器固有番号)です。</li><li><strong>次の <a href="#term-ip">IP</a> ヘッダ</strong>は「世界中のどのコンピュータ宛か」を書きます。 宛先は IP アドレスです。</li><li><strong>次の <a href="#term-tcp">TCP</a> ヘッダ</strong>は「そのコンピュータの中のどのプログラム 宛か」を書きます。宛先は<a href="#term-port">ポート番号</a>です。</li><li><strong>その中身</strong>が、実際に運びたいデータです。</li></ul>
+<p>各層は「自分のヘッダ」だけを見て、その内側は<strong>ただのバイト列</strong>として扱います。 だから層を積み替えられます(IP の上に TCP でも UDP でも載せられる)。</p>
+<p>このプロジェクトでは、さらに内側に NVMe のコマンドが入ります。</p>
+<div class="codewrap"><pre><code> +----------+---------+----------+---------------------------------+
+ | Ethernet |   IP    |   TCP    |   NVMe/TCP の PDU               |
+ +----------+---------+----------+---------------------------------+
+                                 | +---------+-------------------+ |
+                                 | | PDU ヘッダ |  NVMe コマンド  | |
+                                 | +---------+-------------------+ |
+                                 +---------------------------------+</code></pre></div>
+<p><a href="#term-pdu">PDU</a> が何かは <a href="#ch14">第 14 章</a> で説明します。今は 「TCP の中にさらに箱がある」とだけ分かれば十分です。</p>
+<h4>6.2 バイトオーダー — 数値の並べ方</h4>
+<p><code>uint32_t x = 0x12345678;</code> をメモリに置いたとき、バイトの並びは CPU に よって違います。</p>
+<div class="codewrap"><pre><code>  リトルエンディアン(x86、ARM の通常設定): 78 56 34 12
+  ビッグエンディアン                      : 12 34 56 78</code></pre></div>
+<p><strong>ネットワークのヘッダはビッグエンディアン</strong>と決まっています (「<a href="#term-byteorder">ネットワークバイトオーダー</a>」と呼びます)。x86 は リトルエンディアンなので、<strong>ヘッダを読み書きするたびに変換が要ります</strong>。</p>
+<p>C の標準では <code>htons()</code> / <code>ntohl()</code> といった関数がありますが、 このプロジェクトは自前の小さな関数を使っています。</p>
+<div class="codewrap"><pre><code>rd16be(p)   /* p から 16 ビットをビッグエンディアンとして読む */
+wr32be(p,v) /* p へ 32 ビットをビッグエンディアンで書く */
+rd32le(p)   /* リトルエンディアン版 */</code></pre></div>
+<p><strong>なぜ両方あるか</strong>が重要です。<strong>ネットワークのヘッダはビッグエンディアン、 NVMe のコマンドはリトルエンディアン</strong>だからです。同じ 1 個のフレームの中で 両方が混在します。取り違えると値が桁違いになります。</p>
+<h4>6.3 チェックサム — 壊れていないことの確認</h4>
+<p>IP と TCP のヘッダには<strong><a href="#term-checksum">チェックサム</a></strong>という欄があります。 中身を 16 ビットずつ足し合わせた値(の反転)を入れておき、受け取った側が 同じ計算をして一致するかを見ます。</p>
+<p>TCP のチェックサムには工夫があり、<strong><a href="#term-pseudoheader">疑似ヘッダ</a></strong>という 実際には送らない仮想的なヘッダも計算に含めます。ここには送信元 IP と宛先 IP が 入ります。こうすると「IP アドレスが化けた」ことも検出できます。</p>
+<p><strong>このプロジェクトでは、チェックサムの計算を NIC に任せています</strong> (<a href="#term-offload">オフロード</a>)。CPU が全バイトを舐めるより速いからです。 ただし「疑似ヘッダの部分和」だけはソフトウェアで計算して種として書き込み、 残りを NIC に埋めさせる、という分担になっています。</p>
+<blockquote><p><strong>実際に踏んだ不具合</strong>: ある場面で NIC のオフロードを無効にしたところ、 <strong>それまで隠れていたソフトウェア側の計算ミスが表に出ました</strong>。 疑似ヘッダの送信元アドレスを間違えていたのですが、NIC が正しい値で 上書きしていたので誰も気付かなかったのです。 <strong>「ハードウェアが黙って直してくれる」たぐいの不具合は、 ハードウェアを止めた瞬間に別の場所で出ます。</strong></p></blockquote>
+<h4>6.4 MTU — 1 個のフレームに入る大きさの上限</h4>
+<p>1 個のフレームで運べる中身の大きさには上限があります。これを <strong><a href="#term-mtu">MTU</a></strong>(Maximum Transmission Unit)と呼びます。 普通の Ethernet では 1500 バイトです。</p>
+<p>大きなデータを送るときは、<strong>分割して複数のフレームで送ります</strong>。 どの層で分割するかで名前が違います。</p>
+<ul><li><strong>TCP が分割する</strong>: 送るバイト列を MTU に収まる大きさに切って送る。 これが普通のやり方です(切れ目のことを<a href="#term-segment">セグメント</a>と呼ぶ)。</li><li><strong>IP が分割する</strong>: すでに組み立てたパケットを IP の層で切る。 これが<a href="#term-fragment">フラグメント</a>です。効率が悪いので避けられます。</li></ul>
+<p>このプロジェクトが使うリンクでは、<strong>MTU を 9000 バイト超に設定</strong>しています (<a href="#term-jumbo">ジャンボフレーム</a>)。1 フレームで多く運べるほど、 1 バイトあたりのヘッダのコストと処理回数が減ります。</p>
+<blockquote><p><strong>境界値の罠</strong>: MTU ぴったりのサイズを扱う場所は事故が起きやすいところ です。このプロジェクトでは、IPv6 に対応したときに <strong>「IPv6 ヘッダは IPv4 より 20 バイト長い」ことを忘れて</strong>、 フルサイズのフレームだけが NIC に無言で捨てられる、という不具合が ありました。<strong>小さいテストデータでは 1 フレームに収まってしまうので 発見できず</strong>、テストサイズを大きくして初めて見つかっています。</p></blockquote>
+<h4>6.5 このプロジェクトでの受信の入口</h4>
+<p>フレームが届いてから各層に配られるまでは、こうなっています。</p>
+<div class="codewrap"><pre><code>   NIC がフレームを受信して DMA でメモリに書く
+              |
+              v
+   mlx5_net.c : CQ をポーリングして「届いた」を検出
+              |
+              v
+   netif.c    : Ethernet ヘッダを見て、種別ごとに振り分ける
+              |
+      +-------+--------+---------------+
+      v                v               v
+   arp.c            ip.c            ipv6.c
+   (0x0806)        (0x0800)        (0x86DD)
+                      |                |
+              +-------+-----+     (同様に分岐)
+              v       v     v
+           tcp.c   udp.c  icmp.c</code></pre></div>
+<p><code>0x0806</code> などの数字は Ethernet ヘッダの中の <strong><a href="#term-ethertype">EtherType</a></strong> という欄の値で、「中身が何か」を示します。</p>
+<h4>6.6 ソースのどこを読むか</h4>
+<div class="tablewrap"><table><thead><tr><th>知りたいこと</th><th>見るファイル</th></tr></thead><tbody><tr><td>バイトオーダー変換、チェックサム</td><td><code>src/net.h</code></td></tr><tr><td>インターフェース管理とフレームの振り分け</td><td><code>src/netif.c</code>、<code>src/netif.h</code></td></tr><tr><td>フレームバッファの管理</td><td><code>src/net_buf.c</code></td></tr><tr><td>IP アドレスを v4/v6 共通で扱う型</td><td><code>src/netaddr.h</code></td></tr></tbody></table></div>
+<hr>
+<h3 class="chaphead" id="ch7">第 7 章 隣の機械を見つける(ARP / NDP)</h3>
+<h4>7.1 なぜ 2 種類のアドレスが要るのか</h4>
+<p><a href="#ch6">第 6 章</a> で、Ethernet ヘッダには MAC アドレス、IP ヘッダには IP アドレスを 書くと説明しました。<strong>なぜ 2 つも要るのでしょうか。</strong></p>
+<ul><li><strong>IP アドレス</strong>は「世界のどこか」を指す論理的な番号です。引っ越せば変わります。</li><li><strong>MAC アドレス</strong>は「この機器そのもの」を指す物理的な番号です。工場で焼き 付けられていて変わりません。</li></ul>
+<p>送りたい相手の IP アドレスは分かっている。でもフレームを出すには <strong>同じケーブルに繋がっている「次の相手」の MAC アドレス</strong>が要ります。 これを調べるのが <a href="#term-arp">ARP</a>(IPv4 用)と <a href="#term-ndp">NDP</a>(IPv6 用)です。</p>
+<h4>7.2 ARP のやりとり</h4>
+<div class="codewrap"><pre><code>  A(192.168.101.10)が B(192.168.101.11)へ送りたい
+
+  A → 全員 : 「192.168.101.11 を持っているのは誰? 私は A、MAC は xx:xx」
+              (ブロードキャスト = そのケーブルの全員に届く宛先)
+  B → A    : 「私です。MAC は yy:yy」(A だけに返す)
+
+  A は (192.168.101.11 → yy:yy) を覚えておく</code></pre></div>
+<p>覚えておく表を <strong><a href="#term-arpcache">ARP キャッシュ</a></strong> と呼びます。 毎回聞いていたら遅いので、一度聞いたらしばらく覚えます。</p>
+<p>IPv6 の NDP も考え方は同じですが、ブロードキャストではなく <strong><a href="#term-multicast">マルチキャスト</a></strong>(特定のグループ宛)を使います。 無関係な機器を起こさない、という改良です。</p>
+<h4>7.3 キャッシュを永久に持ってはいけない</h4>
+<p>一度覚えたら永久に使う、では困ります。相手の機器が交換されたら 古い MAC に送り続けてしまいます。そこで<strong>有効期限</strong>(このプロジェクトの 既定は 60 秒)を設けます。</p>
+<p>ただし<strong>期限が切れた瞬間に捨てるのも駄目です。</strong> 捨ててしまうと、 次にそのアドレスへ送ろうとしたときに「MAC が分からない」状態になり、 <strong>送信処理の途中で ARP の問い合わせと応答待ちが発生します</strong>。 これは最悪 900 ミリ秒の停止を招きます。</p>
+<p>そこで Linux などと同じ 3 段階にしています。</p>
+<div class="tablewrap"><table><thead><tr><th>状態</th><th>条件</th><th>引いたときの動き</th></tr></thead><tbody><tr><td>新鮮</td><td>期限内</td><td>MAC を返す</td></tr><tr><td>古い</td><td>期限切れ〜猶予期間内</td><td><strong>MAC を返す</strong> + 裏で確認の問い合わせを出す</td></tr><tr><td>死亡</td><td>猶予も過ぎた</td><td>無効にして「未登録」を返す</td></tr></tbody></table></div>
+<p><strong>「古いけど返す」がある</strong>ので、送信が止まりません。裏で確認して、 返事があれば期限を延ばし、無ければ次で死亡扱いになります。</p>
+<h4>7.4 ホットパスに時計を置かない</h4>
+<p>このキャッシュを引く処理は、<strong>TCP のセグメントを 1 個送るたびに通ります</strong>。 1 秒に何万回も通る道(<strong><a href="#term-hotpath">ホットパス</a></strong>と呼びます)なので、 無駄な処理を 1 つも置けません。</p>
+<p>このプロジェクトでは、次の工夫をしています。</p>
+<ul><li>期限は「あと何ミリ秒か」ではなく<strong>絶対時刻</strong>で持つ。引くときは引き算 1 回 で済み、割り算が要らない(時刻はナノ秒なのでミリ秒に直すと 64 ビット除算 が発生する)。</li><li><strong>時刻の読み出しは、アドレスの一致を確認できてから 1 回だけ</strong>行う。 一致しないエントリのために時計を読まない。</li></ul>
+<p>こういう細かい積み重ねが <a href="#ch23">第 23 章</a> の性能に効いてきます。</p>
+<h4>7.5 到達不能検出(NUD)</h4>
+<p>「相手がまだ生きているか」を確かめる仕組みを <a href="#term-nud">NUD</a>(Neighbor Unreachability Detection)と言います。 RFC 4861 で決められていて、このプロジェクトも実装しています。要点は 4 つです。</p>
+<ol><li><strong>期限切れのエントリを使った瞬間には確認を出さない。</strong> 少し待ってから (このプロジェクトでは期限の 1/12)初めて確認する。連続する送信の 1 個目で毎回問い合わせが飛ぶのを避けるためです。</li><li><strong>上位層からの「届いている」証拠を使う。</strong> TCP で「相手が自分のデータを 受け取った」ことが分かったなら、それは問い合わせより強い証拠です。 確認を出さずに期限を延ばします。</li><li><strong>確認はユニキャスト</strong>(その相手だけに送る)。MAC を知っている相手に ブロードキャストを撃つ必要はありません。</li><li><strong>偽の応答に騙されない。</strong> 「上書きしてよい」という印の無い応答が 既存と違う MAC を主張してきたら無視します。これが無いと、 <strong>偽の応答 1 通で他人宛の通信を横取りできてしまいます。</strong></li></ol>
+<h4>7.6 重複アドレス検出</h4>
+<p>自分が使おうとしている IP アドレスを、既に誰かが使っていないか確かめる 仕組みもあります。IPv4 では <a href="#term-arpprobe">ARP Probe</a>、IPv6 では <a href="#term-dad">DAD</a>(Duplicate Address Detection)と呼びます。</p>
+<p>やり方は「そのアドレスについて問い合わせを出し、返事が来たら使われている」 です。ポイントは<strong>送信元アドレスを空にして出す</strong>ことで、まだ自分のもので ないアドレスを名乗らないようにします。</p>
+<blockquote><p><strong>このカード特有の問題</strong>: このカードは<strong>マルチキャストやブロードキャストを 送信元にも返してきます</strong>(自分が出したものが自分に戻ってくる)。 重複アドレス検出を入れた途端、<strong>各ポートが「自分自身と衝突した」と 報告する</strong>ようになりました。対策として、送信元 MAC が自分なら応答も 集計もしない、という判定を入れています。</p></blockquote>
+<h4>7.7 ソースのどこを読むか</h4>
+<div class="tablewrap"><table><thead><tr><th>知りたいこと</th><th>見るファイル</th></tr></thead><tbody><tr><td>ARP(IPv4)</td><td><code>src/arp.c</code>、<code>src/arp.h</code></td></tr><tr><td>NDP(IPv6)と近隣キャッシュ</td><td><code>src/ipv6.c</code></td></tr><tr><td>キャッシュの有効期限の判定</td><td><code>src/arp.c</code> の <code>neigh_check_age()</code></td></tr><tr><td>動作確認コマンド</td><td><code>arptest</code>、<code>arpage</code>、<code>nudtest</code>、<code>dadtest</code>(<a href="#ch27">第 27 章</a>)</td></tr></tbody></table></div>
+<hr>
+<h3 class="chaphead" id="ch8">第 8 章 IP — 住所と道案内</h3>
+<h4>8.1 IP の役割</h4>
+<p><a href="#term-ip">IP</a>(Internet Protocol)の仕事は 2 つです。</p>
+<ol><li><strong>宛先を書く。</strong> 世界中で一意な番号(IP アドレス)で相手を指定します。</li><li><strong>道案内をする。</strong> 相手が同じケーブル上にいないなら、 「とりあえずこの機械に渡してくれ」という中継役を決めます。</li></ol>
+<p>IP アドレスには 2 つの世代があります。</p>
+<ul><li><strong><a href="#term-ipv4">IPv4</a></strong>: 32 ビット。<code>192.168.101.11</code> のように 8 ビットずつ 10 進で書きます。約 43 億個しかなく、枯渇しています。</li><li><strong><a href="#term-ipv6">IPv6</a></strong>: 128 ビット。<code>2001:db8:0:1::20</code> のように 16 ビット ずつ 16 進で書きます。事実上無限です。</li></ul>
+<p><strong>このプロジェクトは両方に対応しています。</strong> 内部では <code>netaddr_t</code> という 共通の型(種別 + 16 バイトの配列)で持ち回り、<strong>ヘッダを組み立てる直前に だけ種別を見て分岐</strong>します。</p>
+<h4>8.2 サブネット — 「同じケーブル上か」の判定</h4>
+<p>IP アドレスは前半が「ネットワークの番号」、後半が「その中の機械の番号」に 分かれます。どこで分かれるかを示すのが<strong><a href="#term-netmask">サブネットマスク</a></strong>です。</p>
+<div class="codewrap"><pre><code>  自分:       192.168.101.10
+  マスク:     255.255.255.0     (前 24 ビットがネットワーク番号)
+  ------------------------------------------------
+  ネットワーク: 192.168.101.0
+
+  宛先 A: 192.168.101.11  → 前 24 ビットが同じ → 同じケーブル上にいる
+  宛先 B: 10.9.9.9        → 違う               → 誰かに中継してもらう</code></pre></div>
+<p>同じケーブル上なら、<a href="#ch7">第 7 章</a> の ARP で相手の MAC を引いて直接送ります。 違うなら、<strong><a href="#term-gateway">デフォルトゲートウェイ</a></strong>(中継役のルータ)の MAC を引いて、そこへ送ります。</p>
+<p><strong>ここが重要です。</strong></p>
+<blockquote><p><strong>中継してもらうときも、IP ヘッダの宛先は最終目的地のままです。 変わるのは Ethernet ヘッダの宛先 MAC だけです。</strong></p></blockquote>
+<div class="codewrap"><pre><code>  10.9.9.9 へ送りたい(ゲートウェイは 192.168.101.11)
+
+  +----------------------+---------------------+--------
+  | Ethernet             | IP                  |
+  | 宛先 MAC = ルータの  | 宛先 IP = 10.9.9.9  |  ...
+  |            MAC       |          (最終目的地)|
+  +----------------------+---------------------+--------</code></pre></div>
+<p>この「次に渡す相手」を<strong><a href="#term-nexthop">次ホップ</a></strong>と呼びます。</p>
+<h4>8.3 断片化(フラグメント)</h4>
+<p><a href="#ch6">第 6 章</a> で MTU の話をしました。IP のパケットが MTU より大きいとき、 IP の層で分割することを<strong><a href="#term-fragment">フラグメント</a></strong>と言います。</p>
+<p>IPv4 のヘッダには、そのための欄があります。</p>
+<ul><li><strong>識別子</strong>: 同じ元パケットから分かれた断片には同じ番号を振る</li><li><strong>オフセット</strong>: 元のパケットの何バイト目からか</li><li><strong>MF ビット</strong>: 「後にもまだ続く」の印</li></ul>
+<p>受け取った側は、識別子でまとめて、オフセット順に並べ直します。</p>
+<p><strong>間違えやすい点が 3 つ</strong>あります。</p>
+<ol><li><strong>オフセットは 8 バイト単位</strong>で記録されます(13 ビットしかないため)。 したがって最後以外の断片の長さは 8 の倍数でなければなりません。</li><li><strong>全断片で識別子を同じにする</strong>必要があります。ヘッダを組み立てる関数が 呼ばれるたびに識別子を増やす作りだと、分割のときに壊れます。</li><li><strong>上位層のヘッダ(TCP など)は先頭の断片にしか入りません。</strong> だから分割は「上位のヘッダまで組み立て終わったあと」に行います。</li></ol>
+<p><strong>IPv6 では経路の途中で分割してはいけない</strong>ことになっています。 送信元が最初から小さく作るか、拡張ヘッダを使って自分で分割します。</p>
+<p>このプロジェクトは <strong>送信側の分割は実装済み、受信側の組み立ては未実装</strong> です(断片が届いたら捨てます)。詳しくは <a href="#ch28">第 28 章</a> の表を見てください。</p>
+<h4>8.4 経路 MTU 探索(PMTUD)</h4>
+<p>途中の経路に「うちは 1400 バイトまでしか通せない」という区間があると、 それより大きなパケットは通れません。</p>
+<p>IPv4 では「分割禁止」の印を立てて送り、通れなかったら中継機が 「大きすぎる。うちの上限は 1400 だ」というエラーを返してきます (<a href="#ch9">第 9 章</a> の ICMP)。IPv6 も同様のエラーがあります。</p>
+<p>これを受け取って<strong>宛先ごとに上限を覚える</strong>のが <a href="#term-pmtud">PMTUD</a>(Path MTU Discovery)です。</p>
+<p>このプロジェクトの実装では、次の点に注意しています。</p>
+<ul><li><strong>エラーの中の MTU 値の位置が IPv4 と IPv6 で違います。</strong> IPv4 は 「未使用 4 バイトの後半 2 バイト」、IPv6 は「4 バイト全体」です。 片方のつもりでもう片方を読むと、値が 0 になったり桁が狂ったりします。</li><li><strong>学習する宛先は「エラーの送信元」ではなく「元のパケットの宛先」です。</strong> 文句を言ってきたルータのアドレスを覚えても意味がありません。</li><li><strong>下げる方向にしか動かしません。</strong> 学習済みより大きい値の報告は無視します。 そうしないと、<strong>偽の大きい値を送り込むだけで学習を無効化できてしまいます。</strong></li><li><strong>床を設けます</strong>(IPv4 は 576、IPv6 は 1280 バイト)。それ未満は採用しません。</li></ul>
+<p>なお、覚えておく表は <a href="#ch7">第 7 章</a> の近隣キャッシュとは<strong>別に持っています</strong>。 近隣キャッシュのキーは「次ホップ」ですが、経路 MTU は「最終宛先」ごとの 性質だからです。同じ表に入れると、同じゲートウェイを通る別々の宛先の値が 混ざってしまいます。</p>
+<h4>8.5 ソースのどこを読むか</h4>
+<div class="tablewrap"><table><thead><tr><th>知りたいこと</th><th>見るファイル</th></tr></thead><tbody><tr><td>IPv4 の送受信、断片化</td><td><code>src/ip.c</code></td></tr><tr><td>IPv6 の送受信、拡張ヘッダ、NDP</td><td><code>src/ipv6.c</code>(約 2,400 行)</td></tr><tr><td>v4/v6 共通のアドレス型</td><td><code>src/netaddr.h</code></td></tr><tr><td>次ホップの判定</td><td><code>src/netif.h</code> の <code>netif_next_hop4()</code> / <code>netif_next_hop6()</code></td></tr><tr><td>経路 MTU の表</td><td><code>src/pmtu.c</code></td></tr><tr><td>動作確認コマンド</td><td><code>route</code>、<code>routetest</code>、<code>fragtest</code>、<code>pmtutest</code></td></tr></tbody></table></div>
+<hr>
+<h3 class="chaphead" id="ch9">第 9 章 ICMP — 「届かなかった」を伝える</h3>
+<h4>9.1 ICMP の役割</h4>
+<p><a href="#term-icmp">ICMP</a>(Internet Control Message Protocol)は、 <strong>ネットワークの都合を伝えるための連絡係</strong>です。データを運ぶのではなく、 「届かなかった」「大きすぎる」「生きてますか」といった制御メッセージを扱います。</p>
+<p>よく使うものは次の 3 つです。</p>
+<div class="tablewrap"><table><thead><tr><th>種別</th><th>意味</th><th>使われ方</th></tr></thead><tbody><tr><td>Echo Request / Reply</td><td>「生きてる?」「生きてる」</td><td><code>ping</code> コマンドの正体</td></tr><tr><td>Destination Unreachable</td><td>「届けられない」</td><td>相手がいない、ポートが閉じている</td></tr><tr><td>Fragmentation Needed</td><td>「大きすぎる。上限は N」</td><td><a href="#ch8">第 8 章</a> の PMTUD</td></tr></tbody></table></div>
+<p>IPv6 版は <a href="#term-icmpv6">ICMPv6</a> と呼ばれ、番号体系が違います。 また IPv6 では、<a href="#ch7">第 7 章</a> の NDP も ICMPv6 のメッセージとして 実装されています(IPv4 の ARP が独立していたのとは対照的です)。</p>
+<h4>9.2 このプロジェクトが返すもの</h4>
+<ul><li><strong>Echo Request が来たら Reply を返します。</strong> だから外部から <code>ping</code> が通ります。</li><li><strong>待ち受けていない UDP ポート宛のパケットには「ポート到達不能」を返します。</strong></li><li><strong>知らないプロトコル番号には「プロトコル到達不能」を返します。</strong></li></ul>
+<p>エラーを返すときは、<strong>元のパケットの IP ヘッダと、その先頭 8 バイト</strong>を 引用して添えます。受け取った側が「どの通信に対するエラーか」を判断できる ようにするためです。</p>
+<h4>9.3 実際に起きた問題 — 実装した途端に迷惑をかけた</h4>
+<p>これは設計を考えるうえで示唆的な事例なので、詳しく書きます。</p>
+<p><a href="#ch5">第 5 章</a> で、フローステアリングの catch-all のせいで <strong>RDMA 用のフレームまで通常の受信キューに複製されて届く</strong>という話をしました。 RDMA は UDP の 4791 番ポートを使います。</p>
+<p>UDP を実装する前は、これらのフレームは 「未対応プロトコル(17)、無視」というログとして無害に捨てられていました。</p>
+<p><strong>ところが UDP を実装した途端</strong>、これが「待ち受けていないポート宛の UDP」と 正しく判定されるようになり、<strong>RDMA のパケット 1 個ごとに ICMP のエラーを 返し始めました</strong>。相手側に大量のエラーが届いて初めて気付きました。</p>
+<p>対策は、UDP の 4791 番宛だけは黙って捨てる、という例外です。</p>
+<blockquote><p><strong>教訓</strong>: 「今まで黙って捨てていたもの」に処理を付けると、 <strong>それまで無害だった異常系が突然表に出ます。</strong> 新しいプロトコルを実装したら、既存の機能を一通り動かしてログの差分を 見る必要があります。</p></blockquote>
+<h4>9.4 ソースのどこを読むか</h4>
+<div class="tablewrap"><table><thead><tr><th>知りたいこと</th><th>見るファイル</th></tr></thead><tbody><tr><td>ICMP(IPv4)</td><td><code>src/icmp.c</code></td></tr><tr><td>ICMPv6</td><td><code>src/ipv6.c</code></td></tr><tr><td>エラーを返す判断</td><td><code>src/ip.c</code></td></tr><tr><td>動作確認コマンド</td><td><code>ping6</code>、<code>udptest</code>、<code>pmtutest</code></td></tr></tbody></table></div>
+<hr>
+<h3 class="chaphead" id="ch10">第 10 章 TCP — 信頼できるバイトの流れを作る</h3>
+<p>この章は第 III 部で一番長く、一番重要です。<strong>TCP は「信頼できない土台の上に 信頼を作る」</strong>仕組みで、そのための工夫がたくさん詰まっています。</p>
+<h4>10.1 IP は何も保証しない</h4>
+<p><a href="#ch8">第 8 章</a> までの仕組み(IP)は、実は何も保証しません。</p>
+<ul><li>パケットは<strong>失われるかもしれません</strong>(混雑した中継機が捨てる)</li><li><strong>順番が入れ替わるかもしれません</strong>(別の経路を通る)</li><li><strong>重複するかもしれません</strong>(再送が二重に届く)</li></ul>
+<p>その上で「送ったバイト列が、順番どおり、欠けずに、重複せずに届く」ことを 実現するのが TCP です。</p>
+<h4>10.2 シーケンス番号 — 全バイトに通し番号を振る</h4>
+<p>TCP の中心的な考え方はこれです。</p>
+<blockquote><p><strong>送るバイト 1 つ 1 つに通し番号を振る。 受け取った側は「ここまで受け取った」を番号で返す。</strong></p></blockquote>
+<p>送る側が付ける番号が<strong><a href="#term-seqnum">シーケンス番号</a></strong>、 受け取った側が返す番号が<strong><a href="#term-acknum">ACK 番号</a></strong>です。</p>
+<div class="codewrap"><pre><code>  送信側                            受信側
+    |                                 |
+    |-- seq=1000, 100 バイト --------&gt;|  (1000〜1099 を受信)
+    |                                 |
+    |&lt;------------- ack=1100 ---------|  「1100 番から先をください」
+    |                                 |
+    |-- seq=1100, 100 バイト --------&gt;|</code></pre></div>
+<p><strong>ACK 番号は「次に欲しい番号」</strong>です。「1099 まで受け取った」ではなく 「1100 をください」と言います。</p>
+<p>もし途中のセグメントが失われると、受信側は<strong>同じ ACK 番号を繰り返します</strong>。</p>
+<div class="codewrap"><pre><code>  送信側                            受信側
+    |-- seq=1000 (100 B) ------------&gt;|  OK
+    |-- seq=1100 (100 B) --X          |  失われた
+    |-- seq=1200 (100 B) ------------&gt;|  1100 が来ていないので…
+    |&lt;------------- ack=1100 ---------|  「まだ 1100 が欲しい」
+    |-- seq=1300 (100 B) ------------&gt;|
+    |&lt;------------- ack=1100 ---------|  「まだ 1100 が欲しい」(重複 ACK)</code></pre></div>
+<p>この<strong><a href="#term-dupack">重複 ACK</a></strong>が「何かが失われた」の合図になります。</p>
+<h4>10.3 接続の確立と切断</h4>
+<p>TCP は「接続」という概念を持ちます。始めるときは 3 回のやりとり (<strong><a href="#term-3way">3-way handshake</a></strong>)をします。</p>
+<div class="codewrap"><pre><code>  クライアント                     サーバ
+      |------- SYN (seq=x) --------&gt;|   「始めたい。私の番号は x から」
+      |&lt;-- SYN|ACK (seq=y, ack=x+1)-|   「いいよ。私は y から」
+      |------- ACK (ack=y+1) ------&gt;|   「了解」
+      |                             |
+      |===== 以降データをやりとり ===|</code></pre></div>
+<p>終わるときは、<strong>両方向を別々に閉じます</strong>。片方が「もう送るものはない」 (FIN)と言っても、逆方向はまだ送れます。</p>
+<div class="codewrap"><pre><code>      |------- FIN ---------------&gt;|   「私はもう送らない」
+      |&lt;------ ACK ----------------|   「了解」(まだ送れる)
+      |&lt;------ FIN ----------------|   「私ももう送らない」
+      |------- ACK ---------------&gt;|   「了解」</code></pre></div>
+<p>閉じたあと、<strong>しばらく待つ</strong>状態(<strong><a href="#term-timewait">TIME_WAIT</a></strong>)があります。 遅れて届いた古いパケットが、同じポート番号で始まった<strong>次の接続に混ざるのを 防ぐ</strong>ためです。</p>
+<h4>10.4 ウィンドウ — 相手の受け入れ余地</h4>
+<p>送る側が一気に大量に送ると、受け取る側のバッファが溢れます。そこで 受信側は「あと何バイト受け取れるか」を毎回 ACK と一緒に伝えます。 これが<strong><a href="#term-window">ウィンドウ</a></strong>です。</p>
+<p>ヘッダのウィンドウ欄は 16 ビットしかない(最大 65535 バイト)ので、 高速なリンクでは足りません。そこで<strong><a href="#term-winscale">ウィンドウスケール</a></strong> というオプションがあり、「この値を 2 の N 乗倍して読んでください」と 接続確立時に取り決めます。</p>
+<h4>10.5 再送 — 失われたものをどうやって送り直すか</h4>
+<p>失われたセグメントを送り直す方法は 2 つあります。</p>
+<p><strong>(1) 時間切れによる再送(<a href="#term-rto">RTO</a>)</strong></p>
+<p>送ってから一定時間 ACK が来なかったら送り直します。確実ですが<strong>遅い</strong> (このプロジェクトの初期値は 500 ミリ秒)。</p>
+<p><strong>(2) 重複 ACK による高速再送(<a href="#term-fastretx">Fast Retransmit</a>)</strong></p>
+<p>10.2 の重複 ACK が 3 個溜まったら、時間切れを待たずに送り直します。</p>
+<p>このプロジェクトは両方を実装しています。ロスを人工的に注入して測ると、 <strong>再送の 97% が重複 ACK 由来</strong>(時間切れではない)になります。</p>
+<h4>10.6 実装で分かった 3 つの落とし穴</h4>
+<p>高速再送を素直に教科書どおり実装すると、<strong>このスタックでは発散します</strong>。 実測に基づいて 3 つの抑制を入れています。</p>
+<p><strong>(1) 1 個だけ送り直すのではなく、そこから全部送り直す</strong></p>
+<p>教科書どおりだと「失われた 1 個だけ」を送り直します。しかし この実装の受信側は順序が乱れたセグメントを 64 個しか保持できません。 1 個ずつ直していると先読みバッファが溢れて<strong>二次的な穴</strong>が増え、 実測でスループットが <strong>8.99 MB/s</strong> まで落ちました。</p>
+<p>そこから全部送り直す方式(<strong><a href="#term-gobackn">Go-Back-N</a></strong>)に変えたら <strong>736 MB/s</strong>(82 倍)になりました。</p>
+<p><strong>(2) 送り直しが生む重複 ACK を差し引く</strong></p>
+<p>K 個送り直すと、相手は「もう持ってるよ」という ACK を K 個返します。 これが 3 個以上あると「また失われた」と誤判定して、 <strong>再送 → 重複 ACK → 再送</strong>の正のフィードバックになります。 実測では<strong>破棄 1318 個に対して再送 517,527 回</strong>という暴走が起きました。 自分の再送が生む ACK の数を数えて差し引くことで解決しています。</p>
+<p><strong>(3) 情報の変わらない ACK を送らない</strong></p>
+<p>これは高速再送そのものより効いた発見です。</p>
+<p>受信バッファを読み出すたびに「空きが増えました」という ACK を送っていた のですが、広告するウィンドウの値には上限があるため、 <strong>実際には値が 1 ビットも変わっていませんでした</strong>。相手に伝わる情報は ゼロで、CPU と帯域を捨てていただけです。</p>
+<p>さらに悪いことに、<strong>この ACK は「重複 ACK」の定義に完全に一致します</strong>。 高速再送を入れた直後、<strong>ロスが 1 つも無いのに重複 ACK を 419 万個検出し、 10 万回の空振り再送</strong>が起きました。</p>
+<p>「前回広告した値と同じなら送らない」と直したところ、誤検出が完全にゼロに なり、<strong>書き込み性能が 20% 向上</strong>しました。</p>
+<blockquote><p><strong>教訓</strong>: 「送っても害は無いだろう」で出しているパケットが、 後から入れる機能の判定材料と衝突することがあります。しかも 419 万個という数は、誤検出を追いかけてカウンタを仕込むまで 誰も見ていませんでした。</p></blockquote>
+<h4>10.7 閉じたポートへの RST</h4>
+<p>接続を受け付けていないポートに SYN が届いたら、 <strong><a href="#term-rst">RST</a></strong>(リセット)を返して即座に断ります。返さないと、 相手は SYN を 5 回再送して 15.5 秒待ちます。実装したことで <strong>接続失敗の確定が 15.5 秒から 0.2 ミリ秒未満</strong>になりました。</p>
+<p>ただし <strong>RST を返してはいけない場面が 4 つ</strong>あり、どれを外しても問題が 起きます。</p>
+<ol><li><strong>受信したのが RST のとき。</strong> RST に RST を返すと無限に往復します。</li><li><strong>そのポートに待ち受けがいるとき。</strong> 待ち受けを張り直す一瞬の隙間に 届いた SYN が「閉じている」ように見えます。ここで RST を返すと <strong>相手の接続が即座に失敗します</strong>。黙って捨てて再送に任せます。</li><li><strong>TIME_WAIT の 4 つ組と一致するとき。</strong> 閉じた直後に届く遅延パケットを 「閉じたポート宛」と誤判定して、<strong>相手の TIME_WAIT を壊してしまいます</strong>。</li><li><strong>宛先がマルチキャストのとき。</strong></li></ol>
+<h4>10.8 この実装が持っていないもの</h4>
+<p>正直に書いておきます。次のものは実装していません。</p>
+<ul><li><strong><a href="#term-sack">SACK</a></strong>(選択確認応答): 「1100 は無いけど 1200〜1299 は ある」と細かく伝える仕組み。あれば 10.6 の (1)(2) の問題が根本から 消えます。</li><li><strong><a href="#term-tcpts">タイムスタンプ</a></strong>: 往復時間をより正確に測るオプション。</li><li><strong>TCP キープアライブ</strong>: 無通信のまま相手が消えたことの検出 (NVMe の層で似た仕組みを持っているので実害は小さい。<a href="#ch16">第 16 章</a>)。</li><li><strong>待ち受けキュー(backlog)</strong>: 同時に複数の接続要求を溜める仕組み。</li></ul>
+<h4>10.9 ソースのどこを読むか</h4>
+<div class="tablewrap"><table><thead><tr><th>知りたいこと</th><th>見るファイル</th></tr></thead><tbody><tr><td>TCP 全体</td><td><code>src/tcp.c</code>(約 3,300 行)、<code>src/tcp.h</code></td></tr><tr><td>受信の入口</td><td><code>tcp_input_addr()</code></td></tr><tr><td>送信の中心</td><td><code>tcp_send()</code></td></tr><tr><td>接続 1 本の状態</td><td><code>tcp_conn_t</code>(<a href="#ch19">第 19 章</a>で詳述)</td></tr><tr><td>ロスを注入する道具</td><td>シェルコマンド <code>txdrop</code>(<a href="#ch27">第 27 章</a>)</td></tr></tbody></table></div>
+<hr>
+<h3 class="chaphead" id="ch11">第 11 章 UDP と IPv6</h3>
+<h4>11.1 UDP — 何も保証しない代わりに軽い</h4>
+<p><a href="#term-udp">UDP</a>(User Datagram Protocol)は、TCP と対照的に<strong>何も保証 しません</strong>。順番も、到達も、重複しないことも。ヘッダはたった 8 バイトです。</p>
+<div class="codewrap"><pre><code> +--------+--------+--------+--------+
+ | 送信元ポート    | 宛先ポート      |
+ +--------+--------+--------+--------+
+ | 長さ            | チェックサム    |
+ +--------+--------+--------+--------+</code></pre></div>
+<p>このプロジェクトで UDP が要る理由は 2 つあります。</p>
+<ol><li><strong><a href="#term-rocev2">RoCEv2</a>(RDMA)が UDP の上に載っている</strong>(<a href="#ch15">第 15 章</a>)</li><li>動作確認用</li></ol>
+<p>チェックサムについて 1 点だけ注意があります。計算結果がたまたま 0 に なったときは、<strong>0 ではなく 0xFFFF を書きます</strong>。UDP では 0 が 「チェックサム無し」を意味するからです。</p>
+<h4>11.2 IPv6 で追加されること</h4>
+<p>IPv6 は「IPv4 のアドレスを長くしただけ」ではありません。付随する仕組みが いくつかあります。このプロジェクトはそれらも実装しています。</p>
+<p><strong>(1) <a href="#term-linklocal">リンクローカルアドレス</a></strong></p>
+<p><code>fe80::</code> で始まるアドレスで、<strong>MAC アドレスから自動的に作られます</strong>。 設定なしで同じケーブル上の通信ができます。</p>
+<p><strong>(2) <a href="#term-slaac">SLAAC</a>(アドレスの自動設定)</strong></p>
+<p>ルータに「このネットワークの番号は何ですか」と尋ね(RS)、 返ってきた答え(RA)と自分の MAC を組み合わせて、 <strong>世界で通用するアドレスを自分で作ります</strong>。DHCP のような サーバが要りません。</p>
+<p><strong>(3) <a href="#term-mld">MLD</a>(マルチキャストの参加表明)</strong></p>
+<p>「私はこのマルチキャストグループを聞いています」とスイッチに伝えます。 <strong>賢いスイッチは、聞いている人がいないマルチキャストを転送しません。</strong> つまり <strong>MLD を実装しないと、そういうスイッチの配下では <a href="#ch7">第 7 章</a> の NDP が一切通りません</strong>(NDP はマルチキャストを使うため)。</p>
+<p><strong>(4) <a href="#term-extheader">拡張ヘッダ</a></strong></p>
+<p>IPv6 では、オプション的な情報を「基本ヘッダと上位プロトコルの間に挟む」 形で表します。数珠つなぎになっていて、順に辿る必要があります。</p>
+<div class="codewrap"><pre><code> +----------+------------+-----------+--------------+
+ | IPv6     | Hop-by-Hop | Fragment  | TCP ...      |
+ | (next=0) | (next=44)  | (next=6)  |              |
+ +----------+------------+-----------+--------------+
+      └── 次は何か ─┘ └── 次は何か ─┘</code></pre></div>
+<p>辿るときの注意点が 4 つあります。</p>
+<ul><li>長さの単位は「(記載値 + 1) × 8 バイト」(最初の 8 バイトを含まない)</li><li>Hop-by-Hop の中の項目は {種別, 長さ, 値} の並びだが、 <strong>種別 0(パディング 1 バイト)だけは長さの欄を持たない</strong>。 一律に読むとそこからずれます。</li><li>知らない項目に出会ったときの扱いは、<strong>種別の上位 2 ビットが決めます</strong>。 「無視してよい」以外は捨てなければなりません。</li><li><strong>上位プロトコルの長さは、全体長から拡張ヘッダぶんを引く</strong>必要があります。 忘れるとチェックサムの検証が全部壊れます。</li></ul>
+<h4>11.3 IPv6 対応で実際に踏んだ不具合</h4>
+<p><strong>外部の Linux 機と繋いで初めて見つかった</strong>ものが 3 件あります。いずれも <strong>自作どうしで通信している限り、両側が同じ間違い方をするので絶対に 検出できない</strong>性質のものでした。</p>
+<ol><li><strong>マルチキャストの受信が無効だった。</strong> NDP の問い合わせはマルチキャスト で来るので、NIC のフィルタに弾かれて<strong>外部からの IPv6 が 1 フレームも 受け取れませんでした</strong>。IPv4 の ARP はブロードキャストなので通っていて、 それで気付きませんでした。</li><li><strong>メッセージ中のアドレスの位置が 4 バイトずれていた。</strong> 送る側も受け取る側も同じだけずれているので、自作どうしでは全部通ります。</li><li><strong>応答に常に自分のリンクローカルアドレスを入れていた。</strong> 相手が 「聞いたのと違うアドレスだ」と判断して捨てます。リンクローカル宛の <code>ping6</code> だけ通り、グローバルアドレス宛が通らない、という形で出ました。</li></ol>
+<blockquote><p><strong>教訓</strong>: <strong>正規の実装と繋ぐまで、自作どうしの検証では見つからない 種類の不具合があります。</strong> <a href="#ch29">第 29 章</a> で、この教訓から生まれた 検証手法を説明します。</p></blockquote>
+<h4>11.4 HW オフロードは IPv6 でもそのまま使える</h4>
+<p>実装時、<a href="#ch6">第 6 章</a> で触れたチェックサムのオフロードと、 大きなデータを NIC に分割させる機能(<a href="#term-lso">LSO</a>、<a href="#ch23">第 23 章</a>)を、 「NIC は IPv4 前提だろう」と考えて IPv6 では無効にしていました。</p>
+<p><strong>実測したら両方ともそのまま動きました。</strong> 無効にしていた間は、 IPv4 と比べて書き込みが 38%、読み出しが 47% 遅くなっていました。</p>
+<blockquote><p><strong>教訓</strong>: 「ハードウェアの機能は古い規格前提だろう」という推測で 機能を切ると、<strong>動くはずのものを落としたまま気付きません。</strong> 切る前に一度有効にして測るべきです。</p></blockquote>
+<h4>11.5 ソースのどこを読むか</h4>
+<div class="tablewrap"><table><thead><tr><th>知りたいこと</th><th>見るファイル</th></tr></thead><tbody><tr><td>UDP</td><td><code>src/udp.c</code></td></tr><tr><td>IPv6 全般、NDP、SLAAC、MLD、拡張ヘッダ</td><td><code>src/ipv6.c</code>(約 2,400 行)</td></tr><tr><td>動作確認コマンド</td><td><code>udptest</code>、<code>udptest6</code>、<code>ping6</code>、<code>tcp6test</code>、<code>slaactest</code>、<code>mldtest</code>、<code>ext6test</code></td></tr></tbody></table></div>
+<hr>
+<h2 class="parthead" id="part-3">第 IV 部 NVMe と NVMe over Fabrics</h2>
+<p>第 III 部で「バイト列を届ける」ところまで来ました。この部では、 <strong>その上に載せる「ストレージとの会話」</strong>を説明します。</p>
+<h3 class="chaphead" id="ch12">第 12 章 NVMe の考え方</h3>
+<h4>12.1 SSD との会話はキューで行う</h4>
+<p>昔のハードディスクとの会話は「命令を 1 個送って、終わるまで待つ」形でした。 機械が回転して磁気ヘッドが動くのを待つので、それで十分だったのです。</p>
+<p>SSD は機械的な待ち時間が無く、しかも<strong>内部で何十もの処理を同時に</strong>進め られます。1 個ずつ待っていては性能が出ません。そこで <a href="#term-nvme">NVMe</a> は、 <a href="#ch5">第 5 章</a> で見たのと同じ<strong>キュー</strong>の考え方を採用しました。</p>
+<div class="codewrap"><pre><code>   ホスト(PC)                              SSD
+   +---------------------+
+   | 送信キュー(SQ)    |  ← ここにコマンドを積む
+   |  [cmd][cmd][cmd]... |  → SSD が読みに来る(DMA)
+   +---------------------+
+   +---------------------+
+   | 完了キュー(CQ)    |  ← SSD が結果を書き込む(DMA)
+   |  [結果][結果]...    |  → ホストが読む
+   +---------------------+</code></pre></div>
+<p><strong>コマンドを積むだけ積んで、結果は後でまとめて回収します。</strong> これが 「<a href="#term-qdepth">キュー深度</a>」(同時に何個投げっぱなしにするか)という 概念の正体です。<a href="#ch1">第 1 章</a> のベンチマーク出力にあった <code>qd</code> がこれです。</p>
+<h4>12.2 コマンドと完了の形</h4>
+<p>NVMe のコマンドは <strong>64 バイト固定</strong>です(<a href="#term-sqe">SQE</a>、 Submission Queue Entry と呼びます)。</p>
+<div class="codewrap"><pre><code>  バイト  0     : オペコード(何をするか。読み=0x02、書き=0x01 など)
+  バイト  2-3   : コマンド ID(この命令を識別する番号)
+  バイト  4-7   : 名前空間 ID(どの領域か。次節)
+  バイト 24-39  : データの置き場所
+  バイト 40-43  : cdw10  ┐
+  バイト 44-47  : cdw11  │ コマンドごとに意味が違う 6 個の 32 ビット欄
+       …                 │ (cdw = Command Dword)
+  バイト 60-63  : cdw15  ┘</code></pre></div>
+<p>完了は <strong>16 バイト固定</strong>です(<a href="#term-cqe">CQE</a>、Completion Queue Entry)。</p>
+<div class="codewrap"><pre><code>  バイト  0-3   : 結果の値(コマンドによる)
+  バイト  8-9   : キューの進み具合
+  バイト 12-13  : どのコマンド ID に対する完了か
+  バイト 14-15  : ステータス(成功か、失敗ならその理由)</code></pre></div>
+<p><strong>同じ「CQE」という略語が <a href="#ch5">第 5 章</a> の NIC のところにも出てきました が、別物です。</strong> NIC の CQE は「送信が終わった」、NVMe の CQE は 「読み書きが終わった」を表します。文脈で区別してください。</p>
+<h4>12.3 名前空間 — SSD の中の区画</h4>
+<p>1 台の SSD を複数の領域に分けて使えます。この 1 つ 1 つを <strong><a href="#term-namespace">名前空間</a></strong>(Namespace)と呼び、<code>nsid</code> という番号で 指定します。Linux からは <code>/dev/nvme0n1</code>、<code>/dev/nvme0n2</code> のように見えます。</p>
+<p>各名前空間は「<a href="#term-lba">LBA</a>(Logical Block Address、論理ブロック番号)が 0 から N まである」という形で表されます。1 ブロックの大きさは典型的には 512 バイトか 4096 バイトです。</p>
+<p><strong>このプロジェクトは名前空間を 2 つ持っています。</strong> 1 番が 256 メガバイト、 2 番が 32 メガバイトです(実体はメモリ上の配列)。大きさを変えてあるのは メモリの節約のためでもありますが、<strong>「名前空間ごとに別の領域を見ているか」 の検証としても効く</strong>からです(<a href="#ch29">第 29 章</a>)。</p>
+<h4>12.4 admin キューと IO キュー</h4>
+<p>キューには 2 種類あります。</p>
+<ul><li><strong><a href="#term-adminq">admin キュー</a></strong>: 管理用。「あなたは誰ですか」 (Identify)、「設定を変えたい」(Set Features)といった制御を行います。 接続ごとに 1 本だけです。</li><li><strong><a href="#term-ioq">IO キュー</a></strong>: 実際の読み書き用。何本でも作れます (普通は CPU コアの数だけ)。</li></ul>
+<p><strong>このプロジェクトは IO キューを 1 本だけ作ります。</strong></p>
+<h4>12.5 主なコマンド</h4>
+<p><strong>admin キュー</strong></p>
+<div class="tablewrap"><table><thead><tr><th>オペコード</th><th>名前</th><th>意味</th></tr></thead><tbody><tr><td>0x06</td><td>Identify</td><td>「あなたの仕様を教えて」</td></tr><tr><td>0x09</td><td>Set Features</td><td>設定を書く</td></tr><tr><td>0x0A</td><td>Get Features</td><td>設定を読む</td></tr><tr><td>0x02</td><td>Get Log Page</td><td>ログ(健康状態など)を読む</td></tr><tr><td>0x0C</td><td>Async Event Request</td><td>「何かあったら教えて」(後述)</td></tr><tr><td>0x18</td><td>Keep Alive</td><td>「生きてます」</td></tr></tbody></table></div>
+<p><strong>IO キュー</strong></p>
+<div class="tablewrap"><table><thead><tr><th>オペコード</th><th>名前</th><th>意味</th></tr></thead><tbody><tr><td>0x01</td><td>Write</td><td>書く</td></tr><tr><td>0x02</td><td>Read</td><td>読む</td></tr><tr><td>0x00</td><td>Flush</td><td>キャッシュを確定させる</td></tr><tr><td>0x08</td><td>Write Zeroes</td><td>指定範囲をゼロにする(データを送らずに)</td></tr><tr><td>0x09</td><td>Dataset Management</td><td>「この範囲はもう使わない」(TRIM)</td></tr></tbody></table></div>
+<h4>12.6 非同期イベント要求という変わったコマンド</h4>
+<p><code>Async Event Request</code>(<strong><a href="#term-aer">AER</a></strong>)は独特です。 <strong>ホストが先に投げておいて、コントローラは何か起きるまで完了させません。</strong></p>
+<div class="codewrap"><pre><code>  ホスト → 「何かあったら教えて」(AER を投げる)
+                  … 何時間でも待つ …
+  コントローラ → 「名前空間が増えました」(このとき初めて完了を返す)
+  ホスト → 「了解」+ すぐに次の AER を投げる</code></pre></div>
+<p>普通のコマンドは「投げたらすぐ返ってくる」ものなので、<strong>ここで即座に 成功を返してしまうと、ホストが即座に再発行して無限ループになります</strong>。</p>
+<h4>12.7 ソースのどこを読むか</h4>
+<div class="tablewrap"><table><thead><tr><th>知りたいこと</th><th>見るファイル</th></tr></thead><tbody><tr><td>コマンド・完了の構造体と定数</td><td><code>src/nvme_types.h</code></td></tr><tr><td>ターゲット側(命令を受ける)</td><td><code>src/nvmet.c</code>(約 3,000 行)</td></tr><tr><td>イニシエータ側(命令を出す)</td><td><code>src/nvme.c</code>(約 2,200 行)</td></tr></tbody></table></div>
+<hr>
+<h3 class="chaphead" id="ch13">第 13 章 ネットワーク越しの NVMe</h3>
+<h4>13.1 発想の転換</h4>
+<p><a href="#ch12">第 12 章</a> の図をもう一度見てください。ホストと SSD は <strong>キューを介して会話しているだけ</strong>です。物理的に隣り合っている必要は ありません。</p>
+<div class="codewrap"><pre><code>   これまで:  ホスト --- PCIe --- SSD
+
+   NVMe-oF:   ホスト --- ネットワーク --- SSD を持つ機械</code></pre></div>
+<p><strong>間の運び方をネットワークに置き換えたもの</strong>が <a href="#term-nvmeof">NVMe-oF</a>(NVMe over Fabrics)です。コマンドの形 (64 バイトの SQE)はそのまま使い、それをネットワークで運びます。</p>
+<p>運び方には種類があり、これを<strong><a href="#term-transport">トランスポート束縛</a></strong>と 呼びます。</p>
+<div class="tablewrap"><table><thead><tr><th>束縛</th><th>運び方</th><th>このプロジェクトの対応</th></tr></thead><tbody><tr><td><strong>NVMe/TCP</strong></td><td>TCP の上に載せる</td><td><strong>実装済み・実機で確認済み</strong></td></tr><tr><td><strong>NVMe-oF RDMA</strong></td><td>RDMA で相手のメモリを直接読み書き</td><td><strong>実装済み・現構成では未確認</strong>(<a href="#ch15">第 15 章</a>)</td></tr><tr><td>NVMe/FC</td><td>ファイバチャネル</td><td>対象外</td></tr></tbody></table></div>
+<h4>13.2 Fabrics コマンド</h4>
+<p>ネットワーク越しになると、PCIe には無かった手順が要ります。</p>
+<ul><li><strong>接続の確立</strong>: 「これからあなたに繋ぎます」という挨拶</li><li><strong>相手の識別</strong>: PCIe なら「このスロットの装置」で分かりましたが、 ネットワークでは名前が要ります</li></ul>
+<p>そのために <strong><a href="#term-fabrics">Fabrics コマンド</a></strong>(オペコード 0x7F)という 特別な系統が追加されています。中でも重要なのが <strong>Connect</strong> です。</p>
+<p>Connect のときにホストが渡すもの:</p>
+<ul><li><strong><a href="#term-nqn">NQN</a></strong>(NVMe Qualified Name): 繋ぎたい相手の名前。 <code>nqn.2014-08.org.nvmexpress:uuid:...</code> のような長い文字列です。</li><li><strong>キュー ID</strong>: 0 なら admin キュー、1 以上なら IO キュー</li><li><strong><a href="#term-kato">KATO</a></strong>(Keep Alive Timeout): 「この時間コマンドが 来なかったら私が死んだと思ってください」</li></ul>
+<h4>13.3 Discovery — 何が繋がっているかを尋ねる</h4>
+<p>いきなり NQN が分かっているとは限りません。そこで、 <strong>「ここには何がありますか」と尋ねるための特別なコントローラ</strong>が 定義されています。<a href="#term-discovery">Discovery</a> コントローラと呼び、 NQN は <code>nqn.2014-08.org.nvmexpress.discovery</code> で固定です。</p>
+<div class="codewrap"><pre><code>$ sudo nvme discover -t tcp -a 192.168.101.11 -s 4421
+Discovery Log Number of Records 1
+=====Discovery Log Entry 0======
+trtype:  tcp
+subnqn:  nqn.2014-08.org.nvmexpress:uuid:deadbeef-...
+traddr:  192.168.101.11</code></pre></div>
+<p>このプロジェクトも Discovery に対応しています。</p>
+<blockquote><p><strong>実装時に踏んだ問題</strong>: Discovery は <strong>IO キューを作りません</strong>。 通常の接続を前提に「IO キューの後始末係が接続の終了を検出する」構造に なっていたため、<strong>Discovery のあと誰も後始末をせず、以後この待ち受けが 一切の接続を受け付けなくなる</strong>という不具合がありました。</p><p><strong>教訓</strong>: 後始末を別の担当に任せている構造では、 <strong>その担当が動かない経路を足したときに後始末が誰の仕事でもなくなります。</strong></p></blockquote>
+<h4>13.4 ソースのどこを読むか</h4>
+<div class="tablewrap"><table><thead><tr><th>知りたいこと</th><th>見るファイル</th></tr></thead><tbody><tr><td>Fabrics コマンドの処理(ターゲット)</td><td><code>src/nvmet.c</code> の <code>nvmet_admin_dispatch()</code></td></tr><tr><td>Discovery のログページ組み立て</td><td><code>src/nvmet.c</code> の <code>nvmet_build_disc_log()</code></td></tr><tr><td>動作確認コマンド</td><td><code>nvmediscover</code></td></tr></tbody></table></div>
+<hr>
+<h3 class="chaphead" id="ch14">第 14 章 NVMe/TCP</h3>
+<h4>14.1 PDU — TCP の上に区切りを作る</h4>
+<p>TCP は<strong>バイトの流れ</strong>です。区切りがありません。一方 NVMe のコマンドは 64 バイトの塊です。だから「ここからここまでが 1 個のコマンド」という 区切りを自分で作る必要があります。</p>
+<p>その単位が <strong><a href="#term-pdu">PDU</a></strong>(Protocol Data Unit)です。</p>
+<div class="codewrap"><pre><code> +--------------------------------+
+ | 共通ヘッダ(8 バイト)         |
+ |   種別 / フラグ / ヘッダ長 /   |
+ |   データ開始位置 / 全体長      |
+ +--------------------------------+
+ | 種別ごとの部分                 |
+ +--------------------------------+
+ | (ヘッダのチェック値)         |
+ +--------------------------------+
+ | データ                         |
+ +--------------------------------+
+ | (データのチェック値)         |
+ +--------------------------------+</code></pre></div>
+<p><strong>全体長がヘッダに書いてある</strong>ので、受け取る側は「あと何バイト読めば 1 個ぶんか」が分かります。</p>
+<p>主な種別:</p>
+<div class="tablewrap"><table><thead><tr><th>種別</th><th>名前</th><th>向き</th><th>意味</th></tr></thead><tbody><tr><td>0x00</td><td>ICReq</td><td>ホスト→</td><td>接続の初期化要求</td></tr><tr><td>0x01</td><td>ICResp</td><td>→ホスト</td><td>その応答</td></tr><tr><td>0x04</td><td>CapsuleCmd</td><td>ホスト→</td><td>NVMe コマンド(64 バイト)を運ぶ</td></tr><tr><td>0x05</td><td>CapsuleResp</td><td>→ホスト</td><td>完了(16 バイト)を運ぶ</td></tr><tr><td>0x06</td><td>H2CData</td><td>ホスト→</td><td>ホストからのデータ本体</td></tr><tr><td>0x07</td><td>C2HData</td><td>→ホスト</td><td>ターゲットからのデータ本体</td></tr><tr><td>0x09</td><td>R2T</td><td>→ホスト</td><td>「データを送ってください」</td></tr></tbody></table></div>
+<h4>14.2 データの運び方が 2 通りある</h4>
+<p><strong>書き込み</strong>のとき、データをどう運ぶかに 2 つの方式があります。</p>
+<p><strong>(1) in-capsule(カプセル同梱)</strong></p>
+<p>コマンドの PDU にデータをくっつけて 1 回で送ります。</p>
+<div class="codewrap"><pre><code>  +-----------+------------------+---------------+
+  | PDU ヘッダ | NVMe コマンド    | データ         |
+  +-----------+------------------+---------------+</code></pre></div>
+<p><strong>やりとりが 1 往復で済む</strong>ので速いのですが、大きなデータには向きません。 上限は接続時に取り決めます。</p>
+<p><strong>(2) R2T(Ready To Transfer)</strong></p>
+<p>コマンドだけ先に送り、ターゲットが「準備できたので送ってください」 (R2T)と返してから、データを送ります。</p>
+<div class="codewrap"><pre><code>  ホスト → CapsuleCmd(「書け」だけ)
+  ホスト ← R2T       (「0 バイト目から 64KB 送って」)
+  ホスト → H2CData   (データ)
+  ホスト ← CapsuleResp(完了)</code></pre></div>
+<p><strong>やりとりが増える代わりに、ターゲットが受け入れ量を制御できます。</strong></p>
+<p><strong>読み出し</strong>は単純で、ターゲットが C2HData でデータを送り、 最後に完了を返します(完了をデータの PDU に埋め込む省略形もあります)。</p>
+<h4>14.3 ダイジェスト(CRC32C)</h4>
+<p>TCP にもチェックサムはありますが、16 ビットしかなく強度が低いため、 NVMe/TCP は独自に <strong><a href="#term-crc32c">CRC32C</a></strong> という 32 ビットの検査値を 付けられます。ヘッダ用(HDGST)とデータ用(DDGST)があり、 接続時に使うかどうかを取り決めます。</p>
+<p>このプロジェクトは両方に対応しています。<strong>CRC32C の計算は x86 の専用命令(SSE 4.2 の <code>crc32</code>)を使い、さらに 3 本の計算を 交互に回して並列度を上げています</strong>(<a href="#ch23">第 23 章</a>)。</p>
+<blockquote><p><strong>この実装で 3 回踏んだ不具合</strong>(いずれも同じ形):</p><p>1. CRC の最後の反転を忘れる 2. <strong>ヘッダの長さを確定させる前にヘッダのチェック値を計算する</strong> 3. 2 を直したとき、長さだけ直して<strong>フラグの欄を見落とし</strong>、同じ形で再発</p><p>どれも「<strong>自分の検証は通るのに、相手側だけが静かに接続を切る</strong>」という 非対称な症状になります。ヘッダのどの欄も、チェック値を計算する前に 最終値にしておく必要があります。</p></blockquote>
+<h4>14.4 ソースのどこを読むか</h4>
+<div class="tablewrap"><table><thead><tr><th>知りたいこと</th><th>見るファイル</th></tr></thead><tbody><tr><td>PDU の組み立て・解析(ターゲット)</td><td><code>src/nvmet_tcp.c</code></td></tr><tr><td>同(イニシエータ)</td><td><code>src/nvme_tcp.c</code></td></tr><tr><td>PDU の定数</td><td><code>src/nvme_tcp_pdu.h</code></td></tr><tr><td>CRC32C</td><td><code>src/crc32c.c</code></td></tr></tbody></table></div>
+<hr>
+<h3 class="chaphead" id="ch15">第 15 章 RDMA と RoCEv2</h3>
+<h4>15.1 RDMA とは何か</h4>
+<p><a href="#ch14">第 14 章</a> の NVMe/TCP では、データが届くたびに<strong>受け取る側の CPU が 働きます</strong>。TCP の処理をして、PDU を解析して、メモリにコピーして…。</p>
+<p><a href="#term-rdma">RDMA</a>(Remote Direct Memory Access)は、これを <strong>相手の CPU を働かせずに</strong>行います。</p>
+<div class="codewrap"><pre><code>   通常(TCP):
+     送信側 CPU → NIC → …… → NIC → 受信側 CPU → メモリ
+                                     ↑ ここで CPU が働く
+
+   RDMA:
+     送信側 CPU → NIC → …… → NIC → メモリ
+                                     ↑ CPU を通らない</code></pre></div>
+<p>受信側の NIC が、<strong>あらかじめ許可された領域に直接書き込みます</strong>。 <a href="#ch5">第 5 章</a> で説明した <a href="#term-mkey">MKey</a>(メモリの使用許可証)が ここで効いてきます。</p>
+<h4>15.2 RDMA の操作</h4>
+<div class="tablewrap"><table><thead><tr><th>操作</th><th>意味</th></tr></thead><tbody><tr><td><strong>SEND</strong></td><td>普通の送信。相手の受信キューに入る(相手の CPU が気付く)</td></tr><tr><td><strong>RDMA_WRITE</strong></td><td><strong>相手のメモリに直接書く</strong>(相手の CPU は気付かない)</td></tr><tr><td><strong>RDMA_READ</strong></td><td><strong>相手のメモリから直接読む</strong>(相手の CPU は気付かない)</td></tr></tbody></table></div>
+<p>RDMA_WRITE / READ をするには、相手のメモリの <strong>アドレスと<a href="#term-rkey">鍵</a>(rkey)</strong>を知っている必要があります。 これは事前に SEND などで教え合います。</p>
+<h4>15.3 なぜ「書き込み」が RDMA_READ になるのか</h4>
+<p>ここが直観に反するところです。</p>
+<p><strong>NVMe-oF RDMA では、ホストがデータを「書く」とき、 ターゲットがホストのメモリから RDMA_READ で引き込みます。</strong></p>
+<div class="codewrap"><pre><code>  ホスト → 「書け。データは私のメモリのここ(アドレスと鍵)にある」
+  ターゲット → RDMA_READ でホストのメモリを読む
+  ターゲット → 「終わった」</code></pre></div>
+<p>ホストが押し込むのではなく、<strong>ターゲットが引き取りに行く</strong>わけです。 こうするとターゲットが受け入れ速度を制御できます。</p>
+<p><strong>この構造には重要な性能上の意味があります。</strong></p>
+<blockquote><p><strong>同時に投げられる RDMA_READ の本数が、そのまま書き込み性能の上限に なります。</strong> 読み出し(ターゲットが RDMA_WRITE で押し込む)は この制限を受けません。</p></blockquote>
+<p>このプロジェクトでは、この設定に<strong>2 件の不具合</strong>がありました。</p>
+<ol><li><strong>カードの能力値を読むビット位置が 4 ビットずれていた</strong>ため、 「同時 1 本」と誤認していた(本当は 16 本)。</li><li><strong>設定を書き込む <a href="#term-qp">QP</a> の状態遷移が間違っていた</strong> (<a href="#ch5">第 5 章</a> 5.8 で触れた話)。1 だけ直すと、相手が 2 本目を 投げた瞬間にエラーになりました。</li></ol>
+<p>両方を直した結果、<strong>書き込み性能が 2.3 倍</strong>になりました。 「書き込みだけがキュー深度でスケールしない」という症状が出たら、 まずここを疑うべきです。</p>
+<h4>15.4 RoCEv2 — Ethernet の上で RDMA をやる</h4>
+<p>RDMA はもともと InfiniBand という専用のネットワーク規格のものでした。 これを<strong>普通の Ethernet + IP + UDP の上で動かす</strong>のが <a href="#term-rocev2">RoCEv2</a>(RDMA over Converged Ethernet version 2)です。</p>
+<div class="codewrap"><pre><code> +----------+------+-------+---------+------------------+
+ | Ethernet |  IP  | UDP   | IB の   | RDMA のデータ    |
+ |          |      | 4791番| ヘッダ  |                  |
+ +----------+------+-------+---------+------------------+</code></pre></div>
+<p><strong>UDP の 4791 番ポート</strong>を使います(<a href="#ch11">第 11 章</a> で触れた番号です)。</p>
+<p>接続の確立には <strong><a href="#term-cm">CM</a></strong>(Connection Manager)という手順を使います。 REQ → REP → RTU の 3 段階で、TCP の 3-way handshake に似ています。</p>
+<h4>15.5 このプロジェクトでの RoCEv2 の状態</h4>
+<p><strong>ここは正確に区別して書きます。</strong> 「動く/動かない」の 2 値ではありません。</p>
+<div class="tablewrap"><table><thead><tr><th>何が</th><th>状態</th><th>根拠</th></tr></thead><tbody><tr><td><strong>RoCEv2 のパケットそのもの</strong></td><td><strong>2 ノード間で確認済み</strong></td><td>OptiPlex から Raspberry Pi 5 へ送ると、<strong>Pi5 側の UDP 4791 番のカウンタが増え、Pi5 の Linux が CM の応答(REJ)を返してきます</strong>。つまり L2・L3・UDP・IB ヘッダ・CM の中身まで、<strong>相手の正規実装が解釈できる形になっています</strong></td></tr><tr><td><strong>同じカードの 2 ポート間(ループバック)</strong></td><td><strong>この構成では不可能</strong></td><td>下記 15.6</td></tr><tr><td><strong>NVMe-oF RDMA のエンドツーエンド</strong></td><td><strong>現在の構成では未確認</strong></td><td>下記 15.7</td></tr></tbody></table></div>
+<h4>15.6 なぜ同じカードの 2 ポート間で通らないのか</h4>
+<p>このプロジェクトは <a href="#ch1">第 1 章</a> の図のとおり、 <strong>1 枚のカードの 2 つのポートを使って自分自身と通信</strong>します。 ところが <strong>RoCEv2 だけはこれができません</strong>。</p>
+<p>切り分けた結果は次のとおりです。</p>
+<div class="tablewrap"><table><thead><tr><th>宛先</th><th>ワイヤに出るか</th></tr></thead><tbody><tr><td>Pi5(別の機械)の MAC + Pi5 の IP</td><td><strong>出る</strong></td></tr><tr><td>Pi5 の MAC + <strong>自分のもう一方のポート</strong>の IP</td><td>出ない</td></tr><tr><td><strong>自分のもう一方のポート</strong>の MAC + 存在しない IP</td><td>出ない</td></tr></tbody></table></div>
+<p>つまり <strong>宛先の MAC か IP のどちらかが自分の装置のものだと、 カードのファームウェアが内部で処理しようとして消えます。</strong></p>
+<p>対策を探して、次のことを試しました(<strong>すべて効果なし</strong>)。</p>
+<ul><li>ファームウェアの設定項目(<code>MPFS_UC_LOOPBACK_DISABLE</code>)→ <strong>このカードは非対応</strong></li><li>内部折り返しを無効にする設定ビット → 読み戻して立っていることを 確認したうえで、症状は変わらず</li><li>送信側のフローステアリングで強制的に外へ出す → 「外へ出す」という 宛先指定がそもそも存在しない</li></ul>
+<p><strong>そして決定的なのは、Linux 純正のドライバでも同じように失敗することです。</strong> ネットワーク名前空間で 2 つのポートを分離して標準ツールで試しても、 RDMA のデータが 1 バイトも流れません。<strong>つまりこれは自作ドライバの不具合 ではなく、このカードの制約です。</strong></p>
+<h4>15.7 では何が未確認なのか</h4>
+<p>上のとおり RoCEv2 のパケットは Pi5 との間で往復できています。 しかし <strong>NVMe-oF RDMA としてのエンドツーエンド</strong>、つまり</p>
+<blockquote><p>自作のイニシエータ → Pi5 の Linux が動かす NVMe-oF RDMA ターゲット へ接続して、実際に読み書きする</p></blockquote>
+<p>は<strong>まだ実施していません</strong>。理由は、<code>bench</code> コマンドが接続先を 指定できる形になっていない(同じカードの 2 ポート間を前提にしている) ためです。これは残作業です。</p>
+<p><strong>過去には動いていました。</strong> 100 ギガビットの別のカードを使い、 2 つのポートを直結していた時期には、NVMe-oF RDMA のベンチマークが完走 していました。<code>README.md</code> の性能表にある RDMA の数値はそのときのものです。 <strong>ただしその構成でも、フレームがワイヤを通っていたのか内部で折り返して いたのかは区別できていませんでした</strong>(区別する手段が無かったため)。</p>
+<h4>15.8 未検証のまま残っている実装</h4>
+<p>RoCEv2 が現構成で動かせないため、<strong>ターゲット側の RDMA 実装 (<code>nvmet_rdma.c</code>)には、TCP 側に入れた切断処理の改善が入っていません。</strong></p>
+<p>具体的には <a href="#ch16">第 16 章</a> で説明する 2 件(接続を閉じる順序の扱いと、 シャットダウン状態の報告)です。<strong>動かせるようになったら同じ手当てが 必要</strong>、という状態で止まっています。</p>
+<h4>15.9 ソースのどこを読むか</h4>
+<div class="tablewrap"><table><thead><tr><th>知りたいこと</th><th>見るファイル</th></tr></thead><tbody><tr><td>QP の作成・状態遷移・WQE</td><td><code>src/mlx5_qp.c</code></td></tr><tr><td>接続確立(CM)</td><td><code>src/rdma_cm.c</code></td></tr><tr><td>NVMe-oF RDMA イニシエータ</td><td><code>src/nvme_rdma.c</code></td></tr><tr><td>NVMe-oF RDMA ターゲット</td><td><code>src/nvmet_rdma.c</code></td></tr><tr><td>動作確認コマンド</td><td><code>bench</code>、<code>rocepeer</code>、<code>qploop</code></td></tr></tbody></table></div>
+<hr>
+<h3 class="chaphead" id="ch16">第 16 章 このターゲットが答えるコマンド</h3>
+<p>この章は、<strong>「Linux から見て本物の SSD に見える」ために何が必要だったか</strong>の 記録です。実装した順に、何を学んだかを添えて並べます。</p>
+<h4>16.1 対応しているコマンド</h4>
+<p><strong>admin キュー</strong></p>
+<div class="tablewrap"><table><thead><tr><th>コマンド</th><th>対応</th><th>備考</th></tr></thead><tbody><tr><td>Fabrics Connect / Property Get / Property Set</td><td>○</td><td>接続とレジスタの読み書き</td></tr><tr><td>Identify</td><td>○</td><td>CNS = 0x00 / 0x01 / 0x02 / 0x03 / 0x05 / 0x06</td></tr><tr><td>Get Features / Set Features</td><td>○</td><td>4 種類の設定項目</td></tr><tr><td>Get Log Page</td><td>○</td><td>エラー情報 / SMART / 名前空間変更 / Discovery</td></tr><tr><td>Async Event Request</td><td>○</td><td>名前空間の増減を通知</td></tr><tr><td>Keep Alive</td><td>○</td><td>タイマも実装済み</td></tr></tbody></table></div>
+<p><strong>IO キュー</strong></p>
+<div class="tablewrap"><table><thead><tr><th>コマンド</th><th>対応</th></tr></thead><tbody><tr><td>Read / Write / Flush</td><td>○</td></tr><tr><td>Write Zeroes</td><td>○</td></tr><tr><td>Dataset Management(TRIM)</td><td>○</td></tr></tbody></table></div>
+<h4>16.2 実装して分かった一番大事なこと</h4>
+<blockquote><p><strong>機能を実装しただけでは、ホストは使ってくれません。 「私はこれができます」と広告して初めて使われます。</strong></p></blockquote>
+<p>この形の問題を <strong>3 回</strong> 踏んでいます。</p>
+<div class="tablewrap"><table><thead><tr><th>広告する場所</th><th>立てないとどうなるか</th></tr></thead><tbody><tr><td><strong>ONCS</strong>(対応コマンドのビット)</td><td>Linux は TRIM の命令を<strong>発行すらしません</strong>。<code>blkdiscard</code> がカーネルの入口で弾かれます</td></tr><tr><td><strong>VS</strong>(準拠する規格の版)</td><td>0 のままだと「古い規格」と見なされ、<strong>名前空間の識別子を問い合わせに来ません</strong></td></tr><tr><td><strong>OAES</strong>(通知できるイベント)</td><td>0 のままだと、ホストは <strong>Async Event Request をそもそも送ってきません</strong></td></tr></tbody></table></div>
+<p>逆に、<strong>実装していない機能のビットを立ててはいけません。</strong> ホストが その機能を使おうとして失敗します。</p>
+<h4>16.3 切断の作法 — 相手の手順に合わせる</h4>
+<p><strong>自作どうしで通信している限り絶対に見つからない</strong>不具合の代表例です。</p>
+<p>Linux は接続を閉じるとき、次の順で畳みます。</p>
+<div class="codewrap"><pre><code>  ① IO キューを切る
+  ② admin キューに「シャットダウンします」と書く(CC.SHN)
+  ③ その状態が反映されるのを待つ(CSTS.SHST を最大 5 秒ポーリング)
+  ④ admin キューを切る</code></pre></div>
+<p>このプロジェクトは当初、<strong>①を見た時点で admin キューも閉じていました</strong>。 自作のイニシエータは①のあと②をしないので、それで問題なかったのです。</p>
+<p>Linux と繋いだ結果:</p>
+<ul><li>②が無応答になり、ホスト側で<strong>60 秒のコマンドタイムアウト</strong></li><li>③の状態を返していなかったので、<strong>毎回 5 秒待たされる</strong></li></ul>
+<p>両方を直して、<strong>切断にかかる時間が 61 秒から 1 秒未満</strong>になりました。</p>
+<blockquote><p><strong>教訓</strong>: 「相手も自分と同じ手順で喋る」という前提は、 <strong>切断のような「成功パス以外」にこそ残っています。</strong></p></blockquote>
+<h4>16.4 状態を持つと後始末が要る</h4>
+<p>Keep Alive のタイマを実装したときに、<strong>既存の不具合が表に出ました</strong>。</p>
+<p>それまで接続の畳み方は「IO キューが先に終わる → admin が待つ」の 1 通り しかありませんでした。ところが Keep Alive の時間切れでは <strong>admin が先に畳みます</strong>。すると、あとから IO 側が立てる「終わりました」の 旗を、admin が<strong>次の接続のもの</strong>と誤解して、<strong>10 秒後に正常な接続を 畳んでしまいました</strong>。</p>
+<blockquote><p><strong>教訓</strong>: 後始末を 2 つの担当が旗で伝え合う構造は、 <strong>畳む順序が変わると壊れます。</strong> 新しい「畳む契機」を足したら、 既存の旗が逆の順序でも成立するかを確認する必要があります。</p></blockquote>
+<h4>16.5 0's based という落とし穴</h4>
+<p>NVMe では、多くの個数の欄が <strong>「0 が 1 個を意味する」</strong>(0's based)形式です。 「16 個」なら 15 と書きます。</p>
+<p><strong>ところが全部がそうではありません。</strong></p>
+<div class="tablewrap"><table><thead><tr><th>欄</th><th>0's based か</th></tr></thead><tbody><tr><td>Write Zeroes の「ブロック数」</td><td><strong>そう</strong>(+1 する)</td></tr><tr><td>Dataset Management の「範囲の個数」</td><td><strong>そう</strong>(+1 する)</td></tr><tr><td><strong>Dataset Management の各範囲の「ブロック数」</strong></td><td><strong>違う</strong>(そのまま)</td></tr></tbody></table></div>
+<p>この取り違えは、<strong>バイト配置を検算する道具では見つかりません</strong> (値の解釈の問題だから)。実際のデータで 「<strong>8 ブロックだけ消えて 9 ブロック目が残っている</strong>」ことを確かめる 必要があります。</p>
+<h4>16.6 ソースのどこを読むか</h4>
+<div class="tablewrap"><table><thead><tr><th>知りたいこと</th><th>見るファイル</th></tr></thead><tbody><tr><td>admin コマンドの処理</td><td><code>src/nvmet.c</code> の <code>nvmet_admin_dispatch()</code></td></tr><tr><td>IO コマンドの処理</td><td><code>src/nvmet.c</code> の <code>nvmet_io_dispatch_cmd()</code></td></tr><tr><td>名前空間の管理</td><td><code>src/nvmet.c</code> の <code>nvmet_ns_get()</code> / <code>nvmet_ns_set_active()</code></td></tr><tr><td>定数(オフセット、ビット位置)</td><td><code>src/nvme_types.h</code></td></tr></tbody></table></div>
+<hr>
+<h2 class="parthead" id="part-4">第 V 部 ソフトウェアの構造</h2>
+<p>ここまでで「何をするか」は分かりました。この部では<strong>それがどう組み立てられ ているか</strong>を見ます。</p>
+<h3 class="chaphead" id="ch17">第 17 章 全体アーキテクチャ</h3>
+<h4>17.1 レイヤ図</h4>
+<div class="codewrap"><pre><code> +--------------------------------------------------------------+
+ | シェル / ベンチマーク / 自己検査                              |
+ |   platform/x86-linux/main.c                                  |
+ +--------------------------------------------------------------+
+ | NVMe-oF                                                      |
+ |   イニシエータ: nvme.c / nvme_tcp.c / nvme_rdma.c            |
+ |   ターゲット  : nvmet.c / nvmet_tcp.c / nvmet_rdma.c         |
+ +--------------------------------------------------------------+
+ | TCP/IP                          | RDMA                        |
+ |   tcp.c udp.c ip.c ipv6.c       |   rdma_cm.c                 |
+ |   icmp.c arp.c pmtu.c           |                             |
+ +---------------------------------+-----------------------------+
+ | netif.c(インターフェース管理とフレームの振り分け)          |
+ +--------------------------------------------------------------+
+ | mlx5 ドライバ                                                |
+ |   mlx5.c(bring-up) mlx5_qp.c(QP) mlx5_net.c(Ethernet)  |
+ +--------------------------------------------------------------+
+ | HAL(プラットフォーム抽象)     include/platform.h           |
+ |   platform/x86-linux/ : vfio.c hal_dma.c hal_smp.c           |
+ |                         hal_timer.c console.c                |
+ +--------------------------------------------------------------+
+ | 基盤: job.c(ジョブ) timestamp.c(計測)                   |
+ |       crc32c.c timer.c net_buf.c                             |
+ +--------------------------------------------------------------+</code></pre></div>
+<h4>17.2 3 つの重要な境界</h4>
+<p><strong>(1) HAL(<code>include/platform.h</code>)</strong></p>
+<p>「DMA できるメモリをください」「このポインタをデバイス用の番地に直して」 といった、<strong>環境によって実装が変わる操作</strong>をここで区切っています。</p>
+<p>この境界のおかげで、元は Raspberry Pi 5 の<strong>ベアメタル環境</strong>(OS 無し)で 動いていたコードが、x86 の Linux ユーザ空間へ移植できました。上位のコードは <code>malloc()</code> も <code>printf()</code> も使わず、HAL の関数だけを呼びます。</p>
+<p><strong>(2) <code>nic_ops_t</code>(NIC の抽象)</strong></p>
+<p>TCP/IP 層から見た NIC は、「フレームを送る」「フレームを受け取る」という 関数ポインタの組でしかありません。<code>mlx5_net.c</code> がその実装を提供します。</p>
+<p><strong>(3) <code>netif_t</code>(インターフェース)</strong></p>
+<p>「1 本のケーブル口」を表す構造体です。IP アドレス、サブネットマスク、 ゲートウェイ、MAC アドレス、どのコアが面倒を見るか、といった情報を持ちます。</p>
+<p>このプロジェクトでは 2 つ登録されています(<code>mlx5-pf0</code> と <code>mlx5-pf1</code>)。 <strong>同じ物理ポートを共有する「別名」を一時的に登録する</strong>こともでき、 これが検証で活躍します(<a href="#ch29">第 29 章</a>)。</p>
+<h4>17.3 メモリは全部静的に確保する</h4>
+<p><strong><code>malloc()</code> を使いません。</strong> すべて静的変数(<code>.bss</code>)です。</p>
+<p>理由は 2 つあります。</p>
+<ol><li><strong>元がベアメタル環境</strong>だった。ヒープが無い。</li><li><strong>DMA できるメモリは特別</strong>(<a href="#ch3">第 3 章</a>)。どこに置かれるかを 制御したい。</li></ol>
+<p>その結果、実行ファイルの <code>.bss</code> は <strong>約 1.2 ギガバイト</strong>あります。 内訳の大半は、名前空間の実体(256MB + 32MB)と、 複数コア用に予約してある領域です。</p>
+<h4>17.4 ソースのどこを読むか</h4>
+<div class="tablewrap"><table><thead><tr><th>知りたいこと</th><th>見るファイル</th></tr></thead><tbody><tr><td>HAL の契約</td><td><code>include/platform.h</code></td></tr><tr><td>NIC 抽象とインターフェース</td><td><code>src/netif.h</code>、<code>src/net.h</code></td></tr><tr><td>起動から bring-up まで</td><td><code>src/platform/x86-linux/main.c</code> の <code>main()</code></td></tr></tbody></table></div>
+<hr>
+<h3 class="chaphead" id="ch18">第 18 章 協調ジョブスケジューラ</h3>
+<h4>18.1 なぜスレッドを使わないのか</h4>
+<p>「TCP の接続を処理する」「NVMe のコマンドを待つ」といった仕事を同時に 進める必要があります。普通なら<strong>スレッド</strong>を使うところです。</p>
+<p>このプロジェクトはスレッドを使わず、<strong><a href="#term-coop">協調マルチタスク</a></strong>を 使っています。理由は次のとおりです。</p>
+<ul><li><strong>ロックが要らない。</strong> スレッドだと共有データにロックが必要ですが、 ロックはホットパスでは高価です。</li><li><strong>切り替えのコストがゼロ。</strong> 関数を呼ぶだけです。</li><li><strong>元がベアメタル環境</strong>だった。スレッドの仕組みが無い。</li><li><strong><a href="#term-polling">ポーリング</a>前提の設計と相性が良い。</strong> どうせ CPU を回し続けるので、その中で順番に見て回れば済みます。</li></ul>
+<h4>18.2 ジョブとは「1 tick 進むステートマシン」</h4>
+<p><a href="#term-job">ジョブ</a>は、次の形の関数です。</p>
+<div class="codewrap"><pre><code>static job_result_t my_job_step(job_t *self)
+{
+    switch (self-&gt;state) {
+    case ST_A:
+        /* 少しだけ進める。待つ必要があれば、そのまま返る */
+        if (まだ条件が揃っていない) return JOB_WAITING;
+        self-&gt;state = ST_B;
+        return JOB_WAITING;
+
+    case ST_B:
+        ...
+        return JOB_DONE;   /* 完了。スケジューラから外れる */
+    }
+}</code></pre></div>
+<p><strong>大事な約束は「ブロックしないこと」</strong>です。この関数の中で待ち続けると、 他のジョブが一切動けなくなります。「まだ来ていない」なら <code>JOB_WAITING</code> を返して、次の tick でまた呼ばれるのを待ちます。</p>
+<p>スケジューラ本体はとても単純です。</p>
+<div class="codewrap"><pre><code>void job_scheduler_tick(void) {
+    for (各ジョブ) {
+        if (このコアが担当するジョブなら)
+            結果 = job-&gt;step(job);
+        if (結果 == JOB_DONE) ジョブを外す;
+    }
+}</code></pre></div>
+<p>これを無限ループで回します。同時に走れるジョブの上限は 12 個です。</p>
+<h4>18.3 何がジョブになっているか</h4>
+<ul><li>NVMe-oF ターゲットの admin キュー担当</li><li>NVMe-oF ターゲットの IO キュー担当</li><li>NVMe-oF イニシエータの接続担当</li><li>RDMA の接続管理(CM)担当</li></ul>
+<p>たとえばターゲットの admin キューのジョブは、次のような状態を持ちます。</p>
+<div class="codewrap"><pre><code>  ARM(待ち受けを張る)
+    → ACCEPT_WAIT(接続を待つ)
+    → ICREQ_RECV(初期化要求を受け取る)
+    → ICRESP_SEND(応答を返す)
+    → RECV_HDR ⇄ (コマンドを受け取って処理する、をずっと繰り返す)
+    → (切断されたら ARM へ戻る)</code></pre></div>
+<p><strong>「終わったら次のクライアントを待つ」</strong>ので、サーバのジョブは <code>JOB_DONE</code> をほとんど返しません。</p>
+<h4>18.4 この構造の弱点</h4>
+<p><strong>1 つのジョブが長時間 CPU を占有すると、他が止まります。</strong></p>
+<p>たとえば「32 メガバイトをゼロで埋める」という命令 (<a href="#ch16">第 16 章</a> の Write Zeroes)は、実行に数ミリ秒かかります。 その間、他のジョブは動きません。TCP の応答が数ミリ秒遅れます。</p>
+<p>このプロジェクトはこれを許容していますが、<strong>上限を設ける</strong>という対処を しています。ホストに「1 回の命令で消せるのは 32 メガバイトまでです」と 広告することで、それより大きな要求が来ないようにしています。</p>
+<h4>18.5 ジョブの後始末は難しい</h4>
+<p><strong>実際に起きた問題</strong>を記録しておきます。</p>
+<p>RDMA の接続に失敗したとき、<strong>失敗を検出したジョブだけが止まって、 関連する別のジョブが動き続けていました</strong>。そこへ別のコアが 「使っていたデータ構造をゼロクリア」したため、動き続けていたジョブが NULL ポインタを踏んで落ちました。</p>
+<p>この経験から、<code>job.c</code> には次の関数が用意されています。</p>
+<div class="codewrap"><pre><code>unsigned job_cancel_by_ctx(const void *ctx);  /* このデータを使うジョブを止めて */
+unsigned job_count_by_ctx(const void *ctx);   /* まだ何個残っている? */</code></pre></div>
+<blockquote><p><strong>約束</strong>: <strong>ジョブが使っているデータ構造を作り直す前に、 それを参照しているジョブが 0 個になるまで待つこと。</strong></p></blockquote>
+<h4>18.6 ソースのどこを読むか</h4>
+<div class="tablewrap"><table><thead><tr><th>知りたいこと</th><th>見るファイル</th></tr></thead><tbody><tr><td>スケジューラ本体</td><td><code>src/job.c</code>、<code>src/job.h</code>(合わせて約 280 行)</td></tr><tr><td>ジョブの実例(いちばん複雑)</td><td><code>src/nvmet.c</code> の <code>nvmet_io_job_step_impl()</code></td></tr><tr><td>動作中のジョブを見る</td><td>シェルコマンド <code>jobs</code></td></tr></tbody></table></div>
+<hr>
+<h3 class="chaphead" id="ch19">第 19 章 主要なデータ構造</h3>
+<h4>19.1 <code>tcp_conn_t</code> — TCP の接続 1 本</h4>
+<p><strong>この構造体はちょうど 64 バイト</strong>で、<a href="#term-cacheline">キャッシュライン</a> 1 本に収まるよう設計されています。</p>
+<div class="codewrap"><pre><code>typedef struct __attribute__((aligned(64))) {
+    volatile tcp_state_t state;        /*  0: 4  状態(ESTABLISHED など)*/
+    volatile uint16_t    local_port;   /*  4: 2 */
+    volatile uint16_t    remote_port;  /*  6: 2 */
+    volatile uint32_t    snd_seq;      /*  8: 4  次に送る番号 */
+    volatile uint32_t    rcv_seq;      /* 12: 4  次に期待する番号 */
+    volatile uint32_t    snd_win;      /* 16: 4  相手の受け入れ余地 */
+    volatile uint16_t    snd_mss;      /* 20: 2  1 個の最大サイズ */
+    uint8_t              pad0[2];      /* 22: 2 */
+    volatile unsigned    owner_core;   /* 24: 4  担当コア */
+    netaddr_t            local_ip;     /* 28:17 */
+    netaddr_t            remote_ip;    /* 45:17 */
+    uint8_t              pad1[2];      /* 62: 2 */
+} tcp_conn_t;
+
+_Static_assert(sizeof(tcp_conn_t) == 64, "1 キャッシュラインちょうどに収める");</code></pre></div>
+<p><strong>注目してほしいのは 3 点</strong>です。</p>
+<ol><li><strong><code>_Static_assert</code> でサイズを固定している。</strong> フィールドを足して 64 バイトを超えたら<strong>ビルドが失敗します</strong>。うっかり性能を落とせません。</li><li><strong>よく使うフィールドが前半に並んでいる。</strong> 受信のたびに読む <code>state</code> / ポート番号 / シーケンス番号が先頭付近にあります。</li><li><strong>パディングが明示してある。</strong> コンパイラ任せにせず、意図を残しています。</li></ol>
+<p>ただし正直に書くと、<strong>64 バイトに揃えたことによる性能向上は測定できません でした</strong>。それでも維持しているのは、「キャッシュラインをまたいでいるせいでは」 という疑いを<strong>今後毎回検討し直さずに済ませる</strong>ためです。</p>
+<h4>19.2 <code>netaddr_t</code> — IPv4 と IPv6 を同じ型で持つ</h4>
+<div class="codewrap"><pre><code>typedef struct {
+    uint8_t family;   /* NETADDR_V4 か NETADDR_V6 */
+    uint8_t a[16];    /* IPv4 なら a[0..3] だけ使う */
+} netaddr_t;</code></pre></div>
+<p><strong>この型のまま持ち回り、ヘッダを組み立てる直前にだけ種別を見て分岐します。</strong> 接続の照合(4 つ組の比較)も、この型のまま行います。</p>
+<p>IPv6 対応でこの型を導入したとき、<strong>1 コマンドあたり約 180 ナノ秒の固定 コスト</strong>が乗りました。小さい読み出し(1 コマンド 3.3 マイクロ秒)では 5.5% の低下として観測されます。試して<strong>効果が無かった</strong>対策も 記録されています(<a href="#ch24">第 24 章</a>)。</p>
+<h4>19.3 <code>nvmet_ctx_t</code> — ターゲットの全状態</h4>
+<p>ターゲット 1 台ぶんの状態が全部入った、<strong>巨大な構造体</strong>です。</p>
+<div class="codewrap"><pre><code>typedef struct {
+    nvmet_tcp_conn_t admin;      /* admin キューの接続 */
+    nvmet_tcp_conn_t io;         /* IO キューの接続 */
+    uint32_t  cc;                /* コントローラ設定レジスタ */
+    ...
+    uint32_t  kato_ms;           /* Keep Alive の上限 */
+    uint64_t  last_cmd_tick;     /* 最後にコマンドが来た時刻 */
+    int       aer_pending;       /* 保留中の通知要求 */
+    ...
+    nvmet_ns_t ns[2];            /* 名前空間 2 つ */
+    uint8_t   ram_disk[256MB];   /* 名前空間 1 の実体 */
+    uint8_t   ram_disk2[32MB];   /* 名前空間 2 の実体 */
+    uint8_t   id_ctrl[4096];     /* Identify の応答(組み立て済み)*/
+    ...
+    uint64_t  stat_read_bytes;   /* SMART 用の統計 */
+    uint64_t  stat_write_cmds;
+} nvmet_ctx_t;</code></pre></div>
+<p><strong>設計上の判断が 2 つ</strong>あります。</p>
+<p><strong>(1) 応答を先に組み立てておく</strong></p>
+<p><code>id_ctrl</code>(自分の仕様書)のような<strong>内容が変わらない応答は、 起動時に 1 回組み立てて置いておきます</strong>。コマンドが来たらそれを送るだけです。</p>
+<p><strong>(2) 大きな配列は後ろに置く</strong></p>
+<p><code>ram_disk</code> のような巨大な配列を前に置くと、後ろのフィールドが 遠くなってキャッシュに乗りません。よく使うものを前に集めています。</p>
+<h4>19.4 <code>nvmet_ns_t</code> — 名前空間</h4>
+<div class="codewrap"><pre><code>typedef struct {
+    int      active;      /* 0 なら「番号はあるが使われていない」 */
+    uint64_t lba_count;   /* 何ブロックあるか */
+    uint8_t *disk;        /* 実体へのポインタ */
+    uint8_t  id_ns[4096]; /* この名前空間の仕様書(組み立て済み) */
+} nvmet_ns_t;</code></pre></div>
+<p><code>active</code> が 3 つ目の状態を表しているのがポイントです。NVMe では <strong>「範囲外の番号」と「範囲内だが使われていない番号」で応答が違います</strong>。 前者はエラー、後者は<strong>ゼロ埋めの正常応答</strong>です。</p>
+<h4>19.5 受信用のリング</h4>
+<p><a href="#ch20">第 20 章</a> で説明する「push 型受信」のために、 <strong>受信処理と処理担当の間にリングバッファ</strong>があります。</p>
+<div class="codewrap"><pre><code>typedef struct {
+    uint8_t   kind;        /* コマンドか、データか */
+    uint8_t   hdr[8];      /* PDU の共通ヘッダ */
+    uint8_t   sqe[64];     /* NVMe コマンド */
+    uint16_t  cid;
+    uint32_t  dlen;
+    uint8_t  *data_dst;    /* データが実際に置かれた場所 */
+    ...
+} nvmet_ready_t;</code></pre></div>
+<p>64 段あります。<strong>受信を担当する処理は「積む」だけ、送信は一切しない</strong> という分担です。</p>
+<blockquote><p><strong>設計判断の例</strong>: この構造体に「Dataset Management の範囲リスト」を 入れる案がありましたが、<strong>やめました</strong>。4 キロバイトの配列を各段に持たせると 段の間隔が 4KB 開き、<strong>通常の読み書き(ホットパス)のアドレス変換に 負担がかかる</strong>からです。代わりに <code>nvmet_ctx_t</code> 側に同じ段数の配列を置き、 リングからはポインタで指しています。</p></blockquote>
+<h4>19.6 ソースのどこを読むか</h4>
+<div class="tablewrap"><table><thead><tr><th>構造体</th><th>定義場所</th></tr></thead><tbody><tr><td><code>tcp_conn_t</code></td><td><code>src/tcp.h</code></td></tr><tr><td><code>netaddr_t</code></td><td><code>src/netaddr.h</code></td></tr><tr><td><code>netif_t</code></td><td><code>src/netif.h</code></td></tr><tr><td><code>nvmet_ctx_t</code>、<code>nvmet_ns_t</code></td><td><code>src/nvmet.h</code></td></tr><tr><td><code>nvmet_ready_t</code></td><td><code>src/nvmet.c</code></td></tr></tbody></table></div>
+<hr>
+<h3 class="chaphead" id="ch20">第 20 章 1 つの I/O を最後まで追う</h3>
+<p>この章が第 V 部の主役です。<strong>Linux ホストが 8 キロバイト書き込むとき、 このプログラムの中で何が起きるか</strong>を最初から最後まで追います。</p>
+<h4>20.1 全体の流れ</h4>
+<div class="codewrap"><pre><code> ① NIC がフレームを受信 → DMA でメモリへ
+ ② mlx5_net.c が完了通知を見つける
+ ③ netif.c が Ethernet ヘッダを見て IP へ渡す
+ ④ ip.c が IP ヘッダを見て TCP へ渡す
+ ⑤ tcp.c が順番を確認し、上位へ渡す
+ ⑥ nvmet.c の受信担当が PDU を解析する
+ ⑦ 「これは書き込みだ」と分かる
+ ⑧ データを名前空間の実体へ書く
+ ⑨ 完了(CQE)を組み立てて返す
+ ⑩ TCP → IP → Ethernet と包んで NIC へ</code></pre></div>
+<h4>20.2 push 型受信 — 呼びに行くのではなく呼ばれる</h4>
+<p>⑤から⑥への渡し方に工夫があります。</p>
+<p><strong>普通のやり方(pull 型)</strong></p>
+<div class="codewrap"><pre><code>/* 処理担当が「データある?」と聞きに行く */
+n = tcp_recv(conn, buf, sizeof(buf), 0);
+if (n &gt; 0) { PDU を解析する }</code></pre></div>
+<p>この場合、TCP の受信バッファに一度溜めてから <code>buf</code> へコピーします。 <strong>コピーが 1 回発生します。</strong></p>
+<p><strong>このプロジェクトのやり方(push 型)</strong></p>
+<div class="codewrap"><pre><code>/* 事前に「届いたらこれを呼んで」と登録しておく */
+tcp_set_recv_upcall(conn, nvmet_io_rx_upcall, job_ctx);</code></pre></div>
+<p>こうすると、TCP がデータを受け取った瞬間に<strong>その場で</strong>この関数 (<a href="#term-upcall">upcall</a> と呼びます)が呼ばれます。TCP の受信バッファを 経由しません。</p>
+<h4>20.3 ゼロコピー — 最初から目的地へ書く</h4>
+<p>push 型の本当の狙いは、コピーを 1 回減らすことではありません。 <strong>受け取りながら、最終的な置き場所へ直接書く</strong>ことです。</p>
+<p><code>nvmet_io_rx_upcall()</code> は、届いたバイト列を<strong>状態機械で少しずつ解析</strong>します。</p>
+<div class="codewrap"><pre><code>  PRX_HDR   : 共通ヘッダ 8 バイトを集める
+      ↓ 集まったら「これは書き込みコマンドだ」と判明
+  PRX_PSH   : NVMe コマンド 64 バイトを集める
+      ↓ ここで「どの名前空間の、どのブロックへ書くか」が分かる
+      ↓ ★ データの置き場所を「名前空間の実体の、その位置」に設定する
+  PRX_DATA  : 以降届くバイトを、その場所へ直接書く</code></pre></div>
+<p>★の行が肝心です。<strong>この時点で最終目的地が決まるので、 データは中間バッファを一切経由しません。</strong></p>
+<div class="codewrap"><pre><code>  普通:   NIC → 受信バッファ → TCP のバッファ → 作業用 buf → 名前空間
+                                                  (コピー 2〜3 回)
+
+  これ:   NIC → 受信バッファ → 名前空間
+                                (コピー 1 回)</code></pre></div>
+<p><strong>読み出し側</strong>も同様で、名前空間の実体を送信元として直接指定します (<code>nvmet_tcp_send_c2h_async()</code>)。</p>
+<h4>20.4 データの検査値もその場で計算する</h4>
+<p><a href="#ch14">第 14 章</a> のダイジェスト(CRC32C)を使う場合、素朴に実装すると 「全部受け取ってから、書き込んだ先を読み直して計算する」となります。 <strong>メモリを 2 回読むことになり、遅くなります。</strong></p>
+<p>このプロジェクトは、<strong>受信ストリームから逐次 CRC を積みます</strong>。 コピーしながら同時に計算するので、2 回目の読み出しが要りません。</p>
+<p>送信側も同様で、<strong>送信元バッファから直接計算</strong>し、4 バイトを 追加でキューに積むだけです。</p>
+<p>以前はダイジェストを有効にすると、この 2 つの高速パスが両方とも 無効になる作りでした。「ダイジェストなら使わない」という単純な条件分岐が 入っていたのです。直した結果、<strong>ヘッダのダイジェスト単体のコストは 誤差の範囲まで消えました</strong>(以前は書き込みが 31%、読み出しが 55% 遅く なっていましたが、その全部が高速パスを使わなかったことによるものでした)。</p>
+<h4>20.5 送信担当と受信担当を分ける</h4>
+<p>push 型の upcall は、<strong>TCP の受信処理の途中で呼ばれます</strong>。 ここで送信をすると、受信処理の中から送信処理が始まり、 その中でまた受信が…という<strong>再入</strong>が起きかねません。</p>
+<p>そこで、<strong>upcall は「解析して、リングに積む」だけ</strong>にしています。 実際の応答は、ジョブのステップ関数(冷たい経路)が リングから取り出して行います。</p>
+<div class="codewrap"><pre><code>   TCP の受信処理
+        │
+        ├→ upcall : 解析してリングに積む(送信は一切しない)
+        │
+   ジョブのステップ
+        │
+        └→ リングから取り出して処理し、応答を送る</code></pre></div>
+<p>これが <a href="#ch19">第 19 章</a> の <code>nvmet_ready_t</code> の役割です。</p>
+<h4>20.6 書き込みの 2 つの経路</h4>
+<p><a href="#ch14">第 14 章</a> で説明したとおり、書き込みのデータの運び方には 2 通りあります。両方とも上記のゼロコピーが効きます。</p>
+<div class="codewrap"><pre><code> (a) in-capsule(コマンドと一緒に届く)
+     upcall がコマンドを解析 → 置き場所を決める → その場に書く
+     → リングに「完了」を積む → ジョブが CQE を返す
+
+ (b) R2T(あとから届く)
+     upcall がコマンドを解析 → 「これは R2T が要る」
+     → リングに積む → ジョブが R2T を送る
+     → データの PDU が届く → upcall が「どのコマンドのぶんか」を照合
+     → 置き場所を決めて、その場に書く
+     → リングに積む → ジョブが CQE を返す</code></pre></div>
+<p>(b) では「今どのコマンドのデータを受け取っている最中か」を 覚えておく必要があります。これが <code>nvmet_pending_write_t</code> です。</p>
+<h4>20.7 読み出しの流れ</h4>
+<div class="codewrap"><pre><code> ① upcall がコマンドを解析(「読み出し」と判明、データ長は 0)
+ ② リングに積む
+ ③ ジョブが取り出す
+ ④ 範囲を検査(名前空間の外なら「範囲外」のエラー)
+ ⑤ 名前空間の実体を送信元として C2HData を送る(コピーなし)
+ ⑥ 完了を送る</code></pre></div>
+<p>読み出しのほうが単純です。<strong>受信でゼロコピーが効くのは書き込み、 送信でゼロコピーが効くのは読み出し</strong>、という対称な関係になっています。</p>
+<h4>20.8 ソースのどこを読むか</h4>
+<div class="tablewrap"><table><thead><tr><th>知りたいこと</th><th>見るファイル</th></tr></thead><tbody><tr><td>upcall(受信の解析)</td><td><code>src/nvmet.c</code> の <code>nvmet_io_rx_upcall()</code> と <code>nvmet_prx_dispatch()</code></td></tr><tr><td>コマンドの処理</td><td><code>src/nvmet.c</code> の <code>nvmet_io_dispatch_cmd()</code></td></tr><tr><td>送信(ゼロコピー)</td><td><code>src/nvmet_tcp.c</code> の <code>nvmet_tcp_send_c2h_async()</code></td></tr><tr><td>upcall の登録</td><td><code>src/tcp.h</code> の <code>tcp_set_recv_upcall()</code></td></tr></tbody></table></div>
+<hr>
+<h3 class="chaphead" id="ch21">第 21 章 マルチコアの使い方</h3>
+<h4>21.1 コアの割り当て</h4>
+<p>このプロジェクトは、<strong>インターフェースごとに担当コアを決めます</strong>。</p>
+<div class="codewrap"><pre><code>  コア 0 : シェル(対話、コマンドの実行)、イニシエータ側のジョブ
+  コア 1 : mlx5-pf1(ターゲット側)のジョブ
+  コア 2, 3 : 予約(今は使っていない)</code></pre></div>
+<p>ジョブには「どのコアで動かすか」を指定でき、スケジューラは <strong>自分の担当のジョブだけ</strong>を実行します。</p>
+<h4>21.2 コアをまたぐときの約束</h4>
+<p><strong>別のコアが動かしているジョブのデータを、横から触ってはいけません。</strong></p>
+<p>具体例を 2 つ挙げます。</p>
+<p><strong>(1) シェルから名前空間を追加するとき</strong></p>
+<p>シェル(コア 0)で <code>nvmens add 2</code> と打つと、名前空間が増えます。 このとき<a href="#ch12">第 12 章</a> の AER でホストへ通知する必要がありますが、 <strong>その送信はコア 0 からしてはいけません</strong>。ターゲットの admin キューは コア 1 のジョブが受信ポーリングしているからです。</p>
+<p>そこで、<strong>シェルは旗を立てるだけ</strong>にしています。</p>
+<div class="codewrap"><pre><code>ctx-&gt;aer_notify_ns = 1;        /* コア 0: 旗を立てる */
+        ...
+/* コア 1 のジョブのステップ関数の先頭で */
+if (ctx-&gt;aer_notify_ns &amp;&amp; ctx-&gt;aer_pending) {
+    通知を送る;
+    ctx-&gt;aer_notify_ns = 0;
+}</code></pre></div>
+<p><strong>(2) Keep Alive の時間切れで接続を畳むとき</strong></p>
+<p>admin キューのジョブ(コア 1)が時間切れを検出しますが、 <strong>IO キューのコネクションは IO キューのジョブに畳ませます</strong>。 横から閉じると、受信 upcall の登録解除などの後始末が抜けるからです。 ここでも旗を使います。</p>
+<h4>21.3 旗を使うときの注意</h4>
+<p>旗は <code>volatile int</code> で持ちます。ただし <strong><code>volatile</code> だけでは 「別コアから必ず見える」保証にはなりません</strong>(コンパイラの最適化は 防げますが、CPU のキャッシュ整合の話は別)。x86 はキャッシュの整合を ハードウェアが保証するアーキテクチャなので、この用途では実用上問題に なりません。</p>
+<p>もっと重要なのは<strong>旗を消すタイミング</strong>です。</p>
+<blockquote><p><strong>実際に踏んだ不具合</strong>: 旗を立てた側が直後に消してしまい、 受け取るはずのジョブが<strong>一度も見ないまま</strong>終わったことがあります。 <strong>旗を消すのは、受け取った側の役目</strong>にすべきです。</p></blockquote>
+<h4>21.4 使っていないコアの準備</h4>
+<p><code>smp_boot_core2()</code> / <code>smp_boot_core3()</code> という関数があります。 <strong>現在どこからも呼ばれていません。</strong></p>
+<p>これは「複数の接続の受信を複数コアへ振り分ける」将来の拡張のために 意図的に残してあるものです。<strong>一度、未使用の関数を一括削除する作業で 消してしまい、復活させた経緯があります。</strong> リンク時に使われない関数は 除去されるので、残しておくコストはゼロです。</p>
+<h4>21.5 ソースのどこを読むか</h4>
+<div class="tablewrap"><table><thead><tr><th>知りたいこと</th><th>見るファイル</th></tr></thead><tbody><tr><td>コアワーカの起動、アフィニティ</td><td><code>src/platform/x86-linux/hal_smp.c</code>、<code>src/smp.h</code></td></tr><tr><td>ジョブへのコア割り当て</td><td><code>src/job.c</code> の <code>job_pin_to_core()</code></td></tr><tr><td>インターフェースの担当コア</td><td><code>src/netif.h</code> の <code>netif_set_owner_core()</code></td></tr></tbody></table></div>
+<hr>
+<h2 class="parthead" id="part-5">第 VI 部 性能</h2>
+<h3 class="chaphead" id="ch22">第 22 章 何をどう測っているか</h3>
+<h4>22.1 測っているもの</h4>
+<p>ベンチマークは 2 つあります。</p>
+<div class="tablewrap"><table><thead><tr><th>コマンド</th><th>何を測るか</th></tr></thead><tbody><tr><td><code>tcpbench</code></td><td>NVMe/TCP のスループットとレイテンシ</td></tr><tr><td><code>bench</code></td><td>NVMe-oF RDMA の同上(<a href="#ch15">第 15 章</a> のとおり現構成では実行できません)</td></tr></tbody></table></div>
+<p>出力は「ブロックサイズ × 読み/書き」の組み合わせごとに、 <strong>MiB/s、IOPS、平均レイテンシ</strong>の 3 つです。</p>
+<h4>22.2 数字を読むときの注意</h4>
+<p><strong>(1) 単位は MiB/s(1024 進)です</strong></p>
+<p>MB/s(1000 進)ではありません。約 4.9% 違います。</p>
+<p><strong>(2) 測定条件が違う数字を比べてはいけません</strong></p>
+<p><code>README.md</code> の性能表には、<strong>100 ギガビットのカードで 2 ポートを直結して いた時期の数値</strong>が載っています。現在の構成は 25 ギガビットのカードで、 しかも 2 本のケーブルが<strong>別の機械(Raspberry Pi 5)を経由</strong>しています。 Pi5 側の接続が細いため、<strong>約 800 MiB/s で頭打ち</strong>になります。</p>
+<p><strong>この 2 つの数字を並べて「遅くなった」と判断してはいけません。</strong> 条件がまったく違います。</p>
+<p><strong>(3) 1 回目は低く出ます</strong></p>
+<p>起動直後の 1 回目は、キャッシュが温まっていないぶん低く出ます。 <strong>同じセッションで連続して測り、定常値を比べます。</strong></p>
+<p><strong>(4) ばらつきが大きい項目があります</strong></p>
+<p>特に<strong>書き込みの 8 キロバイト</strong>は、同じバイナリ・同じセッションでも 942 / 0.01 / 595 MiB/s といった桁違いのばらつきが出ることがあります (0.01 の回は自己修復する既知の現象)。<strong>性能の退行判定にこの項目は 使えません。</strong> 64K / 256K と読み出しの 8K で判断します。</p>
+<h4>22.3 比較対象</h4>
+<p><code>~/script/linux_loopback.sh</code> というスクリプト(リポジトリ外)で、 Linux 側の実装を同じ書式で測れます。</p>
+<div class="tablewrap"><table><thead><tr><th>呼び名</th><th>中身</th></tr></thead><tbody><tr><td>kernel</td><td>Linux カーネルの NVMe-oF ターゲット + イニシエータ + fio</td></tr><tr><td>spdk</td><td>SPDK(ユーザ空間のストレージフレームワーク)</td></tr><tr><td>独自</td><td>このプロジェクト</td></tr></tbody></table></div>
+<p><strong>この比較は対等ではありません。</strong> Linux 側はネットワーク名前空間を経由した 本物の TCP スタックを通っています。<strong>順位そのものより、 「変更の前後で同じ列を比べる」ことに意味があります。</strong></p>
+<h4>22.4 性能に触る変更をするときの手順</h4>
+<p>このリポジトリで守られている作法です。</p>
+<ol><li><strong>同じセッション内で変更前後を比べる。</strong> 実行ごとに 4〜20% ばらつく 環境なので、日をまたいだ比較は無意味です。</li><li><strong>単発の比較で結論を出さない。</strong> 連続して複数回測ります。</li><li><strong>5% 以上の変化があったら <code>README.md</code> の表を更新する。</strong> 5% 未満はばらつきの範囲として扱います。</li></ol>
+<h4>22.5 ソースのどこを読むか</h4>
+<div class="tablewrap"><table><thead><tr><th>知りたいこと</th><th>見るファイル</th></tr></thead><tbody><tr><td>ベンチマークの実装</td><td><code>src/platform/x86-linux/main.c</code> の <code>shell_tcpbench()</code> / <code>shell_rdmabench()</code></td></tr><tr><td>時刻の取得</td><td><code>src/timer.c</code>、<code>src/platform/x86-linux/hal_timer.c</code></td></tr><tr><td>詳細な時間計測(リングバッファ)</td><td><code>src/timestamp.c</code></td></tr></tbody></table></div>
+<hr>
+<h3 class="chaphead" id="ch23">第 23 章 速い理由</h3>
+<p><a href="#ch2">第 2 章</a> で「カーネルを通さないから速い」と書きましたが、 それだけではありません。積み重なった工夫を挙げます。</p>
+<h4>23.1 ゼロコピー</h4>
+<p><a href="#ch20">第 20 章</a> で詳しく説明しました。<strong>受信は最終目的地へ直接、 送信は最終的な置き場所から直接</strong>。</p>
+<p>効果を実感するには、逆の実装を考えてみてください。8 キロバイトの書き込みで コピーが 3 回あれば、24 キロバイトぶんのメモリ帯域を使います。 1 秒に 3 万回なら 720 メガバイト/秒 — <strong>転送量とほぼ同じだけの帯域を コピーだけで消費します。</strong></p>
+<h4>23.2 ポーリング</h4>
+<p><a href="#ch3">第 3 章</a> のとおり、割り込みを使わず回り続けます。 反応が速く、割り込み処理のコストもありません。代償は CPU の占有です。</p>
+<h4>23.3 NIC へのオフロード</h4>
+<p><strong>(1) チェックサム</strong></p>
+<p><a href="#ch6">第 6 章</a> のとおり、IP と TCP のチェックサム計算を NIC にやらせます。 CPU が全バイトを舐める必要がなくなります。</p>
+<p><strong>(2) <a href="#term-lso">LSO</a>(Large Send Offload)</strong></p>
+<p>これが大きい工夫です。<strong>64 キロバイトのデータを「1 個の指示」として NIC に渡すと、NIC が MTU に合わせて分割し、それぞれに TCP ヘッダを 付けて送ってくれます。</strong></p>
+<div class="codewrap"><pre><code>  ソフトウェア:  [ 64KB のデータ ] + 「MSS は 9216 で切って」
+                          ↓
+  NIC:  [hdr|9216B][hdr|9216B][hdr|9216B]... と 8 個に分けて送出</code></pre></div>
+<p>シーケンス番号とチェックサムも NIC が正しく振り直します。 <strong>ソフトウェアの仕事が 1/8 になります。</strong></p>
+<h4>23.4 CRC32C の実装</h4>
+<p><a href="#ch14">第 14 章</a> のダイジェストで使う CRC32C は、 <strong>x86 の専用命令(SSE 4.2 の <code>crc32</code>)</strong>があります。しかしこの命令には 「結果が次の入力になる」という依存があり、 <strong>単純に使うと 1 サイクルあたり 2.67 バイト</strong>が上限です。</p>
+<p>そこで<strong>データを 3 つに分けて、3 本の計算を交互に回します</strong>。 依存が切れるので、命令の遅延を隠せます。最後に 3 本の結果を合成します。</p>
+<p>合成には <strong>PCLMULQDQ</strong>(キャリーなし乗算)命令を使います。</p>
+<blockquote><p><strong>測り方を間違えた記録</strong>: 当初、64 キロバイトを 1 回計算する形で測って 「合成に専用命令は不要」と結論しました。しかし<strong>実際の呼ばれ方 (TCP のセグメントごとに細かく呼ぶ)で測り直すと逆でした</strong>。 汎用的な方法だと 1 回あたり約 30 マイクロ秒かかり、細かく呼ぶと 本体の速さを食い潰していたのです。</p><p><strong>実装が実際にどう呼ばれるかと同じ形で測る</strong>必要があります。</p></blockquote>
+<p>正しさは起動時の自己テストで確認しています。既知の答えとの照合に加えて、 <strong>開始位置を 0〜7 バイトずらした 4096 バイトすべてについて、 1 バイトずつ計算した基準値と一致すること</strong>を確かめます。</p>
+<blockquote><p><strong>この全パターン検証が無かった頃の穴</strong>: 1 パターンしか検証しておらず、 <strong>自作イニシエータと自作ターゲットだけで試すと、両側が同じ間違い方を するので絶対に検出できない</strong>状態でした。</p></blockquote>
+<h4>23.5 無駄なパケットを出さない</h4>
+<p><a href="#ch10">第 10 章</a> 10.6 の (3) で説明した「情報の変わらない ACK を送らない」。 これだけで<strong>書き込み性能が 20% 上がりました</strong>。</p>
+<h4>23.6 同時 RDMA_READ の本数</h4>
+<p><a href="#ch15">第 15 章</a> 15.3 のとおり、この設定を直したことで <strong>RDMA の書き込み性能が 2.3 倍</strong>になりました。</p>
+<h4>23.7 データ構造の配置</h4>
+<p><a href="#ch19">第 19 章</a> のとおり、よく使うフィールドを前に集める、 接続の照合でポート番号を先に比べる(アドレスより短くて弾きやすい)、 といった細かい調整をしています。</p>
+<p>IPv6 対応で乗った 180 ナノ秒の固定コストのうち、これらの調整で <strong>約半分を取り戻しています</strong>。</p>
+<hr>
+<h3 class="chaphead" id="ch24">第 24 章 測って初めて分かったこと</h3>
+<p>この章は、<strong>推測が外れた記録</strong>です。設計の参考になります。</p>
+<h4>24.1 代表的でない条件で測ると逆の結論が出る</h4>
+<p><a href="#ch23">第 23 章</a> 23.4 の CRC の話です。 <strong>「実装が実際にどう呼ばれるかと同じ形で測る」</strong>。</p>
+<h4>24.2 コストの所在は「無効化して測る」と一発で分かる</h4>
+<p>ダイジェストのコストが「プロトコル処理」なのか「CRC の計算」なのかを 知りたいとき、<strong>CRC の関数を「何もしない関数」に差し替えて</strong>測りました。</p>
+<p>送信側も受信側も同じ関数を使うので、ダイジェストの値は自己矛盾なく一致 します。結果、<strong>プロトコル処理が約 3%、CRC 計算が 86%</strong> と切り分けられました。</p>
+<p><strong>憶測で最適化先を決めない。</strong></p>
+<h4>24.3 効果が無かった対策の記録</h4>
+<p>IPv6 対応で乗った固定コストを取り戻そうとして、 <strong>試したが効果が無かった</strong>ものです。同じことを繰り返さないための記録です。</p>
+<div class="tablewrap"><table><thead><tr><th>試したこと</th><th>結果</th></tr></thead><tbody><tr><td>IP ヘッダを右詰めして TCP ヘッダの位置を種別に依存させない</td><td><strong>逆に 6〜9% 遅くなった</strong>。IPv4 のフレーム開始が 64 バイト境界から外れたため。撤回</td></tr><tr><td>接続の構造体を 64 バイト境界に揃える</td><td>差が出なかった(<strong>それでも維持している</strong>。理由は <a href="#ch19">第 19 章</a>)</td></tr><tr><td>受信時のアドレス生成を遅延させる</td><td>差が出なかった(正しさのため残置)</td></tr></tbody></table></div>
+<p><strong>効果があった</strong>もの: よく使うフィールドを前へ移動、接続の照合で ポートを先に比較、未使用領域のゼロ埋めを廃止、分岐ヘルパの インライン化。合計で相当量を回復しました。</p>
+<h4>24.4 ハードウェアが黙って直していたものは、止めた瞬間に出る</h4>
+<p><a href="#ch6">第 6 章</a> と <a href="#ch11">第 11 章</a> で触れた話です。</p>
+<p>IPv6 の断片化を実装したとき、NIC のチェックサムオフロードが <strong>拡張ヘッダを理解できずに間違った位置へ書き込む</strong>ことが分かり、 その場合だけオフロードを外しました。</p>
+<p><strong>するとソフトウェア側の別のバグが露出しました。</strong> 疑似ヘッダの送信元 アドレスを間違えていたのですが、それまでは<strong>NIC が正しい値で上書き していたので誰も気付かなかった</strong>のです。</p>
+<h4>24.5 「動くはず」で機能を切ると、動くものを落とす</h4>
+<p><a href="#ch11">第 11 章</a> 11.4 の話です。<strong>「NIC の機能は古い規格前提だろう」と 推測して IPv6 でオフロードを切ったところ、実際には動きました。</strong> 切っていた間、書き込みが 38%、読み出しが 47% 遅くなっていました。</p>
+<p><strong>切る前に一度有効にして測る。</strong></p>
+<h4>24.6 誰も見ていない数字がある</h4>
+<p><a href="#ch10">第 10 章</a> 10.6 の (3)、<strong>419 万個の無駄な ACK</strong>。 機能としては正常に動いていたので、<strong>カウンタを仕込むまで誰も 気付きませんでした</strong>。</p>
+<p>このプロジェクトに <code>ts_log</code>(時刻付きのリングバッファ)や各種の カウンタが組み込まれているのは、こういう「見えていないもの」を 見えるようにするためです。</p>
+<hr>
+<h2 class="parthead" id="part-6">第 VII 部 使い方</h2>
+<h3 class="chaphead" id="ch25">第 25 章 ビルドと起動</h3>
+<h4>25.1 必要なもの</h4>
+<ul><li>x86-64 の Linux マシン</li><li><strong>Mellanox ConnectX-4 系の NIC</strong></li><li><strong>IOMMU が有効</strong>であること(BIOS の設定と、カーネル起動オプション)</li><li>gcc(SSE 4.2 と PCLMULQDQ を使うので、それに対応した CPU も必要)</li></ul>
+<h4>25.2 ビルド</h4>
+<div class="codewrap"><pre><code>cd ~/vfio_nvme &amp;&amp; make -j8</code></pre></div>
+<p>分岐やオプションはありません。成果物は <code>build/vfio_nvme</code> です。</p>
+<p><strong>注意</strong>: 実行ファイルの <code>.bss</code> が約 1.2 ギガバイトあります (<a href="#ch17">第 17 章</a>)。ファイルサイズ自体は小さい(約 400 キロバイト) のですが、実行時にそれだけのメモリを使います。</p>
+<h4>25.3 起動の準備</h4>
+<p><strong>(1) hugepage を確保する</strong></p>
+<div class="codewrap"><pre><code>echo 1024 | sudo tee /proc/sys/vm/nr_hugepages</code></pre></div>
+<p><strong>(2) NIC を vfio-pci にバインドする</strong></p>
+<div class="codewrap"><pre><code>sudo modprobe vfio-pci
+for d in 0000:01:00.0 0000:01:00.1; do
+  echo vfio-pci | sudo tee /sys/bus/pci/devices/$d/driver_override &gt; /dev/null
+  echo $d | sudo tee /sys/bus/pci/devices/$d/driver/unbind &gt; /dev/null
+  echo $d | sudo tee /sys/bus/pci/drivers_probe &gt; /dev/null
+done</code></pre></div>
+<p><a href="#ch4">第 4 章</a> のとおり、<strong>2 つのポートは同じ IOMMU グループなので まとめて渡す必要があります</strong>。</p>
+<p><strong>(3) 起動する</strong></p>
+<div class="codewrap"><pre><code>sudo ./build/vfio_nvme 0000:01:00.0 0000:01:00.1</code></pre></div>
+<p>引数はデバイスのアドレスです。<strong>引数を 2 つ渡すと常駐シェルに入ります。</strong></p>
+<h4>25.4 実機を扱うときの注意</h4>
+<p><strong>(1) 単発の起動を繰り返さない</strong></p>
+<p>プログラムを起動しては終了する、を繰り返すと<strong>カードやホストが応答しなく なる</strong>ことがあります(電源を切るまで復旧しません)。 <strong>必ず常駐シェルに入って、その中で操作します。</strong></p>
+<p><strong>(2) 終わったらバインドを戻す</strong></p>
+<div class="codewrap"><pre><code>for d in 0000:01:00.0 0000:01:00.1; do
+  echo mlx5_core | sudo tee /sys/bus/pci/devices/$d/driver_override &gt; /dev/null
+  echo $d | sudo tee /sys/bus/pci/devices/$d/driver/unbind &gt; /dev/null
+  echo $d | sudo tee /sys/bus/pci/drivers_probe &gt; /dev/null
+done</code></pre></div>
+<p><strong>(3) 終了する前にプロセスが残っていないか確認する</strong></p>
+<p><a href="#ch4">第 4 章</a> 4.6 のとおり、残っていると <code>unbind</code> が固まります。</p>
+<p><strong>(4) 起動時の既知のメッセージ</strong></p>
+<ul><li><code>[vfio] VFIO_IOMMU_MAP_DMA(...) 失敗 (errno=14)</code> が 1 回出るのは既知です。</li><li><code>monitor</code> コマンドが常に <code>FW=ASSERT</code> と表示するのも既知です (別のバイナリでも同じ表示になることを確認済み)。</li></ul>
+<h4>25.5 ソースのどこを読むか</h4>
+<div class="tablewrap"><table><thead><tr><th>知りたいこと</th><th>見るファイル</th></tr></thead><tbody><tr><td>ビルド設定</td><td><code>Makefile</code></td></tr><tr><td>起動処理</td><td><code>src/platform/x86-linux/main.c</code> の <code>main()</code></td></tr></tbody></table></div>
+<hr>
+<h3 class="chaphead" id="ch26">第 26 章 シェルコマンド一覧</h3>
+<p><code>main.c</code> の分岐から機械的に抽出した<strong>全 41 個</strong>です(<code>monitor</code>/<code>mon</code> と <code>quit</code>/<code>exit</code> の別名を含む)。用途別に分類します。</p>
+<h4>26.1 ベンチマーク</h4>
+<div class="tablewrap"><table><thead><tr><th>コマンド</th><th>意味</th></tr></thead><tbody><tr><td><code>tcpbench [KB[,KB..]] [r|w|rw] [qd] [hdgst] [ddgst] [ipv6]</code></td><td>NVMe/TCP の速度測定</td></tr><tr><td><code>bench [KB[,KB..]] [r|w|rw] [qd]</code></td><td>NVMe-oF RDMA の速度測定(<a href="#ch15">第 15 章</a>)</td></tr></tbody></table></div>
+<h4>26.2 NVMe-oF ターゲットの操作</h4>
+<div class="tablewrap"><table><thead><tr><th>コマンド</th><th>意味</th></tr></thead><tbody><tr><td><code>nvmet [port]</code></td><td>ターゲットを常駐起動する(既定 4421 番)</td></tr><tr><td><code>nvmens [add|del &lt;nsid&gt;]</code></td><td>名前空間の一覧 / 追加 / 削除。<strong>追加・削除で通知が飛ぶ</strong></td></tr><tr><td><code>nvmediscover [dump]</code></td><td>Discovery のログページを取得して表示</td></tr></tbody></table></div>
+<h4>26.3 ネットワークの設定と確認</h4>
+<div class="tablewrap"><table><thead><tr><th>コマンド</th><th>意味</th></tr></thead><tbody><tr><td><code>route [&lt;if&gt; &lt;netmask&gt; &lt;gw&gt;]</code></td><td>経路の表示 / 設定</td></tr><tr><td><code>ip6addr [&lt;if&gt; &lt;addr&gt; [plen]]</code></td><td>IPv6 グローバルアドレスの表示 / 設定</td></tr><tr><td><code>arpage [ms]</code></td><td>近隣キャッシュの有効期間の表示 / 変更</td></tr><tr><td><code>slaac [&lt;if&gt;] [ms]</code></td><td>IPv6 アドレスの自動設定を実行</td></tr><tr><td><code>mld [report|leave|off|on]</code></td><td>マルチキャストの参加表明の表示 / 送出 / 停止</td></tr><tr><td><code>ping6</code></td><td>対向ポートへ ICMPv6 の疎通確認</td></tr><tr><td><code>udp6send &lt;addr&gt; &lt;port&gt; &lt;bytes&gt;</code></td><td>指定先へ UDP を 1 個送る</td></tr></tbody></table></div>
+<h4>26.4 自己検査(詳しくは <a href="#ch27">第 27 章</a>)</h4>
+<div class="tablewrap"><table><thead><tr><th>コマンド</th><th>何を確かめるか</th></tr></thead><tbody><tr><td><code>tcp6test</code></td><td>IPv6 上で TCP を確立して 64KB 往復</td></tr><tr><td><code>udptest</code> / <code>udptest6</code></td><td>UDP の往復</td></tr><tr><td><code>rsttest</code></td><td>閉じたポートへの接続が即座に失敗するか</td></tr><tr><td><code>routetest</code></td><td>サブネット外宛がゲートウェイへ向かうか</td></tr><tr><td><code>arptest</code></td><td>近隣キャッシュの期限切れと延命</td></tr><tr><td><code>nudtest</code></td><td>到達不能検出</td></tr><tr><td><code>dadtest</code></td><td>重複アドレス検出</td></tr><tr><td><code>fragtest</code></td><td>送信側の IP 断片化</td></tr><tr><td><code>pmtutest</code></td><td>経路 MTU 探索</td></tr><tr><td><code>slaactest</code></td><td>IPv6 アドレスの自動設定</td></tr><tr><td><code>mldtest</code></td><td>マルチキャストの参加表明</td></tr><tr><td><code>ext6test</code></td><td>IPv6 拡張ヘッダの走査と断片化</td></tr><tr><td><code>qploop [N]</code></td><td>QP の作成と破棄を繰り返して資源の解放を確認</td></tr></tbody></table></div>
+<h4>26.5 診断・計測</h4>
+<div class="tablewrap"><table><thead><tr><th>コマンド</th><th>意味</th></tr></thead><tbody><tr><td><code>monitor</code> / <code>mon</code></td><td>カードの状態とエラーカウンタ</td></tr><tr><td><code>jobs</code></td><td>動いているジョブの一覧</td></tr><tr><td><code>ts mask &lt;mask&gt; &lt;value&gt;</code></td><td>時刻ログの絞り込み表示</td></tr><tr><td><code>txdrop [N]</code></td><td><strong>送信を N 個に 1 個わざと捨てる</strong>(ロスの注入)+ 再送統計</td></tr><tr><td><code>simdelay</code></td><td>遅延の注入</td></tr><tr><td><code>ackthresh</code></td><td>ACK を返す閾値の調整</td></tr></tbody></table></div>
+<h4>26.6 ハードウェアの調査用</h4>
+<p>RoCEv2 が同じカードの 2 ポート間で通らない問題(<a href="#ch15">第 15 章</a>)を 切り分けるために作られたものです。</p>
+<div class="tablewrap"><table><thead><tr><th>コマンド</th><th>意味</th></tr></thead><tbody><tr><td><code>rocepeer &lt;ip&gt; &lt;pf1|pi5|bogus&gt;</code></td><td>宛先の MAC と IP を独立に変えて RoCE を送る</td></tr><tr><td><code>gidvlan &lt;id&gt;</code></td><td>GID に VLAN を付けて登録する</td></tr><tr><td><code>ftprobe</code> / <code>txuplink</code> / <code>fdbprobe</code></td><td>フローステアリングの各種テーブルを試す</td></tr></tbody></table></div>
+<blockquote><p><strong><code>fdbprobe</code> は危険です。</strong> 転送規則を壊すことがあり、その場合は プロセスを再起動する必要があります。</p></blockquote>
+<h4>26.7 その他</h4>
+<p><code>help</code>、<code>quit</code>、<code>exit</code></p>
+<h4>26.8 使うときの注意</h4>
+<p><strong>(1) <code>nvmet</code> のポート番号は 4421 のままにする</strong></p>
+<p><code>tcpbench</code> は常に 4421 番へ繋ぎに行くので、<strong>別のポートを指定すると 以後のベンチが壊れます</strong>。</p>
+<p><strong>(2) 内部のベンチを回すと、外部からの接続を受けられなくなる</strong></p>
+<p><code>tcpbench</code> を 1 回でも実行すると、<strong>そのプロセスでは以後、外部の Linux から の接続が必ずタイムアウトします</strong>。内部のイニシエータが待ち受けを占有した ままになるためです。</p>
+<p>外部との接続テストは、<strong>プロセスを起動した直後</strong>に行ってください。</p>
+<p><strong>(3) <code>txdrop</code> を 0 に戻し忘れない</strong></p>
+<p>戻し忘れると、以後の測定が全部おかしくなります。</p>
+<hr>
+<h3 class="chaphead" id="ch27">第 27 章 自己検査コマンド</h3>
+<h4>27.1 なぜ自己検査が要るのか</h4>
+<p><a href="#ch2">第 2 章</a> 2.3 で触れたとおり、<strong>このプロジェクトでは <code>tcpdump</code> も <code>netstat</code> も使えません</strong>。カーネルの外で通信しているからです。</p>
+<p>そこで、<strong>自分で自分を検査するコマンド</strong>を組み込んでいます。 <code>*test</code> という名前のコマンドがそれです。</p>
+<h4>27.2 陰性対照と陽性対照</h4>
+<p>検査を設計するときの一番大事な考え方です。</p>
+<blockquote><p><strong>「起きないはずのことが起きなかった」だけでは、検証になりません。 検査処理が一切動いていなくても、それは成立するからです。</strong></p></blockquote>
+<p>たとえば<a href="#ch7">第 7 章</a> の重複アドレス検出。「自分のアドレスは空いている」 という結果は、<strong>検出処理が何も動いていなくても得られます</strong>(応答が来ない ことで判定するため)。</p>
+<p>そこで <strong><a href="#term-positivecontrol">陽性対照</a></strong> を組にします。 「対向ポートのアドレスは使用中と判定される」ことを同時に確かめれば、 検出処理が本当に動いていることが分かります。</p>
+<p>逆に <strong><a href="#term-negativecontrol">陰性対照</a></strong> も要ります。たとえば <a href="#ch11">第 11 章</a> の MLD では、<code>mld off</code> で送信を止めると <strong>通信が 100% 止まる</strong>ことを確かめます。これがあって初めて 「MLD が効いている」と言えます。</p>
+<blockquote><p><strong>陰性対照そのものが間違っていた例</strong>: IPv6 のアドレス自動設定の検査で、 「不正なプレフィックス長」の陰性対照を作るとき、正しいデータの 長さだけを変えて使い回しました。ところが<strong>そのデータ自体が 別の規則に違反していた</strong>ため、意図した理由とは違う理由で失敗して いました。<strong>陰性対照は「試したい性質以外は正しい」形にする</strong>必要があります。</p></blockquote>
+<h4>27.3 主な検査コマンドの中身</h4>
+<p><strong><code>rsttest</code></strong> — 閉じたポートへ接続し、<strong>経過時間で</strong>判定します。 「失敗した」だけを見ると、<a href="#ch10">第 10 章</a> の RST が無くても 再送の時間切れで最終的には失敗するので、退行を検出できません。 <strong>200 ミリ秒以内に失敗すること</strong>を条件にしています。</p>
+<p><strong><code>arptest</code></strong> — 有効期間を一時的に 600 ミリ秒に縮めて、 期限切れ → 確認 → 延命 / 破棄の流れを追います。<strong>終わったら元に戻します。</strong></p>
+<p><strong><code>routetest</code></strong> — 別のサブネットの宛先を作るために、 <strong>同じ物理ポートを共有する「別名インターフェース」を一時登録</strong>します。 決定的な証拠は「どの IP を問い合わせたか」(最終宛先ではなくゲートウェイ) です。アドレスの計算だけを確かめても、宛先とゲートウェイが同じでは 検証になりません。</p>
+<p><strong><code>fragtest</code></strong> — 受信側の組み立てが未実装なので、 <strong>断片を捨てる直前に観測用のフックを挟んで</strong>中身を確かめます。 2 個に割れるだけでは通らない経路(中間の断片)を必ず通すようにしています。</p>
+<p><strong><code>txdrop</code></strong> — 検査ではなく<strong>道具</strong>です。直結のリンクではパケットの ロスがまず起きないので、<strong>わざと捨てないと再送の実装を検証できません</strong>。 だから一時的なデバッグ機能ではなく、恒久的に残してあります。</p>
+<h4>27.4 状態を変える検査は必ず元に戻す</h4>
+<p><code>arptest</code>(有効期間)、<code>routetest</code>(経路)、<code>pmtutest</code>(経路 MTU)、 <code>nudtest</code>(有効期間)は、<strong>いずれも設定を書き換えてから元に戻します</strong>。 途中で失敗しても復元します。</p>
+<p>ただし完全ではありません。経路 MTU の消去は、 <strong>すでに確立している接続のセグメントサイズを元に戻しません</strong>。 接続を張り直す必要があります。</p>
+<h4>27.5 ソースのどこを読むか</h4>
+<p>検査コマンドはすべて <code>src/platform/x86-linux/main.c</code> にあります (約 4,600 行のうち、かなりの部分がこれらです)。 <code>shell_</code> で始まる関数を探してください。</p>
+<hr>
+<h2 class="parthead" id="part-7">第 VIII 部 実装状況</h2>
+<h3 class="chaphead" id="ch28">第 28 章 何がどこまで確かめられているか</h3>
+<p><strong>この章は「動く / 動かない」の 2 値ではなく、4 つに分けて書きます。</strong> 実装したかどうかと、確かめたかどうかは別のことだからです。</p>
+<div class="tablewrap"><table><thead><tr><th>記号</th><th>意味</th></tr></thead><tbody><tr><td><strong>確認済</strong></td><td>実装済み。<strong>実機で動作を確認した</strong></td></tr><tr><td><strong>未検証</strong></td><td>実装済み。<strong>確かめられていない</strong>(理由を添える)</td></tr><tr><td><strong>非実装(意図的)</strong></td><td>作らないと判断した(理由を添える)</td></tr><tr><td><strong>未実装</strong></td><td>まだ作っていない</td></tr></tbody></table></div>
+<h4>28.1 ハードウェア層</h4>
+<div class="tablewrap"><table><thead><tr><th>項目</th><th>状態</th><th>備考</th></tr></thead><tbody><tr><td>VFIO によるデバイスの取得、BAR の mmap</td><td><strong>確認済</strong></td><td></td></tr><tr><td>DMA メモリの確保と IOMMU 登録</td><td><strong>確認済</strong></td><td></td></tr><tr><td>カードの bring-up 一式</td><td><strong>確認済</strong></td><td></td></tr><tr><td>Ethernet の送受信、LSO、チェックサムオフロード</td><td><strong>確認済</strong></td><td></td></tr><tr><td>フローステアリング(catch-all)</td><td><strong>確認済</strong></td><td></td></tr><tr><td>QP に付随する資源の解放</td><td><strong>確認済</strong></td><td>作成と破棄を 252 回繰り返して、資源番号が再利用されることを確認</td></tr><tr><td>複数コアへの受信の振り分け</td><td><strong>非実装(意図的)</strong></td><td>コア 2・3 を起動する関数は残してあるが呼んでいない(<a href="#ch21">第 21 章</a>)</td></tr></tbody></table></div>
+<h4>28.2 ネットワーク層</h4>
+<div class="tablewrap"><table><thead><tr><th>項目</th><th>状態</th><th>備考</th></tr></thead><tbody><tr><td>ARP、近隣キャッシュのエージング</td><td><strong>確認済</strong></td><td></td></tr><tr><td>到達不能検出(NUD)</td><td><strong>確認済</strong></td><td>相手側からワイヤ上の観測もした</td></tr><tr><td>重複アドレス検出</td><td><strong>確認済</strong></td><td>陽性対照つき</td></tr><tr><td>IPv4 の送受信、ルーティング</td><td><strong>確認済</strong></td><td></td></tr><tr><td><strong>送信側の IP 断片化(IPv4)</strong></td><td><strong>確認済</strong></td><td></td></tr><tr><td><strong>受信側の IP 断片の組み立て</strong></td><td><strong>未実装</strong></td><td>断片が届いたら捨てる。実ネットワークで必要になったら実装する</td></tr><tr><td>ICMP / ICMPv6</td><td><strong>確認済</strong></td><td></td></tr><tr><td>経路 MTU 探索</td><td><strong>確認済</strong></td><td></td></tr><tr><td><strong>再送時の再分割</strong></td><td><strong>未実装</strong></td><td>経路 MTU を下げた直後の再送だけは、新しい上限を超えうる</td></tr><tr><td>TCP の確立・転送・切断</td><td><strong>確認済</strong></td><td></td></tr><tr><td>TCP の RST 送信</td><td><strong>確認済</strong></td><td></td></tr><tr><td>高速再送 / 高速回復</td><td><strong>確認済</strong></td><td>ロスを注入して確認</td></tr><tr><td><strong>SACK、タイムスタンプ</strong></td><td><strong>未実装</strong></td><td>あれば高速再送の抑制が要らなくなる(<a href="#ch10">第 10 章</a>)</td></tr><tr><td><strong>TCP キープアライブ</strong></td><td><strong>未実装</strong></td><td>NVMe の層に同等の仕組みがある(<a href="#ch16">第 16 章</a>)</td></tr><tr><td><strong>待ち受けキュー(backlog)</strong></td><td><strong>未実装</strong></td><td></td></tr><tr><td>UDP</td><td><strong>確認済</strong></td><td></td></tr><tr><td>IPv6 の送受信、NDP</td><td><strong>確認済</strong></td><td>外部の Linux と往復</td></tr><tr><td>SLAAC(アドレス自動設定)</td><td><strong>確認済</strong></td><td><strong>Linux が出す本物の RA でも確認</strong></td></tr><tr><td>MLD(マルチキャスト参加表明)</td><td><strong>確認済</strong></td><td>Linux ブリッジのスヌーピングで陰性/陽性の対を取得</td></tr><tr><td>IPv6 拡張ヘッダの走査</td><td><strong>確認済</strong></td><td></td></tr><tr><td><strong>送信側の IPv6 断片化</strong></td><td><strong>確認済</strong></td><td><strong>Linux に組み立てさせて確認</strong></td></tr><tr><td><strong>RA の MTU オプションの適用</strong></td><td><strong>非実装(意図的)</strong></td><td>記録するだけ。リンク MTU を下げると測定条件が変わってしまう</td></tr><tr><td><strong>使われていない近隣エントリの能動確認</strong></td><td><strong>非実装(意図的)</strong></td><td>RFC も Linux も「使われたとき」しか確認しない</td></tr></tbody></table></div>
+<h4>28.3 NVMe/TCP</h4>
+<div class="tablewrap"><table><thead><tr><th>項目</th><th>状態</th><th>備考</th></tr></thead><tbody><tr><td>PDU の送受信、in-capsule、R2T</td><td><strong>確認済</strong></td><td></td></tr><tr><td>ダイジェスト(CRC32C)</td><td><strong>確認済</strong></td><td></td></tr><tr><td>Discovery</td><td><strong>確認済</strong></td><td></td></tr><tr><td>Identify(CNS 6 種)</td><td><strong>確認済</strong></td><td>Linux の <code>nvme-cli</code> で確認</td></tr><tr><td>Get / Set Features</td><td><strong>確認済</strong></td><td>同上、陰性対照つき</td></tr><tr><td>Write Zeroes / Dataset Management</td><td><strong>確認済</strong></td><td><code>blkdiscard</code> と <code>fstrim</code> まで確認</td></tr><tr><td>SMART / エラー情報ログ</td><td><strong>確認済</strong></td><td>カウンタの増加とエラー記録まで確認</td></tr><tr><td>非同期イベント(AER)</td><td><strong>確認済</strong></td><td>名前空間の増減で発火、Linux が再スキャン</td></tr><tr><td>Keep Alive タイマ</td><td><strong>確認済</strong></td><td>リンクを落として時間切れ、陰性対照つき</td></tr><tr><td>複数名前空間</td><td><strong>確認済</strong></td><td><code>/dev/nvme0n2</code> が生え、内容が混ざらない</td></tr><tr><td><strong>IO コマンドの無効な名前空間 ID</strong></td><td><strong>未検証</strong></td><td><strong>ホスト経由では叩けない。</strong> Linux が「コマンド中の nsid とデバイスの nsid が違う」とカーネルの入口で弾き、複数名前空間があると汎用の受け渡しも拒否する。<strong>名前空間の解決そのものは動いている</strong>(サイズの違う 2 つで範囲検査が別々に効くこと、内容が混ざらないことで確認済み)。未到達なのは「無効だったときにどの状態コードを返すか」の 1 分岐だけ</td></tr><tr><td><strong>認証(DH-HMAC-CHAP / TLS)</strong></td><td><strong>未実装</strong></td><td><a href="#ch28">第 28.5 節</a></td></tr></tbody></table></div>
+<h4>28.4 NVMe-oF RDMA / RoCEv2</h4>
+<p><strong>ここが一番、状態を分けて書く必要がある部分です。</strong></p>
+<div class="tablewrap"><table><thead><tr><th>項目</th><th>状態</th><th>備考</th></tr></thead><tbody><tr><td><strong>RoCEv2 のパケットが相手に届き、解釈されること</strong></td><td><strong>確認済(2 ノード間)</strong></td><td>OptiPlex から Raspberry Pi 5 へ送ると、<strong>Pi5 側の UDP 4791 番のカウンタが増え、Pi5 の Linux が接続管理の応答(REJ)を返してくる</strong>。つまり Ethernet・IP・UDP・IB ヘッダ・CM の中身まで、<strong>相手の正規実装が解釈できる形になっている</strong></td></tr><tr><td><strong>同じカードの 2 ポート間(ループバック)</strong></td><td><strong>不可能</strong></td><td><strong>このカードの制約</strong>。宛先の MAC か IP が自装置のものだと、ファームウェアが内部で処理しようとして消える。<strong>Linux 純正のドライバでも同じように失敗する</strong>ので、自作の不具合ではない(<a href="#ch15">第 15 章</a> 15.6)</td></tr><tr><td><strong>NVMe-oF RDMA のエンドツーエンド</strong></td><td><strong>未検証(現構成)</strong></td><td>Pi5 の Linux が動かす RDMA ターゲットへ自作イニシエータを向ける、という手が残っている。<code>bench</code> コマンドが接続先を指定できる形になっていないため未実施</td></tr><tr><td>(参考)過去の構成での動作</td><td>—</td><td>100 ギガビットの別カードで 2 ポートを直結していた時期には、ベンチマークが完走していた。<code>README.md</code> の RDMA の数値はそのときのもの。<strong>ただしその構成でも、ワイヤを通っていたのか内部で折り返していたのかは区別できていなかった</strong></td></tr><tr><td><strong>ターゲット側 RDMA の切断処理の改善</strong></td><td><strong>未実装</strong></td><td>TCP 側に入れた 2 件(接続を閉じる順序、シャットダウン状態の報告。<a href="#ch16">第 16 章</a> 16.3)が <strong><code>nvmet_rdma.c</code> には入っていない</strong>。RoCEv2 を動かせないので検証できないため。<strong>動くようになったら同じ手当てが必要</strong></td></tr></tbody></table></div>
+<h4>28.5 認証について</h4>
+<p>NVMe-oF の実運用では、<strong>接続時の認証</strong>が必要です。方式は 2 つあります。</p>
+<ul><li><strong>DH-HMAC-CHAP</strong>: 合言葉による認証。HMAC-SHA256 と Diffie-Hellman 鍵交換が要ります。</li><li><strong>TLS 1.3</strong>: TCP の上に暗号化の層を追加。鍵交換・証明書・AES-GCM の一式が要ります。</li></ul>
+<p><strong>このプロジェクトには <code>crc32c.c</code> 以外に暗号の実装が 1 つもありません。</strong> ハッシュ関数と大きな数の演算をゼロから持ち込むことになります。</p>
+<p>判断としては、<strong>やるなら DH-HMAC-CHAP のみ、TLS は対象外</strong>が妥当です。 それでも他の項目とは規模が 1 桁違います。</p>
+<h4>28.6 この表の使い方</h4>
+<p>新しく手を入れるとき、<strong>「未検証」の欄を先に見てください。</strong> そこに触る変更をすると、<strong>壊しても気付けません。</strong></p>
+<hr>
+<h3 class="chaphead" id="ch29">第 29 章 検証の考え方</h3>
+<p>このプロジェクトが積み上げてきた<strong>検証の手法</strong>をまとめます。 似た環境で開発する人の役に立つはずです。</p>
+<h4>29.1 根本の問題 — 自作どうしでは検出できない</h4>
+<blockquote><p><strong>自作のイニシエータと自作のターゲットだけで試すと、 両側が同じ間違い方をするので、絶対に検出できない不具合があります。</strong></p></blockquote>
+<p>実例:</p>
+<ul><li><strong>CRC の計算</strong>: 両側が同じ間違いをすれば値は一致します</li><li><strong>メッセージ中のアドレスの位置が 4 バイトずれていた</strong>(<a href="#ch11">第 11 章</a>): 送る側も読む側も同じだけずれているので、全部通ります</li><li><strong>切断の手順</strong>(<a href="#ch16">第 16 章</a>): 自作のイニシエータがその手順を 踏まないので、ターゲットの不備が表に出ません</li></ul>
+<p>この問題への答えが、以下の 7 つの手法です。</p>
+<h4>29.2 手法 1: 相手側の構造体でパースさせる</h4>
+<p><strong>このリポジトリのコードを一切使わず、Linux のヘッダファイルだけで バイト列を読み直すプログラム</strong>を書きます。</p>
+<div class="codewrap"><pre><code>tools/disc_log_check.c   … Linux の &lt;linux/nvme.h&gt; だけを使う
+tools/ip_frag_check.c    … &lt;netinet/ip.h&gt; だけを使う
+tools/icmp_mtu_check.c   … &lt;netinet/ip_icmp.h&gt; / &lt;netinet/icmp6.h&gt; だけ
+tools/ra_check.c         … &lt;netinet/icmp6.h&gt; の RA 構造体だけ
+tools/mld_check.c        … libc の MLD 構造体だけ
+tools/ip6_ext_check.c    … &lt;netinet/ip6.h&gt; の拡張ヘッダ構造体だけ</code></pre></div>
+<p>シェルコマンドに <code>dump</code> を付けると 16 進で出力されるので、 それをこれらのプログラムに食わせます。</p>
+<p><strong>役目は「フィールドの配置の検算」に絞ります。</strong> 値が仕様を満たすかの 判定は受信側の責任です(検査のために意図的に不正な値を入れることが あるため)。</p>
+<blockquote><p><strong>注意</strong>: この道具を書くときにも間違えます。glibc の一部のマクロは <strong>ネットワークバイト順のまま掛ける定数</strong>で、変換後の値に掛けると 壊れます。実際にこれで<strong>正しい実装を「間違い」と判定</strong>したことがあります。</p></blockquote>
+<h4>29.3 手法 2: 本物のホストに読ませる</h4>
+<p><strong>Raspberry Pi 5 に Linux と <code>nvme-cli</code> が入っている</strong>ので、 25 ギガビットのケーブル越しに接続して、<strong>本物の実装に解釈させられます</strong>。</p>
+<p>これは手法 1 より強い検証です。<strong>Linux のカーネルと <code>nvme-cli</code> が、 実際にこのバイト列を読んで、フィールド名つきで展開して表示します。</strong> 配置を間違えれば「別のフィールドに値が出る」形で必ず見えます。</p>
+<p>NVMe の機能(第 IV 部)の検証は、ほぼこの方法で行っています。 そのため、後半の実装では手法 1 の道具を新しく作っていません。</p>
+<h4>29.4 手法 3: 相手側の状態を相手側のツールで読む</h4>
+<p><strong>このプロジェクトの動作が、相手側に状態を作ることを利用します。</strong></p>
+<p>例: Pi5 のネットワークブリッジを「マルチキャストを学習するモード」に すると、こちらが送った参加表明が <strong>Pi5 の <code>bridge mdb show</code> に載ります</strong>。</p>
+<div class="codewrap"><pre><code>自作のプロセスを止める → エントリが消える
+自作のプロセスを起動する → 3 秒で現れる</code></pre></div>
+<p><strong>この因果関係が証拠になります。</strong></p>
+<h4>29.5 手法 4: 陰性対照と陽性対照</h4>
+<p><a href="#ch27">第 27 章</a> 27.2 で説明したとおりです。 <strong>「起きないはずのことが起きなかった」だけでは検証になりません。</strong></p>
+<p>さらに、<strong>機能を止める手段を恒久的に残す</strong>という手もあります。 <code>mld off</code>(参加表明を止める)や <code>txdrop</code>(パケットを捨てる)がそれで、 <strong>止めると通信が 100% 死ぬ</strong>ことが、機能が効いていることの証明になります。</p>
+<h4>29.6 手法 5: 届かないメッセージを自分で注入する</h4>
+<p>「ルータからのエラー通知」のように、<strong>この実験環境では誰も送ってこない メッセージ</strong>があります。これは<strong>対向のポートにルータ役をさせて注入</strong>します。</p>
+<p>受信して処理する側が実装範囲なら、注入する側がテストコードでも成立します。 ただし<strong>注入する形式も自作になる</strong>ので、手法 1 と組で使います。</p>
+<h4>29.7 手法 6: 相手側に「自作でない送り手」を書く</h4>
+<p>Pi5 に Python で AF_PACKET(生のフレームを扱う仕組み)のスクリプトを 置いて、<strong>本物の送り手</strong>を用意します。</p>
+<div class="codewrap"><pre><code>tools/send_ra.py     … IPv6 のルータ役
+tools/sniff_mld.py   … こちらの参加表明を観測する
+tools/sniff_neigh.py … 近隣の問い合わせがユニキャストか観測する
+tools/udp6_echo.py   … 断片化した UDP を組み立てさせる</code></pre></div>
+<p><strong>受信側を書けば、自作の送信がワイヤに出ているかを相手側から確認できます。</strong></p>
+<blockquote><p><strong>Python で生フレームを扱うときの落とし穴が 3 つ</strong>ありました。 どれも「送信は動くので、受信を書くまで気付けない」ものです。 プロトコル番号を省くと 1 フレームも受信できない、変換関数を 掛ける場所を間違えると二重変換になる、ブリッジのポートでは 「全プロトコル」を指定しないと届かない。</p></blockquote>
+<h4>29.8 手法 7: 受信側が未実装なら、捨てる直前にフックを挟む</h4>
+<p>送信側だけ実装して受信側が未実装の機能(IP の断片化など)は、 素直な往復では確かめられません。<strong>捨てる直前に観測用のフックを挟んで</strong>、 テスト側が仕様を見ながら組み直します。</p>
+<h4>29.9 検証の設計で繰り返し間違えたこと</h4>
+<p><strong>(1) 陰性対照そのものが規則違反だった</strong></p>
+<p><a href="#ch27">第 27 章</a> 27.2 の例です。<strong>陰性対照は「試したい性質以外は正しい」 形にする</strong>必要があります。</p>
+<p><strong>(2) 値の解釈の間違いは、配置の検算では見つからない</strong></p>
+<p><a href="#ch16">第 16 章</a> 16.5 の「0's based」の話です。バイトの位置は合っている のに意味が違う、という間違いは手法 1 では検出できません。 <strong>実データで境界を確かめる</strong>必要があります。</p>
+<p><strong>(3) 代表的でない条件で測る</strong></p>
+<p><a href="#ch24">第 24 章</a> 24.1 の CRC の話です。</p>
+<p><strong>(4) 「1 回だけ見る」検査</strong></p>
+<p>「エラーが 0 件だった」は、そもそも検査が動いていなくても成立します。 <strong>接続直後・処理後・異常発生後の 3 点で比べる</strong>といった形にします。</p>
+<h4>29.10 ソースのどこを読むか</h4>
+<div class="tablewrap"><table><thead><tr><th>知りたいこと</th><th>見る場所</th></tr></thead><tbody><tr><td>独立した検算プログラム</td><td><code>tools/*_check.c</code></td></tr><tr><td>相手側で動かすスクリプト</td><td><code>tools/*.py</code></td></tr><tr><td>検査コマンドの実装</td><td><code>src/platform/x86-linux/main.c</code></td></tr><tr><td>過去に踏んだ不具合の記録</td><td><code>CLAUDE.md</code></td></tr></tbody></table></div>
+<hr>
+<h2 class="parthead" id="part-8">付録</h2>
+<h3 class="chaphead" id="appendix-a">付録 A 用語集</h3>
+<p>本文で使ったすべての略語・専門用語です。本文からは各章の初出でここへ リンクしています。前半が英字・略語、後半が日本語の用語です。</p>
+<h4>A.1 英字・略語</h4>
+<div class="tablewrap"><table><thead><tr><th>用語</th><th>意味</th><th>詳しくは</th></tr></thead><tbody><tr><td><a id="term-3way"></a><strong>3-way handshake</strong></td><td>TCP の接続を始める 3 往復のやりとり(SYN → SYN|ACK → ACK)。</td><td><a href="#ch10">第 10 章</a></td></tr><tr><td><a id="term-adminq"></a><strong>admin キュー</strong></td><td>NVMe の管理用コマンド(Identify、設定など)を流すキュー。接続ごとに 1 本。</td><td><a href="#ch12">第 12 章</a></td></tr><tr><td><a id="term-aer"></a><strong>AER</strong></td><td>Asynchronous Event Request。ホストが先に投げておき、何か起きるまで完了しない特殊なコマンド。</td><td><a href="#ch12">第 12 章</a></td></tr><tr><td><a id="term-arp"></a><strong>ARP</strong></td><td>Address Resolution Protocol。IPv4 アドレスから MAC アドレスを引く仕組み。</td><td><a href="#ch7">第 7 章</a></td></tr><tr><td><a id="term-arpcache"></a><strong>ARP キャッシュ</strong></td><td>ARP で調べた「IP → MAC」の対応を覚えておく表。有効期限がある。</td><td><a href="#ch7">第 7 章</a></td></tr><tr><td><a id="term-arpprobe"></a><strong>ARP Probe</strong></td><td>使おうとしている IPv4 アドレスが空いているか確かめる問い合わせ。送信元を空にして出す。</td><td><a href="#ch7">第 7 章</a></td></tr><tr><td><a id="term-bar"></a><strong>BAR</strong></td><td>Base Address Register。デバイスのレジスタが割り当てられたアドレスの範囲。</td><td><a href="#ch3">第 3 章</a></td></tr><tr><td><a id="term-cm"></a><strong>CM</strong></td><td>Connection Manager。RDMA の接続を確立する手順(REQ → REP → RTU)。</td><td><a href="#ch15">第 15 章</a></td></tr><tr><td><a id="term-cmdq"></a><strong>cmdq</strong></td><td>コマンドキュー。NIC のファームウェアに設定を依頼するための窓口。</td><td><a href="#ch5">第 5 章</a></td></tr><tr><td><a id="term-cq"></a><strong>CQ</strong></td><td>Completion Queue。NIC が「作業が終わった」を書き込むキュー。</td><td><a href="#ch5">第 5 章</a></td></tr><tr><td><a id="term-cqe"></a><strong>CQE</strong></td><td>Completion Queue Entry。CQ に入る 1 個の完了報告。<strong>NIC のものと NVMe のものは別物。</strong></td><td><a href="#ch5">第 5 章</a>、<a href="#ch12">第 12 章</a></td></tr><tr><td><a id="term-crc32c"></a><strong>CRC32C</strong></td><td>32 ビットの誤り検出符号。NVMe/TCP のダイジェストに使う。x86 に専用命令がある。</td><td><a href="#ch14">第 14 章</a>、<a href="#ch23">第 23 章</a></td></tr><tr><td><a id="term-dad"></a><strong>DAD</strong></td><td>Duplicate Address Detection。IPv6 版の重複アドレス検出。</td><td><a href="#ch7">第 7 章</a></td></tr><tr><td><a id="term-discovery"></a><strong>Discovery</strong></td><td>「ここには何がありますか」を尋ねるための特別な NVMe-oF コントローラ。</td><td><a href="#ch13">第 13 章</a></td></tr><tr><td><a id="term-dma"></a><strong>DMA</strong></td><td>Direct Memory Access。デバイスが CPU を介さずメモリを直接読み書きすること。</td><td><a href="#ch3">第 3 章</a></td></tr><tr><td><a id="term-doorbell"></a><strong>doorbell</strong></td><td>「キューに新しい指示を置いた」とデバイスに知らせる MMIO 書き込み。</td><td><a href="#ch5">第 5 章</a></td></tr><tr><td><a id="term-eq"></a><strong>EQ</strong></td><td>Event Queue。NIC が異常などを通知するキュー。</td><td><a href="#ch5">第 5 章</a></td></tr><tr><td><a id="term-ethernet"></a><strong>Ethernet</strong></td><td>同じケーブル上の機器どうしでフレームをやりとりする規格。宛先は MAC アドレス。</td><td><a href="#ch6">第 6 章</a></td></tr><tr><td><a id="term-ethertype"></a><strong>EtherType</strong></td><td>Ethernet ヘッダの中の「中身が何か」を示す欄(IPv4 は 0x0800 など)。</td><td><a href="#ch6">第 6 章</a></td></tr><tr><td><a id="term-fabrics"></a><strong>Fabrics コマンド</strong></td><td>NVMe-oF で追加された、接続の確立などを行うコマンド系統(オペコード 0x7F)。</td><td><a href="#ch13">第 13 章</a></td></tr><tr><td><a id="term-fastretx"></a><strong>Fast Retransmit</strong></td><td>重複 ACK が 3 個溜まったら、時間切れを待たずに再送すること。</td><td><a href="#ch10">第 10 章</a></td></tr><tr><td><a id="term-firmware"></a><strong>FW(ファームウェア)</strong></td><td>デバイスの中で動いている小さなプログラム。設定はこれに依頼する。</td><td><a href="#ch5">第 5 章</a></td></tr><tr><td><a id="term-gobackn"></a><strong>Go-Back-N</strong></td><td>失われた地点から先を全部送り直す再送方式。</td><td><a href="#ch10">第 10 章</a></td></tr><tr><td><a id="term-hca"></a><strong>HCA</strong></td><td>Host Channel Adapter。RDMA に対応した NIC の呼び方。</td><td><a href="#ch5">第 5 章</a></td></tr><tr><td><a id="term-hugepage"></a><strong>hugepage</strong></td><td>通常 4KB のメモリページを 2MB(または 1GB)単位にしたもの。DMA 用に使う。</td><td><a href="#ch3">第 3 章</a></td></tr><tr><td><a id="term-icmp"></a><strong>ICMP</strong></td><td>ネットワークの都合(届かない、大きすぎる等)を伝えるプロトコル。ping もこれ。</td><td><a href="#ch9">第 9 章</a></td></tr><tr><td><a id="term-icmpv6"></a><strong>ICMPv6</strong></td><td>IPv6 版の ICMP。NDP もこの上に載っている。</td><td><a href="#ch9">第 9 章</a></td></tr><tr><td><a id="term-iommu"></a><strong>IOMMU</strong></td><td>デバイス専用の MMU。デバイスが触れるメモリを OS が制限する仕組み。</td><td><a href="#ch3">第 3 章</a></td></tr><tr><td><a id="term-iommugroup"></a><strong>IOMMU グループ</strong></td><td>IOMMU が互いを区別できないデバイスの集まり。まとめてしか貸し出せない。</td><td><a href="#ch4">第 4 章</a></td></tr><tr><td><a id="term-ioq"></a><strong>IO キュー</strong></td><td>NVMe の読み書き用のキュー。複数本作れる。</td><td><a href="#ch12">第 12 章</a></td></tr><tr><td><a id="term-iova"></a><strong>IOVA</strong></td><td>IO Virtual Address。デバイスから見たメモリの番地。</td><td><a href="#ch3">第 3 章</a></td></tr><tr><td><a id="term-ip"></a><strong>IP</strong></td><td>Internet Protocol。世界中のどのコンピュータ宛かを指定し、道案内をする層。</td><td><a href="#ch8">第 8 章</a></td></tr><tr><td><a id="term-ipv4"></a><strong>IPv4</strong></td><td>32 ビットのアドレスを使う IP。<code>192.168.101.11</code> の形式。</td><td><a href="#ch8">第 8 章</a></td></tr><tr><td><a id="term-ipv6"></a><strong>IPv6</strong></td><td>128 ビットのアドレスを使う IP。<code>2001:db8::1</code> の形式。</td><td><a href="#ch8">第 8 章</a>、<a href="#ch11">第 11 章</a></td></tr><tr><td><a id="term-jumbo"></a><strong>ジャンボフレーム</strong></td><td>MTU を通常の 1500 バイトより大きく(9000 バイト前後に)したフレーム。</td><td><a href="#ch6">第 6 章</a></td></tr><tr><td><a id="term-kato"></a><strong>KATO</strong></td><td>Keep Alive Timeout。「この時間コマンドが来なかったら死んだと思ってよい」という値。</td><td><a href="#ch13">第 13 章</a>、<a href="#ch16">第 16 章</a></td></tr><tr><td><a id="term-lba"></a><strong>LBA</strong></td><td>Logical Block Address。記憶装置を固定長のブロックに区切ったときの通し番号。</td><td><a href="#ch12">第 12 章</a></td></tr><tr><td><a id="term-lso"></a><strong>LSO</strong></td><td>Large Send Offload。大きなデータを NIC に渡し、MTU に合わせた分割を任せる機能。</td><td><a href="#ch23">第 23 章</a></td></tr><tr><td><a id="term-mac"></a><strong>MAC アドレス</strong></td><td>機器ごとに固有の 48 ビットの番号。Ethernet の宛先に使う。</td><td><a href="#ch6">第 6 章</a></td></tr><tr><td><a id="term-mkey"></a><strong>MKey</strong></td><td>Memory Key。NIC にメモリの使用を許す「許可証」。RDMA では相手に番号を教える。</td><td><a href="#ch5">第 5 章</a></td></tr><tr><td><a id="term-mld"></a><strong>MLD</strong></td><td>Multicast Listener Discovery。「このマルチキャストを聞いています」とスイッチに伝える仕組み。</td><td><a href="#ch11">第 11 章</a></td></tr><tr><td><a id="term-mmio"></a><strong>MMIO</strong></td><td>Memory-Mapped I/O。デバイスのレジスタをメモリの番地に割り当てる方式。代入がハードへの命令になる。</td><td><a href="#ch3">第 3 章</a></td></tr><tr><td><a id="term-mtu"></a><strong>MTU</strong></td><td>Maximum Transmission Unit。1 個のフレームで運べる中身の上限。</td><td><a href="#ch6">第 6 章</a></td></tr><tr><td><a id="term-ndp"></a><strong>NDP</strong></td><td>Neighbor Discovery Protocol。IPv6 版の ARP。マルチキャストを使う。</td><td><a href="#ch7">第 7 章</a></td></tr><tr><td><a id="term-nic"></a><strong>NIC</strong></td><td>Network Interface Card。ネットワークカード。</td><td><a href="#ch1">第 1 章</a></td></tr><tr><td><a id="term-nqn"></a><strong>NQN</strong></td><td>NVMe Qualified Name。NVMe-oF で相手を指定する長い名前。</td><td><a href="#ch13">第 13 章</a></td></tr><tr><td><a id="term-nud"></a><strong>NUD</strong></td><td>Neighbor Unreachability Detection。相手がまだ届く状態かを確かめる仕組み。</td><td><a href="#ch7">第 7 章</a></td></tr><tr><td><a id="term-nvme"></a><strong>NVMe</strong></td><td>Non-Volatile Memory Express。SSD と会話するための規格。キューにコマンドを積む。</td><td><a href="#ch12">第 12 章</a></td></tr><tr><td><a id="term-nvmeof"></a><strong>NVMe-oF</strong></td><td>NVMe over Fabrics。NVMe をネットワーク越しに使う規格。</td><td><a href="#ch13">第 13 章</a></td></tr><tr><td><a id="term-pcie"></a><strong>PCIe</strong></td><td>PCI Express。PC に部品を挿すための規格。</td><td><a href="#ch3">第 3 章</a></td></tr><tr><td><a id="term-pd"></a><strong>PD</strong></td><td>Protection Domain。NIC 内部の資源をまとめるグループ。</td><td><a href="#ch5">第 5 章</a></td></tr><tr><td><a id="term-pdu"></a><strong>PDU</strong></td><td>Protocol Data Unit。TCP のバイト流の上に区切りを作る単位。</td><td><a href="#ch14">第 14 章</a></td></tr><tr><td><a id="term-pf"></a><strong>PF</strong></td><td>Physical Function。1 枚のカードが見せる 1 つのポート(機能)。</td><td><a href="#ch3">第 3 章</a></td></tr><tr><td><a id="term-pmtud"></a><strong>PMTUD</strong></td><td>Path MTU Discovery。経路の途中の MTU を学習する仕組み。</td><td><a href="#ch8">第 8 章</a></td></tr><tr><td><a id="term-qp"></a><strong>QP</strong></td><td>Queue Pair。RDMA の通信単位。送信キューと受信キューの組。</td><td><a href="#ch5">第 5 章</a>、<a href="#ch15">第 15 章</a></td></tr><tr><td><a id="term-rdma"></a><strong>RDMA</strong></td><td>Remote Direct Memory Access。相手の CPU を介さず相手のメモリを読み書きする技術。</td><td><a href="#ch15">第 15 章</a></td></tr><tr><td><a id="term-rkey"></a><strong>rkey</strong></td><td>RDMA で「このメモリを読み書きしてよい」ことを示す鍵。相手に教える。</td><td><a href="#ch15">第 15 章</a></td></tr><tr><td><a id="term-rocev2"></a><strong>RoCEv2</strong></td><td>RDMA over Converged Ethernet v2。Ethernet + IP + UDP(4791 番)の上で RDMA を行う方式。</td><td><a href="#ch15">第 15 章</a></td></tr><tr><td><a id="term-rq"></a><strong>RQ</strong></td><td>Receive Queue。「受信データを入れる空きバッファ」を NIC に渡すキュー。</td><td><a href="#ch5">第 5 章</a></td></tr><tr><td><a id="term-rst"></a><strong>RST</strong></td><td>TCP のリセット。「その接続は無い」と即座に断る印。</td><td><a href="#ch10">第 10 章</a></td></tr><tr><td><a id="term-rto"></a><strong>RTO</strong></td><td>Retransmission TimeOut。ACK が来ないまま一定時間が過ぎたら再送する仕組み。</td><td><a href="#ch10">第 10 章</a></td></tr><tr><td><a id="term-sack"></a><strong>SACK</strong></td><td>Selective ACK。「どこが届いてどこが欠けたか」を細かく伝える TCP の拡張。<strong>このプロジェクトは未実装。</strong></td><td><a href="#ch10">第 10 章</a></td></tr><tr><td><a id="term-slaac"></a><strong>SLAAC</strong></td><td>IPv6 のアドレス自動設定。ルータに尋ねた情報と自分の MAC から作る。</td><td><a href="#ch11">第 11 章</a></td></tr><tr><td><a id="term-sq"></a><strong>SQ</strong></td><td>Send Queue。CPU が「これを送れ」という指示を積むキュー。</td><td><a href="#ch5">第 5 章</a></td></tr><tr><td><a id="term-sqe"></a><strong>SQE</strong></td><td>Submission Queue Entry。NVMe のコマンド 1 個(64 バイト固定)。</td><td><a href="#ch12">第 12 章</a></td></tr><tr><td><a id="term-ssd"></a><strong>SSD</strong></td><td>フラッシュメモリを使った記憶装置。</td><td><a href="#ch1">第 1 章</a></td></tr><tr><td><a id="term-tcp"></a><strong>TCP</strong></td><td>バイトの列を順番どおり欠けずに届けるプロトコル。</td><td><a href="#ch10">第 10 章</a></td></tr><tr><td><a id="term-tcpts"></a><strong>TCP タイムスタンプ</strong></td><td>往復時間をより正確に測るための TCP オプション。<strong>このプロジェクトは未実装。</strong></td><td><a href="#ch10">第 10 章</a></td></tr><tr><td><a id="term-timewait"></a><strong>TIME_WAIT</strong></td><td>TCP を閉じたあとしばらく待つ状態。古いパケットが次の接続に混ざるのを防ぐ。</td><td><a href="#ch10">第 10 章</a></td></tr><tr><td><a id="term-uar"></a><strong>UAR</strong></td><td>User Access Region。doorbell を書くために割り当てられたレジスタ領域。</td><td><a href="#ch5">第 5 章</a></td></tr><tr><td><a id="term-udp"></a><strong>UDP</strong></td><td>順番も到達も保証しない代わりに軽いプロトコル。RoCEv2 の土台でもある。</td><td><a href="#ch11">第 11 章</a></td></tr><tr><td><a id="term-upcall"></a><strong>upcall</strong></td><td>「データが届いたらこれを呼んで」と事前に登録しておく関数。呼びに行くのではなく呼ばれる。</td><td><a href="#ch20">第 20 章</a></td></tr><tr><td><a id="term-vfio"></a><strong>VFIO</strong></td><td>Linux がデバイスをユーザ空間のプログラムに貸し出す仕組み。</td><td><a href="#ch4">第 4 章</a></td></tr><tr><td><a id="term-wqe"></a><strong>WQE</strong></td><td>Work Queue Element。SQ / RQ に積む「作業指示書」1 個。</td><td><a href="#ch5">第 5 章</a></td></tr></tbody></table></div>
+<h4>A.2 日本語の用語</h4>
+<div class="tablewrap"><table><thead><tr><th>用語</th><th>意味</th><th>詳しくは</th></tr></thead><tbody><tr><td><a id="term-negativecontrol"></a><strong>陰性対照</strong></td><td>「機能を止めたら本当に駄目になる」ことを確かめる検査。これが無いと機能が効いている証明にならない。</td><td><a href="#ch27">第 27 章</a></td></tr><tr><td><a id="term-window"></a><strong>ウィンドウ</strong></td><td>TCP で「あと何バイト受け取れるか」を相手に伝える値。</td><td><a href="#ch10">第 10 章</a></td></tr><tr><td><a id="term-winscale"></a><strong>ウィンドウスケール</strong></td><td>ウィンドウの値を 2 の N 乗倍して解釈する TCP のオプション。</td><td><a href="#ch10">第 10 章</a></td></tr><tr><td><a id="term-initiator"></a><strong>イニシエータ</strong></td><td>ストレージに命令を出す側。借りる側。</td><td><a href="#ch1">第 1 章</a></td></tr><tr><td><a id="term-extheader"></a><strong>拡張ヘッダ</strong></td><td>IPv6 で、基本ヘッダと上位プロトコルの間に挟む追加情報。数珠つなぎになる。</td><td><a href="#ch11">第 11 章</a></td></tr><tr><td><a id="term-vaddr"></a><strong>仮想アドレス</strong></td><td>プログラムから見たメモリの番地。<code>malloc()</code> が返す値。</td><td><a href="#ch3">第 3 章</a></td></tr><tr><td><a id="term-cacheline"></a><strong>キャッシュライン</strong></td><td>CPU がメモリをキャッシュに載せる単位(x86 では 64 バイト)。</td><td><a href="#ch19">第 19 章</a></td></tr><tr><td><a id="term-qdepth"></a><strong>キュー深度</strong></td><td>同時に何個の命令を投げっぱなしにするか。ベンチの <code>qd</code>。</td><td><a href="#ch12">第 12 章</a></td></tr><tr><td><a id="term-pseudoheader"></a><strong>疑似ヘッダ</strong></td><td>TCP/UDP のチェックサム計算に含める、実際には送らない仮想的なヘッダ。</td><td><a href="#ch6">第 6 章</a></td></tr><tr><td><a id="term-coop"></a><strong>協調マルチタスク</strong></td><td>各仕事が自発的に「ここまで」と譲る方式。OS が強制的に切り替えない。</td><td><a href="#ch18">第 18 章</a></td></tr><tr><td><a id="term-kernel"></a><strong>カーネル</strong></td><td>OS の中核。特権が要る仕事を担当する。</td><td><a href="#ch1">第 1 章</a></td></tr><tr><td><a id="term-ctxswitch"></a><strong>コンテキストスイッチ</strong></td><td>CPU の動作モードや実行中の処理を切り替えること。コストがかかる。</td><td><a href="#ch2">第 2 章</a></td></tr><tr><td><a id="term-segment"></a><strong>セグメント</strong></td><td>TCP が送るときの 1 個の区切り。</td><td><a href="#ch6">第 6 章</a></td></tr><tr><td><a id="term-zerocopy"></a><strong>ゼロコピー</strong></td><td>データを途中でコピーせず、最初から最終的な置き場所で扱うこと。</td><td><a href="#ch20">第 20 章</a></td></tr><tr><td><a id="term-seqnum"></a><strong>シーケンス番号</strong></td><td>TCP が送るバイト 1 つ 1 つに振る通し番号。</td><td><a href="#ch10">第 10 章</a></td></tr><tr><td><a id="term-acknum"></a><strong>ACK 番号</strong></td><td>TCP の受信側が返す「次に欲しい番号」。</td><td><a href="#ch10">第 10 章</a></td></tr><tr><td><a id="term-dupack"></a><strong>重複 ACK</strong></td><td>同じ ACK 番号が繰り返し返ってくること。何かが失われた合図。</td><td><a href="#ch10">第 10 章</a></td></tr><tr><td><a id="term-syscall"></a><strong>システムコール</strong></td><td>ユーザ空間のプログラムがカーネルに仕事を依頼する仕組み。</td><td><a href="#ch1">第 1 章</a></td></tr><tr><td><a id="term-job"></a><strong>ジョブ</strong></td><td>このプロジェクトの実行単位。1 tick ずつ進むステートマシン。</td><td><a href="#ch18">第 18 章</a></td></tr><tr><td><a id="term-throughput"></a><strong>スループット</strong></td><td>1 秒間に何バイト運べるか。</td><td><a href="#ch1">第 1 章</a></td></tr><tr><td><a id="term-netmask"></a><strong>サブネットマスク</strong></td><td>IP アドレスのどこまでが「ネットワークの番号」かを示す値。</td><td><a href="#ch8">第 8 章</a></td></tr><tr><td><a id="term-target"></a><strong>ターゲット</strong></td><td>ストレージの命令を受けて実行する側。貸す側。</td><td><a href="#ch1">第 1 章</a></td></tr><tr><td><a id="term-checksum"></a><strong>チェックサム</strong></td><td>中身を足し合わせた検査値。壊れていないことを確認する。</td><td><a href="#ch6">第 6 章</a></td></tr><tr><td><a id="term-nexthop"></a><strong>次ホップ</strong></td><td>目的地へ向けて「次に渡す相手」。同じケーブル上にいなければゲートウェイ。</td><td><a href="#ch8">第 8 章</a></td></tr><tr><td><a id="term-gateway"></a><strong>デフォルトゲートウェイ</strong></td><td>自分のサブネットの外へ出るときに渡す中継役。</td><td><a href="#ch8">第 8 章</a></td></tr><tr><td><a id="term-driver"></a><strong>デバイスドライバ</strong></td><td>特定のハードウェアの操作方法を知っているプログラム。</td><td><a href="#ch1">第 1 章</a></td></tr><tr><td><a id="term-transport"></a><strong>トランスポート束縛</strong></td><td>NVMe-oF でコマンドをどう運ぶかの種類(TCP / RDMA / FC)。</td><td><a href="#ch13">第 13 章</a></td></tr><tr><td><a id="term-namespace"></a><strong>名前空間</strong></td><td>1 台の記憶装置を分割した区画。<code>nsid</code> で指定する。</td><td><a href="#ch12">第 12 章</a></td></tr><tr><td><a id="term-byteorder"></a><strong>ネットワークバイトオーダー</strong></td><td>ヘッダの数値をビッグエンディアンで並べる約束。</td><td><a href="#ch6">第 6 章</a></td></tr><tr><td><a id="term-paddr"></a><strong>物理アドレス</strong></td><td>メモリチップ上の実際の位置。</td><td><a href="#ch3">第 3 章</a></td></tr><tr><td><a id="term-fragment"></a><strong>フラグメント</strong></td><td>IP の層でパケットを分割すること。</td><td><a href="#ch8">第 8 章</a></td></tr><tr><td><a id="term-flowsteering"></a><strong>フローステアリング</strong></td><td>届いたフレームをどの受信キューに入れるかを決める NIC の仕組み。</td><td><a href="#ch5">第 5 章</a></td></tr><tr><td><a id="term-hotpath"></a><strong>ホットパス</strong></td><td>1 秒に何万回も通る処理経路。無駄を置けない場所。</td><td><a href="#ch7">第 7 章</a></td></tr><tr><td><a id="term-polling"></a><strong>ポーリング</strong></td><td>「終わった?」と繰り返し見に行く方式。割り込みの反対。</td><td><a href="#ch3">第 3 章</a></td></tr><tr><td><a id="term-port"></a><strong>ポート番号</strong></td><td>1 台のコンピュータの中でどのプログラム宛かを示す 16 ビットの番号。</td><td><a href="#ch6">第 6 章</a></td></tr><tr><td><a id="term-multicast"></a><strong>マルチキャスト</strong></td><td>特定のグループに属する相手だけに届ける宛先。</td><td><a href="#ch7">第 7 章</a></td></tr><tr><td><a id="term-memcopy"></a><strong>メモリコピー</strong></td><td>データをある場所から別の場所へ写すこと。回数を減らすことが性能の鍵。</td><td><a href="#ch2">第 2 章</a></td></tr><tr><td><a id="term-userspace"></a><strong>ユーザ空間</strong></td><td>普通のプログラムが動く、特権の無い領域。</td><td><a href="#ch1">第 1 章</a></td></tr><tr><td><a id="term-positivecontrol"></a><strong>陽性対照</strong></td><td>「起きるべきことが起きた」ことを確かめる検査。陰性だけでは検証にならない。</td><td><a href="#ch27">第 27 章</a></td></tr><tr><td><a id="term-latency"></a><strong>レイテンシ</strong></td><td>1 回の要求にかかる時間。</td><td><a href="#ch1">第 1 章</a></td></tr><tr><td><a id="term-register"></a><strong>レジスタ</strong></td><td>デバイスの中にある小さな記憶場所。値を書くと動作が変わる。</td><td><a href="#ch3">第 3 章</a></td></tr><tr><td><a id="term-ringbuffer"></a><strong>リングバッファ</strong></td><td>配列と 2 つの添字でできた、末尾から先頭へ回る待ち行列。</td><td><a href="#ch5">第 5 章</a></td></tr><tr><td><a id="term-linklocal"></a><strong>リンクローカルアドレス</strong></td><td><code>fe80::</code> で始まる IPv6 アドレス。MAC から自動生成され、同じケーブル内でだけ使える。</td><td><a href="#ch11">第 11 章</a></td></tr><tr><td><a id="term-interrupt"></a><strong>割り込み</strong></td><td>デバイスが CPU に「終わった」と信号を送る方式。ポーリングの反対。</td><td><a href="#ch3">第 3 章</a></td></tr><tr><td><a id="term-offload"></a><strong>オフロード</strong></td><td>ソフトウェアの仕事をハードウェア(NIC)に肩代わりさせること。</td><td><a href="#ch6">第 6 章</a>、<a href="#ch23">第 23 章</a></td></tr></tbody></table></div>
+<hr>
+<h3 class="chaphead" id="appendix-b">付録 B ファイル索引</h3>
+<p><code>src/</code> 以下の全ファイルです(合計約 33,000 行)。</p>
+<p><strong>行数は <code>.c</code> ファイルのみ</strong>の実測値で、対応する <code>.h</code> は含みません (「—」は数百行以下の小さなものです)。</p>
+<h4>B.1 エントリとプラットフォーム依存部</h4>
+<div class="tablewrap"><table><thead><tr><th>ファイル</th><th>行数</th><th>内容</th></tr></thead><tbody><tr><td><code>platform/x86-linux/main.c</code></td><td>4,598</td><td>起動、自己テスト、bring-up、常駐シェル、全 41 個のコマンド、各種の自己検査</td></tr><tr><td><code>platform/x86-linux/vfio.c</code></td><td>343</td><td>VFIO の初期化、BAR の mmap、コンフィグ空間、IOMMU マップ</td></tr><tr><td><code>platform/x86-linux/hal_dma.c</code></td><td>—</td><td>DMA アロケータ、IOVA 変換</td></tr><tr><td><code>platform/x86-linux/hal_smp.c</code></td><td>208</td><td>pthread によるコアワーカ、アフィニティ、遅延注入</td></tr><tr><td><code>platform/x86-linux/hal_timer.c</code></td><td>—</td><td>単調時計</td></tr><tr><td><code>platform/x86-linux/console.c</code></td><td>200</td><td>コンソール入出力、行編集と履歴</td></tr><tr><td><code>include/platform.h</code></td><td>—</td><td>HAL の契約(このファイルが上下を分ける)</td></tr></tbody></table></div>
+<h4>B.2 NIC ドライバ</h4>
+<div class="tablewrap"><table><thead><tr><th>ファイル</th><th>行数</th><th>内容</th></tr></thead><tbody><tr><td><code>mlx5.c</code></td><td>4,295</td><td>HCA の bring-up 一式、コマンドキュー、QP の状態遷移、監視。<strong><code>-O0</code> でコンパイル</strong>(<a href="#ch5">第 5 章</a>)</td></tr><tr><td><code>mlx5_qp.c</code></td><td>667</td><td>RC / UD の QP、WQE の組み立て、CQE のポーリング</td></tr><tr><td><code>mlx5_net.c</code></td><td>1,129</td><td>Ethernet の送受信、LSO、送信キューの復帰</td></tr><tr><td><code>mlx5.h</code> / <code>mlx5_qp.h</code> / <code>mmio.h</code></td><td>—</td><td>定義と MMIO の補助関数</td></tr></tbody></table></div>
+<h4>B.3 ネットワーク層</h4>
+<div class="tablewrap"><table><thead><tr><th>ファイル</th><th>行数</th><th>内容</th></tr></thead><tbody><tr><td><code>netif.c</code> / <code>netif.h</code></td><td>674 / 309</td><td>インターフェース管理、フレームの振り分け、次ホップ判定</td></tr><tr><td><code>arp.c</code> / <code>arp.h</code></td><td>499</td><td>ARP、近隣キャッシュのエージング</td></tr><tr><td><code>ip.c</code> / <code>ip.h</code></td><td>413</td><td>IPv4、送信側の断片化</td></tr><tr><td><code>ipv6.c</code> / <code>ipv6.h</code></td><td>2,445 / 269</td><td>IPv6、NDP、SLAAC、MLD、拡張ヘッダ、断片化</td></tr><tr><td><code>icmp.c</code> / <code>icmp.h</code></td><td>210</td><td>ICMP</td></tr><tr><td><code>tcp.c</code> / <code>tcp.h</code></td><td>3,316</td><td>TCP 一式(確立・転送・再送・切断)</td></tr><tr><td><code>udp.c</code> / <code>udp.h</code></td><td>269</td><td>UDP</td></tr><tr><td><code>pmtu.c</code> / <code>pmtu.h</code></td><td>—</td><td>経路 MTU の学習表</td></tr><tr><td><code>netaddr.h</code></td><td>—</td><td>IPv4 / IPv6 共通のアドレス型</td></tr><tr><td><code>net.h</code></td><td>368</td><td>バイトオーダー変換、チェックサム、高速コピー / ゼロ埋め</td></tr><tr><td><code>net_buf.c</code> / <code>net_buf.h</code></td><td>—</td><td>フレームバッファのプール</td></tr></tbody></table></div>
+<h4>B.4 RDMA</h4>
+<div class="tablewrap"><table><thead><tr><th>ファイル</th><th>行数</th><th>内容</th></tr></thead><tbody><tr><td><code>rdma_cm.c</code> / <code>rdma_cm.h</code></td><td>677</td><td>IB の接続管理(REQ / REP / RTU)</td></tr><tr><td><code>nvme_rdma.c</code> / <code>nvme_rdma.h</code></td><td>1,053</td><td>NVMe-oF RDMA のイニシエータ</td></tr><tr><td><code>nvmet_rdma.c</code> / <code>nvmet_rdma.h</code></td><td>909</td><td>同ターゲット。<strong>切断処理の改善が未適用</strong>(<a href="#ch28">第 28 章</a>)</td></tr><tr><td><code>ib_mad.h</code></td><td>—</td><td>InfiniBand の管理データグラムの定義</td></tr></tbody></table></div>
+<h4>B.5 NVMe / NVMe-oF</h4>
+<div class="tablewrap"><table><thead><tr><th>ファイル</th><th>行数</th><th>内容</th></tr></thead><tbody><tr><td><code>nvme.c</code> / <code>nvme.h</code></td><td>2,201</td><td>イニシエータのプロトコル層</td></tr><tr><td><code>nvme_tcp.c</code> / <code>nvme_tcp.h</code></td><td>508</td><td>イニシエータの PDU 層</td></tr><tr><td><code>nvmet.c</code> / <code>nvmet.h</code></td><td>3,026 / 211</td><td>ターゲットのプロトコル層(admin / IO のコマンド処理、名前空間)</td></tr><tr><td><code>nvmet_tcp.c</code> / <code>nvmet_tcp.h</code></td><td>553</td><td>ターゲットの PDU 層</td></tr><tr><td><code>nvme_types.h</code></td><td>247</td><td>コマンド・完了の構造体、オフセット、ビット定義</td></tr><tr><td><code>nvme_tcp_pdu.h</code></td><td>—</td><td>PDU の定数</td></tr></tbody></table></div>
+<h4>B.6 基盤</h4>
+<div class="tablewrap"><table><thead><tr><th>ファイル</th><th>行数</th><th>内容</th></tr></thead><tbody><tr><td><code>job.c</code> / <code>job.h</code></td><td>222</td><td>協調ジョブスケジューラ</td></tr><tr><td><code>timestamp.c</code> / <code>timestamp.h</code></td><td>562</td><td>時刻付きリングバッファ(性能分析の中核)</td></tr><tr><td><code>crc32c.c</code> / <code>crc32c.h</code></td><td>—</td><td>CRC32C(3 本インタリーブ + PCLMULQDQ 合成)</td></tr><tr><td><code>timer.c</code> / <code>timer.h</code></td><td>—</td><td>時間の単位変換、タイムアウト判定</td></tr><tr><td><code>cache.h</code> / <code>smp.h</code> / <code>uart.h</code></td><td>—</td><td>キャッシュ操作、コア制御、コンソール出力の宣言</td></tr></tbody></table></div>
+<h4>B.7 検証用の道具(<code>tools/</code>)</h4>
+<div class="tablewrap"><table><thead><tr><th>ファイル</th><th>内容</th></tr></thead><tbody><tr><td><code>disc_log_check.c</code></td><td>Discovery のログを Linux のヘッダだけで読み直す</td></tr><tr><td><code>ip_frag_check.c</code></td><td>IPv4 の断片ヘッダを同上</td></tr><tr><td><code>icmp_mtu_check.c</code></td><td>ICMP のエラーを同上</td></tr><tr><td><code>ra_check.c</code></td><td>IPv6 のルータ広告を同上</td></tr><tr><td><code>mld_check.c</code></td><td>MLD を同上</td></tr><tr><td><code>ip6_ext_check.c</code></td><td>IPv6 拡張ヘッダを同上</td></tr><tr><td><code>send_ra.py</code></td><td>相手側で動かす「本物のルータ役」</td></tr><tr><td><code>sniff_mld.py</code> / <code>sniff_neigh.py</code></td><td>相手側でこちらの送信を観測する</td></tr><tr><td><code>udp6_echo.py</code></td><td>相手側に断片を組み立てさせる</td></tr><tr><td><code>sync_to_optiplex.sh</code></td><td>開発機からテスト機への一方向同期</td></tr></tbody></table></div>
+<hr>
+<h3 class="chaphead" id="appendix-c">付録 C 参考にした仕様と実装</h3>
+<p>このプロジェクトの方針は <strong>「仕様は推測せず、実際のソースを取得して 確認する」</strong> です。何を根拠にしたかを記録しておきます。</p>
+<h4>C.1 Linux カーネルのヘッダ</h4>
+<p>テスト機に入っている <code>/usr/src/linux-headers-*/include/linux/</code> を <strong>実際に読んで</strong>、構造体のバイト位置とビットの意味を確認しています。</p>
+<div class="tablewrap"><table><thead><tr><th>ヘッダ</th><th>何を確認したか</th></tr></thead><tbody><tr><td><code>linux/nvme.h</code></td><td>コマンド・完了・Identify・ログページ・状態コードの全構造体</td></tr><tr><td><code>linux/mlx5/mlx5_ifc.h</code></td><td>NIC のコマンドの入出力構造体、能力ビットの位置</td></tr></tbody></table></div>
+<p><strong>推測したオフセットは 1 つも使っていません。</strong> 分からないときは <code>offsetof</code> で出力させて確認しています。</p>
+<h4>C.2 SPDK のソース</h4>
+<p>テスト機に SPDK のソースが置いてあります(<code>~/spdk/lib/nvmf/</code>)。 <strong>実装上の細かい判断</strong>(無効な名前空間 ID にどの状態コードを返すか、 設定の保存要求をどう断るか、など)はここを参照しました。</p>
+<div class="tablewrap"><table><thead><tr><th>ファイル</th><th>参照した内容</th></tr></thead><tbody><tr><td><code>ctrlr.c</code></td><td>Identify / Get Features / Set Features の分岐と状態コード</td></tr><tr><td><code>ctrlr_bdev.c</code></td><td>Dataset Management の範囲の解釈</td></tr></tbody></table></div>
+<h4>C.3 標準規格</h4>
+<div class="tablewrap"><table><thead><tr><th>規格</th><th>使っている範囲</th></tr></thead><tbody><tr><td>NVMe Base Specification</td><td>コマンドの形、状態コード、ログページ</td></tr><tr><td>NVMe over Fabrics Specification</td><td>Fabrics コマンド、Discovery、NVMe/TCP の PDU</td></tr><tr><td>RFC 793 / 5681</td><td>TCP、輻輳制御と高速再送</td></tr><tr><td>RFC 791 / 1191</td><td>IPv4、経路 MTU 探索</td></tr><tr><td>RFC 8200 / 8201</td><td>IPv6、経路 MTU 探索</td></tr><tr><td>RFC 4861 / 4862</td><td>近隣探索、アドレス自動設定</td></tr><tr><td>RFC 2710 / 3810</td><td>MLD</td></tr><tr><td>RFC 5227</td><td>重複アドレス検出(IPv4)</td></tr><tr><td>RFC 792 / 4443</td><td>ICMP / ICMPv6</td></tr><tr><td>RFC 768</td><td>UDP</td></tr><tr><td>IBTA Specification</td><td>RDMA の操作、RoCEv2</td></tr></tbody></table></div>
+<h4>C.4 この文書を書いた時点の状態</h4>
+<ul><li>ソース規模: 約 33,000 行(<code>.c</code> + <code>.h</code> + Makefile)</li><li>シェルコマンド: 41 個</li><li>実装状況: <a href="#ch28">第 28 章</a> の表</li><li>最新の性能値: <code>README.md</code></li></ul>
+<p><strong>実装を変更したら、この文書も更新してください。</strong> 特に <a href="#ch28">第 28 章</a> の表は、変更のたびに見直す必要があります。</p>
+    </div>
+  </main>
+</div>
+
+<script>
+(function(){
+  var links = Array.prototype.slice.call(document.querySelectorAll('.navpart > ul > li > a'));
+  var map = {};
+  links.forEach(function(a){ map[a.getAttribute('data-target')] = a; });
+
+  // 現在読んでいる章をハイライトする
+  var heads = Array.prototype.slice.call(document.querySelectorAll('.chaphead[id]'));
+  var current = null;
+  function mark(id){
+    if(current === id) return;
+    current = id;
+    links.forEach(function(a){ a.classList.remove('active'); });
+    var a = map[id];
+    if(a){
+      a.classList.add('active');
+      var r = a.getBoundingClientRect(), box = document.querySelector('.navscroll').getBoundingClientRect();
+      if(r.top < box.top + 8 || r.bottom > box.bottom - 8) a.scrollIntoView({block:'center'});
+    }
+  }
+  function onScroll(){
+    var best = null, bestTop = -Infinity;
+    for(var i=0;i<heads.length;i++){
+      var t = heads[i].getBoundingClientRect().top;
+      if(t <= 120 && t > bestTop){ bestTop = t; best = heads[i]; }
+    }
+    if(!best && heads.length) best = heads[0];
+    if(best) mark(best.id);
+
+    var doc = document.documentElement;
+    var max = doc.scrollHeight - doc.clientHeight;
+    document.getElementById('bar').style.width = (max > 0 ? (doc.scrollTop / max * 100) : 0) + '%';
+  }
+  document.addEventListener('scroll', onScroll, {passive:true});
+  onScroll();
+
+  // 絞り込み
+  var filter = document.getElementById('filter');
+  filter.addEventListener('input', function(){
+    var q = filter.value.trim().toLowerCase();
+    document.querySelectorAll('.navpart').forEach(function(part){
+      var any = false;
+      part.querySelectorAll('li').forEach(function(li){
+        var hit = !q || li.textContent.toLowerCase().indexOf(q) >= 0;
+        li.style.display = hit ? '' : 'none';
+        if(hit) any = true;
+      });
+      part.style.display = any ? '' : 'none';
+    });
+  });
+
+  // 狭い画面での開閉
+  var rail = document.getElementById('rail'), toggle = document.getElementById('toggle');
+  if(toggle){
+    toggle.addEventListener('click', function(){ rail.classList.toggle('open'); });
+    rail.addEventListener('click', function(e){
+      if(e.target.tagName === 'A' && window.innerWidth <= 900) rail.classList.remove('open');
+    });
+  }
+})();
+</script>
