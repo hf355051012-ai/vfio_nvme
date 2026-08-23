@@ -6,3 +6,8 @@ build/
 # 開発環境が生成するもの(リポジトリには入れない)
 compile_commands.json
 tags
+
+# Markdown のドキュメント一式は公開しない(ローカルには残す)。
+# docs/spec.html だけを公開する。SPEC.md を直したら
+# tools/build_spec_html.sh で docs/spec.html を作り直してコミットすること。
+*.md
