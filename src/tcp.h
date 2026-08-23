@@ -23,6 +23,14 @@ extern volatile uint32_t g_tcp_tx_dropped_count[SMP_MAX_CORES];
 extern volatile uint32_t g_tcp_synack_drop_next;
 extern volatile uint32_t g_tcp_synack_retx_count;
 
+/* Timestamps(RFC 7323)を提案するか(シェルの `tcpts on|off`)。0=提案しない
+ * (陰性対照)。**コネクション単位で SYN の交換のときに決まる**ので、途中で
+ * 変えても既存のコネクションには効かない。 */
+extern volatile uint32_t g_tcp_ts_enable;
+extern volatile uint32_t g_tcp_ts_rtt_samples;   /* TSecr から RTT を測った回数 */
+extern volatile uint32_t g_tcp_paws_drop_count;  /* PAWS で捨てたセグメント数 */
+extern volatile uint32_t g_tcp_rtt_update_count; /* RTT 推定を更新した総回数 */
+
 uint32_t tcp_rx_buf_size(void);
 
 int  tcp_abort_requested(void);
@@ -164,6 +172,10 @@ void tcp_unlisten(int listener);
 void tcp_pmtu_update(const netaddr_t *dst, uint16_t pmtu);
 
 int tcp_window_scaling_enabled(const tcp_conn_t *conn);
+
+/* 対象コネクションの Timestamps の状態と RTT 推定を返す(シェルの表示用)。
+ * 戻り値 1=Timestamps 合意済み。srtt_us / rto_ms は NULL 可。 */
+int tcp_conn_ts_info(const tcp_conn_t *conn, uint64_t *srtt_us, uint32_t *rto_ms);
 
 void tcp_debug_dump_rx(const tcp_conn_t *conn);
 

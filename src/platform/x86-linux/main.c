@@ -1012,6 +1012,248 @@ static void shell_synackdrop(char *args)
 }
 
 /*=================================================================
+ * ロスを注入しながら 64KB を rounds 回送り、その間に RTT 推定が何回
+ * 更新されたかを数える(tcptstest の本体)。
+ *
+ * **Karn のアルゴリズムでは「再送が起きたウィンドウ」の RTT を測れない**
+ * ので、ロスがある状態でこの回数を Timestamps の有無で比べると、
+ * 効果がそのまま数字に出る。
+ *
+ * 引数:
+ *   label      - 表示用ラベル
+ *   self       - クライアント役インターフェース
+ *   srv_if     - サーバ役インターフェース
+ *   dst        - 接続先
+ *   port       - 使用ポート
+ *   rounds     - 64KB を何往復ぶん送るか
+ *   drop_every - ロス注入(データセグメント N 個に 1 個)。0=注入しない
+ *   out_mss    - NULL 可。確立したコネクションの snd_mss
+ *   out_rtt    - NULL 可。RTT 推定の更新回数
+ *   out_ts     - NULL 可。TSecr 由来のサンプル数
+ *   out_retx   - NULL 可。再送回数
+ *   out_srtt   - NULL 可。最後の平滑化 RTT(us)
+ * 戻り値:
+ *   1=全ラウンドでバイト一致、0=失敗
+ * コール元:
+ *   shell_tcptstest()
+ * ===============================================================*/
+static int shell_tcpts_run(const char *label, netif_t *self, netif_t *srv_if,
+                            const netaddr_t *dst, uint16_t port, unsigned rounds,
+                            uint32_t drop_every, uint16_t *out_mss,
+                            uint32_t *out_rtt, uint32_t *out_ts, uint32_t *out_retx,
+                            uint64_t *out_srtt)
+{
+    static tcp_conn_t s_srv, s_cli;
+    static uint8_t tx[65536];
+    static uint8_t rx[65536];
+
+    int listener = tcp_listen(port, srv_if);
+    if (listener < 0) {
+        uart_printf("tcptstest: NG(%s) -- tcp_listen 失敗\n", label);
+        return 0;
+    }
+    s_srv.state = TCP_CLOSED;
+    s_cli.state = TCP_CLOSED;
+    tcp_accept_begin(listener, &s_srv);
+
+    netif_activate(self);
+    tcp_connect_begin_to(&s_cli, dst, port);
+
+    uint64_t t0 = timer_now();
+    int established = 0;
+    while (!timeout_ms(t0, 3000u)) {
+        netif_activate(self);
+        int r = tcp_connect_poll(&s_cli);
+        net_poll_all_and_dispatch();
+        netif_activate(srv_if);
+        tcp_accept_ready_poll(listener);
+        if (r == 1) { established = 1; break; }
+        if (r < 0) break;
+    }
+    netif_activate(self);
+    if (!established) {
+        uart_printf("tcptstest: NG(%s) -- 接続確立できず\n", label);
+        tcp_unlisten(listener);
+        return 0;
+    }
+    if (out_mss) *out_mss = s_cli.snd_mss;
+
+    for (unsigned i = 0; i < sizeof(tx); i++) tx[i] = (uint8_t)(i * 13u + 7u);
+
+    /* 統計はここで 0 に戻す(確立までのぶんを混ぜない)。 */
+    uint32_t rtt_before = g_tcp_rtt_update_count;
+    uint32_t ts_before  = g_tcp_ts_rtt_samples;
+    uint32_t retx_before = 0;
+    for (unsigned c = 0; c < SMP_MAX_CORES; c++) retx_before += g_tcp_retransmit_count[c];
+
+    g_tcp_tx_drop_every = drop_every;
+
+    int ok = 1;
+    for (unsigned r = 0; r < rounds && ok; r++) {
+        netif_activate(self);
+        if (tcp_send(&s_cli, tx, sizeof(tx)) != (int)sizeof(tx)) {
+            uart_printf("tcptstest: NG(%s) -- %u 回目の送信に失敗\n", label, r + 1u);
+            ok = 0;
+            break;
+        }
+        uint32_t got = 0;
+        uint64_t t1 = timer_now();
+        while (got < sizeof(tx) && !timeout_ms(t1, 5000u)) {
+            netif_activate(srv_if);
+            int n = tcp_recv(&s_srv, rx + got, (uint32_t)sizeof(rx) - got, 20u);
+            if (n > 0) got += (uint32_t)n;
+            else if (n < 0) break;
+            net_poll_all_and_dispatch();
+        }
+        if (got != sizeof(tx)) {
+            uart_printf("tcptstest: NG(%s) -- %u 回目の受信が %u バイトで止まった\n",
+                        label, r + 1u, (unsigned)got);
+            ok = 0;
+            break;
+        }
+        for (uint32_t i = 0; ok && i < got; i++) {
+            if (rx[i] != tx[i]) {
+                uart_printf("tcptstest: NG(%s) -- %u 回目の内容が不一致(offset %u)\n",
+                            label, r + 1u, (unsigned)i);
+                ok = 0;
+            }
+        }
+    }
+
+    g_tcp_tx_drop_every = 0;  /* **必ず戻す** */
+
+    if (out_rtt) *out_rtt = g_tcp_rtt_update_count - rtt_before;
+    if (out_ts)  *out_ts  = g_tcp_ts_rtt_samples - ts_before;
+    if (out_retx) {
+        uint32_t retx_after = 0;
+        for (unsigned c = 0; c < SMP_MAX_CORES; c++) retx_after += g_tcp_retransmit_count[c];
+        *out_retx = retx_after - retx_before;
+    }
+    if (out_srtt) tcp_conn_ts_info(&s_cli, out_srtt, NULL);
+
+    netif_activate(self);  tcp_close(&s_cli);
+    netif_activate(srv_if); tcp_close(&s_srv);
+    tcp_unlisten(listener);
+    netif_activate(self);
+    return ok;
+}
+
+/*=================================================================
+ * シェルの `tcptstest`。TCP Timestamps(段階 24 = C3a)の検証。
+ *
+ *   [1] 合意すると MSS が 12 バイト減る(オプションのぶん)
+ *   [2] **ロス注入下でも RTT 推定が更新され続ける**(陽性対照)
+ *   [3] `tcpts off` では Karn の制約で更新が止まる(陰性対照)
+ *
+ * [2] と [3] を組で取るのが要点。無ロスでは Timestamps が無くても RTT は
+ * 測れるので、**ロスを注入しないと効果は 1 つも見えない**。
+ *
+ * コール元:
+ *   shell_dispatch()
+ * ===============================================================*/
+static void shell_tcptstest(void)
+{
+    const uint16_t port  = 6005u;
+    const unsigned rounds = 8u;    /* 64KB x 8 = 512KB */
+    const uint32_t drop  = 12u;    /* データセグメント 12 個に 1 個を捨てる */
+
+    netif_t *peer = NULL;
+    netif_t *self = g_active_ctx;
+    uint8_t peer_ll[16];
+    peer = shell_peer_ll6(peer_ll);
+    if (!peer || !self) {
+        uart_printf("tcptstest: 対向インターフェースが見つかりません(net init mlx5 が必要)\n");
+        return;
+    }
+    uint32_t peer_ip = (net_active_ip() == 0xC0A8650Au) ? 0xC0A8650Bu : 0xC0A8650Au;
+    netaddr_t dst4 = netaddr_v4(peer_ip);
+
+    uint32_t saved_ts   = g_tcp_ts_enable;
+    uint32_t saved_drop = g_tcp_tx_drop_every;
+    uint32_t paws_before = g_tcp_paws_drop_count;
+
+    uart_printf("tcptstest: client=%s server=%s port=%u (64KB x %u、txdrop %u)\n",
+                self->name, peer->name, (unsigned)port, rounds, (unsigned)drop);
+
+    /* [1][2] Timestamps 有効 */
+    g_tcp_ts_enable = 1;
+    uint16_t mss_on = 0; uint32_t rtt_on = 0, ts_on = 0, retx_on = 0; uint64_t srtt_on = 0;
+    int ok_on = shell_tcpts_run("[有効]", self, peer, &dst4, port, rounds, drop,
+                                 &mss_on, &rtt_on, &ts_on, &retx_on, &srtt_on);
+
+    /* [3] 陰性対照: Timestamps 無効 */
+    g_tcp_ts_enable = 0;
+    uint16_t mss_off = 0; uint32_t rtt_off = 0, ts_off = 0, retx_off = 0; uint64_t srtt_off = 0;
+    int ok_off = shell_tcpts_run("[無効]", self, peer, &dst4, port, rounds, drop,
+                                 &mss_off, &rtt_off, &ts_off, &retx_off, &srtt_off);
+
+    g_tcp_ts_enable     = saved_ts;    /* **必ず元に戻す** */
+    g_tcp_tx_drop_every = saved_drop;
+
+    uart_printf("tcptstest: 有効 -- MSS=%u RTT更新=%u(うちTSecr由来=%u) 再送=%u srtt=%uus\n",
+                (unsigned)mss_on, (unsigned)rtt_on, (unsigned)ts_on,
+                (unsigned)retx_on, (unsigned)srtt_on);
+    uart_printf("tcptstest: 無効 -- MSS=%u RTT更新=%u(うちTSecr由来=%u) 再送=%u srtt=%uus\n",
+                (unsigned)mss_off, (unsigned)rtt_off, (unsigned)ts_off,
+                (unsigned)retx_off, (unsigned)srtt_off);
+
+    int ok = ok_on && ok_off;
+    if (ok && mss_off != (uint16_t)(mss_on + 12u)) {
+        uart_printf("tcptstest: NG -- MSS の差が 12 ではありません(有効=%u 無効=%u)\n",
+                    (unsigned)mss_on, (unsigned)mss_off);
+        ok = 0;
+    }
+    if (ok && ts_on == 0u) {
+        uart_printf("tcptstest: NG -- TSecr から RTT を 1 度も測れていません\n");
+        ok = 0;
+    }
+    if (ok && retx_on == 0u) {
+        uart_printf("tcptstest: NG -- 再送が 1 度も起きていません"
+                    "(ロスを注入できていない = 陽性対照になっていない)\n");
+        ok = 0;
+    }
+    if (ok && rtt_on <= rtt_off) {
+        uart_printf("tcptstest: NG -- ロス注入下で RTT の更新回数が増えていません"
+                    "(有効=%u 無効=%u)\n", (unsigned)rtt_on, (unsigned)rtt_off);
+        ok = 0;
+    }
+    if (g_tcp_paws_drop_count != paws_before) {
+        uart_printf("tcptstest: NG -- PAWS が %u 個のセグメントを捨てました"
+                    "(正常な往復で発火してはいけない)\n",
+                    (unsigned)(g_tcp_paws_drop_count - paws_before));
+        ok = 0;
+    }
+    uart_printf("tcptstest: %s (tcpts を %s、txdrop を %u へ復元)\n",
+                ok ? "PASS" : "NG", g_tcp_ts_enable ? "有効" : "無効",
+                (unsigned)g_tcp_tx_drop_every);
+}
+
+/*=================================================================
+ * シェルの `tcpts`。TCP Timestamps(RFC 7323)の有効/無効と統計。
+ *
+ * **コネクション単位で SYN の交換のときに決まる**ので、切り替えても既存の
+ * コネクションには効かない(`tcpbench` のセッションは張り直しが要る)。
+ *
+ * 引数:
+ *   args - on / off。省略時は現在値と統計を表示
+ * コール元:
+ *   shell_dispatch()
+ * ===============================================================*/
+static void shell_tcpts(char *args)
+{
+    while (*args == ' ') args++;
+    if (strncmp(args, "on", 2) == 0) {
+        g_tcp_ts_enable = 1;
+    } else if (strncmp(args, "off", 3) == 0) {
+        g_tcp_ts_enable = 0;
+    }
+    uart_printf("tcpts: %s(次に張るコネクションから。既存のものは変わらない)\n",
+                g_tcp_ts_enable ? "有効" : "無効");
+    uart_printf("tcpts: TSecr から測った RTT サンプル=%u / PAWS で破棄=%u\n",
+                (unsigned)g_tcp_ts_rtt_samples, (unsigned)g_tcp_paws_drop_count);
+}
+
+/*=================================================================
  * 文字列を空白区切りで最大 n トークンに分割する(s を破壊する)。
  *
  * 引数:
@@ -1595,7 +1837,9 @@ static void shell_pmtutest(char *args)
     /* ---- [3] IPv4: 新規 TCP コネクションの MSS が下がる ---- */
     uint16_t mss4 = 0;
     if (shell_tcp_echo_once("pmtutest", self, &s_alias, &far_addr, port, &mss4)) {
-        uint16_t want = (uint16_t)(v4_mtu - 20u - 20u);
+        /* Timestamps を合意していると、載せるオプションのぶん(12 バイト)
+         * ペイロードの上限がさらに下がる(Linux も 1500 の MTU で mss 1448)。 */
+        uint16_t want = (uint16_t)(v4_mtu - 20u - 20u - (g_tcp_ts_enable ? 12u : 0u));
         uart_printf("pmtutest: %s [3] IPv4 コネクションの MSS=%u(期待 %u)\n",
                     (mss4 == want) ? "OK" : "NG", mss4, want);
         if (mss4 != want) ok = 0;
@@ -1645,7 +1889,7 @@ static void shell_pmtutest(char *args)
     /* ---- [6] IPv6: 新規 TCP コネクションの MSS が下がる ---- */
     uint16_t mss6 = 0;
     if (shell_tcp_echo_once("pmtutest6", self, peer, &peer6, (uint16_t)(port + 1u), &mss6)) {
-        uint16_t want = (uint16_t)(v6_mtu - 40u - 20u);
+        uint16_t want = (uint16_t)(v6_mtu - 40u - 20u - (g_tcp_ts_enable ? 12u : 0u));
         uart_printf("pmtutest: %s [6] IPv6 コネクションの MSS=%u(期待 %u)\n",
                     (mss6 == want) ? "OK" : "NG", mss6, want);
         if (mss6 != want) ok = 0;
@@ -4546,6 +4790,10 @@ static void shell_dispatch(char *line, int s0, int s1)
         shell_backlog(line + 7);
     } else if (strncmp(line, "synackdrop", 10) == 0) {
         shell_synackdrop(line + 10);
+    } else if (strncmp(line, "tcptstest", 9) == 0) {
+        shell_tcptstest();
+    } else if (strncmp(line, "tcpts", 5) == 0) {
+        shell_tcpts(line + 5);
     } else if (strncmp(line, "qploop", 6) == 0) {
         shell_qploop(line + 6);
     } else if (strncmp(line, "nvmediscover", 12) == 0) {
@@ -4625,6 +4873,8 @@ static void shell_dispatch(char *line, int s0, int s1)
                     "  backlog [N]                           listen backlogの深さ表示/変更(0=無効)+統計\n"
                     "  backlogtest                           受け皿の用意前に届いたSYNを拾えるか(陰性対照つき)\n"
                     "  synackdrop [N]                        次のSYN|ACKをN個捨てる(握手のロス注入)\n"
+                    "  tcpts [on|off]                        TCP Timestamps(RFC 7323)の有効/無効+統計\n"
+                    "  tcptstest                             ロス注入下でRTT推定が更新され続けるか(陰性対照つき)\n"
                     "  qploop [N]                            RC QPの作成/破棄をN回繰り返しFWリソース枯渇を見る\n"
                     "  nvmediscover [dump]                   Discovery Log Pageを取得(dumpで16進出力)\n"
                     "  nvmet [port] | jobs | help | quit    (↑↓で履歴呼び出し)\n"

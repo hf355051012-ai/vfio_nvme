@@ -177,6 +177,11 @@ typedef struct netif {
     uint8_t     hw_csum_offload;
     uint8_t     tx_zerocopy_2frag;
     uint32_t    hw_lso_max_bytes;
+    /* LSO でインライン化できるヘッダ長の上限。mlx5 は WQE の中へヘッダを
+     * まるごと写して各セグメントへ複製するので、WQE のサイズが上限になる。
+     * **TCP オプションが増えるとここに当たる**(IPv6 + Timestamps = 86 バイトで
+     * 超えた)。超える組み合わせでは LSO を使わず 1 セグメントずつ送る。 */
+    uint16_t    hw_lso_max_hdr_bytes;
     unsigned    owner_core;
     int         is_poll_owner;
 } netif_t;
@@ -304,6 +309,11 @@ static inline int net_active_tx_zerocopy(void)
 static inline uint32_t net_active_lso_max_bytes(void)
 {
     return g_active_ctx ? g_active_ctx->hw_lso_max_bytes : 0u;
+}
+
+static inline uint16_t net_active_lso_max_hdr(void)
+{
+    return g_active_ctx ? g_active_ctx->hw_lso_max_hdr_bytes : 0u;
 }
 
 #endif /* NETIF_H */

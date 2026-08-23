@@ -1085,6 +1085,12 @@ static void mlx5_netif_setup(netif_t *ctx, mlx5_net_state_t *st, mlx5_dev_t *dev
     ctx->hw_csum_offload = 1;
     ctx->tx_zerocopy_2frag = 1;
     ctx->hw_lso_max_bytes = dev->max_lso_bytes;
+    /* LSO WQE は 1 スロット(2 WQEBB = 128 バイト)に収める実装なので、
+     * ヘッダのインライン化に使える長さには上限がある。
+     * ds_cnt = 2 + ceil((hdr_len - 2) / 16) + 1 <= 8 から hdr_len <= 82。
+     * (IPv4 + Timestamps = 66 は収まるが、IPv6 + Timestamps = 86 は超える) */
+    ctx->hw_lso_max_hdr_bytes = (uint16_t)(2u * MLX5_SEND_WQE_BB -
+                                            (2u + 1u) * 16u + 2u);  /* = 82 */
     for (unsigned i = 0; i < ARP_CACHE_SIZE; i++) ctx->arp_cache[i].valid = 0;
     for (unsigned i = 0; i < NDP_CACHE_SIZE; i++) ctx->ndp_cache[i].valid = 0;
 

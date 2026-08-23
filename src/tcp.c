@@ -50,6 +50,14 @@ void tcp_copy_stats_get(uint64_t *c2_ns, uint64_t *c2_by,
 #define TCP_OPT_KIND_NOP    1u
 #define TCP_OPT_KIND_MSS    2u
 #define TCP_OPT_KIND_WSCALE 3u
+#define TCP_OPT_KIND_TS     8u  /* Timestamps (RFC 7323) */
+
+/* Timestamps はオプション本体が 10 バイト。4 バイト境界へ揃えるため NOP を
+ * 2 個前置して 12 バイトで送る(慣例。Linux も同じ並びで出す)。
+ * **有効にすると 1 セグメントあたりのペイロードが 12 バイト減る**ので、
+ * conn->snd_mss から引くのを忘れないこと(引き忘れるとフルサイズの
+ * セグメントだけがリンク MTU を超えて NIC に無言で捨てられる)。 */
+#define TCP_TS_OPT_LEN      12u
 
 #define TCP_MSS_LOCAL           10182u
 #define TCP_MSS_DEFAULT_RFC879   536u  /* 相手がMSSオプションを付けなかった場合の既定値 */
@@ -117,6 +125,39 @@ volatile uint32_t g_tcp_synack_drop_next;
 
 /* 再送された SYN に応えて SYN|ACK を送り直した回数。 */
 volatile uint32_t g_tcp_synack_retx_count;
+
+/* Timestamps(RFC 7323)を提案するか(シェルの `tcpts on|off`)。0 にすると
+ * SYN に付けなくなり、相手が付けてきても使わない(陰性対照)。
+ * **コネクション単位で SYN の交換のときに決まる**ので、途中で変えても既存の
+ * コネクションには効かない。 */
+volatile uint32_t g_tcp_ts_enable = 1u;
+
+/* TSecr から RTT を測った回数と、PAWS で捨てたセグメント数。 */
+volatile uint32_t g_tcp_ts_rtt_samples;
+volatile uint32_t g_tcp_paws_drop_count;
+
+/* RTT 推定を更新した総回数(経路を問わない)。**Karn のアルゴリズムでは
+ * 再送したウィンドウの RTT を測れない**ので、ロス注入下でこの数を
+ * Timestamps の有無で比べると効果がそのまま見える。 */
+volatile uint32_t g_tcp_rtt_update_count;
+
+/*=================================================================
+ * Timestamps オプションに入れる自分の時刻を返す。
+ *
+ * timer_now() は ns なので 1024 で割って約 1.024us 刻みにする(除算ではなく
+ * シフト -- この関数は送信 1 セグメントごとに通るホットパスにある)。
+ * 32bit が一周するのに約 73 分かかるので、PAWS の前提(一周が MSL より
+ * 十分長い)を満たす。
+ *
+ * 戻り値:
+ *   TSval に入れる値
+ * コール元:
+ *   tcp_build_options(), tcp_ts_rtt_sample()
+ * ===============================================================*/
+static inline uint32_t tcp_ts_now(void)
+{
+    return (uint32_t)(timer_now() >> 10);
+}
 
 /*=================================================================
  * このデータセグメントを人為的に捨てるか判定する(g_tcp_tx_drop_every が
@@ -227,6 +268,13 @@ typedef struct {
 
     int      wscale_enabled;
     uint8_t  snd_wscale;
+
+    /* Timestamps(RFC 7323)。SYN の交換で双方が出したときだけ有効になる。
+     * ts_recent は相手へ echo し返す値、ts_last_ack_sent は「どこまで ACK した
+     * 時点の ts_recent か」(R3 の更新条件に要る)。 */
+    uint8_t           ts_enabled;
+    uint32_t          ts_recent;
+    uint32_t          ts_last_ack_sent;
 
     uint32_t          unacked_full_segments;
 
@@ -671,6 +719,7 @@ void tcp_clear_recv_upcall(tcp_conn_t *conn)
  * ===============================================================*/
 static void tcp_rtt_update(tcp_priv_t *priv, uint64_t measured_ticks)
 {
+    g_tcp_rtt_update_count++;
     uint64_t measured_us = ticks_to_us(measured_ticks);
 
     if (priv->srtt_us == 0) {
@@ -698,7 +747,10 @@ static void tcp_rtt_update(tcp_priv_t *priv, uint64_t measured_ticks)
  * スロットサイズは 64 の倍数へ切り上げ、どのスロットも 64 バイト境界から
  * 始まるようにする(NIC が読む先頭を揃える)。 */
 #define TCP_L4_OFFSET_V6 (ETH_HDR_LEN + IPV6_HDR_LEN)   /* 54 */
-#define TCP_SEG_BUF_RAW  (TCP_L4_OFFSET_V6 + TCP_HDR_LEN + 8 + TCP_MSS_LOCAL)
+/* オプション領域の最大長。SYN のとき MSS(4) + NOP+WScale(4) +
+ * NOP+NOP+Timestamps(12) = 20 バイト。 */
+#define TCP_OPT_MAX_LEN  20u
+#define TCP_SEG_BUF_RAW  (TCP_L4_OFFSET_V6 + TCP_HDR_LEN + TCP_OPT_MAX_LEN + TCP_MSS_LOCAL)
 #define TCP_SEG_BUF_SIZE (((TCP_SEG_BUF_RAW) + 63u) & ~63u)
 
 static uint8_t s_seg_bufs[SMP_MAX_CORES][ETH_TX_RING_SIZE][TCP_SEG_BUF_SIZE]
@@ -796,10 +848,16 @@ void tcp_pmtu_update(const netaddr_t *dst, uint16_t pmtu)
             tcp_conn_t *cn = s_conns[c][i];
             if (!cn || cn->state == TCP_CLOSED) continue;
             if (!netaddr_eq((const netaddr_t *)&cn->remote_ip, dst)) continue;
-            if (cn->snd_mss <= mss) continue;
+            /* Timestamps を載せているぶん、ペイロードの上限はさらに小さい
+             * (tcp_parse_syn_options() の末尾と同じ理由)。 */
+            uint16_t conn_mss = mss;
+            if (s_priv[c][i].ts_enabled && conn_mss > TCP_TS_OPT_LEN * 4u) {
+                conn_mss = (uint16_t)(conn_mss - TCP_TS_OPT_LEN);
+            }
+            if (cn->snd_mss <= conn_mss) continue;
             uart_printf("[PMTU] コネクション (port %u->%u) の snd_mss を %u -> %u へ切り下げ\n",
-                        cn->local_port, cn->remote_port, cn->snd_mss, mss);
-            cn->snd_mss = mss;
+                        cn->local_port, cn->remote_port, cn->snd_mss, conn_mss);
+            cn->snd_mss = conn_mss;
         }
     }
 }
@@ -955,6 +1013,81 @@ static uint16_t tcp_wire_window(tcp_conn_t *conn, tcp_priv_t *priv, uint8_t flag
     return (scaled > 0xFFFFu) ? 0xFFFFu : (uint16_t)scaled;
 }
 
+/*=================================================================
+ * このセグメントに載せる TCP オプションのバイト数を返す。
+ *
+ * SYN のときだけ MSS / Window Scale が載り、Timestamps は
+ * (合意していれば)**全セグメントに載る**(RFC 7323 の要求)。
+ *
+ * 引数:
+ *   conn / priv - 対象コネクションとプライベート状態
+ *   flags       - 送出するフラグ
+ * 戻り値:
+ *   オプション領域のバイト数(常に 4 の倍数)
+ * コール元:
+ *   tcp_send_segment(), tcp_send_segment_lso()
+ * ===============================================================*/
+static inline uint8_t tcp_options_len(const tcp_conn_t *conn, const tcp_priv_t *priv,
+                                       uint8_t flags)
+{
+    (void)conn;
+    uint8_t len = 0;
+    if (flags & TCP_FLAG_SYN) {
+        len = 4u;  /* MSS */
+        /* SYN|ACK のときは相手が出してきた場合だけ返す(能動 open は常に出す)。 */
+        if ((flags & TCP_FLAG_ACK) ? priv->wscale_enabled : 1) len = (uint8_t)(len + 4u);
+        if ((flags & TCP_FLAG_ACK) ? priv->ts_enabled : (g_tcp_ts_enable != 0u)) {
+            len = (uint8_t)(len + TCP_TS_OPT_LEN);
+        }
+    } else if (priv->ts_enabled) {
+        len = TCP_TS_OPT_LEN;
+    }
+    return len;
+}
+
+/*=================================================================
+ * TCP ヘッダ直後のオプション領域を組み立てる。並びは
+ * MSS / NOP+Window Scale / NOP+NOP+Timestamps。
+ *
+ * 引数:
+ *   conn / priv - 対象コネクションとプライベート状態
+ *   flags       - 送出するフラグ
+ *   tcph        - TCP ヘッダ先頭
+ *   opt_len     - tcp_options_len() が返した長さ
+ * コール元:
+ *   tcp_send_segment(), tcp_send_segment_lso()
+ * ===============================================================*/
+static void tcp_build_options(tcp_conn_t *conn, tcp_priv_t *priv, uint8_t flags,
+                               volatile uint8_t *tcph, uint8_t opt_len)
+{
+    if (opt_len == 0) return;
+    unsigned o = TCP_HDR_LEN;
+    if (flags & TCP_FLAG_SYN) {
+        tcph[o + 0] = TCP_OPT_KIND_MSS;
+        tcph[o + 1] = 4;
+        wr16be(tcph + o + 2, tcp_mss_cap_for((const netaddr_t *)&conn->remote_ip));
+        o += 4u;
+        if ((flags & TCP_FLAG_ACK) ? priv->wscale_enabled : 1) {
+            tcph[o + 0] = TCP_OPT_KIND_NOP;
+            tcph[o + 1] = TCP_OPT_KIND_WSCALE;
+            tcph[o + 2] = 3;               /* オプション長(kind+len+shiftの3バイト) */
+            tcph[o + 3] = TCP_RCV_WSCALE;  /* shift count */
+            o += 4u;
+        }
+    }
+    if (o < (unsigned)(TCP_HDR_LEN + opt_len)) {
+        /* Timestamps。NOP 2 個で 4 バイト境界へ揃える(慣例)。 */
+        tcph[o + 0] = TCP_OPT_KIND_NOP;
+        tcph[o + 1] = TCP_OPT_KIND_NOP;
+        tcph[o + 2] = TCP_OPT_KIND_TS;
+        tcph[o + 3] = 10;
+        wr32be(tcph + o + 4, tcp_ts_now());
+        /* TSecr は「相手から最後に受け取った TSval」。まだ何も受け取って
+         * いない能動 open の SYN では 0 を入れる(RFC 7323 3.2)。 */
+        wr32be(tcph + o + 8, priv->ts_recent);
+    }
+}
+
 static int tcp_send_segment(tcp_conn_t *conn, tcp_priv_t *priv, uint8_t flags,
                              const void *data, uint16_t data_len)
 {
@@ -980,14 +1113,7 @@ static int tcp_send_segment(tcp_conn_t *conn, tcp_priv_t *priv, uint8_t flags,
         return -1;
     }
 
-    int include_wscale = 0;
-    if (flags & TCP_FLAG_SYN) {
-        include_wscale = (flags & TCP_FLAG_ACK) ? priv->wscale_enabled : 1;
-    }
-    uint8_t opt_len = 0;
-    if (flags & TCP_FLAG_SYN) {
-        opt_len = include_wscale ? 8u : 4u;
-    }
+    uint8_t opt_len = tcp_options_len(conn, priv, flags);
     uint16_t hdr_total = (uint16_t)(TCP_HDR_LEN + opt_len);  /* TCPヘッダ+オプション(データ抜き) */
     uint16_t seg_len = (uint16_t)(hdr_total + data_len);      /* IPペイロード全体(ヘッダ+データ) */
 
@@ -1013,19 +1139,12 @@ static int tcp_send_segment(tcp_conn_t *conn, tcp_priv_t *priv, uint8_t flags,
      * 「どちらも前回と同じ」なら送らずに済ませるため(tcp_recv_internal())。 */
     priv->last_ack_sent = (flags & TCP_FLAG_ACK) ? conn->rcv_seq : 0u;
     priv->last_win_sent = wire_window;
+    /* PAWS の R3(ts_recent を更新してよいのは「ACK 済みの範囲に続く
+     * セグメント」だけ)に要る。last_ack_sent と違い非 ACK でも 0 にしない。 */
+    if (flags & TCP_FLAG_ACK) priv->ts_last_ack_sent = conn->rcv_seq;
     wr16be(tcph + TCP_OFF_CHECKSUM, 0);  /* チェックサム計算前に0クリア */
     wr16be(tcph + TCP_OFF_URGENT, 0);
-    if (opt_len > 0) {
-        tcph[TCP_HDR_LEN + 0] = TCP_OPT_KIND_MSS;
-        tcph[TCP_HDR_LEN + 1] = 4;
-        wr16be(tcph + TCP_HDR_LEN + 2, tcp_mss_cap_for((const netaddr_t *)&conn->remote_ip));
-        if (include_wscale) {
-            tcph[TCP_HDR_LEN + 4] = TCP_OPT_KIND_NOP;
-            tcph[TCP_HDR_LEN + 5] = TCP_OPT_KIND_WSCALE;
-            tcph[TCP_HDR_LEN + 6] = 3;               /* オプション長(kind+len+shiftの3バイト) */
-            tcph[TCP_HDR_LEN + 7] = TCP_RCV_WSCALE;  /* shift count */
-        }
-    }
+    tcp_build_options(conn, priv, flags, tcph, opt_len);
 
     /* HW チェックサムオフロードは v4/v6 共通で使える。種として書き込む疑似
      * ヘッダ部分和は tcp_checksum() が family ごとに正しい形で計算するし、
@@ -1075,6 +1194,39 @@ static int tcp_send_segment(tcp_conn_t *conn, tcp_priv_t *priv, uint8_t flags,
 #define TCP_LSO_MAX_DATA_LEN (0xFFFFu - (uint32_t)sizeof(ip_header_t) - (uint32_t)TCP_HDR_LEN)
 
 /*=================================================================
+ * ペイロードを MSS ごとに切って 1 セグメントずつ送る(LSO が使えない
+ * ときのフォールバック)。conn->snd_seq は呼び出し時の値へ戻すので、
+ * 呼び出し側から見た振る舞いは tcp_send_segment_lso() と同じ。
+ *
+ * 引数:
+ *   conn / priv - 対象コネクションとプライベート状態
+ *   data / len  - 送るペイロード(複数 MSS 分)
+ * 戻り値:
+ *   0=全部キューイングできた、-1=途中で失敗
+ * コール元:
+ *   tcp_send_segment_lso()
+ * ===============================================================*/
+static int tcp_send_segments_split(tcp_conn_t *conn, tcp_priv_t *priv,
+                                    const void *data, uint32_t data_len)
+{
+    const uint8_t *src = (const uint8_t *)data;
+    uint32_t base = conn->snd_seq;
+    uint32_t off  = 0;
+    int rc = 0;
+    while (off < data_len) {
+        uint32_t chunk = data_len - off;
+        if (chunk > conn->snd_mss) chunk = conn->snd_mss;
+        conn->snd_seq = base + off;
+        rc = tcp_send_segment(conn, priv, TCP_FLAG_PSH | TCP_FLAG_ACK,
+                               src + off, (uint16_t)chunk);
+        if (rc != 0) break;
+        off += chunk;
+    }
+    conn->snd_seq = base;
+    return rc;
+}
+
+/*=================================================================
  * LSO 対応の送信ヘルパ。ヘッダを 1 つ組み立て、複数 MSS 分のペイロードを
  * まとめて NIC へ渡して HW に分割させる(LSO 非対応なら呼ばれない)。
  *
@@ -1108,7 +1260,24 @@ static int tcp_send_segment_lso(tcp_conn_t *conn, tcp_priv_t *priv,
         return -1;
     }
 
-    uint32_t seg_len32 = (uint32_t)TCP_HDR_LEN + data_len;
+    /* LSO でも Timestamps は要る(RFC 7323 は RST 以外の全セグメントに求める)。
+     * NIC はヘッダをそのまま各セグメントへ複製するので、オプションも一緒に
+     * 複製される(TSval が同じ値で並ぶのは正常)。 */
+    uint8_t  opt_len = tcp_options_len(conn, priv, TCP_FLAG_PSH | TCP_FLAG_ACK);
+    uint16_t hdr_total = (uint16_t)(TCP_HDR_LEN + opt_len);
+
+    unsigned l4_off = tcp_l4_off((const netaddr_t *)&conn->remote_ip);
+
+    /* **ヘッダは LSO の WQE へインライン化される**ので長さに上限がある
+     * (mlx5 で 82 バイト)。IPv6(54)+ TCP(20)+ Timestamps(12)= 86 は
+     * 超えるので、その組み合わせだけ 1 セグメントずつ送る。ここで諦めずに
+     * -1 を返すと、呼び出し側の送信ループが止まってしまう。 */
+    uint16_t lso_hdr_max = net_active_lso_max_hdr();
+    if (lso_hdr_max != 0u && (uint16_t)(l4_off + hdr_total) > lso_hdr_max) {
+        return tcp_send_segments_split(conn, priv, data, data_len);
+    }
+
+    uint32_t seg_len32 = (uint32_t)hdr_total + data_len;
     if (seg_len32 > 0xFFFFu) {
         uart_printf("[!] TCP: LSO data_lenが大きすぎる(%u)、送信中止\n", (unsigned)data_len);
         return -1;
@@ -1119,7 +1288,6 @@ static int tcp_send_segment_lso(tcp_conn_t *conn, tcp_priv_t *priv,
     unsigned slot = eth_tx_wait_free_slot();
     uint8_t *seg_buf = s_seg_bufs[core][slot];
 
-    unsigned l4_off = tcp_l4_off((const netaddr_t *)&conn->remote_ip);
     tcp_build_l3(seg_buf, (const netaddr_t *)&conn->local_ip,
                   (const netaddr_t *)&conn->remote_ip, dst_mac, seg_len);
 
@@ -1128,8 +1296,9 @@ static int tcp_send_segment_lso(tcp_conn_t *conn, tcp_priv_t *priv,
     wr16be(tcph + TCP_OFF_DST_PORT, conn->remote_port);
     wr32be(tcph + TCP_OFF_SEQ, conn->snd_seq);
     wr32be(tcph + TCP_OFF_ACK, conn->rcv_seq);
-    tcph[TCP_OFF_DATA_OFFSET] = (uint8_t)((TCP_HDR_LEN / 4u) << 4);
+    tcph[TCP_OFF_DATA_OFFSET] = (uint8_t)((hdr_total / 4u) << 4);
     tcph[TCP_OFF_FLAGS] = TCP_FLAG_PSH | TCP_FLAG_ACK;
+    priv->ts_last_ack_sent = conn->rcv_seq;
 
     uint32_t ring_capacity_bytes = (uint32_t)ETH_RX_RING_SIZE * (uint32_t)conn->snd_mss;
     uint32_t safe_window_cap = ring_capacity_bytes / 2u;
@@ -1144,17 +1313,19 @@ static int tcp_send_segment_lso(tcp_conn_t *conn, tcp_priv_t *priv,
     }
     wr16be(tcph + TCP_OFF_WINDOW, wire_window);
     wr16be(tcph + TCP_OFF_URGENT, 0);
+    wr16be(tcph + TCP_OFF_CHECKSUM, 0);  /* チェックサム計算前に0クリア */
+    tcp_build_options(conn, priv, TCP_FLAG_PSH | TCP_FLAG_ACK, tcph, opt_len);
 
     /* LSO は NIC が IPv4 ヘッダの total_length/ID を書き換える前提の機能で、
      * 現在の実装は IPv4 でしか使わない(v6 の呼び出し元は tcp_can_use_lso()
      * で弾いている)。ここでは疑似ヘッダ部分和を種として渡す。 */
     uint16_t csum = tcp_checksum((const netaddr_t *)&conn->local_ip,
                                   (const netaddr_t *)&conn->remote_ip,
-                                  tcph, TCP_HDR_LEN, data, (uint16_t)data_len, 1);
+                                  tcph, hdr_total, data, (uint16_t)data_len, 1);
     wr16be(tcph + TCP_OFF_CHECKSUM, csum);
 
     uint8_t *frame = seg_buf;
-    uint16_t hdr_bytes = (uint16_t)(l4_off + TCP_HDR_LEN);
+    uint16_t hdr_bytes = (uint16_t)(l4_off + hdr_total);
 
     dcache_clean_range(frame, hdr_bytes);
     dcache_clean_range((const void *)data, data_len);
@@ -1666,9 +1837,96 @@ static void tcp_parse_syn_options(tcp_conn_t *conn, tcp_priv_t *priv,
             priv->wscale_enabled = 1;
             priv->snd_wscale = peer_shift;
             uart_printf("[TCP] 相手のWindow Scaleオプション受信: shift=%u\n", peer_shift);
+        } else if (kind == TCP_OPT_KIND_TS && opt_len == 10 && g_tcp_ts_enable) {
+            /* 相手が出してきたときだけ有効になる(SYN|ACK を組むのはこの後
+             * なので、受動 open でもここで決まった値がそのまま使われる)。 */
+            priv->ts_enabled = 1;
+            priv->ts_recent  = rd32be(opts + i + 2);  /* 相手の TSval を echo 用に保持 */
+            uart_printf("[TCP] 相手のTimestampsオプション受信: TSval=%u\n",
+                        (unsigned)priv->ts_recent);
         }
         i = (uint8_t)(i + opt_len);
     }
+
+    /* **Timestamps を使うぶんペイロードが 12 バイト減る。** MSS オプションの
+     * 値は「ペイロードの上限」なので、自分が載せるオプションのぶんは送信側で
+     * 引く(RFC 6691)。引き忘れるとフルサイズのセグメントだけがリンク MTU を
+     * 超えて NIC に無言で捨てられる -- IPv6 対応のときと同じ形の不具合になる。
+     * オプションの並び順に依存しないよう、走査を終えてから引く。 */
+    if (priv->ts_enabled && conn->snd_mss > TCP_TS_OPT_LEN * 4u) {
+        conn->snd_mss = (uint16_t)(conn->snd_mss - TCP_TS_OPT_LEN);
+    }
+}
+
+/*=================================================================
+ * 確立済みコネクションのセグメントから Timestamps を取り出し、PAWS
+ * (RFC 7323 5.3)の判定と TS.Recent の更新を行う。
+ *
+ * 引数:
+ *   conn / priv - 対象コネクションとプライベート状態
+ *   in          - TCP ヘッダ先頭
+ *   hdr_len     - オプション込みの TCP ヘッダ長
+ *   seq         - このセグメントの先頭 seq
+ *   out_tsecr   - 相手が echo してきた自分の TSval(RTT 計測用)
+ * 戻り値:
+ *   1=処理を続けてよい、0=PAWS で破棄した
+ * コール元:
+ *   tcp_input_addr()
+ * ===============================================================*/
+static int tcp_input_timestamps(tcp_conn_t *conn, tcp_priv_t *priv,
+                                 const volatile uint8_t *in, uint8_t hdr_len,
+                                 uint32_t seq, uint32_t *out_tsecr)
+{
+    if (hdr_len <= TCP_HDR_LEN) return 1;  /* 相手が付けてこなかった */
+
+    const volatile uint8_t *o = in + TCP_HDR_LEN;
+    uint8_t olen = (uint8_t)(hdr_len - TCP_HDR_LEN);
+    uint32_t tsval, tsecr;
+
+    if (olen >= TCP_TS_OPT_LEN &&
+        o[0] == TCP_OPT_KIND_NOP && o[1] == TCP_OPT_KIND_NOP &&
+        o[2] == TCP_OPT_KIND_TS  && o[3] == 10) {
+        /* 定番の並び(NOP NOP TS)。確立後はこれしか来ないので、走査せずに読む。 */
+        tsval = rd32be(o + 4);
+        tsecr = rd32be(o + 8);
+    } else {
+        uint8_t i = 0;
+        int found = 0;
+        tsval = 0; tsecr = 0;
+        while (i < olen) {
+            uint8_t kind = o[i];
+            if (kind == TCP_OPT_KIND_END) break;
+            if (kind == TCP_OPT_KIND_NOP) { i++; continue; }
+            if ((uint8_t)(i + 1) >= olen) break;
+            uint8_t l = o[i + 1];
+            if (l < 2 || (uint8_t)(i + l) > olen) break;
+            if (kind == TCP_OPT_KIND_TS && l == 10) {
+                tsval = rd32be(o + i + 2);
+                tsecr = rd32be(o + i + 6);
+                found = 1;
+                break;
+            }
+            i = (uint8_t)(i + l);
+        }
+        if (!found) return 1;  /* 合意したのに付いていない。捨てずに受け入れる */
+    }
+
+    /* R1: TSval が TS.Recent より古ければ「一周した古いセグメント」。
+     * ACK を返して破棄する(相手にこちらの状態を伝えるため)。 */
+    if ((int32_t)(tsval - priv->ts_recent) < 0) {
+        g_tcp_paws_drop_count++;
+        tcp_send_segment(conn, priv, TCP_FLAG_ACK, NULL, 0);
+        return 0;
+    }
+
+    /* R3: ACK 済みの範囲に続くセグメントのときだけ TS.Recent を進める
+     * (順序不正のセグメントで進めると、後から届く正しいものを弾いてしまう)。 */
+    if (!tcp_seq_lt(priv->ts_last_ack_sent, seq)) {
+        priv->ts_recent = tsval;
+    }
+
+    *out_tsecr = tsecr;
+    return 1;
 }
 
 typedef tcp_async_slot_t tcp_async_mlx5_extra_t[TCP_ASYNC_SLOTS_MLX5_EXTRA];
@@ -1808,6 +2066,9 @@ static void tcp_priv_init(tcp_priv_t *priv, unsigned core)
     priv->recv_upcall_ctx = NULL;
     priv->wscale_enabled = 0;
     priv->snd_wscale     = 0;
+    priv->ts_enabled       = 0;
+    priv->ts_recent        = 0;
+    priv->ts_last_ack_sent = 0;
     priv->unacked_full_segments = 0;
     priv->unacked_consumed_bytes = 0;
     priv->last_ack_sent = 0;
@@ -2335,7 +2596,10 @@ int tcp_send(tcp_conn_t *conn, const void *buf, uint32_t len)
             priv->ack_advanced = 0;
             retransmit_attempts = 0;  /* 進捗があったので連続再送カウントをリセット */
 
-            if (!window_retransmitted) {
+            /* Timestamps が有効なら RTT は受信側(TSecr)で測っているので、
+             * ここで二重に更新しない(再送の有無に関わらず測れるぶん、
+             * こちらの Karn 制約つきの推定より良い)。 */
+            if (!window_retransmitted && !priv->ts_enabled) {
                 tcp_rtt_update(priv, timer_now() - window_sent_at);
             }
 
@@ -3139,6 +3403,31 @@ void tcp_backlog_set_max(unsigned depth)
 unsigned tcp_backlog_capacity(void) { return TCP_BACKLOG; }
 
 /*=================================================================
+ * コネクションの Timestamps 合意状態と RTT 推定を返す。
+ *
+ * 「ロス中も RTT が更新され続けているか」を外から見るために要る
+ * (`g_tcp_ts_rtt_samples` が増えているだけでは、値が動いている証拠に
+ * ならない)。
+ *
+ * 引数:
+ *   conn    - 対象コネクション
+ *   srtt_us - NULL 可。平滑化 RTT(us)
+ *   rto_ms  - NULL 可。現在の RTO
+ * 戻り値:
+ *   1=Timestamps 合意済み、0=未合意/不明
+ * コール元:
+ *   shell_tcpts()
+ * ===============================================================*/
+int tcp_conn_ts_info(const tcp_conn_t *conn, uint64_t *srtt_us, uint32_t *rto_ms)
+{
+    tcp_priv_t *priv = tcp_priv_for((tcp_conn_t *)conn);
+    if (!priv) return 0;
+    if (srtt_us) *srtt_us = priv->srtt_us;
+    if (rto_ms)  *rto_ms  = priv->rto_ms;
+    return priv->ts_enabled ? 1 : 0;
+}
+
+/*=================================================================
  * 受信 TCP セグメントを処理する。チェックサム検証(HW 検証済みなら省略)、
  * リスナーへの SYN 受け付け、既存コネクションの状態遷移、in-order データの
  * 配置(upcall か rx_buf)、順序不正セグメントの先読み保持、ACK 処理と
@@ -3389,6 +3678,15 @@ void tcp_input_addr(const uint8_t *pkt, uint16_t len,
         return;
     }
 
+    /* Timestamps(RFC 7323)。合意していないコネクションでは分岐 1 つで抜ける。
+     * PAWS(古いセグメントの検出)はここで行う -- RST より後に置いてあるので
+     * RST は PAWS の対象外(相手を切れなくなるのを避ける)。 */
+    uint32_t seg_tsecr = 0;
+    if (priv->ts_enabled &&
+        !tcp_input_timestamps(conn, priv, in, hdr_len, seq, &seg_tsecr)) {
+        return;  /* PAWS で破棄(ACK は tcp_input_timestamps() が返している) */
+    }
+
     uint32_t prev_snd_win = conn->snd_win;  /* dup ACK 判定に要る(更新前の値) */
     if (priv->wscale_enabled) {
         conn->snd_win = (uint32_t)rd16be(in + TCP_OFF_WINDOW) << priv->snd_wscale;
@@ -3443,6 +3741,19 @@ void tcp_input_addr(const uint8_t *pkt, uint16_t len,
                 priv->ack_advanced = 1;
                 priv->neigh_confirm = 1;   /* 上位層の到達確認(NUD)*/
                 tcp_on_new_ack(priv, ack);
+                /* **Timestamps があれば再送中でも RTT を測れる。** Karn の
+                 * アルゴリズム(再送したウィンドウの RTT は測らない)は
+                 * 「どちらの送信への ACK か分からない」ことへの対処なので、
+                 * TSecr で判別できるなら制約そのものが消える。 */
+                if (priv->ts_enabled && seg_tsecr != 0u) {
+                    uint32_t elapsed = tcp_ts_now() - seg_tsecr;
+                    /* 異常値(相手が変な echo を返した)は捨てる。1.024us 刻みで
+                     * 10 秒ぶん(約 977 万)を超えたら採らない。 */
+                    if (elapsed < 10000000u) {
+                        tcp_rtt_update(priv, (uint64_t)elapsed << 10);
+                        g_tcp_ts_rtt_samples++;
+                    }
+                }
             } else if (ack == priv->snd_una &&
                        payload_len == 0 &&
                        (flags & (TCP_FLAG_SYN | TCP_FLAG_FIN)) == 0 &&
