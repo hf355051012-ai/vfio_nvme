@@ -36,11 +36,11 @@ D9 認証。**D 系は Pi5 の `nvme-cli` で直接叩けるので、B 系のよ
 
 ## 編集とビルド
 
-**編集は Windows 側 `C:\Users\fukud\Documents\vfio_nvme` が正。** ビルドと実機
+**編集は Windows 側 `%USERPROFILE%\Documents\vfio_nvme` が正。** ビルドと実機
 テストは ConnectX-4 のある OptiPlex(`ssh rpi5-rdma-target`)で行う。
 
 ```bash
-wsl -e bash -lc "/mnt/c/Users/fukud/Documents/vfio_nvme/tools/sync_to_optiplex.sh"
+wsl -e bash -lc "/mnt/c/Users/<ユーザ名>/Documents/vfio_nvme/tools/sync_to_optiplex.sh"
 ```
 
 同期は `--delete` 付きの一方向。**OptiPlex 側 `~/vfio_nvme` で直接編集すると次の
@@ -210,10 +210,25 @@ RDMA_READ を投げた瞬間に **`REMOTE_INVAL_REQ_ERR`(syndrome=0x12)**にな�
 FW 14.32.1900、PCIe Gen3 x8)に置き換わった。** 2 本の DAC は両方とも Pi5 へ
 行くので、**PF0↔PF1 の直結ループバックはもう存在しない**。
 
-| OptiPlex | | Pi5(`ssh fukud@192.168.3.135`)|
+| OptiPlex | | Pi5(`ssh pi5`)|
 |---|---|---|
 | PF0 `01:00.0` = 192.168.101.10 | ←DAC→ | `eth2` |
 | PF1 `01:00.1` = 192.168.101.11 | ←DAC→ | `eth1` |
+
+**2 台への接続は `~/.ssh/config` のホストエイリアスで行う**(このリポジトリに
+実アドレスは書かない)。`rpi5-rdma-target` = OptiPlex、`pi5` = Raspberry Pi 5。
+`sync_to_optiplex.sh` などは環境変数 `REMOTE` で上書きできる。
+
+```
+Host rpi5-rdma-target          # OptiPlex(ビルド・実機テスト)
+    HostName  <管理 LAN の IP>
+    User      <ユーザ名>
+    IdentityFile ~/.ssh/<鍵>
+
+Host pi5                       # Raspberry Pi 5(相互運用の相手)
+    HostName  <管理 LAN の IP>
+    User      <ユーザ名>
+```
 
 既存の「対向PF」前提のテスト群を生かすため、**Pi5 側で `eth1`+`eth2` を `br0`
 にブリッジする**(STP off / MTU 9500 / `192.168.101.20/24`)。この状態で
@@ -572,7 +587,7 @@ inline の送信ホットパスなので触らない)。**ルータが消えた�
 
 ```bash
 ssh rpi5-rdma-target 'cd ~/vfio_nvme && gcc -O2 -Wall -Wextra -o /tmp/ra_check tools/ra_check.c'
-scp tools/send_ra.py fukud@192.168.3.135:/tmp/     # Pi5 側
+scp tools/send_ra.py pi5:/tmp/     # Pi5 側
 sudo python3 /tmp/send_ra.py eth2 1800 1800 6 listen
 ```
 
@@ -714,7 +729,7 @@ L4 チェックサムオフロードを外す。** HW は拡張ヘッダを飛�
 MTU 超の UDP を送って Linux に再構成させる**のが本筋の確認。
 
 ```bash
-scp tools/udp6_echo.py fukud@192.168.3.135:/tmp/   # Pi5 側
+scp tools/udp6_echo.py pi5:/tmp/   # Pi5 側
 sudo ip -6 addr add 2001:db8:0:9::20/64 dev br0
 python3 /tmp/udp6_echo.py 7780 40
 # 自作側
@@ -1531,7 +1546,7 @@ Identify Controller(CNTRLTYPE=2)と Get Log Page(LID=0x70)の応答を変える�
   上流の `0000:00:01.0` が group 2)。VFIO はグループ単位でしか扱えないので
   **片方だけ mlx5_core に残すことはできない**。CLAUDE.md 冒頭の
   「どちらか一方にしかバインドできない」の根拠はこれ。
-- Linux 側の NIC はオンボード `enp2s0`(192.168.3.164/24)だけで、ConnectX の
+- Linux 側の NIC はオンボード `enp2s0`(管理 LAN 側)だけで、ConnectX の
   2 ポートは DAC 直結。192.168.101.0/24 へ出る物理経路が無い。
 
 ### 代わりに「相手側の構造体でパースさせる」で検証する

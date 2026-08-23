@@ -51,7 +51,7 @@ DH-HMAC-CHAP のみ」と判断している)。
 
 ## 全項目に共通する作業ルール
 
-- **編集は Windows 側 `C:\Users\fukud\Documents\vfio_nvme` が正。** OptiPlex の
+- **編集は Windows 側 `%USERPROFILE%\Documents\vfio_nvme` が正。** OptiPlex の
   `~/vfio_nvme` は `--delete` 付き rsync で上書きされる。詳細は `CLAUDE.md`。
 - **仕様は推測せず実ソースを取得して確認する。** Linux カーネル
   (`torvalds/linux`)や `linux-rdma/rdma-core` を実際に取ってきて、構造体の
@@ -486,7 +486,7 @@ QP を作り直すたびに FW 側のリソースが溜まる。**既に一度�
   IOMMU グループ単位でしか扱えないので、片方だけ vfio-pci にはできない。
   `readlink /sys/bus/pci/devices/0000:01:00.{0,1}/iommu_group` で確認できる。
 - **別 NIC 経由 → 不可能。** Linux 側の NIC はオンボードの `enp2s0`
-  (192.168.3.164/24)だけで、ConnectX の 2 ポートは DAC で互いに直結されている。
+  (管理 LAN 側)だけで、ConnectX の 2 ポートは DAC で互いに直結されている。
   192.168.101.0/24 へ出る物理経路が無い。
 
 そこで**「実装 + Linux 由来パーサで検証」**を選んだ(ユーザー判断)。
@@ -864,7 +864,7 @@ TTL 1 本を変えれば全部が比例して縮むので、検証で 600ms へ�
 と注意していたが、**A3 の検証に新アドレスは不要だった**。陰性は自分のアドレス
 (`.10` / 自分のリンクローカル)、陽性は対向 PF のアドレス(`.11` / 対向の
 リンクローカル)で足りる。加えて DAC 直結リンクはオンボード NIC
-(`enp2s0` 192.168.3.164/24)と物理的に繋がっていないので、ここで出す
+(`enp2s0`、管理 LAN 側)と物理的に繋がっていないので、ここで出す
 ARP Probe / DAD NS はユーザの LAN には 1 フレームも出ない。
 
 ### 陽性対照が無いと検証にならない

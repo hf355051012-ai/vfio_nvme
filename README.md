@@ -48,11 +48,11 @@ tools/sync_to_optiplex.sh    Windows -> OptiPlex 一方向同期
 
 ## 開発フロー
 
-**編集は Windows 側 (`C:\Users\fukud\Documents\vfio_nvme`) が正**。
+**編集は Windows 側 (`%USERPROFILE%\Documents\vfio_nvme`) が正**。
 ビルドと実機テストは ConnectX-4 のある OptiPlex で行う。
 
 ```bash
-wsl -e bash -lc "/mnt/c/Users/fukud/Documents/vfio_nvme/tools/sync_to_optiplex.sh"
+wsl -e bash -lc "/mnt/c/Users/<ユーザ名>/Documents/vfio_nvme/tools/sync_to_optiplex.sh"
 ```
 
 同期は `--delete` 付きの一方向。OptiPlex 側 (`~/vfio_nvme`) で直接編集すると

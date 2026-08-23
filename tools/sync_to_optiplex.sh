@@ -6,7 +6,7 @@
 # OptiPlex 側で直接編集すると次回の同期で --delete により失われる。
 #
 # WSL から実行する:
-#   wsl -e bash -lc "/mnt/c/Users/fukud/Documents/vfio_nvme/tools/sync_to_optiplex.sh"
+#   wsl -e bash -lc "/mnt/c/Users/<ユーザ名>/Documents/vfio_nvme/tools/sync_to_optiplex.sh"
 #
 # 環境変数で上書きできる:
 #   REMOTE      ssh 先        (既定: rpi5-rdma-target)
