@@ -68,6 +68,15 @@ int nvme_tcp_recv_poll(nvme_tcp_conn_t *c, nvme_tcp_xfer_t *x);
 
 int nvme_tcp_send_icreq(nvme_tcp_conn_t *c);
 
+extern volatile uint32_t g_nvme_tcp_hdgst_corrupt;  /* 検証用 */
+extern volatile uint32_t g_nvme_tcp_term_sent;
+extern volatile uint32_t g_nvme_tcp_term_recv;
+
+/* 致命的なプロトコル誤りを見つけたとき、TCP を閉じる前に理由(FES)を送る
+ * (ターゲット側の nvmet_tcp_send_term() と対)。 */
+int nvme_tcp_send_term(nvme_tcp_conn_t *c, uint16_t fes, uint32_t fei,
+                        const uint8_t *pdu, uint32_t pdu_len);
+
 int nvme_tcp_verify_icresp(nvme_tcp_conn_t *c, const uint8_t icresp_buf[NVME_TCP_ICRESP_LEN]);
 
 int nvme_tcp_send_h2c_data(nvme_tcp_conn_t *c, uint16_t ttag, uint32_t r2to, uint32_t r2tl);

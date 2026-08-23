@@ -45,10 +45,27 @@ uint32_t nvmet_tcp_max_h2c_data(const nvmet_tcp_conn_t *c)
  * コール元:
  *   nvmet_tcp_send_r2t(), nvmet_tcp_send_resp(), nvmet_tcp_send_c2h()
  * ===============================================================*/
+/* 検証用: 次に送る N 個のヘッダダイジェストをわざと壊す(シェルの
+ * `hdgstcorrupt`)。**相手が誤りを検出して TermReq を返してくるかを
+ * 確かめる唯一の手段**で、Linux 相手にも効く。 */
+volatile uint32_t g_nvmet_tcp_hdgst_corrupt;
+/* 検証側をわざと失敗させる(シェルの `hdgstcorrupt v`)。 */
+volatile uint32_t g_nvmet_tcp_hdgst_verify_fail;
+/* 送った / 受け取った TermReq の数。 */
+volatile uint32_t g_nvmet_tcp_term_sent;
+volatile uint32_t g_nvmet_tcp_term_recv;
+
 static uint32_t nvmet_tcp_append_hdgst(nvmet_tcp_conn_t *c, uint8_t *buf, uint32_t hlen)
 {
     if (!c->hdgst) return 0;
     uint32_t crc = ~crc32c(0xFFFFFFFFu, buf, hlen);  /* 最終反転(crc32c.hコメント参照) */
+    if (g_nvmet_tcp_hdgst_corrupt != 0u) {
+        /* **検証用のヘッダダイジェスト破壊**(シェルの `hdgstcorrupt`)。
+         * 相手が誤りを検出して TermReq を返してくるかを確かめる唯一の手段。
+         * 自作 <-> 自作でも Linux 相手でも同じように効く。 */
+        g_nvmet_tcp_hdgst_corrupt--;
+        crc ^= 0x00000001u;
+    }
     wr32le(&buf[hlen], crc);
     return 4u;
 }
@@ -151,6 +168,15 @@ int nvmet_tcp_verify_hdgst(const nvmet_tcp_conn_t *c,
     uint32_t expected = crc32c(0xFFFFFFFFu, hdr1, len1);
     if (hdr2 && len2 > 0) expected = crc32c(expected, hdr2, len2);
     expected = ~expected;  /* 最終反転(crc32c.hコメント参照) */
+    if (g_nvmet_tcp_hdgst_verify_fail != 0u) {
+        /* **検証側をわざと失敗させる**(シェルの `hdgstcorrupt v`)。
+         * 相手が正しく送ってきていても「壊れている」と判定するので、
+         * **こちらが C2H TermReq を送る経路を、相手を選ばず試せる**
+         * (Linux のホストは TermReq を送ってこないので、送信側を壊す
+         * `hdgstcorrupt t` では相手のログに TermReq が出ない)。 */
+        g_nvmet_tcp_hdgst_verify_fail--;
+        expected ^= 0x00000001u;
+    }
 
     uint32_t g = rd32le(got);
     if (g != expected) {
@@ -236,11 +262,50 @@ void nvmet_tcp_accept_arm(nvmet_tcp_conn_t *c, int listener)
  * コール元:
  *   nvmet_admin_job_step(), nvmet_io_job_step_impl()
  * ===============================================================*/
+/*=================================================================
+ * Terminate Connection Request(C2H TermReq)を送る。
+ *
+ * **プロトコル上の致命的な誤りを見つけたら、TCP を閉じる前にこれを送る**
+ * のが NVMe/TCP の規約。送らないと相手のログには「接続が切れた」としか
+ * 残らない(Linux は受け取ると FES を添えて表示する)。
+ *
+ * 引数:
+ *   c       - 対象コネクション
+ *   fes     - Fatal Error Status(NVME_TCP_FES_*)
+ *   fei     - Fatal Error Information(該当が無ければ 0)
+ *   pdu     - 原因になった PDU の先頭(NULL 可)
+ *   pdu_len - そのバイト数
+ * 戻り値:
+ *   0=送信できた、-1=失敗
+ * コール元:
+ *   nvmet_tcp_send_icresp(), nvmet_admin_job_step(), nvmet_io_job_step_impl()
+ * ===============================================================*/
+int nvmet_tcp_send_term(nvmet_tcp_conn_t *c, uint16_t fes, uint32_t fei,
+                         const uint8_t *pdu, uint32_t pdu_len)
+{
+    static uint8_t s_term_buf[NVME_TCP_TERM_PLEN_MAX] __attribute__((aligned(64)));
+    uint32_t total = nvme_tcp_build_term(s_term_buf, NVME_TCP_PDU_C2H_TERM,
+                                          fes, fei, pdu, pdu_len);
+    g_nvmet_tcp_term_sent++;
+    uart_printf("[NVMe/TCP target] C2H TermReq 送信 (fes=0x%02x fei=0x%x len=%u)\n",
+                (unsigned)fes, (unsigned)fei, (unsigned)total);
+    if (c->tcp.state != TCP_ESTABLISHED) return -1;
+    if (tcp_send(&c->tcp, s_term_buf, (uint16_t)total) != (int)total) {
+        uart_printf("[!] NVMe/TCP target: C2H TermReq 送信失敗\n");
+        return -1;
+    }
+    return 0;
+}
+
 int nvmet_tcp_send_icresp(nvmet_tcp_conn_t *c, const uint8_t icreq_buf[NVME_TCP_ICREQ_LEN])
 {
     uint8_t type = icreq_buf[0];
     if (type != NVME_TCP_PDU_ICREQ) {
         uart_printf("[!] NVMe/TCP target: 不正なICReq (type=%u)\n", type);
+        /* ICReq を期待している場所に別の PDU が来た = ヘッダのフィールドが
+         * 不正。**相手に理由を伝えてから閉じる。** */
+        nvmet_tcp_send_term(c, NVME_TCP_FES_INVALID_PDU_HDR, 0,
+                             icreq_buf, NVME_TCP_ICREQ_LEN);
         return -1;
     }
     uint8_t digest = icreq_buf[11];

@@ -235,8 +235,21 @@ int nvme_exec_step(nvme_exec_ctx_t *ec)
         } else if (type == NVME_TCP_PDU_R2T) {
             nvme_tcp_xfer_reset(&ec->xfer, ec->rest_buf, rest_len);
             ec->state = NVEXEC_ST_RECV_R2T_REST;
+        } else if (type == NVME_TCP_PDU_C2H_TERM) {
+            /* **相手が致命的な誤りを見つけて理由を伝えてきた。**
+             * 種別を記録して中断する(相手はこの後 TCP を閉じる)。 */
+            g_nvme_tcp_term_recv++;
+            uart_printf("[!] NVMe/TCP: C2H TermReq 受信 -- "
+                        "相手がプロトコル誤りを検出しました\n");
+            ec->result = -1;
+            ec->state = NVEXEC_ST_DONE;
+            return 1;
         } else {
             uart_printf("[!] NVMe/TCP: 未対応のPDU種別 (type=%u) 受信、応答待ちを中断\n", type);
+            /* **理由を伝えてから中断する。** 伝えないと相手のログには
+             * 「接続が切れた」としか残らない。 */
+            nvme_tcp_send_term(ec->conn, NVME_TCP_FES_INVALID_PDU_HDR, 0,
+                                ec->hdr_buf, NVME_TCP_HDR_LEN);
             ec->result = -1;
             ec->state = NVEXEC_ST_DONE;
             return 1;
@@ -1214,6 +1227,17 @@ static void nvme_pipeline_rx_tick(nvme_ctx_t *ctx)
         } else if (type == NVME_TCP_PDU_R2T) {
             nvme_tcp_xfer_reset(&s_pl_xfer, s_pl_rest_buf, rest_len);
             s_pl_rx_state = PL_RX_R2T_REST;
+        } else if (type == NVME_TCP_PDU_C2H_TERM) {
+            /* **相手が致命的な誤りを見つけて理由を伝えてきた。** 読み捨てて
+             * 再同期しても無駄(相手はこの後 TCP を閉じる)なので中断する。 */
+            g_nvme_tcp_term_recv++;
+            uart_printf("[!] nvme pipeline: C2H TermReq 受信 -- "
+                        "相手がプロトコル誤りを検出しました\n");
+            nvme_pipeline_fail_all_slots();
+            /* **読み終えた印を付け直さないと、同じヘッダを何度も処理する**
+             * (recv_poll は got>=want のとき即座に完了を返すため)。 */
+            nvme_tcp_xfer_reset(&s_pl_xfer, s_pl_hdr_buf, NVME_TCP_HDR_LEN);
+            s_pl_rx_state = PL_RX_HDR;
         } else {
             uart_printf("[!] nvme pipeline: 未対応のPDU種別 (type=%u)、読み捨てて再同期を試みます\n", type);
             nvme_tcp_xfer_reset(&s_pl_xfer, s_pl_hdr_buf, NVME_TCP_HDR_LEN);
@@ -1924,6 +1948,15 @@ static void nvme_pipeline_read_rx_tick(nvme_ctx_t *ctx)
         } else if (type == NVME_TCP_PDU_C2H_DATA) {
             nvme_tcp_xfer_reset(&rd->xfer, rd->rest_buf, rest_len);
             rd->rx_state = PL_READ_RX_C2H_REST;
+        } else if (type == NVME_TCP_PDU_C2H_TERM) {
+            /* 相手が致命的な誤りを見つけて理由を伝えてきた(write 側と同じ)。 */
+            g_nvme_tcp_term_recv++;
+            uart_printf("[!] nvme read pipeline: C2H TermReq 受信 -- "
+                        "相手がプロトコル誤りを検出しました\n");
+            rd->nrx_error = 1;   /* 上位が拾って読み出しを打ち切る */
+            /* write 側と同じ理由で、読み終えた印を付け直す。 */
+            nvme_tcp_xfer_reset(&rd->xfer, rd->hdr_buf, NVME_TCP_HDR_LEN);
+            rd->rx_state = PL_READ_RX_HDR;
         } else {
             uart_printf("[!] nvme read pipeline: 未対応のPDU種別 (type=%u)、読み捨てて再同期を試みます\n", type);
             nvme_tcp_xfer_reset(&rd->xfer, rd->hdr_buf, NVME_TCP_HDR_LEN);

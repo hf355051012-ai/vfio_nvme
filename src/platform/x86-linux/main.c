@@ -219,6 +219,56 @@ static netif_t *shell_peer_ll6(uint8_t out[16]);
  * コール元:
  *   shell_tcpbench()
  * ===============================================================*/
+/*=================================================================
+ * 内蔵イニシエータの NVMe/TCP セッションを閉じ、常駐ターゲットが次の
+ * クライアントを待つ状態へ戻るまで回す。
+ *
+ * **これを呼ばないと、以後そのプロセスでは外部ホストからの `nvme connect`
+ * が必ずタイムアウトする。** 内蔵イニシエータのセッションがターゲットの
+ * accept を占有したままになるため。C1 で「リスナが居るポートには RST を
+ * 返さない」ようにしてあるので、**相手からは SYN が黙って捨てられるように
+ * しか見えない**(原因が分かりにくい)。
+ *
+ * 引数:
+ *   reason - ログに出す理由(NULL 可)
+ * 戻り値:
+ *   1=閉じた、0=元から繋がっていない
+ * コール元:
+ *   shell_ensure_tcp_session(), shell_tcpdisconnect()
+ * ===============================================================*/
+static int shell_tcp_session_close(const char *reason)
+{
+    if (!s_shell_tcp_connected) return 0;
+    if (reason) uart_printf("tcpdisconnect: %s\n", reason);
+    nvme_tcp_close(&s_nvme_ctx.io);
+    nvme_tcp_close(&s_nvme_ctx.admin);
+    s_nvme_ctx.io_connected = 0;
+    s_shell_tcp_connected   = 0;
+    /* 常駐 target が FIN を検出して次のクライアント待ちへ戻るまで回す。 */
+    uint64_t t0 = timer_now();
+    while (!timeout_ms(t0, 1500u)) {
+        job_scheduler_tick();
+        net_poll_all_and_dispatch();
+    }
+    return 1;
+}
+
+/*=================================================================
+ * シェルの `tcpdisconnect`。内蔵イニシエータのセッションを明示的に閉じ、
+ * 外部ホストから `nvme connect` できる状態へ戻す。
+ *
+ * コール元:
+ *   shell_dispatch()
+ * ===============================================================*/
+static void shell_tcpdisconnect(void)
+{
+    if (shell_tcp_session_close("内蔵イニシエータのセッションを閉じます")) {
+        uart_printf("tcpdisconnect: 完了 -- 外部ホストから接続できます\n");
+    } else {
+        uart_printf("tcpdisconnect: 内蔵イニシエータは接続していません\n");
+    }
+}
+
 static int shell_ensure_tcp_session(uint8_t want_hdgst, uint8_t want_ddgst, uint8_t want_ipv6)
 {
     /* ダイジェストは ICReq/ICResp でコネクション確立時に一度だけ合意する。
@@ -227,17 +277,7 @@ static int shell_ensure_tcp_session(uint8_t want_hdgst, uint8_t want_ddgst, uint
     if (s_shell_tcp_connected &&
         (s_nvme_ctx.req_hdgst != want_hdgst || s_nvme_ctx.req_ddgst != want_ddgst ||
          s_shell_tcp_ipv6 != want_ipv6)) {
-        uart_printf("tcpbench: digest/IP版の設定が変わったのでセッションを張り直します\n");
-        nvme_tcp_close(&s_nvme_ctx.io);
-        nvme_tcp_close(&s_nvme_ctx.admin);
-        s_nvme_ctx.io_connected = 0;
-        s_shell_tcp_connected   = 0;
-        /* 常駐 target が FIN を検出して次のクライアント待ちへ戻るまで回す。 */
-        uint64_t t0 = timer_now();
-        while (!timeout_ms(t0, 1500u)) {
-            job_scheduler_tick();
-            net_poll_all_and_dispatch();
-        }
+        shell_tcp_session_close("digest/IP版の設定が変わったのでセッションを張り直します");
     }
     if (s_shell_tcp_connected) return 0;
     s_nvme_ctx.req_hdgst = want_hdgst;
@@ -735,7 +775,72 @@ static void shell_rsttest(void)
     int ok6 = shell_rsttest_one("IPv6", &dst6, dead_port);
     netif_activate(self);
 
-    uart_printf("rsttest: %s\n", (ok4 && ok6) ? "PASS" : "NG");
+    /* ---- RST の検証(RFC 5961 3)----
+     * [3] 窓外の RST では切れない(陰性対照)。**正しい相手は窓外の RST を
+     *     送ってこないので、自分で撃ち込むしかない。**
+     * [4] 正しい seq の RST では切れる(陽性対照)。これが無いと
+     *     「そもそも RST を無視しているだけ」と区別がつかない。 */
+    int ok_rfc5961 = 0;
+    {
+        static tcp_conn_t s_srv2, s_cli2;
+        const uint16_t port = 6009u;
+        int listener = tcp_listen(port, peer);
+        if (listener < 0) {
+            uart_printf("rsttest: NG -- tcp_listen 失敗(RFC 5961 の検査)\n");
+        } else {
+            s_srv2.state = TCP_CLOSED;
+            s_cli2.state = TCP_CLOSED;
+            tcp_accept_begin(listener, &s_srv2);
+            netif_activate(self);
+            tcp_connect_begin_to(&s_cli2, &dst4, port);
+            int est = 0;
+            for (uint64_t t0 = timer_now(); !timeout_ms(t0, 3000u); ) {
+                netif_activate(self);
+                int r = tcp_connect_poll(&s_cli2);
+                net_poll_all_and_dispatch();
+                netif_activate(peer);
+                tcp_accept_ready_poll(listener);
+                if (r == 1) { est = 1; break; }
+                if (r < 0) break;
+            }
+            netif_activate(self);
+            if (!est) {
+                uart_printf("rsttest: NG -- RFC 5961 の検査用コネクションを張れず\n");
+            } else {
+                uint32_t dropped0 = g_tcp_rst_dropped_count;
+                /* [3] 受信ウィンドウのはるか先を指す RST */
+                tcp_debug_inject_rst(&s_cli2, s_cli2.rcv_seq + 1000000u);
+                for (uint64_t t0 = timer_now(); !timeout_ms(t0, 200u); ) {
+                    net_poll_all_and_dispatch();
+                    tcp_poll();
+                }
+                int survived = (s_cli2.state == TCP_ESTABLISHED);
+                int counted  = (g_tcp_rst_dropped_count > dropped0);
+                uart_printf("rsttest: %s [3] 窓外の RST(seq=RCV.NXT+1000000)-- "
+                            "接続は %s、破棄カウンタ %s\n",
+                            (survived && counted) ? "OK" : "NG",
+                            survived ? "生存" : "切断された",
+                            counted ? "増えた" : "増えていない");
+                /* [4] 正しい seq の RST */
+                tcp_debug_inject_rst(&s_cli2, s_cli2.rcv_seq);
+                for (uint64_t t0 = timer_now(); !timeout_ms(t0, 200u); ) {
+                    net_poll_all_and_dispatch();
+                    tcp_poll();
+                    if (s_cli2.state != TCP_ESTABLISHED) break;
+                }
+                int closed = (s_cli2.state != TCP_ESTABLISHED);
+                uart_printf("rsttest: %s [4] 陽性対照 -- seq=RCV.NXT の RST では %s\n",
+                            closed ? "OK" : "NG", closed ? "切断された" : "切れなかった");
+                ok_rfc5961 = (survived && counted && closed);
+            }
+            netif_activate(self);  tcp_close(&s_cli2);
+            netif_activate(peer);  tcp_close(&s_srv2);
+            tcp_unlisten(listener);
+            netif_activate(self);
+        }
+    }
+
+    uart_printf("rsttest: %s\n", (ok4 && ok6 && ok_rfc5961) ? "PASS" : "NG");
 }
 
 /*=================================================================
@@ -1234,6 +1339,103 @@ static void shell_tcptstest(void)
     uart_printf("tcptstest: %s (tcpts を %s、txdrop を %u へ復元)\n",
                 ok ? "PASS" : "NG", g_tcp_ts_enable ? "有効" : "無効",
                 (unsigned)g_tcp_tx_drop_every);
+}
+
+/*=================================================================
+ * シェルの `hdgstcorrupt`。次に送るヘッダダイジェストを N 個わざと壊す。
+ *
+ * **相手が誤りを検出して TermReq を返してくるかを確かめる唯一の手段。**
+ * 自作 ↔ 自作でも、Linux 相手でも同じように効く(`txdrop` はセグメントを
+ * 落とすだけで、中身は壊さない)。
+ *
+ * 引数:
+ *   args - "[t|i] <N>"。t=ターゲット側、i=イニシエータ側(既定は両方)
+ * コール元:
+ *   shell_dispatch()
+ * ===============================================================*/
+static void shell_hdgstcorrupt(char *args)
+{
+    while (*args == ' ') args++;
+    int to_target = 1, to_init = 1, to_verify = 0;
+    if (*args == 't') { to_init = 0; args++; }
+    else if (*args == 'i') { to_target = 0; args++; }
+    else if (*args == 'v') { to_init = 0; to_target = 0; to_verify = 1; args++; }
+    while (*args == ' ') args++;
+    if (*args >= '0' && *args <= '9') {
+        uint32_t n = (uint32_t)atoi(args);
+        if (to_target) g_nvmet_tcp_hdgst_corrupt = n;
+        if (to_init)   g_nvme_tcp_hdgst_corrupt  = n;
+        if (to_verify) g_nvmet_tcp_hdgst_verify_fail = n;
+    }
+    uart_printf("hdgstcorrupt: 残り target=%u initiator=%u verify=%u\n",
+                (unsigned)g_nvmet_tcp_hdgst_corrupt, (unsigned)g_nvme_tcp_hdgst_corrupt,
+                (unsigned)g_nvmet_tcp_hdgst_verify_fail);
+    uart_printf("hdgstcorrupt: TermReq target(送=%u 受=%u) initiator(送=%u 受=%u)\n",
+                (unsigned)g_nvmet_tcp_term_sent, (unsigned)g_nvmet_tcp_term_recv,
+                (unsigned)g_nvme_tcp_term_sent, (unsigned)g_nvme_tcp_term_recv);
+}
+
+/*=================================================================
+ * シェルの `termtest`。NVMe/TCP の Terminate Connection Request の検証。
+ *
+ *   [1] ヘッダダイジェストを壊すと**ターゲットが C2H TermReq を送る**
+ *   [2] イニシエータがそれを受け取る(受け取らずに黙って切れてはいけない)
+ *   [3] 陰性対照 -- 壊さなければ TermReq は 1 通も出ない
+ *
+ * **陰性対照が無いと「セッションを張り直すたびに TermReq が出ている」だけ
+ * かもしれない。**
+ *
+ * コール元:
+ *   shell_dispatch()
+ * ===============================================================*/
+static void shell_termtest(void)
+{
+    uart_printf("termtest: ヘッダダイジェスト有効のセッションで検査します\n");
+
+    /* ---- [3] 陰性対照を先に取る(壊さずに 1 往復)---- */
+    uint32_t t_sent0 = g_nvmet_tcp_term_sent, i_recv0 = g_nvme_tcp_term_recv;
+    if (shell_ensure_tcp_session(1u, 0u, 0u) != 0) {
+        uart_printf("termtest: NG -- hdgst 有効のセッションを張れませんでした\n");
+        return;
+    }
+    {   /* 小さな write を 1 回流して PDU を往復させる。 */
+        uint32_t cnt = 0, el = 0; uint64_t by = 0;
+        nvme_write_pipelined_run(&s_nvme_ctx, 1u, 0u, s_nvmetcp_buf,
+                                  4096u / s_nvme_ctx.lba_size, 300u, &cnt, &by, &el);
+    }
+    int quiet = (g_nvmet_tcp_term_sent == t_sent0 && g_nvme_tcp_term_recv == i_recv0);
+    uart_printf("termtest: %s [3] 陰性対照 -- 壊さなければ TermReq は出ない(送=%u 受=%u)\n",
+                quiet ? "OK" : "NG",
+                (unsigned)(g_nvmet_tcp_term_sent - t_sent0),
+                (unsigned)(g_nvme_tcp_term_recv - i_recv0));
+
+    /* ---- [1][2] イニシエータのヘッダダイジェストを 1 個壊す ---- */
+    uint32_t t_sent1 = g_nvmet_tcp_term_sent, i_recv1 = g_nvme_tcp_term_recv;
+    g_nvme_tcp_hdgst_corrupt = 1;
+    {   /* 小さな write を 1 回流して PDU を往復させる。 */
+        uint32_t cnt = 0, el = 0; uint64_t by = 0;
+        nvme_write_pipelined_run(&s_nvme_ctx, 1u, 0u, s_nvmetcp_buf,
+                                  4096u / s_nvme_ctx.lba_size, 300u, &cnt, &by, &el);
+    }
+    /* 相手が畳むまで少し回す。 */
+    for (uint64_t t0 = timer_now(); !timeout_ms(t0, 1000u); ) {
+        job_scheduler_tick();
+        net_poll_all_and_dispatch();
+    }
+    g_nvme_tcp_hdgst_corrupt = 0;   /* **必ず戻す** */
+
+    uint32_t sent = g_nvmet_tcp_term_sent - t_sent1;
+    uint32_t recv = g_nvme_tcp_term_recv - i_recv1;
+    uart_printf("termtest: %s [1] ターゲットが C2H TermReq を送った(%u 通)\n",
+                sent > 0 ? "OK" : "NG", (unsigned)sent);
+    uart_printf("termtest: %s [2] イニシエータが受け取った(%u 通)\n",
+                recv > 0 ? "OK" : "NG", (unsigned)recv);
+
+    /* セッションは壊れているので閉じておく(次の tcpbench は張り直す)。 */
+    shell_tcp_session_close("TermReq でセッションが終わったので閉じます");
+
+    uart_printf("termtest: %s\n",
+                (quiet && sent > 0 && recv > 0) ? "PASS" : "NG");
 }
 
 /*=================================================================
@@ -5166,6 +5368,12 @@ static void shell_dispatch(char *line, int s0, int s1)
         }
         s_shell_nvmet_started = 1;
         uart_printf("nvmet: ターゲット常駐起動 (pf1, port %u) -- 接続待ち\n", port);
+    } else if (strncmp(line, "tcpdisconnect", 13) == 0) {
+        shell_tcpdisconnect();
+    } else if (strncmp(line, "hdgstcorrupt", 12) == 0) {
+        shell_hdgstcorrupt(line + 12);
+    } else if (strncmp(line, "termtest", 8) == 0) {
+        shell_termtest();
     } else if (strncmp(line, "tcpbench", 8) == 0) {
         shell_tcpbench(line + 8);
     } else if (strncmp(line, "bench", 5) == 0) {
@@ -5282,6 +5490,9 @@ static void shell_dispatch(char *line, int s0, int s1)
                     "  tcpkeepalive [on|off|<idle秒> <間隔秒> <回数>] TCP Keepalive(既定 7200/75/9)+統計\n"
                     "  keepalivetest                         Keepaliveのprobeと切断(陰性/陽性対照つき)\n"
                     "  ackdrop [N]                           次のデータ無しセグメントをN個捨てる\n"
+                    "  tcpdisconnect                         内蔵イニシエータのセッションを閉じる(外部接続の前に)\n"
+                    "  hdgstcorrupt [t|i] [N]                ヘッダダイジェストをN個わざと壊す(TermReqの検証)\n"
+                    "  termtest                              NVMe/TCP Terminate Connection Request(陰性対照つき)\n"
                     "  qploop [N]                            RC QPの作成/破棄をN回繰り返しFWリソース枯渇を見る\n"
                     "  nvmediscover [dump]                   Discovery Log Pageを取得(dumpで16進出力)\n"
                     "  nvmet [port] | jobs | help | quit    (↑↓で履歴呼び出し)\n"

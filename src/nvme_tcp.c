@@ -51,6 +51,10 @@ uint32_t nvme_tcp_ddgst_len(const nvme_tcp_conn_t *c, uint32_t dlen)
     return (c->ddgst && dlen > 0u) ? NVME_TCP_DGST_LEN : 0u;
 }
 
+volatile uint32_t g_nvme_tcp_hdgst_corrupt;  /* 検証用(シェルの `hdgstcorrupt`)*/
+volatile uint32_t g_nvme_tcp_term_sent;
+volatile uint32_t g_nvme_tcp_term_recv;
+
 /*=================================================================
  * ヘッダダイジェストが有効なら buf[0..hlen) の CRC32C を buf[hlen..+4) へ
  * 書く。**呼び出し元は先に flags/plen/pdo など hlen 範囲の全フィールドを
@@ -70,6 +74,12 @@ uint32_t nvme_tcp_append_hdgst(nvme_tcp_conn_t *c, uint8_t *buf, uint32_t hlen)
 {
     if (!c->hdgst) return 0u;
     uint32_t crc = ~crc32c(0xFFFFFFFFu, buf, hlen);  /* 最終反転(crc32c.hコメント参照) */
+    if (g_nvme_tcp_hdgst_corrupt != 0u) {
+        /* 検証用のヘッダダイジェスト破壊(シェルの `hdgstcorrupt`)。
+         * ターゲット側の同名の仕掛けと対。 */
+        g_nvme_tcp_hdgst_corrupt--;
+        crc ^= 0x00000001u;
+    }
     wr32le(&buf[hlen], crc);
     return NVME_TCP_DGST_LEN;
 }
@@ -420,6 +430,41 @@ int nvme_tcp_recv_poll(nvme_tcp_conn_t *c, nvme_tcp_xfer_t *x)
  * コール元:
  *   nvme_connect_job_step()
  * ===============================================================*/
+/*=================================================================
+ * Terminate Connection Request(H2C TermReq)を送る。
+ *
+ * イニシエータ側でプロトコル上の致命的な誤りを見つけたときに、TCP を
+ * 閉じる前に理由(FES)を伝える。ターゲット側の nvmet_tcp_send_term() と
+ * 対になる(組み立ては nvme_tcp_pdu.h の共通ヘルパ)。
+ *
+ * 引数:
+ *   c       - 対象コネクション
+ *   fes     - Fatal Error Status(NVME_TCP_FES_*)
+ *   fei     - Fatal Error Information(該当が無ければ 0)
+ *   pdu     - 原因になった PDU の先頭(NULL 可)
+ *   pdu_len - そのバイト数
+ * 戻り値:
+ *   0=送信できた、-1=失敗
+ * コール元:
+ *   nvme_exec_step(), nvme_pipeline_rx_step()
+ * ===============================================================*/
+int nvme_tcp_send_term(nvme_tcp_conn_t *c, uint16_t fes, uint32_t fei,
+                        const uint8_t *pdu, uint32_t pdu_len)
+{
+    static uint8_t s_term_buf[NVME_TCP_TERM_PLEN_MAX] __attribute__((aligned(64)));
+    uint32_t total = nvme_tcp_build_term(s_term_buf, NVME_TCP_PDU_H2C_TERM,
+                                          fes, fei, pdu, pdu_len);
+    g_nvme_tcp_term_sent++;
+    uart_printf("[NVMe/TCP] H2C TermReq 送信 (fes=0x%02x fei=0x%x len=%u)\n",
+                (unsigned)fes, (unsigned)fei, (unsigned)total);
+    if (c->tcp.state != TCP_ESTABLISHED) return -1;
+    if (tcp_send(&c->tcp, s_term_buf, (uint16_t)total) != (int)total) {
+        uart_printf("[!] NVMe/TCP: H2C TermReq 送信失敗\n");
+        return -1;
+    }
+    return 0;
+}
+
 int nvme_tcp_send_icreq(nvme_tcp_conn_t *c)
 {
     c->maxdata      = 8192u;  /* ICRespが届くまでの暫定値 */

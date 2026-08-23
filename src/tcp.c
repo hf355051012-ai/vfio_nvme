@@ -223,6 +223,12 @@ volatile uint32_t g_tcp_keepalive_reply_count;  /* 相手の probe に ACK を�
 volatile uint32_t g_tcp_ack_drop_next;
 volatile uint32_t g_tcp_ack_dropped_count;
 
+/* RST の検証(RFC 5961 3)。窓外で捨てた数と、窓内だが RCV.NXT でないため
+ * challenge ACK を返した数。**検証を入れる前は 4-tuple 一致だけで畳んで
+ * いた**ので、前の接続の遅延 RST が生きた接続を殺せた。 */
+volatile uint32_t g_tcp_rst_dropped_count;
+volatile uint32_t g_tcp_rst_challenge_count;
+
 /* **実際に送り直したセグメントの数**。g_tcp_retransmit_count は「再送を
  * 始めた回数」なので、Go-Back-N と SACK の差(穴の後ろまで送り直すか)は
  * こちらでないと見えない。 */
@@ -1834,6 +1840,27 @@ static void tcp_send_bare_rst(const netaddr_t *local_ip, uint16_t local_port,
         tcp_send_bare(local_ip, local_port, remote_ip, remote_port,
                        TCP_FLAG_RST | TCP_FLAG_ACK, 0u, ack);
     }
+}
+
+/*=================================================================
+ * 指定コネクション宛に、相手を騙って RST を 1 つ撃ち込む(検証用)。
+ *
+ * **RST の検証(RFC 5961)には「窓外の RST では切れない」という陰性対照が
+ * 要る**が、正しい相手は窓外の RST を送ってこないので、自分で作るしかない。
+ * `txdrop` / `synackdrop` と同じ恒久的な検証道具。
+ *
+ * 引数:
+ *   victim - 撃ち込む先のコネクション
+ *   seq    - RST に載せるシーケンス番号
+ * コール元:
+ *   shell_rsttest()
+ * ===============================================================*/
+void tcp_debug_inject_rst(const tcp_conn_t *victim, uint32_t seq)
+{
+    /* 送信元と宛先を入れ替えて、相手から届いたように見せる。 */
+    tcp_send_bare((const netaddr_t *)&victim->remote_ip, victim->remote_port,
+                   (const netaddr_t *)&victim->local_ip, victim->local_port,
+                   TCP_FLAG_RST, seq, 0u);
 }
 
 /*=================================================================
@@ -4325,6 +4352,37 @@ void tcp_input_addr(const uint8_t *pkt, uint16_t len,
     uint16_t payload_len = (uint16_t)(len - hdr_len);
 
     if (flags & TCP_FLAG_RST) {
+        /* **RST はシーケンス番号を検証してから受け入れる**(RFC 5961 3)。
+         * 4-tuple が一致しただけで畳むと、**前の接続の遅延 RST が生きた
+         * 接続を殺す**(4-tuple は使い回される)。窓外の RST は捨て、
+         * 窓内だが RCV.NXT でないものには challenge ACK を返して確認する。
+         *
+         * SYN_SENT だけは別扱い。受信ウィンドウがまだ無いので、
+         * RFC 793 どおり「自分の SYN を ACK しているか」で判断する
+         * (閉じたポートへ繋ぎに行ったときの RST がこれ。`rsttest`)。 */
+        int rst_ok;
+        if (conn->state == TCP_SYN_SENT) {
+            rst_ok = (flags & TCP_FLAG_ACK) && (ack == priv->expected_ack);
+        } else if (seq == conn->rcv_seq) {
+            rst_ok = 1;
+        } else {
+            uint32_t rwnd = (uint32_t)priv->last_win_sent;
+            if (priv->wscale_enabled) rwnd <<= TCP_RCV_WSCALE;
+            if (rwnd == 0) rwnd = 1u;   /* 窓 0 でも RCV.NXT の 1 個だけは窓内 */
+            int in_window = !tcp_seq_lt(seq, conn->rcv_seq) &&
+                             tcp_seq_lt(seq, conn->rcv_seq + rwnd);
+            if (in_window) {
+                /* 窓内だが RCV.NXT ではない -- challenge ACK を返して、
+                 * 本物なら相手が正しい seq で送り直すのを待つ。 */
+                g_tcp_rst_challenge_count++;
+                tcp_send_segment(conn, priv, TCP_FLAG_ACK, NULL, 0);
+            } else {
+                g_tcp_rst_dropped_count++;
+            }
+            rst_ok = 0;
+        }
+        if (!rst_ok) return;
+
         uart_printf("[TCP] RST受信、コネクションを閉じる\n");
         conn->state = TCP_CLOSED;
         for (unsigned i = 0; i < TCP_MAX_CONNS; i++) {

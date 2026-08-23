@@ -1152,6 +1152,9 @@ typedef enum {
     NADM_ST_RECV_DATA,
     NADM_ST_RECV_DDGST,
     NADM_ST_DISPATCH,
+    /* 相手から H2C TermReq が来たときに FES を読むためだけの終端状態。
+     * ヘッダ 8 バイトの先に FES があるので、あと 16 バイト読んでから畳む。 */
+    NADM_ST_RECV_TERM,
 } nvmet_admin_state_t;
 
 #define NADM_STATE_NAME_COUNT (sizeof(NADM_STATE_NAMES) / sizeof(NADM_STATE_NAMES[0]))
@@ -1410,14 +1413,45 @@ static job_result_t nvmet_admin_job_step(job_t *self)
         int r = nvmet_tcp_recv_poll(&ctx->admin, &jc->xfer);
         if (r < 0) return JOB_WAITING;  /* 同じstate/xferのまま次tickへ(desync回避、上記コメント参照) */
         if (r == 0) return JOB_WAITING;
+        if (jc->hdr_buf[0] == NVME_TCP_PDU_H2C_TERM) {
+            /* **相手が致命的な誤りを見つけて理由を伝えてきた。** FES は
+             * 共通ヘッダ(8 バイト)の先にあるので、あと 16 バイト読んでから
+             * 記録して畳む(相手はこの後 TCP を閉じる)。 */
+            nvmet_tcp_xfer_reset(&jc->xfer, jc->icreq_buf, 16u);
+            self->state = NADM_ST_RECV_TERM;
+            return JOB_WAITING;
+        }
         if (jc->hdr_buf[0] != NVME_TCP_PDU_CMD) {
             uart_printf("[!] nvmet: admin想定外のPDU種別 (type=%u、CapsuleCmdを期待)\n", jc->hdr_buf[0]);
+            nvmet_tcp_send_term(&ctx->admin, NVME_TCP_FES_INVALID_PDU_HDR, 0,
+                                 jc->hdr_buf, NVME_TCP_HDR_LEN);
             nvmet_tcp_xfer_reset(&jc->xfer, jc->hdr_buf, NVME_TCP_HDR_LEN);
             return JOB_WAITING;
         }
         nvmet_tcp_xfer_reset(&jc->xfer, jc->sqe_buf, NVME_SQE_LEN);
         self->state = NADM_ST_RECV_SQE;
         return JOB_WAITING;
+    }
+
+    case NADM_ST_RECV_TERM: {
+        /* H2C TermReq の FES/FEI を読み終えたら記録して畳む。読み切れない
+         * まま相手が閉じた場合も、次の tick で ARM へ戻る経路に乗る。 */
+        int r = nvmet_tcp_recv_poll(&ctx->admin, &jc->xfer);
+        if (r < 0) {
+            return nvmet_admin_session_finish(self, jc, ctx,
+                                              "セッション終了(H2C TermReq の途中で切断)");
+        }
+        if (r == 0) return JOB_WAITING;
+        /* icreq_buf の先頭が PDU オフセット 8。fes(le16)+ feil(le16)+ feiu(le16)。 */
+        uint16_t fes = rd16le(&jc->icreq_buf[0]);
+        uint32_t fei = (uint32_t)rd16le(&jc->icreq_buf[2]) |
+                       ((uint32_t)rd16le(&jc->icreq_buf[4]) << 16);
+        g_nvmet_tcp_term_recv++;
+        uart_printf("[!] nvmet: H2C TermReq 受信 (fes=0x%02x fei=0x%x) -- "
+                    "相手がプロトコル誤りを検出しました\n",
+                    (unsigned)fes, (unsigned)fei);
+        return nvmet_admin_session_finish(self, jc, ctx,
+                                          "セッション終了(H2C TermReq 受信)");
     }
 
     case NADM_ST_RECV_SQE: {
@@ -1471,9 +1505,13 @@ static job_result_t nvmet_admin_job_step(job_t *self)
         if (r < 0 || r == 0) return JOB_WAITING;
         if (nvmet_tcp_verify_hdgst(&ctx->admin, jc->hdr_buf, NVME_TCP_HDR_LEN,
                                     jc->sqe_buf, NVME_SQE_LEN, jc->dgst_buf) != 0) {
-            nvmet_tcp_xfer_reset(&jc->xfer, jc->hdr_buf, NVME_TCP_HDR_LEN);
-            self->state = NADM_ST_RECV_HDR;
-            return JOB_WAITING;
+            /* **ヘッダダイジェストの不一致は致命的**(NVMe/TCP)。ヘッダが
+             * 壊れている以上、次の PDU がどこから始まるか分からないので、
+             * 読み直しても desync するだけ。理由を伝えて畳む。 */
+            nvmet_tcp_send_term(&ctx->admin, NVME_TCP_FES_HDR_DIGEST_ERR, 0,
+                                 jc->hdr_buf, NVME_TCP_HDR_LEN);
+            return nvmet_admin_session_finish(self, jc, ctx,
+                                              "セッション終了(ヘッダダイジェスト不一致)");
         }
         if (jc->dlen > 0) {
             nvmet_tcp_xfer_reset(&jc->xfer, jc->data_buf, jc->dlen);
@@ -2366,6 +2404,9 @@ static void nvmet_io_rx_upcall(void *arg, const volatile uint8_t *data, uint16_t
 
             if (nvmet_tcp_verify_hdgst(&ctx->io, jc->prx_hdr, NVME_TCP_HDR_LEN,
                                         jc->prx_psh, jc->prx_psh_need, jc->prx_dgst) != 0) {
+                /* 理由を伝えてから畳む(prx_error は上位が拾って終了させる)。 */
+                nvmet_tcp_send_term(&ctx->io, NVME_TCP_FES_HDR_DIGEST_ERR, 0,
+                                     jc->prx_hdr, NVME_TCP_HDR_LEN);
                 jc->prx_error = 1;
                 break;
             }
@@ -2595,8 +2636,21 @@ static job_result_t nvmet_io_job_step_impl(job_t *self)
         } else if (pdu_type == NVME_TCP_PDU_H2C_DATA) {
             nvmet_tcp_xfer_reset(&jc->xfer, jc->h2c_rest_buf, 16u);
             self->state = NIO_ST_RECV_H2C_REST;
+        } else if (pdu_type == NVME_TCP_PDU_H2C_TERM) {
+            /* **相手が致命的な誤りを見つけて理由を伝えてきた。** IO キューは
+             * 畳むだけでよい(FES の中身は admin 側で読む -- IO の受信は
+             * push 型 upcall と混在していて、追加の読み出し状態を足すと
+             * desync の扱いが複雑になる)。 */
+            g_nvmet_tcp_term_recv++;
+            uart_printf("[!] nvmet: IOキューで H2C TermReq 受信 -- "
+                        "相手がプロトコル誤りを検出しました\n");
+            return nvmet_io_job_end(self, ctx, 1, "H2C TermReq 受信");
         } else {
             uart_printf("[!] nvmet: IOキューで想定外のPDU種別 (type=%u)\n", pdu_type);
+            /* **相手に理由を伝えてから畳む。** 伝えないと相手のログには
+             * 「接続が切れた」としか残らない。 */
+            nvmet_tcp_send_term(&ctx->io, NVME_TCP_FES_INVALID_PDU_HDR, 0,
+                                 jc->hdr_buf, NVME_TCP_HDR_LEN);
             nvmet_io_debug_desync(ctx, "想定外のPDU種別");
             return nvmet_io_job_end(self, ctx, 1, "desync検出(想定外のPDU種別)");
         }
@@ -2647,9 +2701,10 @@ static job_result_t nvmet_io_job_step_impl(job_t *self)
         if (r == 0) return JOB_WAITING;
         if (nvmet_tcp_verify_hdgst(&ctx->io, jc->hdr_buf, NVME_TCP_HDR_LEN,
                                     jc->sqe_buf, NVME_SQE_LEN, jc->dgst_buf) != 0) {
-            nvmet_tcp_xfer_reset(&jc->xfer, jc->hdr_buf, NVME_TCP_HDR_LEN);
-            self->state = NIO_ST_RECV_PDU_HDR;
-            return JOB_WAITING;
+            /* ヘッダダイジェストの不一致は致命的(admin 側と同じ理由)。 */
+            nvmet_tcp_send_term(&ctx->io, NVME_TCP_FES_HDR_DIGEST_ERR, 0,
+                                 jc->hdr_buf, NVME_TCP_HDR_LEN);
+            return nvmet_io_job_end(self, ctx, 1, "ヘッダダイジェスト不一致");
         }
         if (jc->dlen > 0) {
             nvmet_tcp_xfer_reset(&jc->xfer, jc->cmd_data_dst, jc->dlen);
@@ -2724,9 +2779,9 @@ static job_result_t nvmet_io_job_step_impl(job_t *self)
         if (r == 0) return JOB_WAITING;
         if (nvmet_tcp_verify_hdgst(&ctx->io, jc->hdr_buf, NVME_TCP_HDR_LEN,
                                     jc->h2c_rest_buf, 16u, jc->dgst_buf) != 0) {
-            nvmet_tcp_xfer_reset(&jc->xfer, jc->hdr_buf, NVME_TCP_HDR_LEN);
-            self->state = NIO_ST_RECV_PDU_HDR;
-            return JOB_WAITING;
+            nvmet_tcp_send_term(&ctx->io, NVME_TCP_FES_HDR_DIGEST_ERR, 0,
+                                 jc->hdr_buf, NVME_TCP_HDR_LEN);
+            return nvmet_io_job_end(self, ctx, 1, "ヘッダダイジェスト不一致(H2CData)");
         }
         return nvmet_io_job_h2c_validate(self, jc, ctx);
     }

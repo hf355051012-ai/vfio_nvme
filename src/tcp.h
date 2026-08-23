@@ -73,6 +73,10 @@ extern volatile uint32_t g_tcp_keepalive_reply_count;  /* 相手の probe に応
 extern volatile uint32_t g_tcp_ack_drop_next;
 extern volatile uint32_t g_tcp_ack_dropped_count;
 
+/* RST の検証(RFC 5961 3)。窓外で捨てた数と challenge ACK を返した数。 */
+extern volatile uint32_t g_tcp_rst_dropped_count;
+extern volatile uint32_t g_tcp_rst_challenge_count;
+
 uint32_t tcp_rx_buf_size(void);
 
 int  tcp_abort_requested(void);
@@ -225,6 +229,10 @@ int tcp_conn_ts_info(const tcp_conn_t *conn, uint64_t *srtt_us, uint32_t *rto_ms
 
 /* 対象コネクションで SACK を合意しているか(シェルの表示用)。 */
 int tcp_conn_sack_enabled(const tcp_conn_t *conn);
+
+/* 検証用: 相手を騙って victim へ RST を 1 つ撃ち込む(`rsttest` の陰性対照)。
+ * 正しい相手は窓外の RST を送ってこないので、自分で作るしかない。 */
+void tcp_debug_inject_rst(const tcp_conn_t *victim, uint32_t seq);
 
 void tcp_debug_dump_rx(const tcp_conn_t *conn);
 

@@ -59,4 +59,14 @@ int nvmet_tcp_verify_ddgst(const nvmet_tcp_conn_t *c,
 
 int nvmet_tcp_send_icresp(nvmet_tcp_conn_t *c, const uint8_t icreq_buf[NVME_TCP_ICREQ_LEN]);
 
+/* 検証用: 次に送る N 個のヘッダダイジェストをわざと壊す。 */
+extern volatile uint32_t g_nvmet_tcp_hdgst_corrupt;
+extern volatile uint32_t g_nvmet_tcp_hdgst_verify_fail;
+extern volatile uint32_t g_nvmet_tcp_term_sent;
+extern volatile uint32_t g_nvmet_tcp_term_recv;
+
+/* 致命的なプロトコル誤りを見つけたとき、TCP を閉じる前に理由(FES)を送る。 */
+int nvmet_tcp_send_term(nvmet_tcp_conn_t *c, uint16_t fes, uint32_t fei,
+                         const uint8_t *pdu, uint32_t pdu_len);
+
 #endif /* NVMET_TCP_H */
