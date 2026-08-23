@@ -739,6 +739,279 @@ static void shell_rsttest(void)
 }
 
 /*=================================================================
+ * 「受け皿を用意する前に届いた SYN」がどう扱われるかを 1 回測る
+ * (backlogtest の陽性/陰性で共有する本体)。
+ *
+ * listen だけして tcp_accept_begin() を呼ばずに接続を試み、確立するまでの
+ * 時間を測る。待ち行列があれば即座に確立し、無ければ SYN は捨てられて
+ * 相手の SYN 再送(TCP_INITIAL_RTO_MS=500ms)を待つことになる。
+ * arm_after_ms を過ぎたら受け皿を用意するので、どちらの場合も最後は
+ * accept まで進む(そこまでの経過時間が判定材料)。
+ *
+ * 引数:
+ *   label        - 表示用のラベル
+ *   self         - クライアント役インターフェース
+ *   srv_if       - サーバ役インターフェース
+ *   dst          - 接続先
+ *   port         - 使用ポート
+ *   arm_after_ms - 何 ms 後に tcp_accept_begin() を呼ぶか
+ *   out_estab_us - NULL 可。クライアント側で確立するまでの時間(us)
+ *   out_accept_us- NULL 可。サーバ側で accept が返るまでの時間(us)
+ * 戻り値:
+ *   1=accept まで進んで 64KB が一致した、0=失敗
+ * コール元:
+ *   shell_backlogtest()
+ * ===============================================================*/
+static int shell_backlog_once(const char *label, netif_t *self, netif_t *srv_if,
+                               const netaddr_t *dst, uint16_t port,
+                               uint32_t arm_after_ms,
+                               uint32_t *out_estab_us, uint32_t *out_accept_us)
+{
+    static tcp_conn_t s_srv, s_cli;
+    static uint8_t tx[65536];
+    static uint8_t rx[65536];
+
+    int listener = tcp_listen(port, srv_if);
+    if (listener < 0) {
+        uart_printf("backlogtest: NG(%s) -- tcp_listen 失敗\n", label);
+        return 0;
+    }
+    s_srv.state = TCP_CLOSED;
+    s_cli.state = TCP_CLOSED;
+
+    /* **ここでは tcp_accept_begin() を呼ばない**(受け皿の無い隙間の再現)。 */
+    netif_activate(self);
+    tcp_connect_begin_to(&s_cli, dst, port);
+
+    for (unsigned i = 0; i < sizeof(tx); i++) tx[i] = (uint8_t)(i * 11u + 5u);
+
+    uint64_t t0 = timer_now();
+    int established = 0, armed = 0, accepted = 0, sent = -1;
+    uint32_t estab_us = 0, accept_us = 0;
+    while (!timeout_ms(t0, 5000u)) {
+        if (!armed && timeout_ms(t0, arm_after_ms)) {
+            netif_activate(srv_if);
+            tcp_accept_begin(listener, &s_srv);
+            armed = 1;
+            netif_activate(self);
+        }
+        if (!established) {
+            netif_activate(self);
+            int r = tcp_connect_poll(&s_cli);
+            if (r == 1) { established = 1; estab_us = (uint32_t)get_us_from(t0); }
+            else if (r < 0) break;
+        }
+        if (established && sent < 0 && !armed) {
+            /* **accept される前に**データを流す。待ち行列の中のコネクション
+             * でも受信は動いている(s_conns[] に居るので rx_buf へ積まれる)。
+             * 引き渡しでプライベート状態が失われるとここが不一致になる。 */
+            netif_activate(self);
+            sent = tcp_send(&s_cli, tx, sizeof(tx));
+        }
+        if (armed && !accepted) {
+            netif_activate(srv_if);
+            if (tcp_accept_ready_poll(listener) == 1) {
+                accepted = 1; accept_us = (uint32_t)get_us_from(t0);
+            }
+        }
+        net_poll_all_and_dispatch();
+        if (established && accepted) break;
+    }
+    netif_activate(self);
+
+    if (out_estab_us)  *out_estab_us  = estab_us;
+    if (out_accept_us) *out_accept_us = accept_us;
+
+    if (!established || !accepted) {
+        uart_printf("backlogtest: NG(%s) -- 確立=%d accept=%d (client state=%d server state=%d)\n",
+                    label, established, accepted, (int)s_cli.state, (int)s_srv.state);
+        netif_activate(self); tcp_close(&s_cli);
+        netif_activate(srv_if); tcp_close(&s_srv);
+        tcp_unlisten(listener);
+        netif_activate(self);
+        return 0;
+    }
+
+    /* まだ送っていなければここで送る(陰性対照は accept の後に確立するので
+     * この経路を通る)。フルサイズのセグメントが何本も出る大きさにする。 */
+    if (sent < 0) {
+        netif_activate(self);
+        sent = tcp_send(&s_cli, tx, sizeof(tx));
+    }
+
+    uint32_t got = 0;
+    uint64_t t1 = timer_now();
+    while (sent == (int)sizeof(tx) && got < sizeof(tx) && !timeout_ms(t1, 3000u)) {
+        netif_activate(srv_if);
+        int n = tcp_recv(&s_srv, rx + got, (uint32_t)sizeof(rx) - got, 20u);
+        if (n > 0) got += (uint32_t)n;
+        else if (n < 0) break;
+        net_poll_all_and_dispatch();
+    }
+    int match = (got == sizeof(tx));
+    for (uint32_t i = 0; match && i < got; i++) {
+        if (rx[i] != tx[i]) match = 0;
+    }
+
+    netif_activate(self);  tcp_close(&s_cli);
+    netif_activate(srv_if); tcp_close(&s_srv);
+    tcp_unlisten(listener);
+    netif_activate(self);
+
+    uart_printf("backlogtest: %s -- 確立まで %uus / accept まで %uus / 64KB %s(%u バイト受信)\n",
+                label, (unsigned)estab_us, (unsigned)accept_us,
+                match ? "一致" : "不一致", (unsigned)got);
+    return match;
+}
+
+/*=================================================================
+ * シェルの `backlogtest`。listen backlog(段階 23 = C5)の検証。
+ *
+ * 「受け皿(tcp_accept_begin)を用意する前に SYN が届く」状況を作り、
+ *   [1] 待ち行列が有効なら SYN 再送を待たずに確立する(陽性)
+ *   [2] 待ち行列を 0 にすると SYN が捨てられ、相手の SYN 再送
+ *       (500ms)まで確立しない(陰性対照)
+ * を**経過時間で**判定する。単に「最後は接続できた」を見るだけでは、
+ * backlog が無くても SYN 再送で最終的に成功するので退行を検出できない
+ * (rsttest と同じ考え方)。
+ *
+ * コール元:
+ *   shell_dispatch()
+ * ===============================================================*/
+static void shell_backlogtest(void)
+{
+    const uint16_t port = 6002u;          /* nvmet(4421)/tcp6test(6000)/rsttest(6001)と別 */
+    const uint32_t arm_after_ms  = 1200u; /* SYN 再送(500ms)より後に受け皿を用意する */
+    const uint32_t fast_limit_us = 200000u; /* SYN 1 回ぶんの RTO より十分短いこと */
+
+    uint8_t peer_ll[16];
+    netif_t *peer = shell_peer_ll6(peer_ll);
+    netif_t *self = g_active_ctx;
+    if (!peer || !self) {
+        uart_printf("backlogtest: 対向インターフェースが見つかりません(net init mlx5 が必要)\n");
+        return;
+    }
+    uint32_t peer_ip = (net_active_ip() == 0xC0A8650Au) ? 0xC0A8650Bu : 0xC0A8650Au;
+    netaddr_t dst4 = netaddr_v4(peer_ip);
+
+    uint32_t saved_depth = g_tcp_backlog_max;
+    uint32_t before_accept = g_tcp_backlog_accept_count;
+
+    uart_printf("backlogtest: client=%s server=%s port=%u(受け皿は %ums 後に用意)\n",
+                self->name, peer->name, (unsigned)port, (unsigned)arm_after_ms);
+
+    /* [1] 陽性: 待ち行列が有効。受け皿が無くても SYN を積んで確立まで進む。 */
+    tcp_backlog_set_max(tcp_backlog_capacity());
+    uint32_t estab1 = 0, accept1 = 0;
+    int ok1 = shell_backlog_once("[1] backlog 有効", self, peer, &dst4, port,
+                                  arm_after_ms, &estab1, &accept1);
+    if (ok1 && estab1 > fast_limit_us) {
+        uart_printf("backlogtest: NG -- backlog 有効なのに確立まで %uus かかりました"
+                    "(SYN 再送待ちの疑い、期待 <%uus)\n",
+                    (unsigned)estab1, (unsigned)fast_limit_us);
+        ok1 = 0;
+    }
+    if (ok1 && g_tcp_backlog_accept_count == before_accept) {
+        uart_printf("backlogtest: NG -- 待ち行列からの引き渡しが 1 度も起きていません"
+                    "(隙間に当たっていない)\n");
+        ok1 = 0;
+    }
+
+    /* [2] 陰性対照: 待ち行列を 0 にすると SYN は捨てられ、SYN 再送を待つ。 */
+    tcp_backlog_set_max(0);
+    uint32_t estab2 = 0, accept2 = 0;
+    int ok2 = shell_backlog_once("[2] backlog 0(陰性対照)", self, peer, &dst4, port,
+                                  arm_after_ms, &estab2, &accept2);
+    if (ok2 && estab2 < fast_limit_us) {
+        uart_printf("backlogtest: NG -- backlog 0 なのに %uus で確立しました"
+                    "(SYN を取りこぼしていない = 陰性対照になっていない)\n",
+                    (unsigned)estab2);
+        ok2 = 0;
+    }
+
+    /* [3] SYN|ACK を 1 個だけ落として、相手の SYN 再送に SYN|ACK を送り直す
+     *     経路を通す。送り直さない実装ではこの接続は永久に確立しない
+     *     (相手は SYN を再送し続け、こちらは SYN_RCVD のまま黙る)。
+     *     受け皿は最初から用意する(この検査は backlog とは独立)。 */
+    tcp_backlog_set_max(tcp_backlog_capacity());
+    uint32_t before_retx = g_tcp_synack_retx_count;
+    g_tcp_synack_drop_next = 1;
+    uint32_t estab3 = 0, accept3 = 0;
+    int ok3 = shell_backlog_once("[3] SYN|ACK を 1 個落とす", self, peer, &dst4, port,
+                                  0u /* すぐ arm する */, &estab3, &accept3);
+    if (g_tcp_synack_retx_count == before_retx) {
+        uart_printf("backlogtest: NG -- SYN|ACK の送り直しが起きていません"
+                    "(落とせていない = 陽性対照になっていない)\n");
+        ok3 = 0;
+    }
+    g_tcp_synack_drop_next = 0;  /* **必ず戻す** */
+
+    tcp_backlog_set_max(saved_depth);  /* **必ず元に戻す**(txdrop と同じ注意) */
+
+    uart_printf("backlogtest: 確立まで 有効=%uus / 無効=%uus (差 %uus) / SYN|ACK 落とし=%uus\n",
+                (unsigned)estab1, (unsigned)estab2,
+                (unsigned)((estab2 > estab1) ? (estab2 - estab1) : 0u),
+                (unsigned)estab3);
+    uart_printf("backlogtest: %s (backlog 深さを %u へ復元)\n",
+                (ok1 && ok2 && ok3) ? "PASS" : "NG", (unsigned)g_tcp_backlog_max);
+}
+
+/*=================================================================
+ * シェルの `backlog`。listen backlog の深さの表示/変更(0=無効)。
+ *
+ * 0 にすると「受け皿が用意されているときだけ SYN を受理する」従来の
+ * 挙動へ戻る。**戻し忘れると以後の接続確立が SYN 再送待ちになる**ので
+ * 注意(txdrop と同じ性質の恒久デバッグ機能)。
+ *
+ * 引数:
+ *   args - 深さ。省略時は現在値と統計を表示
+ * コール元:
+ *   shell_dispatch()
+ * ===============================================================*/
+static void shell_backlog(char *args)
+{
+    while (*args == ' ') args++;
+    if (*args >= '0' && *args <= '9') {
+        tcp_backlog_set_max((unsigned)atoi(args));
+    }
+    unsigned waiting = 0, estab = 0;
+    tcp_backlog_stats(&waiting, &estab);
+    if (g_tcp_backlog_max == 0u) {
+        uart_printf("backlog: 無効(受け皿が用意されているときだけ SYN を受理)\n");
+    } else {
+        uart_printf("backlog: 深さ %u (上限 %u)\n",
+                    (unsigned)g_tcp_backlog_max, tcp_backlog_capacity());
+    }
+    uart_printf("backlog: 待機中=%u(うち確立済み=%u) 引き渡し=%u 満杯で破棄=%u\n",
+                waiting, estab,
+                (unsigned)g_tcp_backlog_accept_count,
+                (unsigned)g_tcp_backlog_overflow_count);
+}
+
+/*=================================================================
+ * シェルの `synackdrop`。次に送る SYN|ACK を N 個だけ捨てる。
+ *
+ * `txdrop` はデータを持つセグメントしか捨てないので、握手そのものを
+ * 落として「相手の SYN 再送に SYN|ACK を送り直す」経路を通すにはこれが要る。
+ * **戻し忘れると以後の受動 open が全部 1 回ぶん遅れる**(N は使うたびに
+ * 減るので自然に 0 へ戻るが、大きな値を入れたときは注意)。
+ *
+ * 引数:
+ *   args - N。省略時は残りと送り直した回数を表示
+ * コール元:
+ *   shell_dispatch()
+ * ===============================================================*/
+static void shell_synackdrop(char *args)
+{
+    while (*args == ' ') args++;
+    if (*args >= '0' && *args <= '9') {
+        g_tcp_synack_drop_next = (uint32_t)atoi(args);
+    }
+    uart_printf("synackdrop: 残り %u 個を破棄 / SYN 再送に応じた SYN|ACK 送り直し %u 回\n",
+                (unsigned)g_tcp_synack_drop_next, (unsigned)g_tcp_synack_retx_count);
+}
+
+/*=================================================================
  * 文字列を空白区切りで最大 n トークンに分割する(s を破壊する)。
  *
  * 引数:
@@ -4267,6 +4540,12 @@ static void shell_dispatch(char *line, int s0, int s1)
         shell_ackthresh(line + 9);
     } else if (strncmp(line, "txdrop", 6) == 0) {
         shell_txdrop(line + 6);
+    } else if (strncmp(line, "backlogtest", 11) == 0) {
+        shell_backlogtest();
+    } else if (strncmp(line, "backlog", 7) == 0) {
+        shell_backlog(line + 7);
+    } else if (strncmp(line, "synackdrop", 10) == 0) {
+        shell_synackdrop(line + 10);
     } else if (strncmp(line, "qploop", 6) == 0) {
         shell_qploop(line + 6);
     } else if (strncmp(line, "nvmediscover", 12) == 0) {
@@ -4343,6 +4622,9 @@ static void shell_dispatch(char *line, int s0, int s1)
                     "  mldtest [dump]                        MLD(Queryを注入してReportを確認)\n"
                     "  ip6addr [<if> <addr>|<if> off]        グローバルIPv6アドレスの表示/手動設定\n"
                     "  txdrop [N]                            ロス注入(データN個に1個破棄、0=無効)+再送統計\n"
+                    "  backlog [N]                           listen backlogの深さ表示/変更(0=無効)+統計\n"
+                    "  backlogtest                           受け皿の用意前に届いたSYNを拾えるか(陰性対照つき)\n"
+                    "  synackdrop [N]                        次のSYN|ACKをN個捨てる(握手のロス注入)\n"
                     "  qploop [N]                            RC QPの作成/破棄をN回繰り返しFWリソース枯渇を見る\n"
                     "  nvmediscover [dump]                   Discovery Log Pageを取得(dumpで16進出力)\n"
                     "  nvmet [port] | jobs | help | quit    (↑↓で履歴呼び出し)\n"

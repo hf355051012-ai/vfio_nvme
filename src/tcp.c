@@ -109,6 +109,15 @@ volatile uint32_t g_tcp_tx_drop_every;
 static uint32_t   s_tcp_tx_drop_counter[SMP_MAX_CORES];
 volatile uint32_t g_tcp_tx_dropped_count[SMP_MAX_CORES];
 
+/* 次に送る SYN|ACK を N 個だけ捨てる(シェルの `synackdrop <N>`)。
+ * txdrop はデータを持つセグメントしか捨てないので、握手そのものを落として
+ * 「SYN の再送に SYN|ACK を送り直す」経路を実機で通すにはこれが要る。
+ * ホットパスには乗らない(SYN が立っているときしか読まない)。 */
+volatile uint32_t g_tcp_synack_drop_next;
+
+/* 再送された SYN に応えて SYN|ACK を送り直した回数。 */
+volatile uint32_t g_tcp_synack_retx_count;
+
 /*=================================================================
  * このデータセグメントを人為的に捨てるか判定する(g_tcp_tx_drop_every が
  * 非 0 のときだけ呼ばれる)。
@@ -342,17 +351,141 @@ static void tcp_timewait_reap(void)
     smp_spin_unlock(&s_timewait_lock);
 }
 
+/* リスナ 1 本あたりの待ち行列(listen backlog)の深さ。呼び出し側が
+ * tcp_accept_begin() で受け皿を用意していない間に届いた SYN を、ここに
+ * 積んで先に確立まで進めておく。積まずに捨てると相手の SYN 再送
+ * (Linux の初期値は 1 秒)ぶんだけ接続確立が遅れる。 */
+#define TCP_BACKLOG 4u
+
+/* 待ち行列に積んだまま確立しない(相手が消えた)エントリを回収するまでの
+ * 時間。確立済みで引き渡し待ちのものは対象にしない(Linux も accept 待ちの
+ * コネクションを勝手に切らない)。 */
+#define TCP_BACKLOG_SYN_TIMEOUT_MS 10000u
+
 typedef struct {
     int         in_use;
     uint16_t    port;
     netif_t  *bound_ctx;    /* NULL = インターフェースを問わず受け付ける */
     tcp_conn_t *accept_conn;  /* tcp_accept_begin()が渡してきたconn */
-    volatile int accept_ready; /* ESTABLISHEDになった = 1 */
+    volatile int accept_ready; /* ESTABLISHEDになった = 1(backlog 無効時の直接受理) */
+
+    /* listen backlog。SYN を受けた時点でこの中の 1 本を使って SYN_RCVD へ
+     * 進み、tcp_accept_ready_poll() が呼び出し側の tcp_conn_t へ引き渡す。 */
+    tcp_conn_t       pending[TCP_BACKLOG];
+    uint64_t         pending_since[TCP_BACKLOG];  /* SYN を受けた時刻(ns) */
+    volatile uint8_t pending_used[TCP_BACKLOG];   /* 1=使用中 */
+    volatile uint8_t pending_estab[TCP_BACKLOG];  /* 1=ESTABLISHED(引き渡し待ち) */
 } tcp_listener_slot_t;
 
 #define TCP_LISTENER_TOTAL (TCP_MAX_LISTENERS * SMP_MAX_CORES)
 static tcp_listener_slot_t s_listeners[TCP_LISTENER_TOTAL];
 static smp_spinlock_t      s_listener_lock;
+
+/* 待ち行列の実効深さ。0 にすると backlog を使わず「受け皿が用意されている
+ * ときだけ SYN を受理する」従来の挙動へ戻る(陰性対照。`txdrop` / `mld off`
+ * と同じ「機能を止める手段を恒久的に残す」考え方)。シェルの `backlog <N>`。 */
+volatile uint32_t g_tcp_backlog_max = TCP_BACKLOG;
+
+/* 待ち行列が満杯で捨てた SYN の数(Linux と同じく RST は返さない)。 */
+volatile uint32_t g_tcp_backlog_overflow_count;
+
+/* 待ち行列を経由して引き渡した accept の数。「受け皿の用意前に届いた SYN を
+ * 実際に拾えているか」はこれが増えるかどうかで分かる。 */
+volatile uint32_t g_tcp_backlog_accept_count;
+
+/*=================================================================
+ * 待ち行列の空きスロットを探す。
+ *
+ * 引数:
+ *   l - リスナースロット
+ * 戻り値:
+ *   空きの添字。満杯(または backlog 無効)なら -1
+ * コール元:
+ *   tcp_input_addr()
+ * ===============================================================*/
+static int tcp_backlog_find_free(tcp_listener_slot_t *l)
+{
+    unsigned max = g_tcp_backlog_max;
+    if (max > TCP_BACKLOG) max = TCP_BACKLOG;
+    for (unsigned p = 0; p < max; p++) {
+        if (!l->pending_used[p]) return (int)p;
+    }
+    return -1;
+}
+
+/*=================================================================
+ * conn が待ち行列の中のどのエントリかを返す。
+ *
+ * 引数:
+ *   l    - リスナースロット
+ *   conn - 対象コネクション
+ * 戻り値:
+ *   添字。このリスナのものでなければ -1
+ * コール元:
+ *   tcp_input_addr(), tcp_backlog_reap()
+ * ===============================================================*/
+static int tcp_backlog_index_of(const tcp_listener_slot_t *l, const tcp_conn_t *conn)
+{
+    if (conn < &l->pending[0] || conn > &l->pending[TCP_BACKLOG - 1u]) return -1;
+    return (int)(conn - &l->pending[0]);
+}
+
+/*=================================================================
+ * 待ち行列のエントリを解放する。s_conns[] からも外すので、引き渡さずに
+ * 捨てる経路(相手が消えた/リッスン終了)でも使える。
+ *
+ * 引数:
+ *   l - リスナースロット
+ *   p - 添字
+ * コール元:
+ *   tcp_accept_ready_poll(), tcp_backlog_reap(), tcp_unlisten()
+ * ===============================================================*/
+static void tcp_backlog_release(tcp_listener_slot_t *l, unsigned p)
+{
+    tcp_conn_t *c = &l->pending[p];
+    unsigned    core = c->owner_core;
+    if (core < SMP_MAX_CORES) {
+        for (unsigned i = 0; i < TCP_MAX_CONNS; i++) {
+            if (s_conns[core][i] == c) { s_conns[core][i] = NULL; break; }
+        }
+    }
+    c->state = TCP_CLOSED;
+    l->pending_estab[p] = 0;
+    l->pending_used[p]  = 0;
+}
+
+/*=================================================================
+ * 待ち行列の掃除。畳まれたエントリ(相手からの RST など)と、確立まで
+ * 進まないまま放置されたエントリを回収する。回収しないとコネクション
+ * スロット(TCP_MAX_CONNS)を握ったままになる。
+ *
+ * 確立済みで引き渡し待ちのものは時間では回収しない(呼び出し側が
+ * tcp_accept_begin() を遅らせているだけかもしれない)。
+ *
+ * コール元:
+ *   tcp_poll_once_ex()
+ * ===============================================================*/
+static void tcp_backlog_reap(void)
+{
+    for (unsigned li = 0; li < TCP_LISTENER_TOTAL; li++) {
+        tcp_listener_slot_t *l = &s_listeners[li];
+        if (!l->in_use) continue;
+        for (unsigned p = 0; p < TCP_BACKLOG; p++) {
+            if (!l->pending_used[p]) continue;
+            if (l->pending[p].state == TCP_CLOSED) {
+                tcp_backlog_release(l, p);
+                continue;
+            }
+            if (!l->pending_estab[p] &&
+                timeout_ms(l->pending_since[p], TCP_BACKLOG_SYN_TIMEOUT_MS)) {
+                uart_printf("[TCP] backlog: 確立しないまま %ums 経過したエントリを回収 "
+                            "(local_port=%u)\n",
+                            (unsigned)TCP_BACKLOG_SYN_TIMEOUT_MS, (unsigned)l->port);
+                tcp_backlog_release(l, p);
+            }
+        }
+    }
+}
 
 /*=================================================================
  * リッスンハンドルからリスナースロットを引く。
@@ -829,6 +962,11 @@ static int tcp_send_segment(tcp_conn_t *conn, tcp_priv_t *priv, uint8_t flags,
 
     if (g_tcp_tx_drop_every != 0u && tcp_tx_should_drop(data_len)) {
         return 0;  /* 送ったことにして捨てる(ロス注入、txdrop) */
+    }
+    if ((flags & (TCP_FLAG_SYN | TCP_FLAG_ACK)) == (TCP_FLAG_SYN | TCP_FLAG_ACK) &&
+        g_tcp_synack_drop_next != 0u) {
+        g_tcp_synack_drop_next--;
+        return 0;  /* 同じく「送ったことにして捨てる」(synackdrop) */
     }
 
     netif_t *conn_ctx = tcp_netif_for((const netaddr_t *)&conn->local_ip);
@@ -1406,6 +1544,11 @@ static void tcp_poll_once_ex(int check_ctrl_c)
     }
 
     tcp_timewait_reap();
+
+    /* 待ち行列の掃除は 10 秒単位の話なので、ポーリング 1 回ごとに 32 本の
+     * リスナを走査する必要はない(この関数は受信ポーリングのたびに通る)。 */
+    static unsigned s_backlog_reap_tick;
+    if ((++s_backlog_reap_tick & 0xFFu) == 0u) tcp_backlog_reap();
 }
 
 /*=================================================================
@@ -2733,6 +2876,11 @@ int tcp_listen(uint16_t port, netif_t *ctx)
             s_listeners[i].bound_ctx    = ctx;
             s_listeners[i].accept_conn  = NULL;
             s_listeners[i].accept_ready = 0;
+            for (unsigned p = 0; p < TCP_BACKLOG; p++) {
+                s_listeners[i].pending_used[p]  = 0;
+                s_listeners[i].pending_estab[p] = 0;
+                s_listeners[i].pending[p].state = TCP_CLOSED;
+            }
             smp_spin_unlock(&s_listener_lock);
             return (int)i;
         }
@@ -2754,6 +2902,11 @@ void tcp_unlisten(int listener)
     smp_spin_lock(&s_listener_lock);
     tcp_listener_slot_t *l = tcp_listener_for(listener);
     if (l) {
+        /* 待ち行列に残っているものは引き取り手が居なくなるので、
+         * s_conns[] から外して回収する(コネクションスロットの解放)。 */
+        for (unsigned p = 0; p < TCP_BACKLOG; p++) {
+            if (l->pending_used[p]) tcp_backlog_release(l, p);
+        }
         l->in_use       = 0;
         l->accept_conn  = NULL;
         l->accept_ready = 0;
@@ -2845,8 +2998,9 @@ void tcp_debug_dump_rx(const tcp_conn_t *conn)
 }
 
 /*=================================================================
- * ブロックせずに accept の受け皿だけを用意する。早着 SYN を取りこぼさない
- * よう、待ち始める前に呼んでおく。
+ * ブロックせずに accept の受け皿だけを用意する。待ち行列(backlog)を
+ * 入れた今は「受け皿の用意前に届いた SYN」も取りこぼさないが、確立した
+ * コネクションを引き渡す先はここで渡す conn なので、呼ぶ必要は変わらない。
  *
  * 引数:
  *   listener - リッスンハンドル
@@ -2861,6 +3015,60 @@ void tcp_accept_begin(int listener, tcp_conn_t *conn)
     conn->state    = TCP_CLOSED;
     l->accept_conn  = conn;
     l->accept_ready = 0;
+}
+
+/*=================================================================
+ * 待ち行列で確立済みのコネクションを、呼び出し側が用意した受け皿へ
+ * 引き渡す。tcp_conn_t は 64 バイトの POD で、プライベート状態
+ * (tcp_priv_t)は s_conns[] のポインタ一致で引くので、構造体を複製して
+ * s_conns[] の指す先を差し替えるだけで移せる(rx_buf も ooo も
+ * 受信済みのデータもスロット側に残ったまま)。
+ *
+ * 引数:
+ *   l - リスナースロット
+ * 戻り値:
+ *   1=引き渡した、0=引き渡せるものが無い
+ * コール元:
+ *   tcp_accept_ready_poll()
+ * ===============================================================*/
+static int tcp_backlog_handoff(tcp_listener_slot_t *l)
+{
+    if (l->accept_conn == NULL) return 0;
+
+    /* 先に確立したものから渡す(FIFO)。 */
+    int oldest = -1;
+    for (unsigned p = 0; p < TCP_BACKLOG; p++) {
+        if (!l->pending_used[p] || !l->pending_estab[p]) continue;
+        if (oldest < 0 || l->pending_since[p] < l->pending_since[oldest]) oldest = (int)p;
+    }
+    if (oldest < 0) return 0;
+
+    tcp_conn_t *from = &l->pending[oldest];
+    tcp_conn_t *to   = l->accept_conn;
+    unsigned    pcore = from->owner_core;
+
+    *to = *from;  /* 64 バイトの複製 */
+
+    int moved = 0;
+    if (pcore < SMP_MAX_CORES) {
+        for (unsigned i = 0; i < TCP_MAX_CONNS; i++) {
+            if (s_conns[pcore][i] == from) { s_conns[pcore][i] = to; moved = 1; break; }
+        }
+    }
+    if (!moved) {
+        /* s_conns[] に居ない = 既に畳まれている。引き渡さずに回収する。 */
+        uart_printf("[!] TCP: backlog のエントリが s_conns[] に居ません(引き渡し中止)\n");
+        to->state = TCP_CLOSED;
+        tcp_backlog_release(l, (unsigned)oldest);
+        return 0;
+    }
+
+    from->state = TCP_CLOSED;
+    l->pending_estab[oldest] = 0;
+    l->pending_used[oldest]  = 0;
+    l->accept_conn = NULL;
+    g_tcp_backlog_accept_count++;
+    return 1;
 }
 
 /*=================================================================
@@ -2886,8 +3094,49 @@ int tcp_accept_ready_poll(int listener)
         l->accept_conn  = NULL;
         return 1;
     }
-    return 0;
+    return tcp_backlog_handoff(l);
 }
+
+/*=================================================================
+ * 待ち行列の深さと統計を返す(シェルの `backlog` 表示用)。
+ *
+ * 引数:
+ *   waiting - NULL 可。いま待ち行列に居るコネクション数
+ *   estab   - NULL 可。そのうち確立済み(引き渡し待ち)の数
+ * コール元:
+ *   shell_backlog()
+ * ===============================================================*/
+void tcp_backlog_stats(unsigned *waiting, unsigned *estab)
+{
+    unsigned w = 0, e = 0;
+    for (unsigned li = 0; li < TCP_LISTENER_TOTAL; li++) {
+        if (!s_listeners[li].in_use) continue;
+        for (unsigned p = 0; p < TCP_BACKLOG; p++) {
+            if (!s_listeners[li].pending_used[p]) continue;
+            w++;
+            if (s_listeners[li].pending_estab[p]) e++;
+        }
+    }
+    if (waiting) *waiting = w;
+    if (estab)   *estab   = e;
+}
+
+/*=================================================================
+ * 待ち行列の深さを変える。0 にすると「受け皿が用意されているときだけ
+ * SYN を受理する」従来の挙動へ戻る(陰性対照)。
+ *
+ * 引数:
+ *   depth - 0〜TCP_BACKLOG
+ * コール元:
+ *   shell_backlog()
+ * ===============================================================*/
+void tcp_backlog_set_max(unsigned depth)
+{
+    if (depth > TCP_BACKLOG) depth = TCP_BACKLOG;
+    g_tcp_backlog_max = depth;
+}
+
+unsigned tcp_backlog_capacity(void) { return TCP_BACKLOG; }
 
 /*=================================================================
  * 受信 TCP セグメントを処理する。チェックサム検証(HW 検証済みなら省略)、
@@ -2923,16 +3172,62 @@ void tcp_input_addr(const uint8_t *pkt, uint16_t len,
     uint16_t dst_port = rd16be(in + TCP_OFF_DST_PORT);
 
     int matched_listener = -1;
+    int backlog_index    = -1;  /* >=0 = 待ち行列のエントリ、-1 = 受け皿へ直接 */
     if (in[TCP_OFF_FLAGS] & TCP_FLAG_SYN) {
+        /* 再送された SYN を新しい接続として受理しない(待ち行列を作ると、
+         * 同じ相手の SYN 再送がエントリを食い潰す)。既に SYN_RCVD まで
+         * 進んでいるなら SYN|ACK を送り直す -- こちらの SYN|ACK が落ちた場合、
+         * 相手は SYN を再送してくるので、無視すると永久に確立しない。 */
+        for (unsigned i = 0; i < TCP_MAX_CONNS; i++) {
+            tcp_conn_t *ec = s_conns[core][i];
+            if (ec != NULL &&
+                src_port == ec->remote_port &&
+                dst_port == ec->local_port &&
+                netaddr_eq(src, (const netaddr_t *)&ec->remote_ip)) {
+                if (ec->state == TCP_SYN_RCVD) {
+                    tcp_priv_t *epriv = &s_priv[core][i];
+                    uint32_t    saved = ec->snd_seq;
+                    ec->snd_seq = epriv->expected_ack - 1u;  /* SYN 消費前の ISN */
+                    tcp_send_segment(ec, epriv, TCP_FLAG_SYN | TCP_FLAG_ACK, NULL, 0);
+                    ec->snd_seq = saved;
+                    g_tcp_synack_retx_count++;
+                    uart_printf("[TCP] accept: SYN 再送を受けて SYN|ACK を送り直し "
+                                "(local_port=%u)\n", (unsigned)dst_port);
+                    return;
+                }
+                break;  /* SYN|ACK など、既存コネクションの通常処理へ落とす */
+            }
+        }
         for (unsigned li = 0; li < TCP_LISTENER_TOTAL; li++) {
             tcp_listener_slot_t *l = &s_listeners[li];
             if (l->in_use &&
                 l->port == dst_port &&
-                (l->bound_ctx == NULL || l->bound_ctx == g_active_ctx) &&
-                l->accept_conn != NULL &&
-                l->accept_conn->state == TCP_CLOSED) {
+                (l->bound_ctx == NULL || l->bound_ctx == g_active_ctx)) {
                 matched_listener = (int)li;
                 break;
+            }
+        }
+        if (matched_listener >= 0) {
+            /* 受け皿が用意されているなら従来どおりそこへ直接受理する
+             * (複製が要らないぶん素直で、既存の経路がそのまま残る)。
+             * 用意されていない隙間に届いたぶんだけ待ち行列へ積む。 */
+            tcp_listener_slot_t *l = &s_listeners[matched_listener];
+            if (l->accept_conn != NULL && l->accept_conn->state == TCP_CLOSED) {
+                backlog_index = -1;
+            } else {
+                backlog_index = tcp_backlog_find_free(l);
+                if (backlog_index < 0) {
+                    /* 待ち行列が無効/満杯。Linux が accept キュー溢れでそう
+                     * するのと同じく黙って捨てる(RST を返すと相手の接続が
+                     * 即死する -- 段階 1 の教訓)。 */
+                    g_tcp_backlog_overflow_count++;
+                    if (g_tcp_backlog_overflow_count <= 8u) {
+                        uart_printf("[TCP] backlog: 受け皿も待ち行列も無く SYN を破棄 "
+                                    "(local_port=%u, 深さ=%u)\n",
+                                    (unsigned)dst_port, (unsigned)g_tcp_backlog_max);
+                    }
+                    return;
+                }
             }
         }
     }
@@ -2944,7 +3239,8 @@ void tcp_input_addr(const uint8_t *pkt, uint16_t len,
                         "(local_port=%u, 最大%u本)\n", dst_port, TCP_MAX_CONNS);
         }
         if (slot >= 0) {
-            tcp_conn_t *aconn = l->accept_conn;
+            tcp_conn_t *aconn = (backlog_index >= 0) ? &l->pending[backlog_index]
+                                                     : l->accept_conn;
             tcp_priv_t *apriv = &s_priv[core][slot];
             tcp_priv_init(apriv, core);
 
@@ -2961,6 +3257,11 @@ void tcp_input_addr(const uint8_t *pkt, uint16_t len,
 
             aconn->owner_core = core;
             s_conns[core][slot] = aconn;
+            if (backlog_index >= 0) {
+                l->pending_since[backlog_index] = timer_now();
+                l->pending_estab[backlog_index] = 0;
+                l->pending_used[backlog_index]  = 1;
+            }
 
             aconn->rcv_seq = seg_seq + 1;  /* SYN消費分 */
             aconn->snd_mss = TCP_MSS_DEFAULT_RFC879;
@@ -2969,8 +3270,8 @@ void tcp_input_addr(const uint8_t *pkt, uint16_t len,
             }
             aconn->snd_win = rd16be(in + TCP_OFF_WINDOW);
 
-            uart_printf("[TCP] accept: SYN受信、SYN|ACK送信 (local_port=%u, slot=%d)\n",
-                        dst_port, slot);
+            uart_printf("[TCP] accept: SYN受信、SYN|ACK送信 (local_port=%u, slot=%d, backlog=%d)\n",
+                        dst_port, slot, backlog_index);
 
             tcp_send_segment(aconn, apriv, TCP_FLAG_SYN | TCP_FLAG_ACK, NULL, 0);
 
@@ -3102,8 +3403,16 @@ void tcp_input_addr(const uint8_t *pkt, uint16_t len,
             conn->state = TCP_ESTABLISHED;
             tcp_cwnd_init(conn, priv);
             for (unsigned li = 0; li < TCP_LISTENER_TOTAL; li++) {
-                if (s_listeners[li].in_use && s_listeners[li].accept_conn == conn) {
-                    s_listeners[li].accept_ready = 1;
+                if (!s_listeners[li].in_use) continue;
+                if (s_listeners[li].accept_conn == conn) {
+                    s_listeners[li].accept_ready = 1;  /* 受け皿へ直接受理した経路 */
+                    break;
+                }
+                int bp = tcp_backlog_index_of(&s_listeners[li], conn);
+                if (bp >= 0) {
+                    /* 待ち行列の中で確立した。呼び出し側が受け皿を用意した
+                     * 時点で tcp_accept_ready_poll() が引き渡す。 */
+                    s_listeners[li].pending_estab[bp] = 1;
                     break;
                 }
             }

@@ -17,6 +17,12 @@ extern volatile uint32_t g_tcp_ack_threshold;
 extern volatile uint32_t g_tcp_tx_drop_every;
 extern volatile uint32_t g_tcp_tx_dropped_count[SMP_MAX_CORES];
 
+/* 握手のロス注入(シェルの `synackdrop <N>`)。次に送る SYN|ACK を N 個捨てる。
+ * txdrop はデータを持つセグメントしか捨てないので、「相手の SYN 再送に
+ * SYN|ACK を送り直す」経路を実機で通すにはこちらが要る。 */
+extern volatile uint32_t g_tcp_synack_drop_next;
+extern volatile uint32_t g_tcp_synack_retx_count;
+
 uint32_t tcp_rx_buf_size(void);
 
 int  tcp_abort_requested(void);
@@ -139,6 +145,15 @@ void tcp_input(const uint8_t *pkt, uint16_t len, uint32_t src_ip);
 int tcp_listen(uint16_t port, netif_t *ctx);
 
 void tcp_accept_begin(int listener, tcp_conn_t *conn);
+
+/* listen backlog(シェルの `backlog [N]`)。0=無効(受け皿が用意されている
+ * ときだけ SYN を受理する従来の挙動 = 陰性対照)。既定は TCP_BACKLOG。 */
+extern volatile uint32_t g_tcp_backlog_max;
+extern volatile uint32_t g_tcp_backlog_overflow_count;  /* 満杯で捨てた SYN */
+extern volatile uint32_t g_tcp_backlog_accept_count;    /* 待ち行列から引き渡した数 */
+void     tcp_backlog_set_max(unsigned depth);
+void     tcp_backlog_stats(unsigned *waiting, unsigned *estab);
+unsigned tcp_backlog_capacity(void);
 
 int  tcp_accept_ready_poll(int listener);
 
