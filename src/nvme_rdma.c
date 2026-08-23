@@ -29,6 +29,10 @@ static volatile uint8_t *nvmer_ramdisk_slot1(void)
 }
 
 #define NVME_RDMA_QSIZE               32u
+
+/* 外部ホストのターゲット設定。nvmer_build_connect() が subnqn を、
+ * nvme_rdma_run_bench() が宛先を見るので、両方より前に置く。 */
+static nvme_rdma_remote_t s_remote;
 #define NVME_RDMA_CTRL_READY_POLL_MAX 20u
 #define NVME_RDMA_CTRL_READY_POLL_MS 100u
 #define NVME_RDMA_CMD_TIMEOUT_MS    5000u
@@ -80,15 +84,28 @@ static void nvmer_set_ksgl(volatile uint8_t *dptr, uint64_t addr, uint32_t len, 
 }
 
 /*=================================================================
- * Fabrics Connect capsule を組み立てる(SQE 64B + connect data 1024B の
- * in-capsule 送信)。
+ * Fabrics Connect capsule を組み立てる。
+ *
+ * **connect data(1024B)は in-capsule で送ってはいけない。**
+ * Linux の nvmet_rdma は admin キューの RECV に SGE を 1 本
+ * (= nvme_command の 64 バイトぶん)しか出さないので
+ * (drivers/nvme/target/rdma.c nvmet_rdma_alloc_cmd() の
+ *  `c->wr.num_sge = admin ? 1 : ...`)、64 バイトを超える capsule は
+ * **local length error** で捨てられ、相手はそのまま接続を畳む。
+ * Linux のホスト側も対称で、in-capsule を使うのは
+ * `nvme_rdma_queue_idx(queue) != 0`、つまり IO キューだけ
+ * (drivers/nvme/host/rdma.c nvme_rdma_map_data())。
+ *
+ * したがって data は keyed SGL で指し、相手に RDMA_READ させる。
+ * 自作ターゲットは connect data を読まない(cntlid を返すだけ)ので、
+ * この変更で従来の経路も壊れない。
  *
  * 引数:
  *   ctx   - 送信バッファを持つ initiator コンテキスト
  *   qid   - キュー ID(0=admin、1=IO)
  *   subnqn- 接続先サブシステム NQN
  * 戻り値:
- *   送信すべき合計バイト数(1088)
+   送信すべき合計バイト数(SQE の 64 のみ。data は相手が RDMA_READ する)
  * コール元:
  *   nvme_rdma_connect_job_step()
  * ===============================================================*/
@@ -99,8 +116,8 @@ static uint32_t nvmer_build_connect(nvme_rdma_ctx_t *ctx, uint16_t qid, const ch
     wr32le(&b[0], NVME_FABRIC_CMD | ((uint32_t)NVME_PSDT_SGL_MPTR_CONTIGUOUS << 8));
     wr16le(&b[2], ctx->cur_cid);
     wr32le(&b[4], NVME_FABRIC_FCTYPE_CONNECT);
-    wr32le(&b[32], 1024u);
-    b[39] = (uint8_t)NVME_SGL_TYPE_DATA_BLOCK_OFFSET;
+    nvmer_set_ksgl(&b[24], mlx5_dma_addr((const void *)(uintptr_t)&b[64]), 1024u,
+                   ctx->cm.rc_qp.mkey);
     wr32le(&b[40], (uint32_t)qid << 16);
     wr32le(&b[44], (uint32_t)(NVME_RDMA_QSIZE - 1) & 0xFFFFu);
     wr32le(&b[48], 0);
@@ -110,7 +127,9 @@ static uint32_t nvmer_build_connect(nvme_rdma_ctx_t *ctx, uint16_t qid, const ch
     wr16le(&cd[16], 0xFFFFu); /* cntlid: dynamic */
     nvmer_copy_str_v(&cd[256], 256u, subnqn);
     nvmer_copy_str_v(&cd[512], 256u, NVME_RDMA_HOST_NQN);
-    return 64u + 1024u;
+    /* **送るのは SQE の 64 バイトだけ。** data は b[64..1087] に置いたまま
+     * にして、相手が keyed SGL を使って RDMA_READ で取りに来る。 */
+    return 64u;
 }
 
 /*=================================================================
@@ -188,6 +207,7 @@ static uint32_t nvmer_build_identify(nvme_rdma_ctx_t *ctx, uint8_t cns, uint32_t
     wr32le(&b[4], nsid);
     nvmer_set_ksgl(&b[24], mlx5_dma_addr((const void *)(uintptr_t)dest), dest_len, ctx->cm.rc_qp.mkey);
     wr32le(&b[40], (uint32_t)cns);
+    uart_printf("\n");
     return 64u;
 }
 
@@ -450,7 +470,9 @@ job_result_t nvme_rdma_connect_job_step(job_t *self)
 
     case NVMER_ST_SEND_CONNECT: {
         if (nvmer_post_recv(ctx) != 0) return nvmer_fail(ctx, "post_recv(Connect)失敗");
-        uint32_t len = nvmer_build_connect(ctx, 0u, NVMET_RDMA_SUBNQN);
+        const char *subnqn = (s_remote.enabled && s_remote.subnqn[0]) ? s_remote.subnqn
+                                                                      : NVMET_RDMA_SUBNQN;
+        uint32_t len = nvmer_build_connect(ctx, 0u, subnqn);
         nvmer_post_send(ctx, len);
         self->state = NVMER_ST_WAIT_CONNECT;
         return JOB_WAITING;
@@ -541,7 +563,20 @@ job_result_t nvme_rdma_connect_job_step(job_t *self)
         uint16_t status = rd16le(&ctx->recv_buf[14]);
         if (nvme_cqe_status_code(status) != 0) return nvmer_fail(ctx, "Identify Controller: 応答エラー");
         dcache_invalidate_range((const void *)(uintptr_t)ctx->id_ctrl, NVME_RDMA_ID_BUF_LEN);
-        uart_printf("[nvme-rdma] Identify Controller完了\n");
+        {   /* 相手のモデル名(offset 24、40 バイト)を出す。**RDMA でデータが
+             * 実際に届いたかの一番手軽な確認**で、外部ターゲットのときは
+             * 「本当に Linux の nvmet と喋っている」ことの証拠にもなる。 */
+            char mn[41];
+            unsigned n = 0;
+            for (unsigned i = 0; i < 40u; i++) {
+                char c = (char)ctx->id_ctrl[24u + i];
+                if (c == 0) break;
+                mn[n++] = c;
+            }
+            while (n > 0 && mn[n - 1] == ' ') n--;
+            mn[n] = 0;
+            uart_printf("[nvme-rdma] Identify Controller完了 (model=\"%s\")\n", mn);
+        }
         ctx->cur_cid++;
         self->state = NVMER_ST_SEND_ID_NS;
         return JOB_WAITING;
@@ -562,6 +597,14 @@ job_result_t nvme_rdma_connect_job_step(job_t *self)
         if (rc < 0) return nvmer_fail(ctx, "Identify Namespace失敗");
         uint16_t status = rd16le(&ctx->recv_buf[14]);
         if (nvme_cqe_status_code(status) != 0) return nvmer_fail(ctx, "Identify Namespace: 応答エラー");
+        dcache_invalidate_range((const void *)(uintptr_t)ctx->id_ns, NVME_RDMA_ID_BUF_LEN);
+        for (unsigned i = 0; i < 16u; i++) uart_printf(" %02x", (unsigned)ctx->recv_buf[i]);
+        uart_printf("\n");
+        for (unsigned r = 0; r < 2u; r++) {
+            for (unsigned i = 0; i < 16u; i++)
+                uart_printf(" %02x", (unsigned)ctx->id_ns[r * 16u + i]);
+            uart_printf("\n");
+        }
         dcache_invalidate_range((const void *)(uintptr_t)ctx->id_ns, NVME_RDMA_ID_BUF_LEN);
         uint8_t flbas = (uint8_t)(ctx->id_ns[NVME_ID_NS_OFF_FLBAS] & 0x0Fu);
         uint32_t lbaf_off = NVME_ID_NS_OFF_LBAF0 + (uint32_t)flbas * 4u;
@@ -775,6 +818,36 @@ static nvmet_rdma_ctrl_t s_target_ctrl;
 /* [調査用] bench の initiator が使う宛先の上書き。**宛先 MAC と宛先 GID を
  * 独立に振れるようにするための仕掛け。** FW が「ローカル宛」をどちらで判定して
  * いるのかを切り分けるのに使う(rocepeer シェルコマンド)。 */
+/*=================================================================
+ * 外部ホストのターゲットを接続先に設定する(enable=0 で解除)。
+ *
+ * 引数:
+ *   enable - 1=外部ターゲットを使う、0=従来どおり同一プロセス内に立てる
+ *   ip     - 接続先 IPv4(host order)
+ *   mac    - 接続先 MAC(RoCEv2 は L2 も自分で解決する必要がある)
+ *   port   - NVMe-oF のポート(0 なら 4420)
+ *   subnqn - サブシステム NQN(NULL/空なら自作ターゲットの NQN)
+ * コール元:
+ *   shell_dispatch()
+ * ===============================================================*/
+void nvme_rdma_set_remote_target(int enable, uint32_t ip, const uint8_t mac[6],
+                                 uint16_t port, const char *subnqn)
+{
+    for (unsigned i = 0; i < sizeof(s_remote); i++) ((uint8_t *)&s_remote)[i] = 0;
+    if (!enable) return;
+    s_remote.enabled = 1;
+    s_remote.ip = ip;
+    if (mac) for (unsigned i = 0; i < 6; i++) s_remote.mac[i] = mac[i];
+    s_remote.port = (port != 0u) ? port : 4420u;
+    if (subnqn && subnqn[0]) {
+        unsigned i = 0;
+        while (subnqn[i] && i + 1u < NVME_RDMA_SUBNQN_MAX) { s_remote.subnqn[i] = subnqn[i]; i++; }
+        s_remote.subnqn[i] = 0;
+    }
+}
+
+const nvme_rdma_remote_t *nvme_rdma_remote_target(void) { return &s_remote; }
+
 static int      s_peer_override;
 static uint32_t s_peer_ip_override;
 static uint8_t  s_peer_mac_override[6];
@@ -918,8 +991,12 @@ void nvme_rdma_run_bench(mlx5_dev_t *dev0, mlx5_dev_t *dev1, uint32_t duration_m
     uint32_t ip0_fallback = ip_from_octets(192, 168, 101, 10);
     uint32_t ip1_fallback = ip_from_octets(192, 168, 101, 11);
 
-    int target_ok = s_target_resident && !s_target_ctx.failed &&
-                     s_target_resident_generation == dev1->bringup_generation;
+    /* **外部ターゲットのときは同一プロセス内のターゲットを立てない。**
+     * dev1 も使わない(PF1 は相手ではなく、ただの遊んでいるポートになる)。 */
+    const int use_remote = s_remote.enabled;
+    int target_ok = use_remote ? 1
+                               : (s_target_resident && !s_target_ctx.failed &&
+                                  s_target_resident_generation == dev1->bringup_generation);
     int init_ok = target_ok && nvmer_conn_reusable(&s_init_ctx, dev0);
 
     if (!target_ok) {
@@ -969,7 +1046,20 @@ void nvme_rdma_run_bench(mlx5_dev_t *dev0, mlx5_dev_t *dev1, uint32_t duration_m
         nvmer_destroy_qp_if_valid(s_init_ctx.cm.dev, s_init_ctx.cm.gsi_qp);
         for (uint32_t i = 0; i < sizeof(s_init_ctx); i++) ((uint8_t *)&s_init_ctx)[i] = 0;
         dcache_clean_range((const void *)&s_init_ctx, sizeof(s_init_ctx));
-        if (s_peer_override) {
+        if (use_remote) {
+            uart_printf("nvmermabench: 外部ターゲットへ接続します "
+                        "ip=%u.%u.%u.%u mac=%02x:%02x:%02x:%02x:%02x:%02x port=%u\n",
+                        (unsigned)((s_remote.ip >> 24) & 0xFFu),
+                        (unsigned)((s_remote.ip >> 16) & 0xFFu),
+                        (unsigned)((s_remote.ip >> 8) & 0xFFu),
+                        (unsigned)(s_remote.ip & 0xFFu),
+                        s_remote.mac[0], s_remote.mac[1], s_remote.mac[2],
+                        s_remote.mac[3], s_remote.mac[4], s_remote.mac[5],
+                        (unsigned)s_remote.port);
+            rdma_cm_fill_addr(&s_init_ctx.cm, dev0, "mlx5-pf0", "__override__", ip0_fallback,
+                              s_remote.ip, mac0_fallback, s_remote.mac);
+            s_init_ctx.cm.service_port = s_remote.port;
+        } else if (s_peer_override) {
             uart_printf("nvmermabench: [調査] 宛先を上書き ip=%u.%u.%u.%u "
                         "mac=%02x:%02x:%02x:%02x:%02x:%02x\n",
                         (unsigned)((s_peer_ip_override >> 24) & 0xFFu),
@@ -1005,14 +1095,14 @@ void nvme_rdma_run_bench(mlx5_dev_t *dev0, mlx5_dev_t *dev1, uint32_t duration_m
     while (1) {
         sim_delay_tick();
         job_scheduler_tick();
-        if (s_init_ctx.done || s_target_ctx.failed) break;
+        if (s_init_ctx.done || (!use_remote && s_target_ctx.failed)) break;
         if (timeout_ms(start, (uint64_t)duration_ms + 15000u)) {
             uart_printf("nvmermabench: FAILED (overall timeout)\n");
             break;
         }
     }
 
-    if (s_init_ctx.done && !s_init_ctx.failed && !s_target_ctx.failed) {
+    if (s_init_ctx.done && !s_init_ctx.failed && (use_remote || !s_target_ctx.failed)) {
         s_init_ctx.stop_requested = 1;
     } else {
         s_target_ctx.stop_requested = 1;
@@ -1031,7 +1121,7 @@ void nvme_rdma_run_bench(mlx5_dev_t *dev0, mlx5_dev_t *dev1, uint32_t duration_m
         }
     }
 
-    if (!s_init_ctx.done || s_init_ctx.failed || s_target_ctx.failed) {
+    if (!s_init_ctx.done || s_init_ctx.failed || (!use_remote && s_target_ctx.failed)) {
         uart_printf("nvmermabench: FAILED (count=%u)\n", s_init_ctx.bench_count);
         return;
     }

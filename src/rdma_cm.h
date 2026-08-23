@@ -49,7 +49,16 @@ typedef struct {
     uint32_t peer_starting_psn; // 相手のnext_send_psn(REQ/REPペイロードから学習)
     uint8_t  peer_path_mtu;    // 相手がCM REQで広告したPATH_PACKET_PAYLOAD_MTU
 
-    uint16_t nvme_qid; // ULPプレースホルダ(フェーズg以降で実際に使う)
+    uint16_t nvme_qid; // CM private data の nvme_rdma_cm_req.qid(0=admin)
+
+    /* CM REQ に載せる値。0 のときは rdma_cm_fill_addr() が既定を入れる。
+     * **Linux の rdma_cm はリスナを SERVICE_ID で引く**ので、
+     * service_port を間違えると相手は「該当なし」で REJ を返す。 */
+    uint16_t service_port; // 接続先の NVMe-oF ポート(既定 4420)
+    uint16_t src_port;     // cma_hdr.port(相手から見た自分の擬似ソースポート)
+    uint16_t hsqsize;      // nvme_rdma_cm_req.hsqsize(**0's based**)
+    uint16_t hrqsize;      // nvme_rdma_cm_req.hrqsize(1's based)
+    uint16_t cntlid;       // IO キューのときだけ載せる(admin は 0xFFFF)
 
     int skip_ping;
 
@@ -65,6 +74,7 @@ typedef struct {
     int      established; // RC QPがRTSに達した時点で1(active/passive共通)
     int      ping_ok;     // 確立後のping-pong検証が成功したら1
     int      failed;
+    uint16_t rej_reason;  // REJ を受けたときの理由コード(0=なし)
 
     int      rtu_phase_done;
 } rdma_cm_ctx_t;

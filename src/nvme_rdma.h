@@ -95,4 +95,21 @@ void nvme_rdma_run_bench(mlx5_dev_t *dev0, mlx5_dev_t *dev1, uint32_t duration_m
 
 void nvme_rdma_set_peer_override(int enable, uint32_t ip, const uint8_t mac[6]);
 
+/* 外部ホストのターゲットへ繋ぐ設定。**有効にすると同一プロセス内の
+ * ターゲットを立てず、イニシエータだけを動かす。** PF0<->PF1 の RoCEv2 は
+ * FW が内部で折り返して消すので、実際に相互運用できる相手はこちらだけ。 */
+#define NVME_RDMA_SUBNQN_MAX 224u
+
+typedef struct {
+    int      enabled;
+    uint32_t ip;               /* host order */
+    uint8_t  mac[6];
+    uint16_t port;             /* NVMe-oF のポート(既定 4420)*/
+    char     subnqn[NVME_RDMA_SUBNQN_MAX];
+} nvme_rdma_remote_t;
+
+void nvme_rdma_set_remote_target(int enable, uint32_t ip, const uint8_t mac[6],
+                                 uint16_t port, const char *subnqn);
+const nvme_rdma_remote_t *nvme_rdma_remote_target(void);
+
 #endif /* NVME_RDMA_H */

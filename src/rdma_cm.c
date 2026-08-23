@@ -9,11 +9,37 @@
 #include "job.h"
 
 #define CM_REQ_ATTR_ID 0x0010u
+#define CM_REJ_ATTR_ID 0x0012u
+
+/* REJ の理由コード(IBTA Vol1 Table 113 / Linux の enum ib_cm_rej_reason)。
+ * **これを見ないと「相手が拒否した」しか分からず、
+ * リスナが無いのか古い接続が残っているのかを切り分けられない。 */
+#define CM_REJ_STALE_CONN            10u
+#define CM_REJ_INVALID_SERVICE_ID     8u
+#define CM_REJ_CONSUMER_DEFINED      28u
+
 #define CM_REP_ATTR_ID 0x0013u
 #define CM_RTU_ATTR_ID 0x0014u
 #define IB_CM_CLASS_VERSION 2u // drivers/infiniband/core/cm_msgs.hで確認済み
 
-#define RDMA_CM_SERVICE_ID_PLACEHOLDER 0x0000000000000001ull
+/* Linux の rdma_cm はサービス ID を (port_space << 16) + port で作り、
+ * 受け取った REQ のサービス ID からリスナを引く
+ * (drivers/infiniband/core/cma.c の rdma_get_service_id() /
+ *  rdma_ps_from_service_id() / cma_port_from_service_id())。
+ * RDMA_PS_TCP は include/uapi/rdma/rdma_user_cm.h より 0x0106。
+ * **ここを固定値にしていると相手は「リスナ無し」で REJ を返す。** */
+#define RDMA_CM_PORT_SPACE_TCP 0x0106ull
+#define RDMA_CM_DEFAULT_PORT   4420u
+#define RDMA_CM_DEFAULT_SRC_PORT 0xC000u /* 擬似的な ephemeral ポート */
+
+/* nvme_rdma_cm_req のキューサイズ。Linux のホスト側
+ * (drivers/nvme/host/rdma.c nvme_rdma_route_resolved())は admin キューで
+ * hrqsize=NVME_AQ_DEPTH(32)、hsqsize=NVME_AQ_DEPTH-1(31)を送る。
+ * **hsqsize は 0's based** で、ターゲットは hsqsize+1 を受信キュー長として
+ * 見る(nvmet_rdma_parse_cm_req())。32 を入れると 33 > NVME_AQ_DEPTH に
+ * なって INVALID_HSQSIZE で拒否される。 */
+#define RDMA_CM_DEFAULT_HRQSIZE 32u
+#define RDMA_CM_DEFAULT_HSQSIZE 31u
 
 #define RDMA_CM_REQ_RETRY_TIMEOUT_MS 2000u
 #define RDMA_CM_REQ_MAX_RETRIES      3u
@@ -57,8 +83,19 @@ static void rdma_cm_build_req(rdma_cm_ctx_t *ctx) {
     volatile uint8_t *p = &buf[IB_MAD_HDR_LEN];
 
     wr32be_ib(&p[0], ctx->local_comm_id); // LOCAL_COMM_ID
-    wr64be(&p[8], RDMA_CM_SERVICE_ID_PLACEHOLDER); // SERVICE_ID
-    wr64be(&p[16], 0); // LOCAL_CA_GUID(プレースホルダ、未使用)
+    /* SERVICE_ID = (RDMA_PS_TCP << 16) + 接続先ポート。相手はこれでリスナを引く。 */
+    wr64be(&p[8], (RDMA_CM_PORT_SPACE_TCP << 16) | (uint64_t)ctx->service_port);
+    /* LOCAL_CA_GUID: 自分の MAC から EUI-64 を作る。**0 のままにしない。**
+     * Linux の ib_cm は (remote_ca_guid, remote_qpn) で重複接続と
+     * TIMEWAIT を引くので(cm.c の cm_insert_remote_qpn())、GUID が 0 だと
+     * 別のノードと見分けられない。 */
+    {
+        uint64_t guid = 0;
+        for (unsigned i = 0; i < 3u; i++) guid = (guid << 8) | ctx->own_mac[i];
+        guid = (guid << 16) | 0xFFFEu;
+        for (unsigned i = 3; i < 6u; i++) guid = (guid << 8) | ctx->own_mac[i];
+        wr64be(&p[16], guid); // LOCAL_CA_GUID
+    } // LOCAL_CA_GUID(プレースホルダ、未使用)
     wr32be_ib(&p[28], 0); // LOCAL_Q_KEY(RCでは不要)
     p[32] = (uint8_t)(ctx->rc_qp.qpn >> 16);
     p[33] = (uint8_t)(ctx->rc_qp.qpn >> 8);
@@ -87,16 +124,16 @@ static void rdma_cm_build_req(rdma_cm_ctx_t *ctx) {
     volatile uint8_t *priv = &p[140];
     priv[0] = 0; // cma_hdr.cma_version = CMA_VERSION(0)
     priv[1] = (uint8_t)(4u << 4); // cma_hdr.ip_version = 4(IPv4)<<4
-    wr16be_ib(&priv[2], 0); // cma_hdr.port(プレースホルダ)
+    wr16be_ib(&priv[2], ctx->src_port); // cma_hdr.port(相手から見た自分のポート)
     // priv[4..19] = src_addr(union cma_ip_addr、16B) -- IPv4は末尾4Bのみ使用。
     wr32be_ib(&priv[16], ctx->own_ip);
     // priv[20..35] = dst_addr(16B)。
     wr32be_ib(&priv[32], ctx->peer_ip);
     wr16le(&priv[36], 0); // recfmt = NVME_RDMA_CM_FMT_1_0
     wr16le(&priv[38], ctx->nvme_qid); // qid
-    wr16le(&priv[40], 32); // hrqsize(プレースホルダ)
-    wr16le(&priv[42], 32); // hsqsize(プレースホルダ)
-    wr16le(&priv[44], 0xFFFFu); // cntlid(未接続)
+    wr16le(&priv[40], ctx->hrqsize); // hrqsize(1's based)
+    wr16le(&priv[42], ctx->hsqsize); // hsqsize(**0's based**)
+    wr16le(&priv[44], ctx->cntlid);  // cntlid(admin は 0xFFFF)
 }
 
 /*=================================================================
@@ -371,7 +408,21 @@ job_result_t rdma_cm_job_step(job_t *self) {
                 self->state = RDMA_CM_ST_ACTIVE_MODIFY_QP;
                 return JOB_WAITING;
             }
-            // REP以外(想定外)は無視して再度RECVを構える。
+            if (rdma_cm_recv_attr_id(ctx->recv_buf) == CM_REJ_ATTR_ID) {
+                /* REJ の REASON はペイロード先頭から 10-11 バイト目。 */
+                const volatile uint8_t *pp = &ctx->recv_buf[MLX5_GRH_BYTES + IB_MAD_HDR_LEN];
+                uint16_t reason = (uint16_t)(((uint16_t)pp[10] << 8) | pp[11]);
+                const char *why = "?";
+                if (reason == CM_REJ_STALE_CONN)              why = "古い接続が残っている(stale connection)";
+                else if (reason == CM_REJ_INVALID_SERVICE_ID) why = "その SERVICE_ID で待ち受けていない";
+                else if (reason == CM_REJ_CONSUMER_DEFINED)   why = "上位(NVMe-oF)が拒否";
+                uart_printf("rdma_cm: REJ received (reason=%u %s)\n", (unsigned)reason, why);
+                ctx->rej_reason = reason;
+                ctx->failed = 1;
+                self->state = RDMA_CM_ST_DONE_FAIL;
+                return JOB_DONE;
+            }
+            // REP/REJ 以外(想定外)は無視して再度RECVを構える。
             {
                 const volatile uint8_t *pp = &ctx->recv_buf[MLX5_GRH_BYTES + IB_MAD_HDR_LEN];
                 uart_printf("rdma_cm: [DBG] 想定外MAD attr_id=0x%04x local_comm=0x%08x "
@@ -674,4 +725,11 @@ void rdma_cm_fill_addr(rdma_cm_ctx_t *ctx, mlx5_dev_t *dev, const char *self_lab
     }
     mlx5_build_roce_gid_v4(ctx->own_ip, ctx->own_gid);
     mlx5_build_roce_gid_v4(ctx->peer_ip, ctx->peer_gid);
+
+    /* CM REQ に載せる既定値。呼び出し側はこの後で上書きしてよい。 */
+    ctx->service_port = RDMA_CM_DEFAULT_PORT;
+    ctx->src_port     = RDMA_CM_DEFAULT_SRC_PORT;
+    ctx->hrqsize      = RDMA_CM_DEFAULT_HRQSIZE;
+    ctx->hsqsize      = RDMA_CM_DEFAULT_HSQSIZE;
+    ctx->cntlid       = 0xFFFFu;
 }

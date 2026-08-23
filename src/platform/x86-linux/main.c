@@ -5398,6 +5398,80 @@ static void shell_dispatch(char *line, int s0, int s1)
         while (*a >= '0' && *a <= '9') { v = v * 10u + (unsigned)(*a - '0'); a++; }
         s_dev1.roce_gid_vlan = (uint16_t)v;
         uart_printf("gidvlan: PF1 の GID VLAN = %u (0=無効)\n", v);
+    } else if (strncmp(line, "rdmatarget", 10) == 0) {
+        /* rdmatarget                       -- 現在の設定を表示
+         * rdmatarget off                   -- 解除(同一プロセス内のターゲットへ戻す)
+         * rdmatarget <ip> <mac> [port] [subnqn]
+         *
+         * **外部ホストの NVMe-oF RDMA ターゲットへ繋ぐための設定。**
+         * PF0 -> PF1 の RoCEv2 は FW が内部で折り返して消すので
+         * (CLAUDE.md「未解決」節)、RDMA を本当に往復させられる相手は
+         * 外部ホストだけ。MAC まで要るのは、RoCEv2 では L2 の宛先も
+         * こちらで決めるため。 */
+        char *arg = line + 10;
+        while (*arg == ' ') arg++;
+        if (*arg == 0) {
+            const nvme_rdma_remote_t *rt = nvme_rdma_remote_target();
+            if (!rt->enabled) {
+                uart_printf("rdmatarget: 未設定(bench は同一プロセス内のターゲットを使います)\n");
+            } else {
+                uart_printf("rdmatarget: %u.%u.%u.%u:%u mac=%02x:%02x:%02x:%02x:%02x:%02x\n",
+                            (unsigned)((rt->ip >> 24) & 0xFFu), (unsigned)((rt->ip >> 16) & 0xFFu),
+                            (unsigned)((rt->ip >> 8) & 0xFFu), (unsigned)(rt->ip & 0xFFu),
+                            (unsigned)rt->port, rt->mac[0], rt->mac[1], rt->mac[2],
+                            rt->mac[3], rt->mac[4], rt->mac[5]);
+                uart_printf("rdmatarget: subnqn=%s\n",
+                            rt->subnqn[0] ? rt->subnqn : "(自作ターゲットの既定)");
+            }
+        } else if (strncmp(arg, "off", 3) == 0) {
+            nvme_rdma_set_remote_target(0, 0, 0, 0, 0);
+            uart_printf("rdmatarget: 解除しました\n");
+        } else {
+            char *tok[8];
+            unsigned nt = shell_tokenize(arg, tok, 8);
+            if (nt < 2) {
+                uart_printf("使い方: rdmatarget <ip> <mac> [port] [subnqn] | off\n");
+            } else {
+                unsigned a = 0, b = 0, c = 0, d = 0;
+                {   const char *q = tok[0];
+                    unsigned *slot[4] = { &a, &b, &c, &d };
+                    for (unsigned i = 0; i < 4u; i++) {
+                        unsigned v = 0;
+                        while (*q >= '0' && *q <= '9') { v = v * 10u + (unsigned)(*q - '0'); q++; }
+                        *slot[i] = v;
+                        if (*q == '.') q++;
+                    }
+                }
+                uint8_t mac[6] = {0, 0, 0, 0, 0, 0};
+                {   const char *q = tok[1];
+                    for (unsigned i = 0; i < 6u; i++) {
+                        unsigned v = 0;
+                        for (unsigned k = 0; k < 2u; k++) {
+                            char ch = *q;
+                            unsigned dg;
+                            if (ch >= '0' && ch <= '9')      dg = (unsigned)(ch - '0');
+                            else if (ch >= 'a' && ch <= 'f') dg = (unsigned)(ch - 'a') + 10u;
+                            else if (ch >= 'A' && ch <= 'F') dg = (unsigned)(ch - 'A') + 10u;
+                            else break;
+                            v = v * 16u + dg; q++;
+                        }
+                        mac[i] = (uint8_t)v;
+                        if (*q == ':' || *q == '-') q++;
+                    }
+                }
+                uint16_t port = (nt >= 3) ? (uint16_t)atoi(tok[2]) : 0u;
+                const char *subnqn = (nt >= 4) ? tok[3] : 0;
+                nvme_rdma_set_remote_target(1, ip_from_octets((uint8_t)a, (uint8_t)b,
+                                                              (uint8_t)c, (uint8_t)d),
+                                            mac, port, subnqn);
+                const nvme_rdma_remote_t *rt = nvme_rdma_remote_target();
+                uart_printf("rdmatarget: %u.%u.%u.%u:%u mac=%02x:%02x:%02x:%02x:%02x:%02x へ繋ぎます\n",
+                            a, b, c, d, (unsigned)rt->port,
+                            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+                uart_printf("rdmatarget: subnqn=%s\n",
+                            rt->subnqn[0] ? rt->subnqn : "(自作ターゲットの既定)");
+            }
+        }
     } else if (strncmp(line, "rocepeer", 8) == 0) {
         /* rocepeer <a.b.c.d> <pf1|pi5|bogus> -- 次の bench の宛先 GID と宛先 MAC を
          * 独立に指定する。**FW が「ローカル宛」を MAC で見ているのか GID で見て
