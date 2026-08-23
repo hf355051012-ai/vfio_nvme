@@ -7,13 +7,32 @@ NVMe/TCP のターゲットとイニシエータを同一プロセスに立て�
 **このリポジトリは x86 専用**、rpi5 の履歴は引き継いでいない。
 
 構成・レイヤ・シェルコマンド・性能値といった説明は `README.md` にある。
+
+**仕組みそのものの説明は `SPEC.md`(仕様書)にある。** ネットワークもドライバも
+知らない読者向けに、前提知識から順に積み上げた文書。**実装を変えたらここも
+更新すること**(特に「第 28 章 何がどこまで確かめられているか」の表)。
+**左に章ナビゲーションを置いた HTML 版**が `docs/spec.html` にある。SPEC.md を
+直したら `tools/build_spec_html.sh` で作り直す(手で編集しない)。
+
 このファイルには**作業上の手順と、実機で踏んだ落とし穴**だけを書く。
 
 **未実装のプロトコル機能とその実装順は `PLAN_protocol_gaps.md` にある。**
-残っているのは B 系(IPv6 の SLAAC / MLD / NUD / 拡張ヘッダ)。段階 1〜10 =
-RST 送信 / 高速再送 / RDMA リソース解放 / Discovery / ルーティング /
-近隣キャッシュのエージング / 重複アドレス検出 / 送信側 IP フラグメント /
-Path MTU Discovery は実装済み。着手したらあのファイルの進捗表を更新すること。
+**ネットワーク層(段階 1〜14)はすべて完了した(2026-08-22)。** RST 送信 /
+高速再送 / RDMA リソース解放 / Discovery / ルーティング / 近隣キャッシュの
+エージング / 重複アドレス検出 / 送信側 IP フラグメント / Path MTU Discovery /
+SLAAC / MLD / NUD / IPv6 拡張ヘッダ。
+
+**次は段階 15〜22 = D 系(NVMe コントローラとして期待される機能)**:
+D2 Get Features / D3 Identify の CNS 網羅 / D4 TRIM・Write Zeroes /
+D5 SMART ログ / D6 AER の完了 / D7 Keep Alive タイマ / D8 複数名前空間 /
+D9 認証。**D 系は Pi5 の `nvme-cli` で直接叩けるので、B 系のような検証の
+工夫は要らない**(現状の実測結果も計画に載せてある)。着手したらあのファイルの
+進捗表を更新すること。
+
+**D 系は D2〜D8 が完了した(2026-08-22)** -- Get Features / Identify の CNS
+網羅 / TRIM・Write Zeroes / SMART・Error Information ログ / AER / Keep Alive
+タイマ / 複数名前空間。**残るは D9(認証)だけ**(計画自身が「TLS は対象外、
+やるなら DH-HMAC-CHAP のみ」と判断している)。
 
 ## 編集とビルド
 
@@ -482,6 +501,590 @@ B1〜B4 の IPv6 系だけで、どれも RDMA を使わない。Pi5 と繋い�
 - 検証: Pi5 の br0 に `2001:db8:0:1::20/64` を振って
   `ping6 2001:db8:0:1::10` が通ること(NS/NA からエコーまで実際に往復し、
   Linux の近隣キャッシュに `REACHABLE` で載る)。
+
+## IPv6 アドレス自動設定 SLAAC(`PLAN_protocol_gaps.md` 段階 11 = B1)
+
+RS(ICMPv6 type 133)を `ff02::2` へ送り、RA(type 134)の Prefix Information
+から **プレフィックス + EUI-64** のグローバルアドレスを作る。デフォルトルータ
+(A1 の `gateway6`)も RA から設定する。起動時に各インターフェースへ RS を
+1 回だけ出す(`SLAAC_RS_NUM` / `SLAAC_RS_INTERVAL_MS`。RFC 4861 は 3 回 x 4 秒
+だが、ルータの居ないこのリンクでは起動が延びるだけ。**実 LAN へ出すときは
+RFC 値へ戻すこと**)。**非要請 RA はいつ届いても処理する。**
+
+- `slaac [<if>] [ms]` — RS を送って RA を待ち、結果を表示する。
+- `slaactest [dump]` — 対向 PF にルータ役をさせて RA を注入する 12 項目の検査。
+- `ip6addr` — 手動設定は SLAAC より優先される(**RA では上書きしない**)。
+
+### 入れないと退行する / 危険になる判断
+
+1. **NDP は hop limit 255 以外を捨てる**(RFC 4861 6.1)。ルータは転送のたびに
+   hop limit を減らすので、255 で届いた = 同一リンク上から来た、の意味。
+   **これが無いとリンク外のノードが RA でデフォルトルータとプレフィックスを
+   乗っ取れる。** RS/RA/NS/NA の 4 つに効かせている。
+2. **RA の送信元がリンクローカルでなければ捨てる**(同 6.1.2)。
+3. **RFC 4862 の「2 時間ルール」**。既存アドレスの寿命を縮める RA は、残りが
+   2 時間以下なら無視する。**無いと偽の RA を 1 個投げるだけで他人のアドレスを
+   即座に失効させられる。**
+4. **手動設定(`ip6addr` / `route`)を RA で上書きしない。** 外部の RA が
+   飛んでくると `routetest` / `pmtutest` が名乗らせるアドレスやゲートウェイが
+   原因不明で書き換わる。
+5. **MTU オプションは記録するだけで適用しない**(`netif_t.ra_link_mtu`)。
+   リンク MTU を下げると `mss_cap` も下がり、**`txdrop` を 0 に戻し忘れたときと
+   同じで「以後の測定が全部おかしい」状態**になる。経路ごとの MTU 低下は
+   A5/A6(PMTUD)が宛先単位で扱うので実害も無い。`reachable time` /
+   `retrans timer` も採用しない(`g_neigh_cache_ttl_ms` は `arpage`/`arptest`
+   の前提値)。
+
+### DAD は RA 受信ハンドラから実行できない
+
+`ipv6_dad()` は内部で `net_poll_all_and_dispatch()` を回すので、受信処理の
+中から呼ぶと受信が再入する(`arp_resolve()` を送信ホットパスから呼んだときと
+同じ形)。冷たい経路の `ipv6_slaac_solicit()` が RA 処理の後に実行する。
+**したがって非要請 RA だけで設定されたアドレスは DAD 未実施のまま**になる
+(`netif_t.ip6_global_dad` が `NETIF_DAD_UNKNOWN`)。衝突を検出したときは
+**そのアドレスを使わない** -- 手動設定の「検出しても使い続ける」方針(A3)は
+2 つの PF を同一プロセスで駆動しているせいの妥協で、RA から勝手に作った
+アドレスまで使い続ける理由は無い。
+
+### 寿命の判定をホットパスに置かない
+
+`ipv6_global_addr()` は**受信フレームごと**(`ipv6_addr_is_ours`)と
+**送信ごと**(`ipv6_source_for`)に通る。無条件に `timer_now()` を呼ぶと
+そこへ時刻読み出しが乗るので、**`ip6_global_valid_until != 0` のときだけ**
+`ipv6_slaac_age()` を呼ぶ。手動設定と未設定は期限を持たない(=0)ので
+コストがかからない。ルータ寿命も同じ関数で判定する(`netif_next_hop6()` は
+inline の送信ホットパスなので触らない)。**ルータが消えたまま誰もその
+インターフェースを使わなければ `gateway6` は次に使われるまで残る。**
+
+### 検証: 自作でない送り手を必ず 1 つ挟む
+
+`slaactest` は RA を**自作コードで組んで**注入するので、それだけでは
+「自分の間違いを自分で受け入れて PASS」になる。2 つで塞ぐ:
+
+- **`tools/ra_check.c`** — `slaactest dump` の 16 進を、このリポジトリのコードを
+  一切 include せず glibc の `struct nd_router_advert` /
+  `struct nd_opt_prefix_info` で読み直す(`disc_log_check.c` /
+  `ip_frag_check.c` / `icmp_mtu_check.c` と同じ考え方)。
+- **`tools/send_ra.py`** — Pi5 で動かす**本物の送り手**(radvd が無いので
+  AF_PACKET)。`listen` を付けると RS を待って RA を返す「ルータ役」になり、
+  **自作の RS がワイヤに出ているかを相手側で確認できる**(Pi5 に tcpdump が
+  無いのでこれが唯一の観測手段)。
+
+```bash
+ssh rpi5-rdma-target 'cd ~/vfio_nvme && gcc -O2 -Wall -Wextra -o /tmp/ra_check tools/ra_check.c'
+scp tools/send_ra.py fukud@192.168.3.135:/tmp/     # Pi5 側
+sudo python3 /tmp/send_ra.py eth2 1800 1800 6 listen
+```
+
+**Pi5 で AF_PACKET を使うときの落とし穴 3 つ**(どれも送信は動くので、受信を
+書くまで気付けない):protocol を省くと 1 フレームも受信できない /
+**`htons()` が要るのは `socket()` の第 3 引数だけ**で `bind()` のタプルに
+掛けると二重変換になる / **`ETH_P_IPV6` では駄目で `ETH_P_ALL` が要る**
+(br0 のポートである eth1/eth2 では bridge の rx_handler がフレームを先に
+消費し、プロトコル別配送まで届かない。br0 側で待っても、ホストが join して
+いないマルチキャスト `ff02::2` は上がってこない)。
+
+### 実機で踏んだこと
+
+- **陰性対照そのものが RFC 違反だった。** `prefix_len=48` の陰性対照に `/64`
+  用のプレフィックスを長さだけ変えて使い回していたが、**プレフィックス長より
+  下のビットは 0 でなければならない**(RFC 4861 4.6.2)。`ra_check` が検出した。
+  **陰性対照は「試したい性質以外は正しい」形にする。**
+- **外部テストの残骸で `slaactest` が落ちる。** Pi5 から RA を受けた直後だと
+  対向 PF に RA 由来の `gateway6` が残っていて、サブネット外宛を Pi5 へ向けて
+  しまう(Pi5 はルータではないので Destination Unreachable が返る)。
+  テスト側で peer の `gateway6` も退避・復元するようにした。**A1 を入れた後は
+  「宛先が同一リンクにある」という暗黙の前提がテストごとに壊れうる。**
+- **他インターフェース宛の RA で待機を打ち切っていた。** 2 つの PF が同じ
+  リンクに居るので、PF1 の RS に対する RA が PF0 に届くことがある。RA の受信
+  カウンタだけでなく**どのインターフェースが処理したか**も見る。
+
+## 到達不能検出 NUD(`PLAN_protocol_gaps.md` 段階 13 = B3)
+
+A2 の「失効 -> 確認要求 -> 延命/破棄」に、RFC 4861 7.3 の残りを足したもの。
+検証は `nudtest`(TTL を一時的に縮めて実行し、**必ず元に戻す**)。
+
+1. **DELAY 相**。失効したエントリを**使った瞬間には確認要求を出さない**。
+   `probe_at == 0` を「失効後まだ一度も使われていない」印として使い、
+   DELAY(TTL/12。既定 60s なら 5 秒 = RFC の DELAY_FIRST_PROBE_TIME)を
+   置いてから初めて確認要求を出す。**新しい状態フィールドは足していない。**
+2. **上位層の到達確認**。TCP の累積 ACK が進んだ = 相手が自分のデータを
+   受け取った、という**確認要求より強い証拠**なので、確認要求を出さずに延命
+   する。`priv->neigh_confirm` を `ack_advanced` の隣で立て、次の送信で
+   `tcp_resolve_mac()` が消費する。
+3. **確認要求はユニキャスト**(ARP request も NS も)。MAC を知っている相手に
+   ブロードキャスト/マルチキャストを撃たない。**B2 の後はこの差が効く** --
+   スヌーピングするスイッチでマルチキャストが刈られていても必ず届く。
+4. **NA のフラグ解釈**: **Solicited のときだけ延命**、**Override 無しで既存と
+   違う MAC を主張する NA は無視**。無いと**偽の NA 1 通で他人宛の
+   トラフィックを奪える**。
+
+**「使われていないエントリを能動的に確認する」は入れていない。** RFC 4861 も
+Linux も確認するのは「使われたとき」だけで、使っていない相手を叩くのは
+帯域と相手の割り込みを捨てるだけ。計画にあった項目だが、直さないほうが正しい。
+
+### 検証で取り違えやすい 3 点
+
+- **`arptest` が落ちたら、まず仕様変更を疑う。** DELAY 相を入れたので
+  「stale を 1 回引いただけ」では確認要求が出ない。テスト側を合わせる。
+- **TCP 往復中のブロードキャスト ARP は NUD の確認要求ではない。**
+  猶予切れで破棄された後の再解決。Pi5 のブリッジ越しでは **RTO による
+  200ms の停止**が起きるので、猶予(TTL/6)がそれより短いと必ず踏む。
+- **「確認要求が 0 個」だけでは検証にならない**(DELAY 中で黙っていただけ
+  かもしれない)。`g_neigh_confirm_count` が増えていることを併せて見る。
+- **`tools/sniff_neigh.py`** を Pi5 で回すと、**ワイヤ上で本当にユニキャストに
+  なっているか**を相手側から読める(初回解決はブロードキャスト/マルチキャスト、
+  到達確認はユニキャスト、と並んで出る)。
+
+## MLD と IPv6 拡張ヘッダ(`PLAN_protocol_gaps.md` 段階 12 = B2 / 14 = B4 前半)
+
+参加しているマルチキャストグループ(= 要請ノードマルチキャスト)を MLD で
+報告し、Querier の Query に応答する。**スヌーピングするスイッチの配下では、
+これが無いと要請ノードマルチキャストが転送されず NDP が一切通らない。**
+
+- `mld` — 参加グループと版(v1 互換 / v2)を表示。
+- `mld report` / `mld leave` — 非要請 Report / 離脱通知。
+- **`mld off` / `mld on` — MLD の送信を止める/再開する。** `txdrop` と同じ
+  恒久デバッグ機能で、**止めると実スイッチ配下では通信が死ぬ**(それが
+  「MLD が効いている」ことの唯一の証明手段でもある)。**戻し忘れに注意。**
+- `mldtest [dump]` — 対向 PF に Querier 役をさせる 9 項目の検査。
+
+### MLDv1 も要る(Linux ブリッジの既定が v1)
+
+`mcast_mld_version` の既定は **1**。実際に繋ぐと v1 の Query が飛んでくるので、
+v2 だけ実装しても片手落ちになる。**v1 と v2 の Query は ICMPv6 メッセージ長で
+区別する**(v1=24、v2>=28。Linux も同じ判定)。v1 の Query を受けたら
+一定時間 v1 互換モードに入り、Report を v1 で送る。
+
+**宛先が版と種類で違う**: v2 Report は **ff02::16**、v1 Report は**グループ自身**、
+v1 Done は **ff02::2**。
+
+### MLD は普通の `ipv6_send()` では送れない
+
+- **Hop-by-Hop の Router Alert が必須**(RFC 2710 3)。
+- **hop limit は 1**(`ipv6_send_from()` は 255 固定)。
+- **チェックサムの疑似ヘッダに使う next header は 58(ICMPv6)で、IPv6 ヘッダに
+  書く 0(Hop-by-Hop)ではない。** 長さも ICMPv6 メッセージ長だけで拡張ヘッダを
+  含めない。ここを取り違えると**相手だけが静かに捨てる**。
+
+受信側の妥当性検査は 3 つ(RFC 3810 6.2): hop limit が 1 / Router Alert がある /
+送信元がリンクローカル。**抜けるとリンク外のノードにマルチキャスト受信を
+止められる**(B1 の hop limit 255 検査と同じ性質)。
+
+### 拡張ヘッダの走査(受信側)
+
+MLD の Query が Hop-by-Hop 付きで届くので、`ipv6_skip_ext_headers()` が
+先に要った。Hop-by-Hop / Routing / Destination Options を辿り、Fragment は
+ログを出して破棄する(再構成は IPv4 側と同じく未実装)。検証は `ext6test`。
+
+- 長さは **(hdr_ext_len + 1) * 8**(最初の 8 バイトを含まない)。
+- **Hop-by-Hop の TLV では PAD1(type 0)だけが長さフィールドを持たない。**
+  一律に {type, len} で読むとそこからずれる。
+- **未知オプションの扱いは type の上位 2 ビットが決める**(RFC 8200 4.2)。
+  00 以外は破棄する。一律に読み飛ばしてはいけない。
+- **Routing ヘッダは Segments Left が 0 でなければ破棄する**(同 4.4)。
+  読み飛ばすと **RFC 5095 で廃止された Routing Type 0** を受け入れてしまう。
+- **上位プロトコルの長さは payload_length から拡張ヘッダぶんを引く。**
+  引き忘れると TCP/UDP のチェックサム検証が全部壊れる。
+
+### 送信側の IPv6 断片化と、HW オフロードが壊した 4 バイト
+
+**IPv6 は経路上で分割されない**(RFC 8200 4.5)ので、MTU 超は送信元が
+Fragment 拡張ヘッダで割る(`ipv6_send_fragmented()`)。IPv4 との違いは、
+分割情報が 8 バイトの拡張ヘッダに載ること(1 断片は MTU−40−8)、
+next_header が 44 になり元のプロトコル番号が Fragment ヘッダへ移ること、
+Identification が 32bit であること。
+
+**`mlx5_net_post_frame()` は IPv6 の next_header が 44 のフレームでは
+L4 チェックサムオフロードを外す。** HW は拡張ヘッダを飛ばした先を L4 ヘッダと
+みなしてチェックサムを書き込むので、**2 個目以降の断片のデータ 6-7 バイト目が
+潰れる**(1 個目はそこが本物の UDP チェックサム欄なので気付けない)。実機では
+「4000 バイト中 4 バイトだけ化ける」という形で出た。
+
+**そして、その修正が別のバグを露出させた。** `udp_send6()` が疑似ヘッダの
+送信元に常にリンクローカルを使っており、グローバル宛のときだけ食い違って
+いた。**それまでは NIC の L4 オフロードが正しい値へ上書きしていたので誰も
+気付かなかった。** 「HW が黙って直してくれる」たぐいの不具合は、HW を止めた
+瞬間に別の場所で出る。
+
+### 検証: Linux に再構成させる
+
+自作 ↔ 自作では受信側が再構成しないので、自分で組み直して一致を見るところ
+までしか言えない。**`tools/udp6_echo.py` を Pi5 で動かし、`udp6send` で
+MTU 超の UDP を送って Linux に再構成させる**のが本筋の確認。
+
+```bash
+scp tools/udp6_echo.py fukud@192.168.3.135:/tmp/   # Pi5 側
+sudo ip -6 addr add 2001:db8:0:9::20/64 dev br0
+python3 /tmp/udp6_echo.py 7780 40
+# 自作側
+ip6addr mlx5-pf0 2001:0db8:0000:0009:0000:0000:0000:0010 64
+udp6send 2001:0db8:0000:0009:0000:0000:0000:0020 7780 9300
+```
+
+`tools/ip6_ext_check.c` は `ext6test dump` の拡張ヘッダを glibc の
+`struct ip6_frag` / `ip6_rthdr` / `ip6_hbh` で読み直す。**glibc の
+`IP6F_OFF_MASK` などはネットワークバイト順のまま掛ける定数**で、`ntohs()`
+した値に掛けると壊れる(このツールを書いたとき実際に間違え、正しい実装を
+NG と判定した)。
+
+### 検証: スヌーピングする実スイッチで陰性/陽性の対を取る
+
+Pi5 のブリッジを Querier + スヌーピングにし、ポートの未登録マルチキャストの
+フラッディングを止めて測る。**これをやらないと「元々フラッディングで通って
+いただけ」と区別がつかない。**
+
+```bash
+# Pi5 側(ブリッジをスヌーピング Querier にし、未登録は転送しない)
+sudo ip link set br0 type bridge mcast_snooping 1 mcast_querier 1
+sudo ip link set dev eth1 type bridge_slave mcast_flood off
+sudo ip link set dev eth2 type bridge_slave mcast_flood off
+sudo /sbin/bridge mdb show          # 自作の Report で学習したグループが載る
+# 終わったら必ず戻す
+sudo ip link set dev eth1 type bridge_slave mcast_flood on
+sudo ip link set dev eth2 type bridge_slave mcast_flood on
+sudo ip link set br0 type bridge mcast_querier 0
+```
+
+| 自作側 | MDB | Pi5 から `ping6` |
+|---|---|---|
+| `mld off` | eth1/eth2 にエントリ無し | **100% ロス** |
+| `mld on` + `mld report` | 両 PF のグループが載る | **0% ロス** |
+
+- **`bridge` コマンドは Pi5 にある**(`/sbin/bridge`。非ログインシェルの
+  PATH に入っていないのでフルパスで叩く)。`bridge mdb show` が
+  **相手側から見た決定的な証拠**になる。
+- **`mld leave` では通信は止まらない。** 離脱を通知するとブリッジが
+  group-specific query を投げ、こちらはまだリスナなので即座に報告し直す
+  (RFC どおりの正しい動作)。陰性対照には `mld off` を使う。
+- **`tools/mld_check.c`** — 送信した MLD を libc の `struct mld_hdr` /
+  `struct icmp6_hdr` で読み直す。MLDv2 のレコード構造だけは Linux の
+  `include/net/mld.h` からの転記(あのヘッダはカーネル専用の型を引くので
+  ユーザ空間から include できない)なので、**Linux 自身が出した MLDv2 Report を
+  同じツールに食わせて**転記を検算する。
+- **`tools/sniff_mld.py`** — Pi5 で MLD を観測して `MLDDUMP` 形式で吐く。
+  自作の Report がワイヤに出ているかの確認と、Linux の MLD を `mld_check` へ
+  流すための道具。**ブリッジポートでは `ETH_P_ALL` でないと受信できない。**
+
+## Get Features と Identify の CNS(`PLAN_protocol_gaps.md` 段階 15 = D2 / 16 = D3)
+
+Pi5 の `nvme-cli` から叩いて足りないと分かったものを実装した。**D 系は
+実ホストで直接叩けるので、B 系のような検証の工夫は要らない。**
+
+- `nvme get-feature -f 6|7|0x0b|0x0f` が値を返す(`-s 1` default /
+  `-s 3` supported capabilities も)。
+- `nvme list-ns`(CNS=0x02)/ `nvme ns-descs`(CNS=0x03)が通る。
+- Linux が接続時に投げる CNS=0x05 はゼロ埋めで正常完了。
+
+### CQE の status は Linux の `NVME_SC_*` を 1bit 左シフトした値
+
+status フィールドは **bit0=Phase / bit8:1=SC / bit11:9=SCT / bit15=DNR**。
+Linux の `enum { NVME_SC_* }` は SC と SCT を 1 つの 15bit 値として持って
+いる(`NVME_SCT_COMMAND_SPECIFIC = 0x100`、`NVME_STATUS_DNR = 0x4000`)ので、
+**そのまま 1bit 左シフトすれば status になる**。
+
+既存の `NVMET_SC_GENERIC_ERROR = 0x0002` は名前と裏腹に
+**SC=0x01 Invalid Command Opcode** そのもの。「未対応の FID」「未対応の CNS」
+まで全部これで返していたので、ホストからは**コマンドごと無いのか
+フィールドが悪いのかが区別できなかった**。
+
+### 「知らない値にも成功を返す」のをやめる
+
+Set Features は**どんな FID でも成功を返していた**。ホストは設定できた
+つもりで先へ進むので、Get Features を実装した瞬間に必ず食い違う。
+Get / Set が **同じ判定関数(`nvmet_feat_current()`)** を通るようにして、
+対応 FID が片方だけ増えることが起きないようにしてある。
+
+同じ理由で **Select=saved と Set Features の SV=1 は「保存できない」で返す**
+(current の値を返すと「保存された値がある」という嘘になる)。
+Select=supported capabilities は現在値ではなく能力ビットを返す別の関数。
+
+### VS が 0 だと CNS=0x03 は永久に来ない
+
+`nvme ns-descs` は手で叩けば通るが、**ホストが自発的に取りに来るかは
+VS レジスタ(Property Get offset 0x08)次第**で、0 のままだと「1.0 未満」と
+見なされて 1.3 以降の CNS を一切使わない。Property Get の VS と Identify
+Controller の VER(offset 80)に 1.3.0 を入れて初めて接続時に飛んでくる。
+**機能を実装しても、能力の広告を直さないとホストは使わない**(`oncs` が 0 だと
+`blkdiscard` が ioctl 段階で弾かれるのと同じ構造。D4 でも同じことをする)。
+
+### EUI-64 / NGUID を全 0 のままにしない
+
+全 0 は「識別子を持たない」の意味なので、**ホストは名前空間の同一性を
+判断できない**。`id_ns` の nguid(offset 104)/ eui64(120)と CNS=0x03 の
+記述子リストに**同じ値**を入れる(片方だけだと食い違う名前空間に見える)。
+値は先頭に 0x02(ローカル管理ビット)を置いて実在の OUI を騙らず、末尾
+2 バイトに NSID を入れて D8 で増えても衝突しないようにしてある。
+dmesg の `No UUID available providing old NGUID` が「読めている」証拠。
+
+### `tools/*_check.c` はもう要らない場面がある
+
+`disc_log_check.c` 系の「相手側の構造体でパースさせる」道具が要ったのは
+**実ホストへ繋ぐ経路が無かったから**。Pi5 と繋がった今、`nvme ns-descs` は
+Linux の TLV パーサそのもので、カーネルは NGUID を `wwid` に採用する。
+**自作でない実装に読ませる、という目的はそれで達成されている**ので、
+D3 では新しい check ツールを作っていない。
+
+### nsid の扱いは SPDK の `_nvmf_ctrlr_get_ns_safe()` に合わせた
+
+| 条件 | 応答 |
+|---|---|
+| nsid が 0 / 範囲外 / ブロードキャスト | Invalid Namespace or Format(SC=0x0B)|
+| 範囲内だが未使用 | **ゼロ埋めで正常完了**(エラーではない)|
+| CNS=0x02 の nsid | 「**この値より大きい** NSID を並べよ」の意味。対象を指すのではない |
+
+OptiPlex に **SPDK のソースが置いてある**(`~/spdk/lib/nvmf/` の `ctrlr.c` /
+`ctrlr_bdev.c`)ので、
+NVMe 仕様の細かい振る舞いはこれとカーネルヘッダ
+(`/usr/src/linux-headers-*/include/linux/nvme.h`)で確認できる。**推測しない。**
+
+## TRIM(Deallocate)と Write Zeroes(`PLAN_protocol_gaps.md` 段階 17 = D4)
+
+`nvmet.c` に Write Zeroes(0x08)と Dataset Management(0x09)を足し、
+ONCS(offset 520)の bit2/bit3 と `id_ns` の DLFEAT(offset 33)で広告する。
+実体は `nvmet_zero_lba_range()` の `volatile_fast_zero()`(`net.h` に追加。
+**既存の `nvmet_zero()` はバイト単位のループ**なので 32MB には使えない)。
+
+### NLB は 2 つあって、0's based なのは片方だけ
+
+| フィールド | 0's based か |
+|---|---|
+| Write Zeroes の cdw12 NLB | **そう**(+1 する)|
+| DSM の cdw10 NR(範囲数)| **そう**(+1 する)|
+| **`struct nvme_dsm_range` の NLB** | **違う**(0 = 0 ブロック。そのまま使う)|
+
+根拠は Linux の `nvme_setup_discard()` が `nlb = bi_size >> lba_shift` を
++1 せず入れていることと、SPDK の `nvmf_bdev_ctrlr_unmap()` が
+`lba_count = dsm_range.length` とそのまま使っていること。
+**この取り違えはバイト配置の検算(`tools/*_check.c`)では見つからない** --
+値の解釈の問題なので、「8 ブロックだけ消えて 9 ブロック目が残る」ことを
+実データで確かめるしかない(`blkdiscard -l 4096` の後に 9 ブロック目以降を
+`cmp` する)。
+
+### discard の上限を広告しないと 268MB の memset が飛んでくる
+
+DMRL / DMRSL / DMSL は **Identify CNS=0x06(I/O Command Set specific
+Identify Controller、CSI=NVM)の `struct nvme_id_ctrl_nvm`** にある。
+広告しないと Linux は `max_hw_discard_sectors` を絞らないので、
+`blkdiscard` 一発で名前空間全体の Deallocate が来る。RAM ディスクを
+memset する実装ではそのあいだジョブスケジューラが止まる。
+
+- DMRSL = 65536 ブロック(32MB)を広告して、Write Zeroes の NLB 上限
+  (16bit + 1 = 65536)と最悪ケースを揃えてある。
+- 効いていることの確認は **`/sys/block/nvme0n1/queue/discard_max_bytes` が
+  33554432 になる**こと。全体 `blkdiscard` は 32MB x 8 に分割されて 67ms。
+- **D3 で「CNS=0x06 は未対応のままでよい」と判断したのは早すぎた。**
+  Linux が接続時に投げてくる CNS には、たいてい投げてくるだけの理由がある。
+
+### DSM のデータは in-capsule で来る(R2T 経路は作っていない)
+
+Linux は discard を `rq_data_dir()==WRITE` と見なすので
+`nvme_tcp_has_inline_data()` が真になり、**16 バイト x NR は必ず
+in-capsule で届く**。`pending_writes` は write 専用(受信先が RAM ディスク
+固定)なので、そこへ流し込むと**範囲リストを名前空間へ書き込む**。
+R2T で来たら黙って成功を返さず Invalid Field で落とす(消したつもりに
+させない)。
+
+### dispatch まで生かす必要があるデータは ready-ring と 1 対 1 で置く
+
+write は受信時に RAM ディスクへ直接置くので、**これまで dispatch 時に
+受信データを読むコマンドが 1 つも無かった**。共有の `data_buf` に置くと
+次のコマンドが届いた時点で上書きされる。かといって ready-ring の要素に
+4KB の配列を持たせるとスロットの間隔が 4KB 開いて **hot path の TLB を
+荒らす**ので、`nvmet_ctx_t` 側に `dsm_stage[NVMET_READY_RING][4096]` を
+置き、ring からは既存の未使用フィールド `data_dst` で指す。
+
+### 検証(Pi5)
+
+**「書いてから消して読む」の 3 段で、かつ境界の外が残っていることまで見る。**
+ゼロが返るだけでは元々ゼロだった可能性がある。
+
+```bash
+sudo blkdiscard -o 0 -l 4096 /dev/nvme0n1      # 実装前は Operation not supported
+sudo mkfs.ext4 -q -F -E discard /dev/nvme0n1   # 実ファイルシステム経由の多範囲 DSM
+sudo fstrim -v /mnt/nvt                        # 229.8 MiB trimmed
+```
+
+## SMART と Error Information ログ(`PLAN_protocol_gaps.md` 段階 18 = D5)
+
+Get Log Page に LID=0x02(SMART、512 バイト)と LID=0x01(Error Information、
+64 バイト)を足した。統計は `nvmet_ctx_t` に持ち、**セッションをまたいで
+持ち越す**(実コントローラの通電中統計はホストが繋ぎ直しても 0 に戻らない。
+リセットは `nvmet_job_start()` = プロセス起動時だけ)。
+
+- **温度はケルビン。** 0 のままだと nvme-cli が **-273℃(0 K)**と表示する。
+- **128bit カウンタは 16 バイトぜんぶ書く**(`nvmet_wr128le()`)。上位 8 バイトに
+  残骸があると桁が跳ねる。
+- `data_units_read/written` は **512 バイト x 1000 単位で切り上げ**。
+
+### エラー記録のフックは `nvmet_build_cqe()` に置く
+
+エラー応答は 50 箇所あるが、**全部がこの関数を通る**。ここに
+`status != 0` の分岐を 1 つ置けば取りこぼさない(呼び出し側に配ると、次に
+足すエラーパスで必ず忘れる)。引数へ `ctx` を足す機械的な変更で済む。
+sqid / nsid / lba は dispatch の入口で `ctx->err_*` に置き、LBA を持つ
+コマンドだけがエラー直前に `err_lba` を入れる。
+
+- **`status_field` には CQE の status ワードをそのまま入れる**(bit0 が
+  phase の位置に来る 16bit)。Linux の `nvmet_set_error()` も
+  `cqe->status` と `status_field` の両方へ同じ `status << 1` を入れており、
+  nvme-cli は表示時に 1 ビット右へ寄せる。**寄せて入れると nvme-cli の
+  表示だけが半分の値になる。**
+- **Fabrics コマンドは nsid のワードを fctype に使う**ので、そこを nsid として
+  記録しない。
+
+### 実装していない能力ビットは立てない(LPA=0)
+
+LPA bit0(名前空間ごとの SMART)も bit1(Command Effects ログ)も持って
+いないので 0 のまま。**立てるとホストがそのログを取りに来て失敗する。**
+ELPE は 0's based なので 0 = 1 エントリ保持、が正しい。
+
+### 検証: 「増えること」を 3 点で見る
+
+固定値を返しているだけでも 1 点だけ見れば通ってしまう。
+**接続直後 → IO を流した後 → わざとエラーを起こした後**で比べる。
+
+| 見るもの | 期待 |
+|---|---|
+| `nvme smart-log` の `Data Units Written` | 64MiB write のあと 132(= 67.58 MB)|
+| `host_write_commands` | 256(= 64MiB / MDTS 256KiB)|
+| `nvme error-log` の陽性対照 | 範囲外 write-zeroes で `status_field : 0x4080` / **`lba : 0x7fff8`** / `sqid : 1` |
+| admin 側の陽性対照 | `get-feature -f 0x7f` で `sqid : 0` / `0x4002` |
+| `num_err_log_entries` | エラーログの `error_count` と一致して増える |
+
+**nvme-cli がフィールド名つきで全項目を展開する**ので、オフセットを間違えれば
+「別のフィールドに値が出る」形で必ず見える。`tools/smart_check.c` は
+そのぶん要らない。
+
+## 非同期イベントと複数名前空間(`PLAN_protocol_gaps.md` 段階 19 = D6 / 21 = D8)
+
+**この 2 つは組でしか検証できない。** AER は「イベントを生成する何か」が
+無いと保留のままだし、名前空間の増減はホストへ通知できないと気付かれない。
+シェルの **`nvmens [add|del <nsid>]`** が発火点で、`nvmens` だけなら一覧表示。
+
+名前空間は **nsid=1 が 256MB、nsid=2 が 32MB**(既定では 1 だけ有効)。
+サイズを変えてあるのは `.bss` の都合でもあるが、**「名前空間ごとに別の実体と
+別の上限を見ているか」の確認としても強い**(ns2 の範囲外 LBA が ns1 なら
+有効な値になる)。
+
+### イベントを送る前に「送ってよい」と広告する
+
+**OAES(Identify Controller offset 92)の Namespace Attribute Notices を
+立てないと、Linux は Async Event Request をそもそも送ってこない。**
+`nvme_enable_aen()` が `ctrl->oaes` を見て早期 return するため、AEN の
+Set Features も AER も飛ばない。D2 のときに「AER が 1 度も来なかった」と
+記録したのはこれが原因だった。**D4 の ONCS、D3 の VS に続いて 3 例目。**
+
+### AER の CQE を送るのはシェルではなく admin ジョブ
+
+`nvmens` はシェル(core0)から呼ばれるが、admin キューを回しているのは
+core1。**別コアから同じコネクションへ送ると、受信ポーリング中の admin
+ジョブと競合する**(RDMA CM で同じ形の不具合を踏んでいる)。
+`nvmens` は `ctx->aer_notify_ns` の旗を立てるだけにして、送信は
+`nvmet_admin_job_step()` の先頭で行う。
+
+- 保留は cid 1 つだけ(AERL=0 = 0's based で同時 1 件)。2 件目は
+  **Async Event Request Limit Exceeded** で返す(黙って捨てるとホストは
+  永久に待つ)。
+- **Changed Namespace List(LID=0x04)は読み出したらクリアする。**
+  しないとホストが同じ変更を何度も見て再スキャンを繰り返す。
+- **切断時に保留を捨てる。** 次のホストが自分の出していない cid の CQE を
+  受け取ることになる。
+
+### nsid を見る場所は dispatch だけではない
+
+書き換えたのは Identify(CNS=0x00/0x02/0x03)、IO の dispatch、
+**受信パーサ 2 つ**(push の in-capsule write と pull の同等処理)、
+H2CData の受信先、データダイジェストの検証。`nvmet_pending_write_t` に
+`disk` を持たせて R2T 経路でも取り違えないようにしてある。
+**受信経路を 4 箇所書き換えたので、回帰確認の本命は `tcpbench`。**
+
+- **Flush は名前空間の解決より前に置く。** `nvme smart-log` と同じで
+  **nsid=0xFFFFFFFF(全名前空間)で来る**ので、先に解決すると Invalid
+  Namespace で落とすことになる。
+- **NN は「実際に有効な数」ではなく「取りうる最大 nsid」。** 未使用の nsid が
+  あってよく、ホストは CNS=0x02 で有効なものを引く。
+
+### 検証(Pi5)と、ホスト経由では叩けないもの
+
+```
+nvmens add 2   → ターゲット: 非同期イベント通知 (type=2 info=0x0 lid=0x4)
+               → Pi5: dmesg に "rescanning namespaces"、/dev/nvme0n2 が生える
+nvmens del 2   → 同じく再スキャン、/dev/nvme0n2 が消える
+```
+
+陰性対照は 3 つ: n1/n2 に別データを書いて**混ざらない**こと、
+`write-zeroes /dev/nvme0n2 -s 65530 -c 15` が **LBA Out of Range**
+(ns1 なら有効な LBA)、`nvme id-ns -n 3` が Invalid Namespace or Format。
+
+**IO コマンドの「無効な nsid」だけはホスト経由で叩けない。** Linux は
+`/dev/nvme0n1` へのパススルーで nsid 不一致をカーネル側で弾き
+(`nsid (3) in cmd does not match nsid (1) of namespace`)、`/dev/nvme0` の
+IO パススルーは名前空間が複数あると拒否する
+(`NVME_IOCTL_IO_CMD not supported when multiple namespaces present!`)。
+IO パスが nsid を解決していること自体は上の陰性対照 2 つで示せているので、
+未到達なのは「無効だったときの status」の 1 分岐だけ。
+
+### 2 コアが同時に uart_printf すると出力が混ざる
+
+`nvmens add 2` の応答(core0)と AER 通知のログ(core1)が文字単位で
+インターリーブして読めなくなる。**既知の性質で害は無いが、実機ログを
+読むときは「壊れている」と誤読しないこと。**
+
+## Keep Alive タイマ(`PLAN_protocol_gaps.md` 段階 20 = D7)
+
+Fabrics Connect の **cdw12**(cdw10 ではない)で受け取った KATO を超えて
+コマンドが来なければセッションを畳む。TCP の FIN が来ない切断
+(ケーブル抜け、相手のクラッシュ)を検出する唯一の手段。
+
+- **KATO=0 は「Keep Alive 無効」。** Discovery コントローラは 0 で繋いで
+  くるので、回すと接続直後に切ってしまう。**`nvmediscover` が通ることが
+  そのまま「0 のときは回していない」の確認になる。**
+- 判定は admin ジョブの step(冷たい経路)。`timeout_ms()` の 64bit 除算を
+  ここに置くのは問題ない(A2 で禁じたのはホットパスの話)。
+
+### IO の hot path に時刻読み出しを足さずに「相手が生きている」を知る
+
+Keep Alive だけを見ると、admin が忙しいときに切ってしまう。かといって
+IO の dispatch で `timer_now()` を呼ぶと 1 コマンドあたりの固定コストになる
+(read 8k は 1 コマンド 3.3us なので効く)。
+
+**D5 で入れた SMART のコマンド数カウンタ(`stat_read_cmds + stat_write_cmds`)が
+進んだかどうかを admin ジョブ側で見る**ことで代用した。**追加コストはゼロ。**
+「別の目的で既にホットパスにあるカウンタを、冷たい経路から観測して使う」は
+ほかにも使える手。
+
+### 畳む順序が変わると、旗で伝え合う後始末が壊れる
+
+**D7 で初めて「admin が先に畳む」経路ができ、既存のバグが露呈した。**
+
+これまでは必ず「IO が先に終わる → admin が linger して待つ」だった。
+KATO 切れでは admin が先に `NADM_ST_ARM` へ戻り、**そのあとで IO ジョブが
+`session_done` を立てる**。admin はもう次の接続を待っているので、この旗を
+「IO が切れた」と解釈して linger を始め、**10 秒後に「相手が閉じないので
+打ち切り」として次の(正常な)セッションを畳んでしまう**。
+
+実機ではリンク復旧後の再接続が確立した直後にこれが出た。直し方は
+「ARM / ACCEPT_WAIT で `session_done` を見たら前のセッションの残骸として
+捨てる」。**新しい「畳む契機」を足したら、既存の旗が逆順でも成立するかを見る。**
+
+- IO キューは **IO ジョブ自身に畳ませる**(`ctx->kato_expired` の旗)。
+  別ジョブが握っているコネクションを横から閉じると、受信 upcall の解除など
+  `nvmet_io_job_end()` に集約した後始末が抜ける。
+- **旗を消費するのは IO ジョブ側。** admin の `session_finish()` でリセット
+  すると、立てた直後に消えて IO ジョブが一度も見ない。
+
+### 検証(Pi5)
+
+```bash
+sudo nvme connect ... --keep-alive-tmo=5
+# 陰性対照: 20 秒放置しても切れない(Linux が Keep Alive を送り続ける)
+sudo ip link set eth1 down    # PF1(192.168.101.11)側のリンクを落とす
+# → ターゲットが 5 秒強で「Keep Alive タイムアウト」を出して畳む
+sudo ip link set eth1 up      # → Linux が Successfully reconnected
+```
+
+**陰性対照が無いと「ただのタイムアウト」と区別がつかない。**
 
 ## Linux 側比較ベンチ `~/script/linux_loopback.sh`
 

@@ -27,6 +27,11 @@ void arp_handle_frame(const uint8_t *payload, size_t len, const uint8_t *src_mac
 
 int arp_send_request(uint32_t target_ip);
 
+/* 到達確認(NUD)用のユニキャスト ARP request。MAC を既に知っている相手に
+ * 「まだそこに居るか」を聞くので、ブロードキャストにしない(RFC 4861 7.2.4 の
+ * ARP 版。Linux の NUD PROBE も同じ)。 */
+int arp_send_request_unicast(uint32_t target_ip, const uint8_t mac[6]);
+
 /* 重複アドレス検出(RFC 5227 の ARP Probe)。ip を使い始める前に呼ぶ。
  * 0=空き、1=既に使われている(out_mac に相手の MAC)、-1=失敗。
  * 「応答が返ってこないこと」で判定するので probes*interval_ms かかる。
@@ -44,6 +49,11 @@ int arp_probe(uint32_t ip, unsigned probes, uint32_t interval_ms, uint8_t out_ma
 void arp_cache_insert(uint32_t ip, const uint8_t mac[6]);
 
 int arp_cache_lookup(uint32_t ip, uint8_t out_mac[6]);
+
+/* 上位層の到達確認(RFC 4861 7.3.1)を受け取れる版。confirmed=1 なら
+ * 「相手が自分のデータを確かに受け取った」ので、確認要求を出さずに延命する。
+ * TCP の送信経路だけがこれを使う(累積 ACK が進んだかを知っているため)。 */
+int arp_cache_lookup_nud(uint32_t ip, uint8_t out_mac[6], int confirmed);
 
 /* キャッシュを引かずにエントリの寿命だけを見る(`arptest` の観測用)。
  * 0=fresh、1=stale(猶予中)、-1=未登録。remain_ms は残り猶予/寿命。 */

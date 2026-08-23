@@ -8,6 +8,10 @@ bring-up からフローステアリング、TCP/IP、NVMe-oF プロトコルま
 `rpi5_boot`(Raspberry Pi 5 ベアメタル)の x86 VFIO ポートを切り出して独立
 させたもの。**このリポジトリは x86 専用**で、rpi5 の履歴は引き継いでいない。
 
+**初めて読む人へ**: 仕組みの説明は **[`SPEC.md`](SPEC.md)(仕様書)** にあります。
+ネットワークやドライバの前提知識が無くても読めるように、`MMIO` や `DMA` の
+説明から順に積み上げてあります。この README は要約・ビルド手順・性能値です。
+
 ## 構成
 
 ```
@@ -40,7 +44,7 @@ tools/sync_to_optiplex.sh    Windows -> OptiPlex 一方向同期
 | | `timestamp.c` | `ts_log` リングバッファ(性能分析の中核) |
 | | `crc32c.c` `timer.c` `net_buf.c` | CRC32C(SSE4.2)、単位変換、フレームバッファプール |
 
-規模: 約 20,500 行(`.c` + `.h` + Makefile)。
+規模: 約 33,000 行(`.c` + `.h` + Makefile)。
 
 ## 開発フロー
 

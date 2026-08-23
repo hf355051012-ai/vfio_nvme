@@ -46,6 +46,17 @@ int neigh_check_age(uint64_t now, uint64_t expires_at, uint64_t *probe_at)
     uint64_t grace_ns = (uint64_t)(ttl_ms / 6u) * 1000000ull;
     if ((int64_t)(now - (expires_at + grace_ns)) >= 0) return NEIGH_DEAD;
 
+    /* **失効してから初めて使われたときは確認要求を出さない**(RFC 4861 の
+     * DELAY 相)。probe_at==0 が「まだ一度も使われていない」印なので、ここで
+     * DELAY の期限を入れて今回は黙って MAC を返す。この猶予のあいだに上位層
+     * (TCP の累積 ACK 前進)が到達性を裏付ければ、確認要求は 1 個も出ない。 */
+    if (*probe_at == 0u) {
+        uint32_t delay_ms = ttl_ms / NEIGH_DELAY_DIVISOR;
+        if (delay_ms < 10u) delay_ms = 10u;
+        *probe_at = now + (uint64_t)delay_ms * 1000000ull;
+        return NEIGH_STALE;
+    }
+
     if ((int64_t)(now - *probe_at) >= 0) {
         uint32_t interval_ms = ttl_ms / 60u;
         if (interval_ms < 10u) interval_ms = 10u;
@@ -53,6 +64,38 @@ int neigh_check_age(uint64_t now, uint64_t expires_at, uint64_t *probe_at)
         return NEIGH_STALE_PROBE;
     }
     return NEIGH_STALE;
+}
+
+/* ---- 確認要求の観測フック(`nudtest` 用)---- */
+volatile uint32_t g_neigh_confirm_count;
+
+static neigh_probe_observer_t s_neigh_probe_observer;
+
+/*=================================================================
+ * 確認要求(ARP request / NS)の観測フックを登録する(NULL で解除)。
+ *
+ * コール元:
+ *   shell_nudtest()
+ * ===============================================================*/
+void neigh_set_probe_observer(neigh_probe_observer_t fn)
+{
+    s_neigh_probe_observer = fn;
+}
+
+/*=================================================================
+ * 確認要求を出す直前に観測フックへ渡す。**ユニキャストで出ているか**は
+ * 送信直前か相手側でしか分からない。
+ *
+ * 引数:
+ *   is_v6      - 1=NDP、0=ARP
+ *   is_unicast - 1=キャッシュ済み MAC へ直接、0=ブロードキャスト/マルチキャスト
+ *   dst_mac    - 実際に使う L2 宛先
+ * コール元:
+ *   arp_send_request_to(), ndp_send_ns_to()
+ * ===============================================================*/
+void neigh_probe_notify(int is_v6, int is_unicast, const uint8_t dst_mac[ETH_ALEN])
+{
+    if (s_neigh_probe_observer) s_neigh_probe_observer(is_v6, is_unicast, dst_mac);
 }
 
 netif_t *g_netif_active_slots[SMP_MAX_CORES];

@@ -1540,6 +1540,1502 @@ static void shell_dadtest(void)
     uart_printf("dadtest: %s\n", ok ? "PASS" : "NG");
 }
 
+/* ---- slaac / slaactest: RA を注入して SLAAC の学習と適用を確かめる ---- */
+
+static uint8_t s_ra_dump;  /* 1=注入した RA を 16 進で出す(tools/ra_check 用) */
+
+/*=================================================================
+ * Router Advertisement を 1 個組み立てて送る。ルータの役を対向インター
+ * フェースが務める(pmtutest が ICMP エラーを注入するのと同じ手)。
+ *
+ * **オプションの並びとバイト配置が要点**。RA 本体は 16 バイト
+ * (ICMPv6 ヘッダ 8 + reachable 4 + retrans 4)で、cur hop limit は byte 4、
+ * フラグは byte 5、ルータ寿命は byte 6-7。オプションはそこから 8 バイト単位。
+ * Prefix Information は 32 バイト固定で、プレフィックス本体は先頭から 16。
+ * ここを間違えると受信側も同じ間違い方をして「自分の間違いを自分で受け入れて
+ * PASS する」ので、`dump` の 16 進を `tools/ra_check`(glibc の
+ * struct nd_router_advert / nd_opt_prefix_info のみ)に食わせて確かめる。
+ *
+ * 引数:
+ *   to / to_mac  - 送り先(RA を受け取る側)
+ *   prefix       - 広告するプレフィックス(上位 plen ビットのみ意味を持つ)
+ *   plen         - プレフィックス長
+ *   pio_flags    - PIO_FLAG_ONLINK / PIO_FLAG_AUTO
+ *   valid / pref - 有効期間・優先期間(秒)
+ *   rlife        - ルータ寿命(秒)。0 なら「デフォルトルータから外せ」
+ *   mtu          - MTU オプションの値(0 なら付けない)
+ *   hop_limit    - IPv6 ヘッダの hop limit。**255 以外は受信側が捨てるはず**
+ * 戻り値:
+ *   0=送信完了、-1=失敗
+ * コール元:
+ *   shell_slaactest()
+ * ===============================================================*/
+static int shell_inject_ra(const uint8_t to[16], const uint8_t to_mac[6],
+                            const uint8_t prefix[16], uint8_t plen, uint8_t pio_flags,
+                            uint32_t valid, uint32_t pref, uint16_t rlife,
+                            uint32_t mtu, uint8_t hop_limit)
+{
+    static uint8_t msg[16u + 8u + 32u + 8u];
+    unsigned len = 16u + 8u + 32u;
+    for (unsigned i = 0; i < sizeof(msg); i++) msg[i] = 0;
+
+    msg[0] = ICMPV6_TYPE_RA;
+    msg[1] = 0;
+    /* msg[2..3] はチェックサム。 */
+    msg[RA_OFF_CUR_HOP_LIMIT] = 64u;
+    msg[RA_OFF_FLAGS]         = 0;      /* M/O とも立てない(DHCPv6 は無い) */
+    wr16be(msg + RA_OFF_ROUTER_LIFETIME, rlife);
+    /* reachable time / retrans timer は 0 =「指定しない」(RFC 4861 4.2)。 */
+
+    /* Source Link-Layer Address(ルータの MAC を教える)。 */
+    uint8_t self_mac[6];
+    eth_get_mac(self_mac);
+    msg[16] = NDP_OPT_SRC_LLADDR;
+    msg[17] = 1u;
+    for (unsigned i = 0; i < 6u; i++) msg[18u + i] = self_mac[i];
+
+    /* Prefix Information(32 バイト固定 = 長さ 4)。 */
+    uint8_t *p = msg + 24u;
+    p[0] = NDP_OPT_PREFIX_INFO;
+    p[1] = 4u;
+    p[PIO_OFF_PREFIX_LEN] = plen;
+    p[PIO_OFF_FLAGS]      = pio_flags;
+    wr32be(p + PIO_OFF_VALID, valid);
+    wr32be(p + PIO_OFF_PREFERRED, pref);
+    /* p[12..15] は reserved2。 */
+    for (unsigned i = 0; i < 16u; i++) p[PIO_OFF_PREFIX + i] = prefix[i];
+
+    if (mtu != 0u) {
+        uint8_t *m = msg + 56u;
+        m[0] = NDP_OPT_MTU;
+        m[1] = 1u;
+        /* m[2..3] は reserved。 */
+        wr32be(m + 4u, mtu);
+        len += 8u;
+    }
+
+    uint8_t src[16];
+    ipv6_link_local_addr(src);
+    wr16be(msg + 2, ipv6_pseudo_checksum(src, to, IPV6_NH_ICMPV6, msg, (uint16_t)len));
+
+    if (s_ra_dump) {
+        uart_printf("RADUMP len=%u", len);
+        for (unsigned i = 0; i < len; i++) uart_printf(" %02x", msg[i]);
+        uart_printf("\n");
+    }
+
+    /* **hop limit を変えられる必要がある**(255 以外を捨てることの確認)ので、
+     * hop limit 255 固定の ipv6_send() ではなく自分でフレームを組む。 */
+    net_buf_t *nb = net_buf_alloc();
+    if (!nb) return -1;
+    ipv6_build_header(nb->data, src, to, to_mac, IPV6_NH_ICMPV6, (uint16_t)len);
+    nb->data[ETH_HDR_LEN + offsetof(ipv6_header_t, hop_limit)] = hop_limit;
+    for (unsigned i = 0; i < len; i++) {
+        nb->data[ETH_HDR_LEN + IPV6_HDR_LEN + i] = msg[i];
+    }
+    nb->len = (uint16_t)(ETH_HDR_LEN + IPV6_HDR_LEN + len);
+    return eth_send(nb);
+}
+
+/*=================================================================
+ * self が RA を処理し終えるまで受信を回す(注入は非同期なので待ちが要る)。
+ *
+ * 引数:
+ *   ms - 待つ時間
+ * コール元:
+ *   shell_slaactest()
+ * ===============================================================*/
+static void shell_poll_ms(uint32_t ms)
+{
+    for (uint64_t t0 = timer_now(); !timeout_ms(t0, ms); ) net_poll_all_and_dispatch();
+}
+
+/*=================================================================
+ * netif のグローバルアドレスを SLAAC の状態ごと解除する(テストの各段の
+ * 前提を揃えるため)。
+ *
+ * コール元:
+ *   shell_slaactest()
+ * ===============================================================*/
+static void shell_clear_global6(netif_t *ni)
+{
+    ni->ip6_global_set         = 0;
+    ni->ip6_global_from_ra     = 0;
+    ni->ip6_global_valid_until = 0;
+    ni->ip6_global_dad         = NETIF_DAD_UNKNOWN;
+}
+
+/*=================================================================
+ * シェルの `slaac`。Router Solicitation を送って RA を待ち、結果を表示する。
+ *
+ * このリンクにはルータが居ないので、通常は「RA が来ませんでした」で終わる
+ * (それが正しい)。**RA を出す相手が居るときにグローバルアドレスが生えるか**
+ * を見るためのコマンドで、ループバックでの検証は `slaactest` が行う。
+ *
+ * 引数:
+ *   args - "" で全インターフェース、"<if>" で 1 つ、続けて待ち時間(ms)
+ * コール元:
+ *   shell_dispatch()
+ * ===============================================================*/
+static void shell_slaac(char *args)
+{
+    while (*args == ' ') args++;
+
+    char name[32] = {0};
+    unsigned k = 0;
+    while (*args && *args != ' ' && k < sizeof(name) - 1u) name[k++] = *args++;
+    name[k] = 0;
+    while (*args == ' ') args++;
+    uint32_t wait_ms = (*args >= '0' && *args <= '9') ? (uint32_t)atoi(args)
+                                                      : SLAAC_RS_INTERVAL_MS;
+
+    netif_t *prev = g_active_ctx;
+    static const char *ifnames[] = { "mlx5-pf0", "mlx5-pf1" };
+    for (unsigned i = 0; i < 2u; i++) {
+        netif_t *ni = netif_find(ifnames[i]);
+        if (!ni) continue;
+        if (name[0] && strncmp(name, ni->name, sizeof(name)) != 0) continue;
+
+        int r = ipv6_slaac_solicit(ni, SLAAC_RS_NUM, wait_ms);
+        ipv6_slaac_age(ni);
+        uart_printf("slaac: %-10s RS x%u(各 %ums)-> %s\n", ni->name, SLAAC_RS_NUM, wait_ms,
+                    (r == 1) ? "グローバルアドレスを設定"
+                             : (r == 0 ? "RA なし(このリンクにはルータが居ない)"
+                                       : "RS の送信に失敗"));
+        if (ni->ip6_global_set) {
+            uart_printf("slaac: %-10s addr=", ni->name);
+            for (unsigned j = 0; j < 8u; j++) {
+                uart_printf("%s%02x%02x", (j ? ":" : ""),
+                            ni->ip6_global[j * 2u], ni->ip6_global[j * 2u + 1u]);
+            }
+            uart_printf("/%u (%s, DAD=%s)\n", ni->ip6_prefix_len,
+                        ni->ip6_global_from_ra ? "SLAAC" : "手動",
+                        ni->ip6_global_dad == NETIF_DAD_PASSED ? "衝突なし"
+                            : (ni->ip6_global_dad == NETIF_DAD_CONFLICT ? "衝突" : "未実施"));
+        }
+        if (ni->gateway6_set) {
+            uart_printf("slaac: %-10s router=", ni->name);
+            for (unsigned j = 0; j < 8u; j++) {
+                uart_printf("%s%02x%02x", (j ? ":" : ""),
+                            ni->gateway6[j * 2u], ni->gateway6[j * 2u + 1u]);
+            }
+            uart_printf(" (%s)\n", ni->gateway6_from_ra ? "RA 由来" : "手動");
+        }
+        if (ni->ra_link_mtu) {
+            uart_printf("slaac: %-10s RA の MTU オプション=%u(記録のみ。mss_cap=%u は"
+                        "変えない)\n", ni->name, (unsigned)ni->ra_link_mtu, ni->mss_cap);
+        }
+    }
+    if (prev) netif_activate(prev);
+}
+
+/*=================================================================
+ * シェルの `slaactest`。B1(RS/RA + SLAAC)の検証。
+ *
+ * **このリンクには RA を出すルータが居ない**ので、対向 PF にルータ役をさせて
+ * RA を注入する(pmtutest と同じ)。B1 の実装範囲は「RS を出し、RA を解釈して
+ * アドレスとデフォルトルータを設定する」側なので、注入側がテストコードでも
+ * 検証の意味は失われない。ただし**注入する RA の形式そのものが自作**なので、
+ * `dump` を付けて `tools/ra_check` に読ませること。
+ *
+ * 陰性対照(A フラグ無し / prefix_len != 64 / hop limit != 255)を必ず組で
+ * 見る。「アドレスが設定された」だけを見ても、何でも受け入れる実装と区別が
+ * つかない。
+ *
+ * 引数:
+ *   args - "dump" で 16 進出力を有効化
+ * コール元:
+ *   shell_dispatch()
+ * ===============================================================*/
+static void shell_slaactest(char *args)
+{
+    while (*args == ' ') args++;
+    s_ra_dump = (strncmp(args, "dump", 4) == 0);
+
+    uint8_t peer_ll[16];
+    netif_t *peer = shell_peer_ll6(peer_ll);
+    netif_t *self = g_active_ctx;
+    if (!peer || !self) {
+        uart_printf("slaactest: 対向インターフェースが見つかりません(net init mlx5 が必要)\n");
+        return;
+    }
+    uint8_t self_ll[16];
+    ipv6_link_local_addr(self_ll);
+    uint8_t self_mac[6];
+    for (unsigned i = 0; i < 6u; i++) self_mac[i] = self->mac[i];
+
+    /* テスト用プレフィックス 2001:db8:0:7::/64(ドキュメント用アドレス)。 */
+    uint8_t prefix[16] = { 0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00, 0x00, 0x07,
+                           0, 0, 0, 0, 0, 0, 0, 0 };
+    uint8_t want[16];
+    for (unsigned i = 0; i < 8u; i++)  want[i] = prefix[i];
+    for (unsigned i = 8u; i < 16u; i++) want[i] = self_ll[i];
+
+    /* 元の状態を控えて最後に戻す。 */
+    const uint8_t  save_gw_set  = self->gateway6_set;
+    const uint8_t  save_gw_ra   = self->gateway6_from_ra;
+    const uint64_t save_gw_till = self->gateway6_valid_until;
+    uint8_t save_gw[16];
+    for (unsigned i = 0; i < 16u; i++) save_gw[i] = self->gateway6[i];
+    const uint16_t save_mss = self->mss_cap;
+    const uint16_t save_mtu = self->mtu;
+    /* **peer 側のデフォルトルータも一旦外す。** [6] は peer をクライアントに
+     * するので、peer に(外部の RA などで)ゲートウェイが残っていると
+     * サブネット外宛として L2 をルータへ向けてしまい、実データが届かない。
+     * 実機でこれを踏んだ -- Pi5 から RA を受けた直後に slaactest を回すと
+     * [6] だけが Destination Unreachable で落ちる。 */
+    const uint8_t  save_pgw_set  = peer->gateway6_set;
+    const uint8_t  save_pgw_ra   = peer->gateway6_from_ra;
+    const uint64_t save_pgw_till = peer->gateway6_valid_until;
+
+    int ok = 1;
+    shell_clear_global6(self);
+    self->gateway6_set = 0; self->gateway6_from_ra = 0; self->gateway6_valid_until = 0;
+    self->ra_link_mtu = 0;
+    peer->gateway6_set = 0; peer->gateway6_from_ra = 0; peer->gateway6_valid_until = 0;
+
+    uart_printf("slaactest: self=%s peer(ルータ役)=%s\n", self->name, peer->name);
+
+    /* ---- [1] 初期状態 ---- */
+    if (self->ip6_global_set || self->gateway6_set) {
+        uart_printf("slaactest: NG [1] 初期化したのに設定が残っている\n");
+        ok = 0;
+    } else {
+        uart_printf("slaactest: OK [1] 初期状態 -- グローバルアドレス/ルータとも未設定\n");
+    }
+
+    /* ---- [2] RS を出せること ----
+     * ここで見るのは「送信できること」だけ。**外部にルータが居るかどうかで
+     * 判定を変えてはいけない** -- Pi5 で `send_ra.py ... listen`(ルータ役)を
+     * 動かしたまま回すと本物の RA が返ってくる。実機でこれを踏んだので、
+     * 「RA が来ないこと」を条件にせず、来たら状態を消してから先へ進む。 */
+    int rs = ipv6_slaac_solicit(self, 1u, 100u);
+    netif_activate(self);
+    uart_printf("slaactest: %s [2] RS 送信 -> %s\n", (rs >= 0) ? "OK" : "NG",
+                rs == 0 ? "RA なし(このリンクにルータは居ない)"
+                        : (rs == 1 ? "RA あり(外部にルータが居る。以降は注入で検証する)"
+                                   : "送信失敗"));
+    if (rs < 0) ok = 0;
+    shell_clear_global6(self);
+    self->gateway6_set = 0; self->gateway6_from_ra = 0; self->gateway6_valid_until = 0;
+    self->ra_link_mtu = 0;
+
+    /* ---- [3] RA を注入 -> プレフィックス + EUI-64 のアドレスが生える ---- */
+    netif_activate(peer);
+    int inj = shell_inject_ra(self_ll, self_mac, prefix, 64u,
+                              PIO_FLAG_ONLINK | PIO_FLAG_AUTO,
+                              1800u, 900u, 1800u, 9000u, 255u);
+    netif_activate(self);
+    shell_poll_ms(200u);
+
+    int addr_ok = self->ip6_global_set && self->ip6_global_from_ra &&
+                  self->ip6_prefix_len == 64u;
+    for (unsigned i = 0; addr_ok && i < 16u; i++) {
+        if (self->ip6_global[i] != want[i]) addr_ok = 0;
+    }
+    uart_printf("slaactest: %s [3] RA -> addr=", (inj == 0 && addr_ok) ? "OK" : "NG");
+    for (unsigned j = 0; j < 8u; j++) {
+        uart_printf("%s%02x%02x", (j ? ":" : ""),
+                    self->ip6_global[j * 2u], self->ip6_global[j * 2u + 1u]);
+    }
+    uart_printf("(期待 2001:0db8:0000:0007: + EUI-64)\n");
+    if (inj != 0 || !addr_ok) ok = 0;
+
+    /* ---- [4] デフォルトルータが RA の送信元になる ---- */
+    int gw_ok = self->gateway6_set && self->gateway6_from_ra;
+    for (unsigned i = 0; gw_ok && i < 16u; i++) {
+        if (self->gateway6[i] != peer_ll[i]) gw_ok = 0;
+    }
+    uart_printf("slaactest: %s [4] デフォルトルータ = RA の送信元リンクローカル\n",
+                gw_ok ? "OK" : "NG");
+    if (!gw_ok) ok = 0;
+
+    /* ---- [5] MTU オプションは記録するだけで適用しない ---- */
+    int mtu_ok = (self->ra_link_mtu == 9000u) && (self->mss_cap == save_mss) &&
+                 (self->mtu == save_mtu);
+    uart_printf("slaactest: %s [5] MTU オプション=%u を記録(mss_cap=%u/mtu=%u は不変)\n",
+                mtu_ok ? "OK" : "NG", (unsigned)self->ra_link_mtu,
+                self->mss_cap, self->mtu);
+    if (!mtu_ok) ok = 0;
+
+    /* ---- [6] そのアドレスで実データが通る ----
+     * peer(クライアント、リンクローカル)-> self(サーバ、SLAAC アドレス)で
+     * 64KB を往復させる。**アドレスを名乗るだけでなく、受信の振り分け
+     * (ipv6_addr_is_ours / netif_find_by_ip6)まで通ることを確認する。** */
+    {
+        netaddr_t dst = netaddr_v6(self->ip6_global);
+        int echo = shell_tcp_echo_once("slaactest", peer, self, &dst, 6005u, NULL);
+        uart_printf("slaactest: %s [6] SLAAC アドレス宛に 64KB 往復\n", echo ? "OK" : "NG");
+        if (!echo) ok = 0;
+        netif_activate(self);
+    }
+
+    /* ---- [7] 2 時間ルール: 既存アドレスの寿命は縮められない ---- */
+    netif_activate(peer);
+    shell_inject_ra(self_ll, self_mac, prefix, 64u, PIO_FLAG_ONLINK | PIO_FLAG_AUTO,
+                    1u, 1u, 1800u, 0u, 255u);
+    netif_activate(self);
+    shell_poll_ms(200u);
+    shell_poll_ms(1300u);          /* valid=1 が効いていれば、ここで消える */
+    ipv6_slaac_age(self);
+    uart_printf("slaactest: %s [7] valid=1s の RA で既存アドレスは縮まない"
+                "(RFC 4862 の 2 時間ルール)\n", self->ip6_global_set ? "OK" : "NG");
+    if (!self->ip6_global_set) ok = 0;
+
+    /* ---- [8] 有効期間の満了で解除される(新規アドレスには 2 時間ルールが
+     *          適用されないので、一度解除してから短い寿命で作り直す)---- */
+    shell_clear_global6(self);
+    netif_activate(peer);
+    shell_inject_ra(self_ll, self_mac, prefix, 64u, PIO_FLAG_ONLINK | PIO_FLAG_AUTO,
+                    1u, 1u, 1800u, 0u, 255u);
+    netif_activate(self);
+    shell_poll_ms(200u);
+    int born = self->ip6_global_set;
+    shell_poll_ms(1300u);
+    ipv6_slaac_age(self);
+    uart_printf("slaactest: %s [8] valid=1s で作り直すと 1 秒後に解除される"
+                "(設定=%d -> 解除後=%d)\n",
+                (born && !self->ip6_global_set) ? "OK" : "NG",
+                born, self->ip6_global_set);
+    if (!born || self->ip6_global_set) ok = 0;
+
+    /* ---- [9] 陰性対照: A フラグ無し ---- */
+    shell_clear_global6(self);
+    netif_activate(peer);
+    shell_inject_ra(self_ll, self_mac, prefix, 64u, PIO_FLAG_ONLINK,
+                    1800u, 900u, 1800u, 0u, 255u);
+    netif_activate(self);
+    shell_poll_ms(200u);
+    uart_printf("slaactest: %s [9] 陰性対照 -- A フラグ無しの prefix では設定しない\n",
+                self->ip6_global_set ? "NG" : "OK");
+    if (self->ip6_global_set) ok = 0;
+
+    /* ---- [10] 陰性対照: prefix_len != 64(EUI-64 と合わせて 128 にならない)----
+     * **プレフィックス長より下のビットは 0 でなければならない**(RFC 4861 4.6.2)
+     * ので、/64 用のプレフィックスを長さだけ 48 にして使い回してはいけない。
+     * 陰性対照は「試したい性質以外は正しい」形にする -- そうしないと、実装が
+     * どちらの理由で捨てたのか区別できない(`tools/ra_check` がこの違反を
+     * 検出したので気付いた)。 */
+    {
+        uint8_t prefix48[16] = { 0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00, 0, 0,
+                                 0, 0, 0, 0, 0, 0, 0, 0 };
+        shell_clear_global6(self);
+        netif_activate(peer);
+        shell_inject_ra(self_ll, self_mac, prefix48, 48u, PIO_FLAG_ONLINK | PIO_FLAG_AUTO,
+                        1800u, 900u, 1800u, 0u, 255u);
+    }
+    netif_activate(self);
+    shell_poll_ms(200u);
+    uart_printf("slaactest: %s [10] 陰性対照 -- prefix_len=48 は無視する\n",
+                self->ip6_global_set ? "NG" : "OK");
+    if (self->ip6_global_set) ok = 0;
+
+    /* ---- [11] 陰性対照: hop limit != 255(リンク外からの RA)----
+     * **これが効いていないと、リンク外のノードが経路とプレフィックスを
+     * 注入できる**(RFC 4861 6.1.2 が 255 を要求する理由)。 */
+    shell_clear_global6(self);
+    netif_activate(peer);
+    shell_inject_ra(self_ll, self_mac, prefix, 64u, PIO_FLAG_ONLINK | PIO_FLAG_AUTO,
+                    1800u, 900u, 1800u, 0u, 64u);
+    netif_activate(self);
+    shell_poll_ms(200u);
+    uart_printf("slaactest: %s [11] 陰性対照 -- hop limit=64 の RA は破棄する\n",
+                self->ip6_global_set ? "NG" : "OK");
+    if (self->ip6_global_set) ok = 0;
+
+    /* ---- [12] ルータ寿命 0 でデフォルトルータから外れる ---- */
+    netif_activate(peer);
+    shell_inject_ra(self_ll, self_mac, prefix, 64u, PIO_FLAG_ONLINK | PIO_FLAG_AUTO,
+                    1800u, 900u, 0u, 0u, 255u);
+    netif_activate(self);
+    shell_poll_ms(200u);
+    uart_printf("slaactest: %s [12] router_lifetime=0 でデフォルトルータが外れる\n",
+                self->gateway6_set ? "NG" : "OK");
+    if (self->gateway6_set) ok = 0;
+
+    /* ---- [13] 後始末 ---- */
+    shell_clear_global6(self);
+    self->ra_link_mtu = 0;
+    self->gateway6_set         = save_gw_set;
+    self->gateway6_from_ra     = save_gw_ra;
+    self->gateway6_valid_until = save_gw_till;
+    for (unsigned i = 0; i < 16u; i++) self->gateway6[i] = save_gw[i];
+    peer->gateway6_set         = save_pgw_set;
+    peer->gateway6_from_ra     = save_pgw_ra;
+    peer->gateway6_valid_until = save_pgw_till;
+    netif_activate(self);
+    s_ra_dump = 0;
+
+    uart_printf("slaactest: %s(グローバルアドレスと RA 由来のルータは"
+                "解除しました)\n", ok ? "PASS" : "NG");
+}
+
+/*=================================================================
+ * IPv6 アドレスの文字列を 16 バイトへ変換する。**RFC 4291 の完全表記
+ * (8 グループ)のみ**受け付け、`::` の省略記法は展開しない
+ * (nvmet.c の IPv6 表記と同じ方針)。
+ *
+ * 引数:
+ *   s   - "2001:0db8:0000:0009:0000:0000:0000:0020" のような文字列
+ *   out - 16 バイトの格納先
+ * 戻り値:
+ *   1=解析できた、0=書式不正
+ * コール元:
+ *   shell_dispatch()(ip6addr / udp6send)
+ * ===============================================================*/
+static int shell_parse_ip6(const char *s, uint8_t out[16])
+{
+    unsigned gi = 0, v = 0, ndig = 0;
+    for (;; s++) {
+        if (*s == ':' || *s == 0) {
+            if (ndig == 0 || gi >= 8u) return 0;
+            out[gi * 2u] = (uint8_t)(v >> 8); out[gi * 2u + 1u] = (uint8_t)v;
+            gi++; v = 0; ndig = 0;
+            if (*s == 0) break;
+        } else {
+            unsigned d;
+            if (*s >= '0' && *s <= '9')      d = (unsigned)(*s - '0');
+            else if (*s >= 'a' && *s <= 'f') d = (unsigned)(*s - 'a') + 10u;
+            else if (*s >= 'A' && *s <= 'F') d = (unsigned)(*s - 'A') + 10u;
+            else return 0;
+            v = (v << 4) | d; ndig++;
+            if (ndig > 4u) return 0;
+        }
+    }
+    return (gi == 8u);
+}
+
+/*=================================================================
+ * シェルの `udp6send <addr> <port> <bytes>`。指定した IPv6 宛へ UDP を
+ * 1 個送る。**リンク MTU を超える長さを指定すると送信側の断片化が走る**ので、
+ * 外部ホスト(Linux)に再構成させて B4 を確かめるのに使う。
+ *
+ * データは `(i * 31 + 7) & 0xff` で埋める(`tools/udp6_echo.py` が同じ式で
+ * 検算する)。
+ *
+ * 引数:
+ *   args - "<addr> <port> <bytes>"
+ * コール元:
+ *   shell_dispatch()
+ * ===============================================================*/
+static void shell_udp6send(char *args)
+{
+    char tok[3][80];
+    unsigned nt = 0;
+    const char *q = args;
+    while (*q && nt < 3u) {
+        while (*q == ' ') q++;
+        if (!*q) break;
+        unsigned k = 0;
+        while (*q && *q != ' ' && k < 79u) tok[nt][k++] = *q++;
+        tok[nt][k] = 0;
+        nt++;
+    }
+    if (nt < 3u) {
+        uart_printf("udp6send: 使い方 udp6send <完全表記のIPv6> <port> <bytes>\n"
+                    "  例: udp6send 2001:0db8:0000:0009:0000:0000:0000:0020 7780 9300\n");
+        return;
+    }
+
+    uint8_t dst[16];
+    if (!shell_parse_ip6(tok[0], dst)) {
+        uart_printf("udp6send: アドレスは完全表記(8 グループ)で指定してください\n");
+        return;
+    }
+    uint16_t port  = (uint16_t)atoi(tok[1]);
+    unsigned bytes = (unsigned)atoi(tok[2]);
+    if (bytes > 10000u) bytes = 10000u;
+
+    uint8_t mac[6];
+    netaddr_t d6 = netaddr_v6(dst);
+    if (net_resolve_mac(&d6, mac) != 0) {
+        uart_printf("udp6send: 宛先 MAC を解決できません(NDP 失敗)\n");
+        return;
+    }
+
+    static uint8_t buf[10000];
+    for (unsigned i = 0; i < bytes; i++) buf[i] = (uint8_t)(i * 31u + 7u);
+
+    int r = udp_send6(dst, mac, port, port, buf, (uint16_t)bytes);
+    uart_printf("udp6send: %u バイトを :%u へ送信 -> %s(リンク MTU=%u なので"
+                "%s)\n", bytes, port, (r == 0) ? "OK" : "失敗", net_active_ip_mtu(),
+                ((unsigned)(bytes + 8u + 40u) > net_active_ip_mtu())
+                    ? "断片化される" : "断片化されない");
+}
+
+/* ---- ext6test: IPv6 拡張ヘッダの走査と送信側の断片化 ---- */
+
+#define EXT6_MAX_FRAGS 16u
+static struct { uint16_t off; uint16_t len; int more; uint32_t id; uint8_t nh; }
+    s_ext6_seen[EXT6_MAX_FRAGS];
+static unsigned s_ext6_count;
+static unsigned s_ext6_overflow;
+static uint8_t  s_ext6_reasm[32768];
+static uint8_t  s_ext6_dump;
+
+/*=================================================================
+ * 受信 IPv6 断片の観測フック。**受信側の再構成は実装していない**ので、
+ * 送信側の断片化はここでしか確かめられない(`fragtest` の IPv4 版と同じ)。
+ *
+ * コール元:
+ *   ipv6_skip_ext_headers() から関数ポインタ経由
+ * ===============================================================*/
+static void shell_ext6_frag_observer(uint32_t id, uint16_t frag_off, int more,
+                                      uint8_t next_header, const uint8_t *payload,
+                                      uint16_t len)
+{
+    if (s_ext6_count >= EXT6_MAX_FRAGS) { s_ext6_overflow++; return; }
+    s_ext6_seen[s_ext6_count].off  = frag_off;
+    s_ext6_seen[s_ext6_count].len  = len;
+    s_ext6_seen[s_ext6_count].more = more;
+    s_ext6_seen[s_ext6_count].id   = id;
+    s_ext6_seen[s_ext6_count].nh   = next_header;
+    s_ext6_count++;
+
+    if ((uint32_t)frag_off + len <= sizeof(s_ext6_reasm)) {
+        for (uint16_t i = 0; i < len; i++) s_ext6_reasm[frag_off + i] = payload[i];
+    }
+    if (s_ext6_dump) {
+        uart_printf("IP6FRAG id=%u off=%u more=%d nh=%u len=%u\n",
+                    (unsigned)id, frag_off, more, next_header, len);
+    }
+}
+
+/* ext6test が注入する拡張ヘッダの種類。 */
+#define EXT6_KIND_HBH        0   /* Hop-by-Hop(PadN のみ)*/
+#define EXT6_KIND_DSTOPTS    1   /* Destination Options(PadN のみ)*/
+#define EXT6_KIND_RT_SEG0    2   /* Routing、segments_left=0(読み飛ばす)*/
+#define EXT6_KIND_RT_SEG1    3   /* Routing、segments_left=1(破棄すべき)*/
+#define EXT6_KIND_BAD_TLV    4   /* 未知オプション、上位 2bit=01(破棄すべき)*/
+#define EXT6_KIND_FRAGMENT   5   /* Fragment ヘッダ(破棄すべき)*/
+
+/*=================================================================
+ * 拡張ヘッダを 1 つ付けた UDP over IPv6 を 1 個組み立てて送る。
+ *
+ * **チェックサムの疑似ヘッダに入れるのは UDP の長さと next header=17** で、
+ * 拡張ヘッダは含めない(MLD の Router Alert と同じ落とし穴)。IPv6 ヘッダの
+ * next_header と、疑似ヘッダの next header は別物。
+ *
+ * 引数:
+ *   to / to_mac - 送り先
+ *   kind        - EXT6_KIND_*
+ *   port        - UDP の送信元/宛先ポート
+ *   body / blen - UDP ペイロード
+ * 戻り値:
+ *   0=送信完了、-1=失敗
+ * コール元:
+ *   shell_ext6test()
+ * ===============================================================*/
+static int shell_inject_ext6(const uint8_t to[16], const uint8_t to_mac[6],
+                              int kind, uint16_t port,
+                              const uint8_t *body, uint16_t blen)
+{
+    uint8_t src[16];
+    ipv6_link_local_addr(src);
+
+    /* UDP データグラム(ヘッダ 8 + 本体)。 */
+    static uint8_t udp[256];
+    uint16_t ulen = (uint16_t)(8u + blen);
+    if (ulen > sizeof(udp)) return -1;
+    for (unsigned i = 0; i < ulen; i++) udp[i] = 0;
+    wr16be(udp + 0, port);
+    wr16be(udp + 2, port);
+    wr16be(udp + 4, ulen);
+    for (uint16_t i = 0; i < blen; i++) udp[8u + i] = body[i];
+    wr16be(udp + 6, ipv6_pseudo_checksum(src, to, IPV6_NH_UDP, udp, ulen));
+
+    /* 拡張ヘッダ 8 バイト。 */
+    uint8_t ext[8];
+    uint8_t ext_nh;
+    for (unsigned i = 0; i < 8u; i++) ext[i] = 0;
+    switch (kind) {
+    case EXT6_KIND_HBH:
+    case EXT6_KIND_DSTOPTS:
+        ext_nh = (kind == EXT6_KIND_HBH) ? IPV6_NH_HOPOPTS : IPV6_NH_DSTOPTS;
+        ext[0] = IPV6_NH_UDP; ext[1] = 0;
+        ext[2] = IPV6_TLV_PADN; ext[3] = 4;   /* PadN で 8 バイトへ揃える */
+        break;
+    case EXT6_KIND_RT_SEG0:
+    case EXT6_KIND_RT_SEG1:
+        ext_nh = IPV6_NH_ROUTING;
+        ext[0] = IPV6_NH_UDP; ext[1] = 0;
+        ext[2] = 0;                                        /* routing type 0 */
+        ext[3] = (kind == EXT6_KIND_RT_SEG1) ? 1u : 0u;    /* segments left */
+        break;
+    case EXT6_KIND_BAD_TLV:
+        ext_nh = IPV6_NH_DSTOPTS;
+        ext[0] = IPV6_NH_UDP; ext[1] = 0;
+        ext[2] = 0x41u;   /* 上位 2bit=01 = 「破棄せよ」、未知の type */
+        ext[3] = 4;
+        break;
+    case EXT6_KIND_FRAGMENT:
+    default:
+        ext_nh = IPV6_NH_FRAGMENT;
+        ext[0] = IPV6_NH_UDP; ext[1] = 0;
+        wr16be(ext + 2, IPV6_FRAG_MORE);   /* offset=0、More=1 */
+        wr32be(ext + 4, 0xABCD1234u);
+        break;
+    }
+
+    if (s_ext6_dump) {
+        uart_printf("EXT6DUMP kind=%d nh=%u len=8", kind, ext_nh);
+        for (unsigned i = 0; i < 8u; i++) uart_printf(" %02x", ext[i]);
+        uart_printf("\n");
+    }
+
+    net_buf_t *nb = net_buf_alloc();
+    if (!nb) return -1;
+    ipv6_build_header(nb->data, src, to, to_mac, ext_nh, (uint16_t)(8u + ulen));
+    uint8_t *p = nb->data + ETH_HDR_LEN + IPV6_HDR_LEN;
+    for (unsigned i = 0; i < 8u; i++) p[i] = ext[i];
+    for (uint16_t i = 0; i < ulen; i++) p[8u + i] = udp[i];
+    nb->len = (uint16_t)(ETH_HDR_LEN + IPV6_HDR_LEN + 8u + ulen);
+    return eth_send(nb);
+}
+
+/*=================================================================
+ * シェルの `ext6test`。B4(IPv6 拡張ヘッダ / フラグメント)の検証。
+ *
+ * 受信側のチェーン走査は B2(MLD)の前提として先に入れたもので、**Linux
+ * ブリッジが出す Hop-by-Hop 付きの MLD Query を処理できている**ことで実
+ * パケットでの確認は済んでいる。ここで確かめるのは、
+ *   - Hop-by-Hop 以外(Destination Options / Routing)も辿れること
+ *   - **Routing の segments_left != 0 は破棄する**こと(RFC 8200 4.4。
+ *     一律に読み飛ばすと廃止された Routing Type 0 を受け入れてしまう)
+ *   - **未知オプションの上位 2bit が「破棄」なら破棄する**こと(同 4.2)
+ *   - Fragment ヘッダ付きは破棄すること
+ *   - **送信側の断片化**(B4 の本体。IPv6 は経路上で分割されないので、
+ *     MTU 超のデータグラムは送信元が割るしかない)
+ *
+ * 引数:
+ *   args - "dump" で 16 進/断片情報も出す(tools/ip6_ext_check 用)
+ * コール元:
+ *   shell_dispatch()
+ * ===============================================================*/
+static void shell_ext6test(char *args)
+{
+    while (*args == ' ') args++;
+    s_ext6_dump = (strncmp(args, "dump", 4) == 0);
+
+    uint8_t peer_ll[16];
+    netif_t *peer = shell_peer_ll6(peer_ll);
+    netif_t *self = g_active_ctx;
+    if (!peer || !self) {
+        uart_printf("ext6test: 対向インターフェースが見つかりません(net init mlx5 が必要)\n");
+        return;
+    }
+    uint8_t self_ll[16], self_mac[6], peer_mac[6];
+    ipv6_link_local_addr(self_ll);
+    for (unsigned i = 0; i < 6u; i++) self_mac[i] = self->mac[i];
+    for (unsigned i = 0; i < 6u; i++) peer_mac[i] = peer->mac[i];
+
+    const uint16_t port = 7779u;
+    int ok = 1;
+    if (udp_bind(port, shell_udptest_handler) != 0) {
+        uart_printf("ext6test: udp_bind 失敗\n");
+        return;
+    }
+
+    static uint8_t body[32];
+    for (unsigned i = 0; i < sizeof(body); i++) body[i] = (uint8_t)(0xA0u + i);
+
+    /* ---- [1]〜[5] 受信側: 拡張ヘッダ付きのパケットを注入する ---- */
+    static const struct { int kind; int expect_deliver; const char *name; } cases[] = {
+        { EXT6_KIND_HBH,      1, "[1] Hop-by-Hop 付き -- 上位へ届く" },
+        { EXT6_KIND_DSTOPTS,  1, "[2] Destination Options 付き -- 上位へ届く" },
+        { EXT6_KIND_RT_SEG0,  1, "[3] Routing(segments_left=0)-- 読み飛ばして届く" },
+        { EXT6_KIND_RT_SEG1,  0, "[4] 陰性対照 -- Routing(segments_left=1)は破棄" },
+        { EXT6_KIND_BAD_TLV,  0, "[5] 陰性対照 -- 未知オプション(破棄指示)は破棄" },
+    };
+    for (unsigned c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+        uint32_t before = s_udptest_rx;
+        netif_activate(peer);
+        int inj = shell_inject_ext6(self_ll, self_mac, cases[c].kind, port,
+                                    body, (uint16_t)sizeof(body));
+        netif_activate(self);
+        for (uint64_t t0 = timer_now(); !timeout_ms(t0, 150u); ) net_poll_all_and_dispatch();
+        netif_activate(self);
+        int got = (s_udptest_rx != before);
+        int len_ok = !got || (s_udptest_len == (uint16_t)sizeof(body));
+        int good = (inj == 0) && (got == cases[c].expect_deliver) && len_ok;
+        uart_printf("ext6test: %s %s(受信=%d 期待=%d%s)\n", good ? "OK" : "NG",
+                    cases[c].name, got, cases[c].expect_deliver,
+                    got ? (len_ok ? " 長さ一致" : " **長さ不一致**") : "");
+        if (!good) ok = 0;
+    }
+
+    /* ---- [6] Fragment ヘッダ付きは破棄され、観測フックには届く ---- */
+    s_ext6_count = 0; s_ext6_overflow = 0;
+    ipv6_set_frag_observer(shell_ext6_frag_observer);
+    {
+        uint32_t before = s_udptest_rx;
+        netif_activate(peer);
+        shell_inject_ext6(self_ll, self_mac, EXT6_KIND_FRAGMENT, port,
+                          body, (uint16_t)sizeof(body));
+        netif_activate(self);
+        for (uint64_t t0 = timer_now(); !timeout_ms(t0, 150u); ) net_poll_all_and_dispatch();
+        netif_activate(self);
+        int delivered = (s_udptest_rx != before);
+        int good = (!delivered) && (s_ext6_count == 1u) &&
+                   (s_ext6_seen[0].id == 0xABCD1234u) && (s_ext6_seen[0].more == 1) &&
+                   (s_ext6_seen[0].off == 0u) && (s_ext6_seen[0].nh == IPV6_NH_UDP);
+        uart_printf("ext6test: %s [6] Fragment 付きは上位へ渡さない(受信=%d)、"
+                    "断片として観測できる(%u 個 / id=0x%08x more=%d nh=%u)\n",
+                    good ? "OK" : "NG", delivered, s_ext6_count,
+                    s_ext6_count ? (unsigned)s_ext6_seen[0].id : 0u,
+                    s_ext6_count ? s_ext6_seen[0].more : -1,
+                    s_ext6_count ? s_ext6_seen[0].nh : 0u);
+        if (!good) ok = 0;
+    }
+
+    /* ---- [7] 送信側の断片化 ----
+     * **PMTU を下げてから送る。** リンク MTU(9256)のままだと 1 断片に
+     * 9208 バイト載るので、`udp_send6` のバッファ上限(NET_BUF_SIZE)では
+     * 中間断片(MF=1 かつ offset 非 0)を作れない。A5/A6 で学習した PMTU が
+     * そのまま分割に効くことの確認も兼ねる。 */
+    const uint16_t test_mtu = 1400u;
+    netaddr_t peer6 = netaddr_v6(peer_ll);
+    pmtu_clear();
+    pmtu_learn(&peer6, test_mtu);
+    {
+        static uint8_t big[4000];
+        for (unsigned i = 0; i < sizeof(big); i++) big[i] = (uint8_t)(i * 31u + 7u);
+
+        s_ext6_count = 0; s_ext6_overflow = 0;
+        for (unsigned i = 0; i < sizeof(s_ext6_reasm); i++) s_ext6_reasm[i] = 0;
+
+        netif_activate(self);
+        int sent = udp_send6(peer_ll, peer_mac, port, port, big, (uint16_t)sizeof(big));
+        for (uint64_t t0 = timer_now(); !timeout_ms(t0, 300u); ) net_poll_all_and_dispatch();
+        netif_activate(self);
+
+        /* chunk = (1400 - 40 - 8) & ~7 = 1352。UDP ヘッダ 8 + 4000 = 4008 なので
+         * 1352 + 1352 + 1304 の 3 断片。 */
+        uint16_t want_chunk = (uint16_t)((test_mtu - 40u - 8u) & ~7u);
+        int has_middle = 0;
+        for (unsigned i = 0; i < s_ext6_count; i++) {
+            if (s_ext6_seen[i].more && s_ext6_seen[i].off != 0u) has_middle = 1;
+        }
+        /* 再構成した UDP データグラムがバイト一致するか(先頭 8 バイトは
+         * UDP ヘッダなので、その後ろを比べる)。 */
+        unsigned bad = 0, first_bad = 0;
+        for (unsigned i = 0; i < sizeof(big); i++) {
+            if (s_ext6_reasm[8u + i] != big[i]) {
+                if (bad == 0u) first_bad = i;
+                bad++;
+            }
+        }
+        int match = (s_ext6_count == 3u) && (bad == 0u);
+        if (bad) {
+            uart_printf("ext6test:   不一致 %u バイト、最初は i=%u:", bad, first_bad);
+            for (unsigned k = 0; k < 8u && first_bad + k < sizeof(big); k++) {
+                uart_printf(" %02x/%02x", s_ext6_reasm[8u + first_bad + k],
+                            big[first_bad + k]);
+            }
+            uart_printf(" (受信/期待)\n");
+        }
+        int good = (sent == 0) && (s_ext6_count == 3u) && !s_ext6_overflow &&
+                   (s_ext6_seen[0].len == want_chunk) && has_middle && match &&
+                   (s_ext6_seen[0].nh == IPV6_NH_UDP);
+        uart_printf("ext6test: %s [7] PMTU=%u で UDP 4000B を送信 -- 断片 %u 個 / "
+                    "先頭 %u バイト(期待 3 個 / %u)/ 中間断片=%d / 再構成一致=%d\n",
+                    good ? "OK" : "NG", test_mtu, s_ext6_count,
+                    s_ext6_count ? s_ext6_seen[0].len : 0u, want_chunk, has_middle, match);
+        if (!good) ok = 0;
+    }
+
+    /* ---- [8] 陰性対照: MTU 以下は分割しない ---- */
+    {
+        static uint8_t small[512];
+        for (unsigned i = 0; i < sizeof(small); i++) small[i] = (uint8_t)i;
+        s_ext6_count = 0;
+        uint32_t before = s_udptest_rx;
+        netif_activate(self);
+        udp_send6(peer_ll, peer_mac, port, port, small, (uint16_t)sizeof(small));
+        for (uint64_t t0 = timer_now(); !timeout_ms(t0, 200u); ) net_poll_all_and_dispatch();
+        netif_activate(self);
+        int delivered = (s_udptest_rx != before);
+        uart_printf("ext6test: %s [8] 陰性対照 -- PMTU 以下(512B)は分割せず"
+                    "そのまま届く(断片 %u 個 / 受信=%d)\n",
+                    (s_ext6_count == 0u && delivered) ? "OK" : "NG",
+                    s_ext6_count, delivered);
+        if (s_ext6_count != 0u || !delivered) ok = 0;
+    }
+
+    ipv6_set_frag_observer(NULL);
+    pmtu_clear();
+    udp_unbind(port);
+    netif_activate(self);
+    s_ext6_dump = 0;
+    uart_printf("ext6test: %s(PMTU キャッシュはクリアしました)\n", ok ? "PASS" : "NG");
+}
+
+/* ---- nudtest: 到達不能検出(DELAY / ユニキャスト probe / 上位層の確認)---- */
+
+static unsigned s_nud_uni;      /* 観測したユニキャストの確認要求 */
+static unsigned s_nud_multi;    /* 観測したブロードキャスト/マルチキャストの要求 */
+static unsigned s_nud_other;    /* 対向(サーバ役)側から出た確認要求 */
+static uint8_t  s_nud_last_mac[6];
+static netif_t *s_nud_self;     /* どちらのインターフェースの送信かを見分ける */
+
+/*=================================================================
+ * 確認要求の観測フック。**ユニキャストで出ているか**はここか相手側でしか
+ * 見えない(送信後のフレームは誰も保持しない)。
+ *
+ * コール元:
+ *   neigh_probe_notify() から関数ポインタ経由
+ * ===============================================================*/
+static void shell_nud_observer(int is_v6, int is_unicast, const uint8_t dst_mac[6])
+{
+    (void)is_v6;
+    /* **どちらのインターフェースが出した確認要求か**を分ける。TCP の往復では
+     * サーバ役(対向 PF)も送信するが、**データを受け取るだけの側には上位層の
+     * 到達確認が存在しない**(相手が自分のデータを受け取った証拠が無い)ので、
+     * そちらが確認要求を出すのは正しい動作。検証したいのは送信側。 */
+    uart_printf("nudtest:   [観測] %s の確認要求 %s -> %02x:%02x:%02x:%02x:%02x:%02x (%s)\n",
+                is_v6 ? "IPv6" : "IPv4", is_unicast ? "ユニキャスト" : "ブロードキャスト",
+                dst_mac[0], dst_mac[1], dst_mac[2], dst_mac[3], dst_mac[4], dst_mac[5],
+                g_active_ctx ? g_active_ctx->name : "?");
+    if (s_nud_self && g_active_ctx != s_nud_self) {
+        s_nud_other++;
+        return;
+    }
+    if (is_unicast) s_nud_uni++; else s_nud_multi++;
+    for (unsigned i = 0; i < 6u; i++) s_nud_last_mac[i] = dst_mac[i];
+}
+
+/*=================================================================
+ * Neighbor Advertisement を 1 個組み立てて送る。**フラグ(Solicited /
+ * Override)を自由に振れる**ことが要点で、これが無いと RFC 4861 7.2.5 の
+ * 「Override 無しの NA は既存の MAC を書き換えない」を確かめられない。
+ *
+ * 引数:
+ *   to / to_mac - 送り先(NA を受け取る側)
+ *   target      - NA の Target Address
+ *   tgt_mac     - Target Link-Layer Address オプションに入れる MAC
+ *   solicited   - S フラグ、override_flag - O フラグ
+ * 戻り値:
+ *   0=送信完了、-1=失敗
+ * コール元:
+ *   shell_nudtest()
+ * ===============================================================*/
+static int shell_inject_na(const uint8_t to[16], const uint8_t to_mac[6],
+                            const uint8_t target[16], const uint8_t tgt_mac[6],
+                            int solicited, int override_flag)
+{
+    static uint8_t msg[8u + 16u + 8u];
+    for (unsigned i = 0; i < sizeof(msg); i++) msg[i] = 0;
+
+    msg[0] = ICMPV6_TYPE_NA;
+    msg[1] = 0;
+    /* msg[2..3] はチェックサム。msg[4] の上位 3 ビットが R/S/O。 */
+    msg[4] = (uint8_t)((solicited ? 0x40u : 0u) | (override_flag ? 0x20u : 0u));
+    for (unsigned i = 0; i < 16u; i++) msg[8u + i] = target[i];
+    msg[24] = 2u;   /* Target Link-Layer Address */
+    msg[25] = 1u;
+    for (unsigned i = 0; i < 6u; i++) msg[26u + i] = tgt_mac[i];
+
+    uint8_t src[16];
+    ipv6_link_local_addr(src);
+    wr16be(msg + 2, ipv6_pseudo_checksum(src, to, IPV6_NH_ICMPV6, msg, (uint16_t)sizeof(msg)));
+    return ipv6_send(to, to_mac, IPV6_NH_ICMPV6, msg, (uint16_t)sizeof(msg));
+}
+
+/*=================================================================
+ * シェルの `nudtest`。B3(到達不能検出)の検証。
+ *
+ * A2 で入った「失効 -> 確認 -> 延命/破棄」に対して、B3 で足したのは 3 つ:
+ *   - **DELAY 相**: 失効したエントリを使った瞬間には確認要求を出さない
+ *   - **ユニキャストの確認要求**: MAC を知っている相手にブロードキャストしない
+ *   - **上位層の到達確認**: TCP の累積 ACK が進んだら確認要求を出さずに延命
+ * 加えて **NA のフラグ解釈**(Solicited だけが到達確認、Override 無しは
+ * 既存の MAC を書き換えない)。
+ *
+ * `arptest` と同じく TTL を一時的に縮めて実行し、**必ず元に戻す**。
+ *
+ * コール元:
+ *   shell_dispatch()
+ * ===============================================================*/
+static void shell_nudtest(void)
+{
+    uint8_t peer_ll[16];
+    netif_t *peer = shell_peer_ll6(peer_ll);
+    netif_t *self = g_active_ctx;
+    if (!peer || !self) {
+        uart_printf("nudtest: 対向インターフェースが見つかりません(net init mlx5 が必要)\n");
+        return;
+    }
+    uint8_t self_ll[16], self_mac[6];
+    ipv6_link_local_addr(self_ll);
+    for (unsigned i = 0; i < 6u; i++) self_mac[i] = self->mac[i];
+
+    /* **TTL は 1200ms**。猶予(TTL/6)が 200ms あるので、失効してから
+     * 「NA を注げて、状態を読み取れる」窓が十分に取れる。600ms だと猶予が
+     * 100ms しかなく、注入と読み取りのあいだに破棄されて誤判定した(実機)。 */
+    const uint32_t saved_ttl = g_neigh_cache_ttl_ms;
+    const uint32_t ttl = 1200u;         /* 猶予=200ms、DELAY=100ms、probe 間隔=20ms */
+    const uint32_t delay_ms = ttl / NEIGH_DELAY_DIVISOR;
+    g_neigh_cache_ttl_ms = ttl;
+
+    int ok = 1;
+    uint8_t mac[6];
+    s_nud_self = self;
+    s_nud_other = 0;
+    neigh_set_probe_observer(shell_nud_observer);
+    uart_printf("nudtest: TTL=%ums DELAY=%ums で検証(終了時に %ums へ戻します)\n",
+                ttl, delay_ms, saved_ttl);
+
+    /* ---- 準備: 対向 PF の v4/v6 を解決し、**寿命の起点を作り直す** ----
+     * **`arp_resolve()` / `ndp_resolve()` だけでは足りない。** キャッシュが
+     * fresh なら何も送らずに帰るので、`expires_at` は前回入った時点の TTL の
+     * ままになる。直前に `arptest`(TTL を 600ms へ変えて最後に 60000ms へ
+     * 戻す)を走らせていると **60 秒先の期限が残り、この検証の待ち時間では
+     * 失効しない**。実機で「nudtest 単独なら PASS、arptest の直後だけ NG」と
+     * いう形で踏んだ。`*_cache_insert()` は必ず現在の TTL で入れ直す。 */
+    netif_activate(self);
+    if (arp_resolve(peer->ip, mac) != 0 || ndp_resolve(peer_ll, mac) != 0) {
+        uart_printf("nudtest: NG -- 対向 PF の解決に失敗\n");
+        neigh_set_probe_observer(NULL);
+        g_neigh_cache_ttl_ms = saved_ttl;
+        return;
+    }
+    netif_activate(self);
+    arp_cache_insert(peer->ip, peer->mac);
+    ndp_cache_insert(peer_ll, peer->mac);
+
+    /* ---- [1] DELAY: 失効直後の lookup では確認要求を出さない ---- */
+    for (uint64_t t0 = timer_now(); !timeout_ms(t0, ttl + 20u); ) net_poll_all_and_dispatch();
+    s_nud_uni = 0; s_nud_multi = 0;
+    netif_activate(self);
+    /* **「確認要求が 0 個」だけでは DELAY を確かめたことにならない** --
+     * エントリがまだ fresh でも同じ結果になる。先に本当に失効しているかを
+     * peek で確認する(これが無くて、fresh のまま PASS していた)。 */
+    int stale4 = (arp_cache_peek(peer->ip, NULL) == 1);
+    int stale6 = (ndp_cache_peek(peer_ll, NULL) == 1);
+    int hit4 = (arp_cache_lookup(peer->ip, mac) == 0);
+    int hit6 = (ndp_cache_lookup(peer_ll, mac) == 0);
+    uart_printf("nudtest: %s [1] DELAY -- 失効済み(v4=%d v6=%d)の lookup は MAC を返し"
+                "(v4=%d v6=%d)、確認要求は %u 個(期待 0)\n",
+                (stale4 && stale6 && hit4 && hit6 &&
+                 s_nud_uni == 0u && s_nud_multi == 0u) ? "OK" : "NG",
+                stale4, stale6, hit4, hit6, s_nud_uni + s_nud_multi);
+    if (!stale4 || !stale6 || !hit4 || !hit6 || s_nud_uni != 0u || s_nud_multi != 0u) ok = 0;
+
+    /* ---- [2] DELAY 経過後はユニキャストで確認要求を出す ---- */
+    for (uint64_t t0 = timer_now(); !timeout_ms(t0, delay_ms + 20u); ) {
+        net_poll_all_and_dispatch();
+    }
+    s_nud_uni = 0; s_nud_multi = 0;
+    netif_activate(self);
+    arp_cache_lookup(peer->ip, mac);
+    int uni4 = s_nud_uni;
+    int mac4_ok = 1;
+    for (unsigned i = 0; i < 6u; i++) if (s_nud_last_mac[i] != peer->mac[i]) mac4_ok = 0;
+    uart_printf("nudtest: %s [2] IPv4 の確認要求 -- ユニキャスト %u / ブロードキャスト %u、"
+                "宛先 MAC が対向 PF=%d\n",
+                (uni4 == 1 && s_nud_multi == 0u && mac4_ok) ? "OK" : "NG",
+                s_nud_uni, s_nud_multi, mac4_ok);
+    if (uni4 != 1 || s_nud_multi != 0u || !mac4_ok) ok = 0;
+
+    s_nud_uni = 0; s_nud_multi = 0;
+    netif_activate(self);
+    ndp_cache_lookup(peer_ll, mac);
+    int mac6_ok = 1;
+    for (unsigned i = 0; i < 6u; i++) if (s_nud_last_mac[i] != peer->mac[i]) mac6_ok = 0;
+    uart_printf("nudtest: %s [3] IPv6 の確認要求 -- ユニキャスト %u / マルチキャスト %u、"
+                "宛先 MAC が対向 PF=%d(33:33:ff:.. ではない)\n",
+                (s_nud_uni == 1u && s_nud_multi == 0u && mac6_ok) ? "OK" : "NG",
+                s_nud_uni, s_nud_multi, mac6_ok);
+    if (s_nud_uni != 1u || s_nud_multi != 0u || !mac6_ok) ok = 0;
+
+    /* ---- [4] 上位層の到達確認: confirmed=1 なら確認要求を出さずに延命 ---- */
+    netif_activate(self);
+    arp_resolve(peer->ip, mac);
+    for (uint64_t t0 = timer_now(); !timeout_ms(t0, ttl + delay_ms + 30u); ) {
+        net_poll_all_and_dispatch();
+    }
+    netif_activate(self);
+    s_nud_uni = 0; s_nud_multi = 0;
+    int was_stale = (arp_cache_peek(peer->ip, NULL) == 1);
+    arp_cache_lookup_nud(peer->ip, mac, 1);
+    int now_fresh = (arp_cache_peek(peer->ip, NULL) == 0);
+    uart_printf("nudtest: %s [4] 上位層の到達確認 -- stale(%d)から確認要求 %u 個で"
+                "fresh(%d)へ戻る\n",
+                (was_stale && now_fresh && s_nud_uni == 0u && s_nud_multi == 0u)
+                    ? "OK" : "NG", was_stale, s_nud_uni + s_nud_multi, now_fresh);
+    if (!was_stale || !now_fresh || s_nud_uni != 0u || s_nud_multi != 0u) ok = 0;
+
+    /* ---- [5] TCP を流すと確認要求が 1 個も出ない ----
+     * **TCP が到達確認フラグを立てていることの端から端までの確認。**
+     * わざと失効させた状態で往復させる。 */
+    /* **この段だけ TTL を伸ばす。** 猶予(TTL/6)より長い停止が往復の途中に
+     * 入るとエントリが破棄され、NUD の確認要求ではなく `arp_resolve()` の
+     * ブロードキャスト再解決が走る。この経路(Pi5 のブリッジ越し)では
+     * **RTO による 200ms の停止が実際に起きる**ので、TTL=1200ms の猶予
+     * 200ms では足りなかった(実機で踏み、原因を取り違えかけた)。 */
+    const uint32_t ttl5 = 3000u;   /* 猶予 500ms > RTO 200ms */
+    g_neigh_cache_ttl_ms = ttl5;
+    netif_activate(self);
+    /* **`arp_resolve()` では起点を作り直せない。** キャッシュが fresh なら
+     * 何も送らずに帰るので、`expires_at` は前の TTL のままになる(実機で
+     * 「待ったのに DEAD」になって気付いた)。`arp_cache_insert()` は必ず
+     * 現在の TTL で入れ直すので、こちらを使う(`arptest` と同じ手)。 */
+    arp_cache_insert(peer->ip, peer->mac);
+    for (uint64_t t0 = timer_now(); !timeout_ms(t0, ttl5 + 20u); ) {
+        net_poll_all_and_dispatch();
+    }
+    netif_activate(self);
+    int stale_before = (arp_cache_peek(peer->ip, NULL) == 1);
+    s_nud_uni = 0; s_nud_multi = 0; s_nud_other = 0;
+    uint32_t confirm_before = g_neigh_confirm_count;
+    netaddr_t peer_v4 = netaddr_v4(peer->ip);
+    int echo = shell_tcp_echo_once("nudtest", self, peer, &peer_v4, 6007u, NULL);
+    netif_activate(self);
+    /* **往復後に fresh へ戻っていること**が上位層の確認が効いた証拠。確認要求を
+     * 1 個も出していないのだから、延命できる経路は他に無い。 */
+    int fresh_after = (arp_cache_peek(peer->ip, NULL) == 0);
+    uint32_t confirms = g_neigh_confirm_count - confirm_before;
+    /* **「確認要求が 0 個」だけでは足りない** -- DELAY 中で黙っていただけかも
+     * しれない。上位層の確認が実際に適用された回数が増えていることを見る。 */
+    uart_printf("nudtest: %s [5] stale(%d)のまま TCP を 64KB 往復 -- 上位層の確認 %u 回 / "
+                "送信側の確認要求 %u 個(期待 0)、往復後に fresh(%d)/ 受信側 %u 個"
+                "(こちらは正常 -- データを受けるだけの側に到達確認は無い)\n",
+                (echo && stale_before && fresh_after && confirms > 0u &&
+                 s_nud_uni == 0u && s_nud_multi == 0u) ? "OK" : "NG",
+                stale_before, confirms, s_nud_uni + s_nud_multi, fresh_after, s_nud_other);
+    if (!echo || !stale_before || !fresh_after || confirms == 0u ||
+        s_nud_uni != 0u || s_nud_multi != 0u) {
+        ok = 0;
+    }
+    g_neigh_cache_ttl_ms = ttl;
+
+    /* ---- [6][7] NA のフラグ解釈(RFC 4861 7.2.5)----
+     * 実在しないアドレスにエントリを仕込んで、そこへ偽の NA を投げる
+     * (実際に使っているアドレスを汚さないため)。 */
+    {
+        uint8_t fake[16], real[6] = { 0x02, 0x00, 0x00, 0x00, 0xAA, 0xAA };
+        uint8_t bogus[6] = { 0x02, 0x00, 0x00, 0x00, 0xBB, 0xBB };
+        for (unsigned i = 0; i < 16u; i++) fake[i] = 0;
+        fake[0] = 0xFE; fake[1] = 0x80; fake[14] = 0xDE; fake[15] = 0xAD;
+
+        netif_activate(self);
+        ndp_cache_insert(fake, real);
+
+        /* [6] Override 無しで違う MAC を主張する NA は無視する。 */
+        netif_activate(peer);
+        shell_inject_na(self_ll, self_mac, fake, bogus, 1, 0);
+        netif_activate(self);
+        for (uint64_t t0 = timer_now(); !timeout_ms(t0, 150u); ) net_poll_all_and_dispatch();
+        netif_activate(self);
+        ndp_cache_lookup(fake, mac);
+        int kept = 1;
+        for (unsigned i = 0; i < 6u; i++) if (mac[i] != real[i]) kept = 0;
+        uart_printf("nudtest: %s [6] 陰性対照 -- Override 無しの NA は既存の MAC を"
+                    "書き換えない\n", kept ? "OK" : "NG");
+        if (!kept) ok = 0;
+
+        /* [7] Override 有りなら書き換わる(陽性対照)。 */
+        netif_activate(peer);
+        shell_inject_na(self_ll, self_mac, fake, bogus, 1, 1);
+        netif_activate(self);
+        for (uint64_t t0 = timer_now(); !timeout_ms(t0, 150u); ) net_poll_all_and_dispatch();
+        netif_activate(self);
+        ndp_cache_lookup(fake, mac);
+        int changed = 1;
+        for (unsigned i = 0; i < 6u; i++) if (mac[i] != bogus[i]) changed = 0;
+        uart_printf("nudtest: %s [7] 陽性対照 -- Override 有りの NA は書き換える\n",
+                    changed ? "OK" : "NG");
+        if (!changed) ok = 0;
+
+        /* [8] 非要請 NA(S=0)は延命しない。
+         * **猶予(TTL/6 = 200ms)の中で「注入 -> 読み取り」を 2 回やる**ので、
+         * 失効直後から始めて待ち時間を短く刻む。ここを雑にすると、猶予切れで
+         * 破棄されたものを「延命しなかった」と誤読する(ndp_cache_peek は
+         * 未登録と猶予切れをどちらも -1 で返す)。 */
+        /* **起点をここで作り直す。** 直前の段の待ち時間ぶん寿命が進んでいると、
+         * 猶予(TTL/6)の末尾で判定することになり「延命しなかった」と
+         * 「猶予切れで破棄された」を取り違える(実機で踏んだ。
+         * `ndp_cache_peek` はどちらも -1 ではなく…前者は 1、後者は -1 を返す
+         * ので、== 1 の判定が静かに落ちる)。 */
+        netif_activate(peer);
+        shell_inject_na(self_ll, self_mac, fake, bogus, 1, 1);
+        netif_activate(self);
+        for (uint64_t t0 = timer_now(); !timeout_ms(t0, 30u); ) net_poll_all_and_dispatch();
+        for (uint64_t t0 = timer_now(); !timeout_ms(t0, ttl - 10u); ) {
+            net_poll_all_and_dispatch();
+        }
+        netif_activate(self);
+        int before = ndp_cache_peek(fake, NULL);
+        netif_activate(peer);
+        shell_inject_na(self_ll, self_mac, fake, bogus, 0, 1);
+        netif_activate(self);
+        for (uint64_t t0 = timer_now(); !timeout_ms(t0, 40u); ) net_poll_all_and_dispatch();
+        netif_activate(self);
+        int still_stale = (ndp_cache_peek(fake, NULL) == 1);
+        netif_activate(peer);
+        shell_inject_na(self_ll, self_mac, fake, bogus, 1, 1);
+        netif_activate(self);
+        for (uint64_t t0 = timer_now(); !timeout_ms(t0, 40u); ) net_poll_all_and_dispatch();
+        netif_activate(self);
+        int refreshed = (ndp_cache_peek(fake, NULL) == 0);
+        uart_printf("nudtest: %s [8] 非要請 NA は延命せず(注入前=%d stale のまま=%d)、"
+                    "solicited NA で fresh へ戻る(%d)\n",
+                    (before == 1 && still_stale && refreshed) ? "OK" : "NG",
+                    before, still_stale, refreshed);
+        if (before != 1 || !still_stale || !refreshed) ok = 0;
+    }
+
+    neigh_set_probe_observer(NULL);
+    s_nud_self = NULL;
+    g_neigh_cache_ttl_ms = saved_ttl;
+    netif_activate(self);
+    uart_printf("nudtest: %s(TTL は %ums へ戻しました)\n", ok ? "PASS" : "NG", saved_ttl);
+}
+
+/* ---- mld / mldtest: MLD の Report 送出と Query 応答を確かめる ---- */
+
+static uint8_t  s_mld_dump;          /* 1=送信した MLD を 16 進で出す(tools/mld_check 用) */
+static unsigned s_mld_seen;          /* 観測した MLD メッセージ数 */
+static uint8_t  s_mld_last[256];     /* 直近に送った MLD メッセージ */
+static unsigned s_mld_last_len;
+static uint8_t  s_mld_last_dst[16];
+
+/*=================================================================
+ * 送信 MLD の観測フック。ルータもスヌーピングするスイッチも居ないので、
+ * 自分が何を送ったかはここでしか確かめられない(`ip_set_frag_observer()` と
+ * 同じ考え方)。
+ *
+ * コール元:
+ *   mld_send() から関数ポインタ経由
+ * ===============================================================*/
+static void shell_mld_observer(const uint8_t *msg, unsigned len, const uint8_t dst[16])
+{
+    s_mld_seen++;
+    if (len > sizeof(s_mld_last)) len = sizeof(s_mld_last);
+    for (unsigned i = 0; i < len; i++) s_mld_last[i] = msg[i];
+    s_mld_last_len = len;
+    for (unsigned i = 0; i < 16u; i++) s_mld_last_dst[i] = dst[i];
+
+    if (s_mld_dump) {
+        uart_printf("MLDDUMP len=%u", len);
+        for (unsigned i = 0; i < len; i++) uart_printf(" %02x", msg[i]);
+        uart_printf("\n");
+    }
+}
+
+/*=================================================================
+ * MLD の Query を 1 個組み立てて送る。Querier の役を対向インターフェースが
+ * 務める(`pmtutest` / `slaactest` と同じ手)。
+ *
+ * **v1 と v2 は長さで区別される**(v1=24、v2>=28)。受信側が長さではなく
+ * 別の何かで判定していれば、ここで作り分けたときに食い違って露見する。
+ * Router Alert と hop limit=1 も Query 側の必須条件なので、引数で外せる
+ * ようにして陰性対照に使う。
+ *
+ * 引数:
+ *   to / to_mac  - 送り先
+ *   mca          - 対象グループ(全 0 なら General Query)
+ *   v2           - 1=MLDv2 Query(28 バイト)、0=MLDv1 Query(24 バイト)
+ *   hop_limit    - IPv6 ヘッダの hop limit(1 以外は受信側が捨てるはず)
+ *   router_alert - 0 なら Hop-by-Hop を付けない(受信側が捨てるはず)
+ * 戻り値:
+ *   0=送信完了、-1=失敗
+ * コール元:
+ *   shell_mldtest()
+ * ===============================================================*/
+static int shell_inject_mld_query(const uint8_t to[16], const uint8_t to_mac[6],
+                                   const uint8_t mca[16], int v2,
+                                   uint8_t hop_limit, int router_alert)
+{
+    static uint8_t msg[28];
+    unsigned len = v2 ? 28u : 24u;
+    for (unsigned i = 0; i < sizeof(msg); i++) msg[i] = 0;
+
+    msg[0] = ICMPV6_TYPE_MLD_QUERY;
+    msg[1] = 0;
+    /* msg[2..3] はチェックサム。msg[4..5] = Maximum Response Code(ms)。 */
+    wr16be(msg + 4u, 1000u);
+    /* msg[6..7] は reserved。msg[8..23] が Multicast Address。 */
+    for (unsigned i = 0; i < 16u; i++) msg[8u + i] = mca[i];
+    if (v2) {
+        msg[24] = 2u;   /* QRV=2、S フラグ無し */
+        msg[25] = 125u; /* QQIC */
+        wr16be(msg + 26u, 0);  /* 送信元指定無し */
+    }
+
+    uint8_t src[16];
+    ipv6_link_local_addr(src);
+    wr16be(msg + 2, ipv6_pseudo_checksum(src, to, IPV6_NH_ICMPV6, msg, (uint16_t)len));
+
+    if (s_mld_dump) {
+        uart_printf("MLDDUMP len=%u", len);
+        for (unsigned i = 0; i < len; i++) uart_printf(" %02x", msg[i]);
+        uart_printf("\n");
+    }
+
+    net_buf_t *nb = net_buf_alloc();
+    if (!nb) return -1;
+    unsigned hbh = router_alert ? 8u : 0u;
+    ipv6_build_header(nb->data, src, to, to_mac,
+                      router_alert ? IPV6_NH_HOPOPTS : IPV6_NH_ICMPV6,
+                      (uint16_t)(hbh + len));
+    nb->data[ETH_HDR_LEN + offsetof(ipv6_header_t, hop_limit)] = hop_limit;
+
+    uint8_t *p = nb->data + ETH_HDR_LEN + IPV6_HDR_LEN;
+    if (router_alert) {
+        p[0] = IPV6_NH_ICMPV6; p[1] = 0;
+        p[2] = IPV6_TLV_ROUTER_ALERT; p[3] = 2; p[4] = 0; p[5] = 0;
+        p[6] = IPV6_TLV_PADN;  p[7] = 0;
+    }
+    for (unsigned i = 0; i < len; i++) p[hbh + i] = msg[i];
+    nb->len = (uint16_t)(ETH_HDR_LEN + IPV6_HDR_LEN + hbh + len);
+    return eth_send(nb);
+}
+
+/*=================================================================
+ * シェルの `mld`。参加グループと MLD の状態を表示する。`mld report` で
+ * 非要請 Report を送る。
+ *
+ * 引数:
+ *   args - "report" で Report を送る
+ * コール元:
+ *   shell_dispatch()
+ * ===============================================================*/
+static void shell_mld(char *args)
+{
+    while (*args == ' ') args++;
+    int do_report = (strncmp(args, "report", 6) == 0);
+    /* **`mld leave` は実スイッチ配下では通信を止める。** スヌーピングする
+     * スイッチが要請ノードマルチキャストの転送をやめるので、相手からの NS が
+     * 届かなくなる(= B2 が効いていることの陰性対照そのもの)。戻すには
+     * `mld report`。 */
+    int do_leave  = (strncmp(args, "leave", 5) == 0);
+    if (strncmp(args, "off", 3) == 0 || strncmp(args, "on", 2) == 0) {
+        int on = (args[1] == 'n');
+        ipv6_mld_set_enabled(on);
+        uart_printf("mld: MLD の送信を%s(%s)\n", on ? "再開しました" : "止めました",
+                    on ? "通常" : "**スヌーピングするスイッチ配下では通信が止まる。"
+                                 "戻すのを忘れないこと**");
+        return;
+    }
+
+    netif_t *prev = g_active_ctx;
+    static const char *ifnames[] = { "mlx5-pf0", "mlx5-pf1" };
+    for (unsigned i = 0; i < 2u; i++) {
+        netif_t *ni = netif_find(ifnames[i]);
+        if (!ni) continue;
+        uint8_t groups[IPV6_MCAST_MAX][16];
+        unsigned n = ipv6_mcast_groups(ni, groups, IPV6_MCAST_MAX);
+        uart_printf("mld: %-10s 報告対象 %u グループ(ff02::1 は対象外)、%s%s\n",
+                    ni->name, n, ipv6_mld_v1_mode() ? "v1 互換モード" : "v2",
+                    ipv6_mld_enabled() ? "" : " ** 送信停止中(mld on で再開)**");
+        for (unsigned k = 0; k < n; k++) {
+            uart_printf("mld: %-10s   ", ni->name);
+            for (unsigned j = 0; j < 8u; j++) {
+                uart_printf("%s%02x%02x", (j ? ":" : ""),
+                            groups[k][j * 2u], groups[k][j * 2u + 1u]);
+            }
+            uart_printf("\n");
+        }
+        if (do_report) {
+            int sent = ipv6_mld_report_all(ni);
+            uart_printf("mld: %-10s Report を %d 通送信\n", ni->name, sent);
+        }
+        if (do_leave) {
+            netif_activate(ni);
+            for (unsigned k = 0; k < n; k++) ipv6_mld_leave(groups[k]);
+            uart_printf("mld: %-10s %u グループの離脱を通知(戻すには mld report)\n",
+                        ni->name, n);
+        }
+    }
+    if (prev) netif_activate(prev);
+}
+
+/*=================================================================
+ * シェルの `mldtest`。B2(MLD)の検証。
+ *
+ * **このリンクには Querier が居ない**ので、対向 PF に Querier 役をさせて
+ * Query を注入する。送信した Report は誰も受け取らない(ルータもスヌーピング
+ * するスイッチも居ない)ので、`ipv6_set_mld_observer()` で送信直前に覗く。
+ *
+ * 陰性対照(hop limit != 1 / Router Alert 無し / 参加していないグループ)を
+ * 必ず組で見る。「Report を送った」だけを見ても、何でも応答する実装と区別が
+ * つかない。
+ *
+ * 引数:
+ *   args - "dump" で 16 進出力(tools/mld_check 用)
+ * コール元:
+ *   shell_dispatch()
+ * ===============================================================*/
+static void shell_mldtest(char *args)
+{
+    while (*args == ' ') args++;
+    s_mld_dump = (strncmp(args, "dump", 4) == 0);
+
+    uint8_t peer_ll[16];
+    netif_t *peer = shell_peer_ll6(peer_ll);
+    netif_t *self = g_active_ctx;
+    if (!peer || !self) {
+        uart_printf("mldtest: 対向インターフェースが見つかりません(net init mlx5 が必要)\n");
+        return;
+    }
+    uint8_t self_ll[16], self_sol[16], self_mac[6];
+    ipv6_link_local_addr(self_ll);
+    ipv6_solicited_node_addr(self_ll, self_sol);
+    for (unsigned i = 0; i < 6u; i++) self_mac[i] = self->mac[i];
+
+    uint8_t any[16], other[16];
+    for (unsigned i = 0; i < 16u; i++) { any[i] = 0; other[i] = 0; }
+    /* 参加していないグループ(陰性対照用)。ff02::1:ff00:9999 */
+    other[0] = 0xFF; other[1] = 0x02; other[11] = 0x01; other[12] = 0xFF;
+    other[13] = 0x00; other[14] = 0x99; other[15] = 0x99;
+
+    int ok = 1;
+    ipv6_set_mld_observer(shell_mld_observer);
+
+    /* ---- [1] 参加グループの列挙 ---- */
+    {
+        uint8_t groups[IPV6_MCAST_MAX][16];
+        unsigned n = ipv6_mcast_groups(self, groups, IPV6_MCAST_MAX);
+        int good = (n >= 1u);
+        for (unsigned j = 0; good && j < 16u; j++) {
+            if (groups[0][j] != self_sol[j]) good = 0;
+        }
+        /* ff02::1 が混ざっていないこと(RFC 3810 6 で報告対象外)。 */
+        for (unsigned k = 0; k < n; k++) {
+            if (groups[k][15] == 0x01 && groups[k][12] == 0x00) good = 0;
+        }
+        uart_printf("mldtest: %s [1] 報告対象は %u グループ(要請ノード。ff02::1 は含まない)\n",
+                    good ? "OK" : "NG", n);
+        if (!good) ok = 0;
+    }
+
+    /* ---- [2] 非要請 Report(v2)---- */
+    s_mld_seen = 0; s_mld_last_len = 0;
+    ipv6_mld_report_all(self);
+    netif_activate(self);
+    {
+        /* v2 Report: type=143、レコード数は 6-7、レコードは 20 バイト。 */
+        int good = (s_mld_seen == MLD_UNSOLICITED_REPORTS) &&
+                   (s_mld_last_len >= 28u) &&
+                   (s_mld_last[0] == ICMPV6_TYPE_MLD2_REPORT) &&
+                   (s_mld_last[7] >= 1u) &&
+                   (s_mld_last[8] == MLD2_CHANGE_TO_EXCLUDE) &&
+                   (s_mld_last_dst[15] == 0x16);
+        uart_printf("mldtest: %s [2] 非要請 Report -- %u 通 / type=%u / レコード %u 個 / "
+                    "宛先 ff02::%02x\n", good ? "OK" : "NG", s_mld_seen,
+                    s_mld_last[0], s_mld_last[7], s_mld_last_dst[15]);
+        if (!good) ok = 0;
+    }
+
+    /* ---- [3] v2 General Query -> MODE_IS_EXCLUDE で応答 ---- */
+    s_mld_seen = 0;
+    netif_activate(peer);
+    int inj = shell_inject_mld_query(self_ll, self_mac, any, 1, 1u, 1);
+    netif_activate(self);
+    for (uint64_t t0 = timer_now(); !timeout_ms(t0, 200u); ) net_poll_all_and_dispatch();
+    {
+        int good = (inj == 0) && (s_mld_seen >= 1u) &&
+                   (s_mld_last[0] == ICMPV6_TYPE_MLD2_REPORT) &&
+                   (s_mld_last[8] == MLD2_MODE_IS_EXCLUDE);
+        uart_printf("mldtest: %s [3] v2 General Query -> v2 Report(レコード種別 %u、"
+                    "期待 %u=MODE_IS_EXCLUDE)\n", good ? "OK" : "NG",
+                    s_mld_last[8], MLD2_MODE_IS_EXCLUDE);
+        if (!good) ok = 0;
+    }
+
+    /* ---- [4] 陰性対照: hop limit != 1 の Query は無視 ---- */
+    s_mld_seen = 0;
+    netif_activate(peer);
+    shell_inject_mld_query(self_ll, self_mac, any, 1, 64u, 1);
+    netif_activate(self);
+    for (uint64_t t0 = timer_now(); !timeout_ms(t0, 200u); ) net_poll_all_and_dispatch();
+    uart_printf("mldtest: %s [4] 陰性対照 -- hop limit=64 の Query は無視する\n",
+                (s_mld_seen == 0u) ? "OK" : "NG");
+    if (s_mld_seen != 0u) ok = 0;
+
+    /* ---- [5] 陰性対照: Router Alert 無しの Query は無視 ---- */
+    s_mld_seen = 0;
+    netif_activate(peer);
+    shell_inject_mld_query(self_ll, self_mac, any, 1, 1u, 0);
+    netif_activate(self);
+    for (uint64_t t0 = timer_now(); !timeout_ms(t0, 200u); ) net_poll_all_and_dispatch();
+    uart_printf("mldtest: %s [5] 陰性対照 -- Router Alert 無しの Query は無視する\n",
+                (s_mld_seen == 0u) ? "OK" : "NG");
+    if (s_mld_seen != 0u) ok = 0;
+
+    /* ---- [6] 陰性対照: 参加していないグループ宛の Specific Query ----
+     * **宛先はそのグループ**なので、自分宛と判定されるように self の
+     * 要請ノードアドレス宛で送りつつ、本文のグループだけを別物にする。 */
+    s_mld_seen = 0;
+    netif_activate(peer);
+    shell_inject_mld_query(self_sol, self_mac, other, 1, 1u, 1);
+    netif_activate(self);
+    for (uint64_t t0 = timer_now(); !timeout_ms(t0, 200u); ) net_poll_all_and_dispatch();
+    uart_printf("mldtest: %s [6] 陰性対照 -- 参加していないグループの Query には応答しない\n",
+                (s_mld_seen == 0u) ? "OK" : "NG");
+    if (s_mld_seen != 0u) ok = 0;
+
+    /* ---- [7] Group-Specific Query -> そのグループだけ報告 ---- */
+    s_mld_seen = 0;
+    netif_activate(peer);
+    shell_inject_mld_query(self_sol, self_mac, self_sol, 1, 1u, 1);
+    netif_activate(self);
+    for (uint64_t t0 = timer_now(); !timeout_ms(t0, 200u); ) net_poll_all_and_dispatch();
+    {
+        int good = (s_mld_seen == 1u) && (s_mld_last[7] == 1u);
+        uart_printf("mldtest: %s [7] Group-Specific Query -> %u 通 / レコード %u 個"
+                    "(期待 1 通 / 1 個)\n", good ? "OK" : "NG", s_mld_seen, s_mld_last[7]);
+        if (!good) ok = 0;
+    }
+
+    /* ---- [8] v1 Query(24 バイト)-> v1 互換モードへ落ちる ----
+     * **Linux ブリッジの既定は `mcast_mld_version 1`** なので、実スイッチ
+     * 配下ではこちらが本番の経路になる。 */
+    s_mld_seen = 0;
+    netif_activate(peer);
+    shell_inject_mld_query(self_ll, self_mac, any, 0, 1u, 1);
+    netif_activate(self);
+    for (uint64_t t0 = timer_now(); !timeout_ms(t0, 200u); ) net_poll_all_and_dispatch();
+    {
+        /* v1 Report: type=131、24 バイト、8-23 がグループ、宛先はグループ自身。 */
+        int good = (s_mld_seen >= 1u) && ipv6_mld_v1_mode() &&
+                   (s_mld_last[0] == ICMPV6_TYPE_MLD_REPORT) && (s_mld_last_len == 24u);
+        for (unsigned j = 0; good && j < 16u; j++) {
+            if (s_mld_last[8u + j] != self_sol[j]) good = 0;
+            if (s_mld_last_dst[j] != self_sol[j]) good = 0;
+        }
+        uart_printf("mldtest: %s [8] v1 Query -> v1 Report(type=%u len=%u、"
+                    "互換モード=%d、宛先=グループ自身)\n", good ? "OK" : "NG",
+                    s_mld_last[0], s_mld_last_len, ipv6_mld_v1_mode());
+        if (!good) ok = 0;
+    }
+
+    /* ---- [9] v1 互換モード中の離脱は Done(type 132)---- */
+    s_mld_seen = 0;
+    ipv6_mld_leave(self_sol);
+    {
+        int good = (s_mld_seen == 1u) && (s_mld_last[0] == ICMPV6_TYPE_MLD_DONE) &&
+                   (s_mld_last_dst[15] == 0x02);   /* ff02::2 全ルータ */
+        uart_printf("mldtest: %s [9] 離脱通知 -- type=%u(期待 %u=Done)/ 宛先 ff02::%02x\n",
+                    good ? "OK" : "NG", s_mld_last[0], ICMPV6_TYPE_MLD_DONE,
+                    s_mld_last_dst[15]);
+        if (!good) ok = 0;
+    }
+
+    /* ---- [10] 後始末: v1 互換モードを抜けて参加し直す ----
+     * **`mldtest` は Done を送ってしまうので、必ず Report を送り直す**
+     * (実スイッチ配下なら、ここを忘れると以後 NDP が届かなくなる)。 */
+    ipv6_mld_clear_v1_mode();
+    ipv6_mld_report_all(self);
+    netif_activate(self);
+    ipv6_set_mld_observer(NULL);
+    s_mld_dump = 0;
+
+    uart_printf("mldtest: %s(v1 互換モードを解除し、Report を送り直しました)\n",
+                ok ? "PASS" : "NG");
+}
+
 /*=================================================================
  * シェルの `arpage`。近隣キャッシュ(ARP/NDP 共通)の有効期間を変更する。
  * 既定は 60 秒だが、それでは検証に 1 分以上かかるので短くできるようにして
@@ -1688,13 +3184,26 @@ static void shell_arptest(void)
         ok = 0;
     }
 
+    /* **DELAY 相を跨いでからもう一度 lookup する**(B3 で入った RFC 4861 の
+     * DELAY_FIRST_PROBE_TIME)。stale なエントリを使った最初の 1 回は確認要求を
+     * 出さずに黙って MAC を返すので、そこで待っても応答は来ない。DELAY
+     * (TTL/12)が明けてから引き直すと確認要求が出る。 */
+    t0 = timer_now();
+    while (!timeout_ms(t0, test_ttl_ms / NEIGH_DELAY_DIVISOR + 20u)) {
+        net_poll_all_and_dispatch();
+        job_scheduler_tick();
+    }
+    netif_activate(self);
+    arp_cache_lookup(peer_ip, mac);
+    ndp_cache_lookup(peer_ll, mac);
+
     /* 応答が届くまで少し回す。 */
     t0 = timer_now();
     while (!timeout_ms(t0, 50u)) {
         net_poll_all_and_dispatch();
         job_scheduler_tick();
     }
-    uart_printf("arptest: [4] 確認要求への応答後\n");
+    uart_printf("arptest: [4] DELAY 経過後に引き直して確認要求 -> 応答後\n");
     int s4 = arp_cache_peek(peer_ip, &remain);
     shell_print_neigh("ARP 対向PF", s4, remain);
     int s6 = ndp_cache_peek(peer_ll, &remain);
@@ -2565,13 +4074,22 @@ static void shell_dispatch(char *line, int s0, int s1)
             for (unsigned i = 0; i < 2u; i++) {
                 netif_t *ni = netif_find(ifnames[i]);
                 if (!ni) continue;
+                ipv6_slaac_age(ni);   /* 表示は冷たい経路なのでここで満了を判定する */
                 if (ni->ip6_global_set) {
                     uart_printf("ip6addr: %-10s global=", ni->name);
                     for (unsigned j = 0; j < 8u; j++) {
                         uart_printf("%s%02x%02x", (j ? ":" : ""),
                                     ni->ip6_global[j * 2u], ni->ip6_global[j * 2u + 1u]);
                     }
-                    uart_printf("/%u\n", ni->ip6_prefix_len);
+                    uart_printf("/%u %s", ni->ip6_prefix_len,
+                                ni->ip6_global_from_ra ? "(SLAAC" : "(手動");
+                    if (ni->ip6_global_valid_until != 0u) {
+                        uint64_t now = timer_now();
+                        uint64_t rem = ((int64_t)(ni->ip6_global_valid_until - now) > 0)
+                                     ? (ni->ip6_global_valid_until - now) : 0u;
+                        uart_printf("、残り %us", (unsigned)(rem / 1000000000ull));
+                    }
+                    uart_printf(")\n");
                 } else {
                     uart_printf("ip6addr: %-10s global=(未設定、リンクローカルのみ)\n", ni->name);
                 }
@@ -2581,7 +4099,22 @@ static void shell_dispatch(char *line, int s0, int s1)
             if (!ni) {
                 uart_printf("ip6addr: インターフェース %s が見つかりません\n", tok[0]);
             } else if (strncmp(tok[1], "off", 3) == 0) {
-                ni->ip6_global_set = 0;
+                /* **解除の前に離脱を通知する。** そのアドレスの要請ノード
+                 * マルチキャストにはもう用が無いので、スヌーピングする
+                 * スイッチに転送をやめさせる(順序が逆だとグループが
+                 * 分からなくなる)。 */
+                if (ni->ip6_global_set) {
+                    uint8_t sol[16];
+                    ipv6_solicited_node_addr(ni->ip6_global, sol);
+                    netif_t *prev6 = g_active_ctx;
+                    netif_activate(ni);
+                    ipv6_mld_leave(sol);
+                    if (prev6) netif_activate(prev6);
+                }
+                ni->ip6_global_set         = 0;
+                ni->ip6_global_from_ra     = 0;
+                ni->ip6_global_valid_until = 0;
+                ni->ip6_global_dad         = NETIF_DAD_UNKNOWN;
                 uart_printf("ip6addr: %s のグローバルアドレスを解除しました\n", ni->name);
             } else {
                 uint8_t a[16];
@@ -2611,6 +4144,13 @@ static void shell_dispatch(char *line, int s0, int s1)
                     for (unsigned j = 0; j < 16u; j++) ni->ip6_global[j] = a[j];
                     ni->ip6_global_set = 1;
                     ni->ip6_prefix_len = 64u;
+                    /* **手動設定は寿命を持たない**(valid_until=0)。この 2 つを
+                     * 落としておかないと、RA から作ったアドレスを上書きした
+                     * ときに古い期限が残り、勝手に解除される。 */
+                    ni->ip6_global_from_ra     = 0;
+                    ni->ip6_global_valid_until = 0;
+                    /* 新しい要請ノードマルチキャストへの参加を報告する。 */
+                    ipv6_mld_report_all(ni);
                     if (nt >= 3u) {
                         unsigned pl = 0; const char *t = tok[2];
                         while (*t >= '0' && *t <= '9') { pl = pl * 10u + (unsigned)(*t - '0'); t++; }
@@ -2682,6 +4222,24 @@ static void shell_dispatch(char *line, int s0, int s1)
     } else if (strncmp(line, "ftprobe", 7) == 0) {
         mlx5_probe_flow_table_types(&s_dev0, "pf0");
         mlx5_probe_flow_table_types(&s_dev1, "pf1");
+    } else if (strncmp(line, "nvmens", 6) == 0) {
+        /* 名前空間の一覧 / 追加 / 削除。**稼働中に叩くと D6 の AER が発火し、
+         * ホストが名前空間を再スキャンする**(D8 と組で確かめる項目)。 */
+        const char *p = line + 6;
+        while (*p == ' ') p++;
+        if (*p == '\0') { nvmet_ns_show(&s_x86_nvmet); return; }
+        int add = (strncmp(p, "add", 3) == 0);
+        int del = (strncmp(p, "del", 3) == 0);
+        if (!add && !del) {
+            uart_printf("usage: nvmens [add <nsid> | del <nsid>]\n");
+            return;
+        }
+        p += 3;
+        while (*p == ' ') p++;
+        uint32_t nsid = (uint32_t)atoi(p);
+        if (nvmet_ns_set_active(&s_x86_nvmet, nsid, add) == 0) {
+            nvmet_ns_show(&s_x86_nvmet);
+        }
     } else if (strncmp(line, "nvmet", 5) == 0) {
         if (s_shell_nvmet_started) {
             uart_printf("nvmet: 既に常駐起動済み\n");
@@ -2737,6 +4295,20 @@ static void shell_dispatch(char *line, int s0, int s1)
         shell_fragtest(line + 8);
     } else if (strncmp(line, "pmtutest", 8) == 0) {
         shell_pmtutest(line + 8);
+    } else if (strncmp(line, "slaactest", 9) == 0) {
+        shell_slaactest(line + 9);
+    } else if (strncmp(line, "slaac", 5) == 0) {
+        shell_slaac(line + 5);
+    } else if (strncmp(line, "udp6send", 8) == 0) {
+        shell_udp6send(line + 8);
+    } else if (strncmp(line, "ext6test", 8) == 0) {
+        shell_ext6test(line + 8);
+    } else if (strncmp(line, "nudtest", 7) == 0) {
+        shell_nudtest();
+    } else if (strncmp(line, "mldtest", 7) == 0) {
+        shell_mldtest(line + 7);
+    } else if (strncmp(line, "mld", 3) == 0) {
+        shell_mld(line + 3);
     } else if (strncmp(line, "arpage", 6) == 0) {
         shell_arpage(line + 6);
     } else if (strncmp(line, "jobs", 4) == 0) {
@@ -2759,9 +4331,17 @@ static void shell_dispatch(char *line, int s0, int s1)
                     "  routetest                             サブネット外宛がゲートウェイのMACで送られるか(v4/v6)\n"
                     "  arpage [ms]                           ARP/NDPキャッシュの有効期間(既定60000ms)\n"
                     "  arptest                               キャッシュのエージング(失効→確認→延命/破棄)\n"
+                    "  udp6send <addr> <port> <bytes>        指定IPv6宛にUDPを1個送る(MTU超で断片化)\n"
+                    "  ext6test [dump]                       IPv6拡張ヘッダの走査と送信側の断片化\n"
+                    "  nudtest                               到達不能検出(DELAY/ユニキャスト確認/上位層の確認)\n"
                     "  dadtest                               重複アドレス検出(ARP Probe / IPv6 DAD)\n"
                     "  fragtest [dump]                       送信側IP断片化(MTU超のUDP/IPを分割)\n"
                     "  pmtutest [dump]                       経路MTU探索(ICMP Frag Needed/PTBを注入)\n"
+                    "  slaac [<if>] [ms]                     RSを送りRAを待つ(IPv6アドレス自動設定)\n"
+                    "  slaactest [dump]                      SLAAC(RAを注入してプレフィックス+EUI-64)\n"
+                    "  mld [report|leave|off|on]             参加グループ表示/Report送出/離脱/送信停止\n"
+                    "  mldtest [dump]                        MLD(Queryを注入してReportを確認)\n"
+                    "  ip6addr [<if> <addr>|<if> off]        グローバルIPv6アドレスの表示/手動設定\n"
                     "  txdrop [N]                            ロス注入(データN個に1個破棄、0=無効)+再送統計\n"
                     "  qploop [N]                            RC QPの作成/破棄をN回繰り返しFWリソース枯渇を見る\n"
                     "  nvmediscover [dump]                   Discovery Log Pageを取得(dumpで16進出力)\n"
@@ -2922,6 +4502,23 @@ static void run_shell(int s0, int s1)
      * 衝突が無ければ待ち時間ぶん(4 アドレス x 100ms 程度)かかる。 */
     net_dup_addr_detect(netif_find("mlx5-pf0"));
     net_dup_addr_detect(netif_find("mlx5-pf1"));
+
+    /* アドレスの検査が済んだら Router Solicitation を出し、RA が来れば
+     * SLAAC でグローバルアドレスを作る(RFC 4861/4862)。**このリンクには
+     * ルータが居ないので通常は何も起きない**が、非要請 RA を受け取ったときの
+     * 経路と同じものなので、外部にルータが居る構成へ持って行けばそのまま
+     * 効く。RS の回数と間隔は ipv6.h の SLAAC_RS_* で短くしてある
+     * (RFC 値の 3 回 x 4 秒だと起動が 12 秒延びるだけになる)。 */
+    ipv6_slaac_solicit(netif_find("mlx5-pf0"), SLAAC_RS_NUM, SLAAC_RS_INTERVAL_MS);
+    ipv6_slaac_solicit(netif_find("mlx5-pf1"), SLAAC_RS_NUM, SLAAC_RS_INTERVAL_MS);
+
+    /* 参加しているマルチキャストグループを MLD で報告する(RFC 2710/3810)。
+     * **スヌーピングするスイッチの配下では、これを出さないと要請ノード
+     * マルチキャストが転送されず NDP が一切通らない。** アドレスが確定した
+     * 後(DAD と SLAAC の後)でなければ報告するグループが決まらないので、
+     * 必ずこの位置。 */
+    ipv6_mld_report_all(netif_find("mlx5-pf0"));
+    ipv6_mld_report_all(netif_find("mlx5-pf1"));
 
     int fl = fcntl(0, F_GETFL, 0);
     if (fl != -1) (void)fcntl(0, F_SETFL, fl | O_NONBLOCK);

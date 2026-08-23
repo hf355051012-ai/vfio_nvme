@@ -82,18 +82,31 @@ void arp_cache_insert(uint32_t ip, const uint8_t mac[ETH_ALEN])
  * 猶予も尽きたら無効化して未登録として返す。
  *
  * 引数:
- *   ip      - 探す IPv4 アドレス(ホストバイトオーダー)
- *   out_mac - 見つかった MAC の格納先(6 バイト)
+ *   ip        - 探す IPv4 アドレス(ホストバイトオーダー)
+ *   out_mac   - 見つかった MAC の格納先(6 バイト)
+ *   confirmed - 1=上位層が到達性を裏付けた(TCP の累積 ACK が進んだ)
  * 戻り値:
  *   0=ヒット(fresh または stale)、-1=未登録/寿命切れ
  * コール元:
- *   arp_resolve(), tcp_resolve_mac()
+ *   arp_cache_lookup(), tcp_resolve_mac()
  * ===============================================================*/
-int arp_cache_lookup(uint32_t ip, uint8_t out_mac[ETH_ALEN])
+int arp_cache_lookup_nud(uint32_t ip, uint8_t out_mac[ETH_ALEN], int confirmed)
 {
     arp_cache_entry_t *cache = g_active_ctx->arp_cache;
     for (unsigned i = 0; i < ARP_CACHE_SIZE; i++) {
         if (!cache[i].valid || cache[i].ip != ip) continue;
+
+        /* **上位層の到達確認**(RFC 4861 7.3.1)。相手が自分の送ったデータを
+         * 確かに受け取った(TCP の累積 ACK が進んだ)なら、それは ARP/NS を
+         * 撃つより強い到達性の証拠なので、確認要求を出さずに延命する。
+         * ここで済ませれば TTL ごとの 1 往復が丸ごと消える。 */
+        if (confirmed) {
+            g_neigh_confirm_count++;
+            cache[i].expires_at = neigh_expiry_from_now();
+            cache[i].probe_at   = 0;
+            for (int j = 0; j < ETH_ALEN; j++) out_mac[j] = cache[i].mac[j];
+            return 0;
+        }
 
         /* 時刻の読み出しは照合が当たったときだけ(1 回)。 */
         int age = neigh_check_age(timer_now(), cache[i].expires_at, &cache[i].probe_at);
@@ -103,11 +116,20 @@ int arp_cache_lookup(uint32_t ip, uint8_t out_mac[ETH_ALEN])
         }
         for (int j = 0; j < ETH_ALEN; j++) out_mac[j] = cache[i].mac[j];
         if (age == NEIGH_STALE_PROBE) {
-            arp_send_request(ip);  /* 応答が来れば arp_cache_insert() が延命する */
+            /* **到達確認はユニキャストで出す**(RFC 4861 7.2.4 / Linux の
+             * NUD PROBE と同じ)。MAC はもう持っているので、ブロードキャストで
+             * リンク上の全員を起こす理由が無い。応答が来れば
+             * arp_cache_insert() が延命する。 */
+            arp_send_request_unicast(ip, cache[i].mac);
         }
         return 0;
     }
     return -1;
+}
+
+int arp_cache_lookup(uint32_t ip, uint8_t out_mac[ETH_ALEN])
+{
+    return arp_cache_lookup_nud(ip, out_mac, 0);
 }
 
 /*=================================================================
@@ -297,7 +319,8 @@ void arp_handle_frame(const uint8_t *payload, size_t len, const uint8_t *src_mac
  * コール元:
  *   arp_send_request(), arp_probe()
  * ===============================================================*/
-static int arp_send_request_from(uint32_t target_ip, uint32_t sender_ip)
+static int arp_send_request_from(uint32_t target_ip, uint32_t sender_ip,
+                                  const uint8_t dst_mac[ETH_ALEN])
 {
     net_buf_t *nb = net_buf_alloc();
     if (!nb) {
@@ -314,8 +337,12 @@ static int arp_send_request_from(uint32_t target_ip, uint32_t sender_ip)
 
     volatile uint8_t *out = nb->data;
 
-    /* Ethernetヘッダ: dst=ブロードキャスト, src=自分, type=ARP(0x0806) */
-    for (int i = 0; i < ETH_ALEN; i++) out[i]            = 0xFFu;
+    /* Ethernetヘッダ: dst=ブロードキャスト または相手の MAC, src=自分,
+     * type=ARP(0x0806)。**到達確認(NUD)は既にキャッシュしている MAC へ
+     * ユニキャストで送る** -- ブロードキャストだと、そのリンク上の全ノードの
+     * 割り込みを起こしてキャッシュも汚す。Linux も NUD の PROBE は
+     * ユニキャストの ARP request を使う。 */
+    for (int i = 0; i < ETH_ALEN; i++) out[i]            = dst_mac ? dst_mac[i] : 0xFFu;
     for (int i = 0; i < ETH_ALEN; i++) out[ETH_ALEN + i] = self_mac[i];
     out[12] = 0x08;
     out[13] = 0x06;
@@ -337,9 +364,14 @@ static int arp_send_request_from(uint32_t target_ip, uint32_t sender_ip)
         uart_printf("[ARP] probe 送信: who-has %u.%u.%u.%u (送信元 0.0.0.0、RFC 5227)\n",
                     tpa[0], tpa[1], tpa[2], tpa[3]);
     } else {
-        uart_printf("[ARP] request 送信: who-has %u.%u.%u.%u tell %u.%u.%u.%u\n",
+        uart_printf("[ARP] request 送信: who-has %u.%u.%u.%u tell %u.%u.%u.%u%s\n",
                     tpa[0], tpa[1], tpa[2], tpa[3],
-                    self_ip[0], self_ip[1], self_ip[2], self_ip[3]);
+                    self_ip[0], self_ip[1], self_ip[2], self_ip[3],
+                    dst_mac ? " (到達確認、ユニキャスト)" : "");
+    }
+    {
+        const uint8_t bcast[ETH_ALEN] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
+        neigh_probe_notify(0, dst_mac ? 1 : 0, dst_mac ? dst_mac : bcast);
     }
 
     int ret = eth_send(nb);
@@ -360,7 +392,24 @@ static int arp_send_request_from(uint32_t target_ip, uint32_t sender_ip)
  * ===============================================================*/
 int arp_send_request(uint32_t target_ip)
 {
-    return arp_send_request_from(target_ip, NET_SELF_IP);
+    return arp_send_request_from(target_ip, NET_SELF_IP, NULL);
+}
+
+/*=================================================================
+ * 到達確認(NUD)用のユニキャスト ARP request。**MAC を既に知っている相手に
+ * 「まだそこに居るか」を聞く**ので、ブロードキャストにする理由が無い。
+ *
+ * 引数:
+ *   target_ip - 確認したい IPv4 アドレス(ホストバイトオーダー)
+ *   mac       - キャッシュしている相手の MAC
+ * 戻り値:
+ *   0=送信成功、-1=失敗
+ * コール元:
+ *   arp_cache_lookup_nud()
+ * ===============================================================*/
+int arp_send_request_unicast(uint32_t target_ip, const uint8_t mac[ETH_ALEN])
+{
+    return arp_send_request_from(target_ip, NET_SELF_IP, mac);
 }
 
 /*=================================================================
@@ -392,7 +441,7 @@ int arp_probe(uint32_t ip, unsigned probes, uint32_t interval_ms, uint8_t out_ma
     s_probe_target = ip;
 
     for (unsigned attempt = 0; attempt < probes && !s_probe_conflict; attempt++) {
-        if (arp_send_request_from(ip, 0u) != 0) {
+        if (arp_send_request_from(ip, 0u, NULL) != 0) {
             s_probe_target = 0u;
             return -1;
         }

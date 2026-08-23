@@ -146,6 +146,31 @@ static inline void wr64le(volatile void *p, uint64_t v)
 }
 
 /* ------------------------------------------------------------------ */
+/* アライメント適応ゼロ埋め(volatile_fast_copy のゼロ版)               */
+/*                                                                      */
+/* Deallocate / Write Zeroes は 1 コマンドで数十 MB を消しうるので、     */
+/* バイト単位のループでは桁違いに遅い。                                 */
+/* ------------------------------------------------------------------ */
+static inline void volatile_fast_zero(volatile void *dst, size_t len)
+{
+#if defined(__x86_64__)
+    memset((void *)(uintptr_t)dst, 0, len);
+    return;
+#else
+    volatile uint8_t *d = (volatile uint8_t *)dst;
+    size_t i = 0;
+
+    if (((uintptr_t)d & 7u) == 0) {
+        for (; i + 8 <= len; i += 8) *(volatile uint64_t *)(d + i) = 0;
+    } else if (((uintptr_t)d & 3u) == 0) {
+        for (; i + 4 <= len; i += 4) *(volatile uint32_t *)(d + i) = 0;
+    }
+
+    for (; i < len; i++) d[i] = 0;
+#endif /* __x86_64__ */
+}
+
+/* ------------------------------------------------------------------ */
 /* アライメント適応コピー(MMU無効環境でのバイト単位コピー高速化)         */
 /* ------------------------------------------------------------------ */
 static inline void volatile_fast_copy(volatile void *dst, const volatile void *src, size_t len)

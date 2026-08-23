@@ -87,6 +87,32 @@ typedef struct {
 #define NEIGH_STALE_PROBE  2   /* 同上。加えて今回は確認要求を出す番 */
 #define NEIGH_DEAD        -1   /* 猶予も尽きた。破棄する */
 
+/* ---- 到達不能検出(NUD、RFC 4861 7.3)----
+ *
+ * **失効したエントリを使った瞬間に確認要求を出してはいけない。** RFC 4861 の
+ * DELAY 相がこれで、「使われたら少し待ち、そのあいだに上位層が到達性を
+ * 裏付けたら確認要求は出さない」という猶予を置く。TCP が順調に流れている
+ * 相手へ、TTL が切れるたびに ARP/NS を 1 往復投げるのは無駄でしかない
+ * (Linux の NUD も DELAY -> PROBE の順に進む)。
+ *
+ * 猶予(TTL/6)の内訳: 前半 TTL/12 が DELAY、残りが PROBE。TTL に連動させて
+ * あるので `arpage` で TTL を縮めれば検証時間も縮む(既定 60s なら DELAY は
+ * 5 秒 = RFC 4861 の DELAY_FIRST_PROBE_TIME と同じ)。 */
+#define NEIGH_DELAY_DIVISOR 12u
+
+/* 送信する確認要求を覗くフック(`nudtest` の観測用)。**確認要求がユニキャスト
+ * で出ているか**は、相手側か送信直前でしか見えない。冷たい経路でしか
+ * 呼ばれないので性能には影響しない。 */
+typedef void (*neigh_probe_observer_t)(int is_v6, int is_unicast,
+                                        const uint8_t dst_mac[ETH_ALEN]);
+void neigh_set_probe_observer(neigh_probe_observer_t fn);
+void neigh_probe_notify(int is_v6, int is_unicast, const uint8_t dst_mac[ETH_ALEN]);
+
+/* 上位層の到達確認が実際に適用された回数(`nudtest` の切り分け用)。
+ * **「確認要求が出ていない」だけでは、確認が効いたのか単に DELAY 中なのかを
+ * 区別できない。** この数が増えていることが効いた証拠になる。 */
+extern volatile uint32_t g_neigh_confirm_count;
+
 /* 有効期間(ミリ秒)。猶予は TTL/6、確認要求の間隔は TTL/60 として連動する。
  * シェルの `arpage` で変更できる(短くして検証するため)。 */
 extern volatile uint32_t g_neigh_cache_ttl_ms;
@@ -124,6 +150,16 @@ typedef struct netif {
     uint8_t     ip6_global[16];
     uint8_t     ip6_global_set; /* 1=ip6_global が有効 */
     uint8_t     ip6_prefix_len; /* 表示用 */
+    /* ---- SLAAC(RFC 4862)で自動設定したときだけ使う ----
+     * **手動設定(`ip6addr`)は寿命を持たない**(valid_until=0)。RA から作った
+     * ものだけが期限を持ち、満了したら解除する。判定は冷たい経路でしか
+     * 行わない(理由は ipv6.c の ipv6_slaac_age() の説明を参照)。 */
+    uint8_t     ip6_global_from_ra;  /* 1=SLAAC 由来。手動設定を RA で潰さない */
+    uint8_t     ip6_global_dad;      /* NETIF_DAD_*(SLAAC で作ったアドレスの検査結果) */
+    uint64_t    ip6_global_valid_until; /* timer_now() と同じ ns の絶対時刻。0=無期限 */
+    uint8_t     gateway6_from_ra;    /* 1=RA 由来のデフォルトルータ */
+    uint64_t    gateway6_valid_until;/* 同上。0=無期限(手動設定) */
+    uint32_t    ra_link_mtu;         /* RA の MTU オプション。**記録するだけで適用しない** */
     uint8_t     ipv4_dup;       /* NETIF_DAD_*(IPv4 アドレス) */
     uint8_t     dup_mac6[ETH_ALEN];  /* IPv6 で衝突した相手の MAC(表示用) */
     uint8_t     dup_mac4[ETH_ALEN];  /* IPv4 で衝突した相手の MAC(表示用) */

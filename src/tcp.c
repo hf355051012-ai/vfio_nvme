@@ -176,6 +176,11 @@ typedef struct {
 
     volatile uint32_t snd_una;
     volatile int      ack_advanced;
+    /* **上位層による到達確認**(RFC 4861 7.3.1 / NUD)。累積 ACK が進んだ =
+     * 相手が自分の送ったデータを確かに受け取った、なので近隣キャッシュを
+     * 延命してよい。`ack_advanced` は送信ループが消費してしまうラッチなので
+     * 別に持つ。次の送信で近隣キャッシュを引くときに消費する。 */
+    volatile int      neigh_confirm;
 
     uint64_t srtt_us;
     uint64_t rttvar_us;
@@ -678,16 +683,44 @@ void tcp_pmtu_update(const netaddr_t *dst, uint16_t pmtu)
  * コール元:
  *   tcp_send_segment(), tcp_send_segment_lso(), tcp_send_bare_ack()
  * ===============================================================*/
-static inline int tcp_resolve_mac(const netaddr_t *remote, uint8_t out_mac[ETH_ALEN])
+/*=================================================================
+ * 上位層の到達確認フラグを 1 回ぶん消費する(NUD、RFC 4861 7.3.1)。
+ *
+ * 「累積 ACK が進んだ」は 1 回きりの事実なので、近隣キャッシュの延命に
+ * 使ったら落とす。落とさないと、相手が居なくなっても延命し続けてしまう。
+ *
+ * 引数:
+ *   priv - コネクションの内部状態
+ * 戻り値:
+ *   1=前回の送信以降に累積 ACK が進んだ、0=進んでいない
+ * コール元:
+ *   tcp_send_segment(), tcp_send_segment_lso()
+ * ===============================================================*/
+static inline int tcp_take_confirm(tcp_priv_t *priv)
+{
+    if (!priv || !priv->neigh_confirm) return 0;
+    priv->neigh_confirm = 0;
+    return 1;
+}
+
+static inline int tcp_resolve_mac(const netaddr_t *remote, uint8_t out_mac[ETH_ALEN],
+                                   int confirmed)
 {
     /* 解決する相手は「宛先」ではなく「次ホップ」。同一サブネットなら両者は
      * 同じで、サブネット外ならゲートウェイになる(L3 の宛先は変えず、L2 の
-     * 宛先だけをルータへ向ける)。ゲートウェイ未設定なら分岐 1 個で素通りする。 */
+     * 宛先だけをルータへ向ける)。ゲートウェイ未設定なら分岐 1 個で素通りする。
+     *
+     * confirmed は「相手が自分のデータを受け取ったことを TCP が確認した」の
+     * 意味(NUD の上位層確認、RFC 4861 7.3.1)。**時刻の読み出しはキャッシュ
+     * 照合が当たったときにしか起きない**ので、ホットパスへの追加コストは
+     * 引数 1 個ぶんの分岐だけ。 */
     if (remote->family == NETADDR_V6) {
-        return ndp_resolve(netif_next_hop6(g_active_ctx, remote->a), out_mac);
+        const uint8_t *nh = netif_next_hop6(g_active_ctx, remote->a);
+        if (ndp_cache_lookup_nud(nh, out_mac, confirmed) == 0) return 0;
+        return ndp_resolve(nh, out_mac);
     }
     uint32_t ip = netif_next_hop4(g_active_ctx, netaddr_v4_host(remote));
-    if (arp_cache_lookup(ip, out_mac) == 0) return 0;
+    if (arp_cache_lookup_nud(ip, out_mac, confirmed) == 0) return 0;
     return arp_resolve(ip, out_mac);
 }
 
@@ -804,7 +837,7 @@ static int tcp_send_segment(tcp_conn_t *conn, tcp_priv_t *priv, uint8_t flags,
     }
 
     uint8_t dst_mac[ETH_ALEN];
-    if (tcp_resolve_mac((const netaddr_t *)&conn->remote_ip, dst_mac) != 0) {
+    if (tcp_resolve_mac((const netaddr_t *)&conn->remote_ip, dst_mac, tcp_take_confirm(priv)) != 0) {
         uart_printf("[!] TCP: 宛先MACの解決失敗、送信中止\n");
         return -1;
     }
@@ -932,7 +965,7 @@ static int tcp_send_segment_lso(tcp_conn_t *conn, tcp_priv_t *priv,
     }
 
     uint8_t dst_mac[ETH_ALEN];
-    if (tcp_resolve_mac((const netaddr_t *)&conn->remote_ip, dst_mac) != 0) {
+    if (tcp_resolve_mac((const netaddr_t *)&conn->remote_ip, dst_mac, tcp_take_confirm(priv)) != 0) {
         uart_printf("[!] TCP: 宛先MACの解決失敗、送信中止(LSO)\n");
         return -1;
     }
@@ -1016,7 +1049,7 @@ static void tcp_send_bare(const netaddr_t *local_ip, uint16_t local_port,
     }
 
     uint8_t dst_mac[ETH_ALEN];
-    if (tcp_resolve_mac(remote_ip, dst_mac) != 0) {
+    if (tcp_resolve_mac(remote_ip, dst_mac, 0) != 0) {
         return;
     }
 
@@ -3099,6 +3132,7 @@ void tcp_input_addr(const uint8_t *pkt, uint16_t len,
             if (tcp_seq_gt(ack, priv->snd_una)) {
                 priv->snd_una = ack;     /* パイプライン送信(tcp_send())向け、累積ACKで進める */
                 priv->ack_advanced = 1;
+                priv->neigh_confirm = 1;   /* 上位層の到達確認(NUD)*/
                 tcp_on_new_ack(priv, ack);
             } else if (ack == priv->snd_una &&
                        payload_len == 0 &&
@@ -3219,6 +3253,7 @@ void tcp_input_addr(const uint8_t *pkt, uint16_t len,
             if (tcp_seq_gt(ack, priv->snd_una)) {
                 priv->snd_una = ack;
                 priv->ack_advanced = 1;
+                priv->neigh_confirm = 1;   /* 上位層の到達確認(NUD)*/
             }
         }
         if (flags & TCP_FLAG_FIN) {

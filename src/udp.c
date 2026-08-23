@@ -253,8 +253,14 @@ int udp_send6(const uint8_t dst[16], const uint8_t dst_mac[6],
         buf[UDP_HDR_LEN + i] = payload[i];
     }
 
+    /* **疑似ヘッダの送信元は「実際に IPv6 ヘッダへ書かれる送信元」でなければ
+     * ならない。** ipv6_send() は ipv6_source_for() で選ぶので、ここも同じ
+     * 関数を使う。以前はリンクローカル固定で、グローバル宛のときだけ食い違って
+     * いた -- **NIC の L4 チェックサムオフロードが正しい値へ上書きするので
+     * 気付けなかった**。B4 で断片にはオフロードを掛けないようにした途端、
+     * 「断片化された UDP だけ相手が捨てる」という形で表に出た。 */
     uint8_t src[16];
-    ipv6_link_local_addr(src);
+    ipv6_source_for(dst, src);
     uint16_t csum = ipv6_pseudo_checksum(src, dst, IPV6_NH_UDP, buf, (uint16_t)total);
     if (csum == 0u) csum = 0xFFFFu;
     wr16be(buf + UDP_OFF_CHECKSUM, csum);

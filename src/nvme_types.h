@@ -65,6 +65,11 @@ _Static_assert(sizeof(nvme_keyed_sgl_desc_t) == 16, "must match nvme_sqe_t.dptr[
 #define NVME_REG_CC   0x14u  /* Controller Configuration (4バイト) */
 #define NVME_REG_CSTS 0x1Cu  /* Controller Status (4バイト) */
 
+/* VS レジスタと Identify Controller の VER(offset 80)に載せる版。
+ * bit31:16=major、bit15:8=minor、bit7:0=tertiary。**1.3 を名乗るなら
+ * Namespace Identification Descriptor List(CNS=0x03)が要る。** */
+#define NVME_VS_1_3_0 0x00010300u
+
 #define NVME_CC_EN       0x00000001u
 #define NVME_CC_CSS_NVM  0x00000000u
 #define NVME_CC_AMS_RR   0x00000000u
@@ -90,25 +95,148 @@ _Static_assert(sizeof(nvme_keyed_sgl_desc_t) == 16, "must match nvme_sqe_t.dptr[
 #define NVME_ADM_CMD_KEEP_ALIVE    0x18u
 
 /* NVM Command Set (IO queue) オペコード。 */
-#define NVME_IO_CMD_FLUSH  0x00u
-#define NVME_IO_CMD_WRITE  0x01u
-#define NVME_IO_CMD_READ   0x02u
+#define NVME_IO_CMD_FLUSH         0x00u
+#define NVME_IO_CMD_WRITE         0x01u
+#define NVME_IO_CMD_READ          0x02u
+#define NVME_IO_CMD_WRITE_ZEROES  0x08u
+#define NVME_IO_CMD_DSM           0x09u
+
+/* Dataset Management の cdw11(属性)。値は Linux の enum { NVME_DSMGMT_* }。 */
+#define NVME_DSMGMT_IDR  0x1u   /* Integral Dataset for Read(ヒント)*/
+#define NVME_DSMGMT_IDW  0x2u   /* Integral Dataset for Write(ヒント)*/
+#define NVME_DSMGMT_AD   0x4u   /* Deallocate。**これが立っているときだけ実際に消す** */
+
+/* struct nvme_dsm_range(16 バイト)。
+ * **NLB は 0's based ではない**(0 = 0 論理ブロック)。0's based なのは
+ * cdw10 の NR と Write Zeroes の cdw12 NLB のほうで、ここで取り違えると
+ * 1 ブロック余計に消す。Linux の nvme_setup_discard() が
+ * `nlb = bi_size >> lba_shift` を +1 せずそのまま入れているのが根拠。 */
+#define NVME_DSM_RANGE_LEN    16u
+#define NVME_DSM_OFF_CATTR     0u
+#define NVME_DSM_OFF_NLB       4u
+#define NVME_DSM_OFF_SLBA      8u
+#define NVME_DSM_MAX_RANGES  256u   /* NR は 8bit + 0's based = 最大 256 */
 
 #define NVME_FABRIC_CMD                  0x7Fu
 #define NVME_FABRIC_FCTYPE_PROPERTY_SET  0x00u
 #define NVME_FABRIC_FCTYPE_CONNECT       0x01u
 #define NVME_FABRIC_FCTYPE_PROPERTY_GET  0x04u
 
+/* Get/Set Features の cdw10 下位バイト(FID: Feature Identifier)。値は Linux の
+ * include/linux/nvme.h の enum { NVME_FEAT_* } と同じ。 */
+#define NVME_FEAT_VOLATILE_WC  0x06u
+#define NVME_FEAT_NUM_QUEUES   0x07u
+#define NVME_FEAT_ASYNC_EVENT  0x0Bu
+#define NVME_FEAT_KATO         0x0Fu
+
+/* Get Features の Select(cdw10 bit 10:8)。Set Features の Save は cdw10 bit31。 */
+#define NVME_FEAT_SEL_CURRENT    0u
+#define NVME_FEAT_SEL_DEFAULT    1u
+#define NVME_FEAT_SEL_SAVED      2u
+#define NVME_FEAT_SEL_SUPPORTED  3u
+
+/* Get Features(Select=supported capabilities)が DW0 で返す能力ビット。 */
+#define NVME_FEAT_CAP_SAVEABLE     0x1u
+#define NVME_FEAT_CAP_NS_SPECIFIC  0x2u
+#define NVME_FEAT_CAP_CHANGEABLE   0x4u
+
 /* Get Log Page の cdw10 下位バイト(LID: Log Page Identifier)。
- * 値は Linux の include/linux/nvme.h の NVME_LOG_DISC と同じ。 */
+ * 値は Linux の include/linux/nvme.h の enum { NVME_LOG_* } と同じ。 */
+#define NVME_LOG_LID_ERROR      0x01u
+#define NVME_LOG_LID_SMART      0x02u
+#define NVME_LOG_LID_CHANGED_NS 0x04u
 #define NVME_LOG_LID_DISCOVERY  0x70u
 
-/* Identify command の cdw10 下位バイト(CNS: Controller or Namespace Structure)。 */
-#define NVME_IDENTIFY_CNS_NAMESPACE   0x00u
-#define NVME_IDENTIFY_CNS_CONTROLLER  0x01u
+/* Changed Namespace List(LID=0x04)は 32bit の NSID を 1024 個。
+ * **読み出したらクリアする**のが仕様。 */
+#define NVME_MAX_CHANGED_NAMESPACES 1024u
+
+/* 非同期イベント。CQE の DW0 は
+ * bit2:0 = Event Type / bit15:8 = Event Info / bit23:16 = Log Page Identifier。 */
+#define NVME_AER_ERROR   0u
+#define NVME_AER_SMART   1u
+#define NVME_AER_NOTICE  2u
+#define NVME_AER_NOTICE_NS_CHANGED 0x00u
+
+/* Set Features(FID=0x0B)と Identify Controller の OAES(offset 92)で
+ * 使うビット。**OAES を立てないと Linux は AEN を有効化せず、
+ * Async Event Request をそもそも送ってこない。** */
+#define NVME_AEN_CFG_NS_ATTR (1u << 8)
+
+#define NVME_ID_CTRL_OFF_OAES  92u
+#define NVME_ID_CTRL_OFF_AERL 259u  /* Async Event Request Limit、**0's based** */
+
+/* struct nvme_smart_log(512 バイト)のオフセット。
+ * **16 バイト(128bit)のカウンタが並ぶ**ので、ここを 8 バイト刻みだと
+ * 思って書くと以降が全部ずれる。 */
+#define NVME_SMART_LOG_LEN            512u
+#define NVME_SMART_OFF_CRIT_WARN        0u
+#define NVME_SMART_OFF_TEMP             1u   /* 2 バイト。**単位はケルビン** */
+#define NVME_SMART_OFF_AVAIL_SPARE      3u
+#define NVME_SMART_OFF_SPARE_THRESH     4u
+#define NVME_SMART_OFF_PERCENT_USED     5u
+#define NVME_SMART_OFF_DATA_UNITS_READ 32u   /* 512B x 1000 単位、切り上げ */
+#define NVME_SMART_OFF_DATA_UNITS_WRIT 48u
+#define NVME_SMART_OFF_HOST_READS      64u
+#define NVME_SMART_OFF_HOST_WRITES     80u
+#define NVME_SMART_OFF_CTRL_BUSY_TIME  96u
+#define NVME_SMART_OFF_POWER_CYCLES   112u
+#define NVME_SMART_OFF_POWER_ON_HOURS 128u
+#define NVME_SMART_OFF_UNSAFE_SHUTDN  144u
+#define NVME_SMART_OFF_MEDIA_ERRORS   160u
+#define NVME_SMART_OFF_NUM_ERR_LOG    176u
+
+/* struct nvme_error_slot(64 バイト)のオフセット。 */
+#define NVME_ERROR_SLOT_LEN   64u
+#define NVME_ERR_OFF_COUNT     0u
+#define NVME_ERR_OFF_SQID      8u
+#define NVME_ERR_OFF_CMDID    10u
+#define NVME_ERR_OFF_STATUS   12u   /* CQE の status ワードそのまま(bit0 は phase の位置)*/
+#define NVME_ERR_OFF_PARAM    14u
+#define NVME_ERR_OFF_LBA      16u
+#define NVME_ERR_OFF_NSID     24u
+
+/* Identify command の cdw10 下位バイト(CNS: Controller or Namespace Structure)。
+ * 値は Linux の enum nvme_identify_cns と同じ。 */
+#define NVME_IDENTIFY_CNS_NAMESPACE       0x00u
+#define NVME_IDENTIFY_CNS_CONTROLLER      0x01u
+#define NVME_IDENTIFY_CNS_NS_ACTIVE_LIST  0x02u  /* Active Namespace ID List */
+#define NVME_IDENTIFY_CNS_NS_DESC_LIST    0x03u  /* Namespace Identification Descriptor List */
+#define NVME_IDENTIFY_CNS_CS_NAMESPACE    0x05u  /* I/O Command Set specific Identify Namespace */
+#define NVME_IDENTIFY_CNS_CS_CONTROLLER   0x06u  /* I/O Command Set specific Identify Controller */
+
+/* Identify の cdw11 bit31:24 = CSI(Command Set Identifier)。 */
+#define NVME_CSI_NVM 0x00u
+
+/* CNS=0x06(CSI=NVM)が返す struct nvme_id_ctrl_nvm のオフセット。
+ * **Linux はここから discard の上限を読む**(`nvme_init_non_mdts_limits()`)。 */
+#define NVME_ID_CTRL_NVM_OFF_VSL    0u   /* Verify Size Limit */
+#define NVME_ID_CTRL_NVM_OFF_WZSL   1u   /* Write Zeroes Size Limit */
+#define NVME_ID_CTRL_NVM_OFF_WUSL   2u   /* Write Uncorrectable Size Limit */
+#define NVME_ID_CTRL_NVM_OFF_DMRL   3u   /* DSM: 1 コマンドあたりの最大範囲数 */
+#define NVME_ID_CTRL_NVM_OFF_DMRSL  4u   /* DSM: 1 範囲の最大論理ブロック数 */
+#define NVME_ID_CTRL_NVM_OFF_DMSL   8u   /* DSM: 1 コマンド合計の最大論理ブロック数 */
+
+/* Identify Controller の ONCS(offset 520)。値は Linux の NVME_CTRL_ONCS_*。 */
+#define NVME_CTRL_ONCS_DSM          (1u << 2)
+#define NVME_CTRL_ONCS_WRITE_ZEROES (1u << 3)
+#define NVME_ID_CTRL_OFF_ONCS      520u
+#define NVME_ID_CTRL_OFF_LPA       261u  /* Log Page Attributes */
+#define NVME_ID_CTRL_OFF_ELPE      262u  /* Error Log Page Entries、**0's based** */
+
+/* CNS=0x03 の記述子の型(NIDT)。記述子は {NIDT, NIDL, 予約 2 バイト, 値} の
+ * TLV を連結したもので、**終端は NIDT=0**(= ゼロ埋めのまま)。 */
+#define NVME_NIDT_EUI64  0x01u   /* 8 バイト */
+#define NVME_NIDT_NGUID  0x02u   /* 16 バイト */
+#define NVME_NIDT_UUID   0x03u   /* 16 バイト */
+#define NVME_NIDT_CSI    0x04u   /* 1 バイト */
+#define NVME_NIDT_HDR_LEN 4u
 
 #define NVME_ID_NS_OFF_FLBAS   26u   /* offset within the 4096B Identify Namespace buffer */
 #define NVME_ID_NS_OFF_LBAF0   128u  /* LBA Format 0 descriptor offset (4 bytes each) */
+#define NVME_ID_NS_OFF_DLFEAT   33u  /* struct nvme_id_ns の dlfeat */
+#define NVME_ID_NS_OFF_NGUID   104u  /* struct nvme_id_ns の nguid[16] */
+#define NVME_ID_NS_OFF_EUI64   120u  /* struct nvme_id_ns の eui64[8] */
 
 typedef struct __attribute__((packed)) {
     uint16_t ms;   /* metadata size */

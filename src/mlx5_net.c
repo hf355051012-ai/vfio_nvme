@@ -333,7 +333,21 @@ static int mlx5_net_post_frame(mlx5_net_state_t *st, const eth_frag_t *frags, un
     wqe[7] = (uint8_t)qpn_ds;
     wqe[11] = (uint8_t)MLX5_WQE_CTRL_CQ_UPDATE;
 
-    wqe[20] = 0xC0u; // MLX5_ETH_WQE_L3_CSUM(0x40) | MLX5_ETH_WQE_L4_CSUM(0x80)
+    /* MLX5_ETH_WQE_L3_CSUM(0x40) | MLX5_ETH_WQE_L4_CSUM(0x80)。
+     *
+     * **IPv6 の Fragment ヘッダが付いたフレームでは L4 を外す。** HW は
+     * 拡張ヘッダを飛ばした先を L4 ヘッダとみなしてチェックサムを書き込むので、
+     * 2 個目以降の断片では**データの 6-7 バイト目が破壊される**(1 個目は
+     * そこが本物の UDP チェックサム欄なので気付けない)。実機で
+     * 「4000 バイト中 4 バイトだけ化ける」という形で踏んだ。上位層の
+     * チェックサムは分割前にソフトウェアで計算済みなので、外して問題ない。
+     * LSO 経路は TCP 専用で断片を送らないため、そちらは触らない。 */
+    uint8_t cs_flags = 0xC0u;
+    if (header_src[12] == 0x86u && header_src[13] == 0xDDu &&
+        header_src[ETH_HDR_LEN + 6u] == 44u /* IPV6_NH_FRAGMENT */) {
+        cs_flags = 0x40u;
+    }
+    wqe[20] = cs_flags;
 
     wqe[28] = (uint8_t)(ihs >> 8);
     wqe[29] = (uint8_t)ihs;

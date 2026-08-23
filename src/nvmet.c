@@ -19,7 +19,27 @@ int g_nvmet_force_pull = 0;
 
 #define NVMET_IO_DATA_BUF_MAX NVMET_MAX_TRANSFER_BYTES
 
-#define NVMET_SC_GENERIC_ERROR 0x0002u
+/* CQE の status フィールドは bit0=Phase / bit8:1=SC / bit11:9=SCT / bit15=DNR
+ * なので、**Linux の enum { NVME_SC_* }(SC と SCT を 1 つの 15bit 値として
+ * 持つ)を 1 ビット左シフトした値**になる。DNR(NVME_STATUS_DNR=0x4000)は
+ * 「再送しても無駄」の意味で、コマンドの作りが悪い系のエラーに付ける。 */
+#define NVMET_SC_GENERIC_ERROR 0x0002u      /* SC=0x01 Invalid Command Opcode */
+#define NVMET_SC_INVALID_FIELD 0x8004u      /* SC=0x02 Invalid Field in Command + DNR */
+#define NVMET_SC_INVALID_NS    0x8016u      /* SC=0x0B Invalid Namespace or Format + DNR */
+#define NVMET_SC_SGL_LEN_INVALID 0x801Eu    /* SC=0x0F Data SGL Length Invalid + DNR */
+#define NVMET_SC_LBA_RANGE     0x8100u      /* SC=0x80 LBA Out of Range + DNR */
+#define NVMET_SC_KA_INVALID    0x8034u      /* SC=0x1A Keep Alive Timeout Invalid + DNR */
+#define NVMET_SC_FEAT_NOT_SAVEABLE 0x821Au  /* SCT=1 SC=0x0D Feature Identifier Not Saveable + DNR */
+#define NVMET_SC_ASYNC_LIMIT   0x820Au      /* SCT=1 SC=0x05 Async Event Request Limit Exceeded + DNR */
+
+/* Keep Alive Timeout の粒度。Identify Controller の KAS=2(100ms 単位)と
+ * 揃える。ホストの要求値はこの倍数へ切り上げてから受理する。 */
+#define NVMET_KATO_GRANULARITY_MS 200u
+
+/* 定義はもっと下(エラー記録のフックを兼ねる)。AER の完了を組み立てる
+ * nvmet_aer_complete() がそれより前に来るので前方宣言する。 */
+static void nvmet_build_cqe(nvmet_ctx_t *ctx, nvme_cqe_t *cqe, uint16_t cid,
+                            uint32_t result, uint16_t status);
 
 static void nvmet_zero(void *p, size_t len)
 {
@@ -145,13 +165,34 @@ static void nvmet_build_id_ctrl(nvmet_ctx_t *ctx)
     nvmet_copy_padded(&ctx->id_ctrl[64], "1.0", 8);                         /* FR [64..71] */
     ctx->id_ctrl[77] = 6;                       /* MDTS = 6 (2^6 * 4KB = 256KB、NVMET_MAX_TRANSFER_BYTES参照) */
 
+    wr32le(&ctx->id_ctrl[80], NVME_VS_1_3_0);     /* VER: VS レジスタと同じ値を名乗る */
+
     wr16le(&ctx->id_ctrl[78], 1);                /* CNTLID = 1 (ctx->ctrlr_idと一致させる) */
 
     ctx->id_ctrl[111] = 1;                      /* CNTRLTYPE = 1 (I/O controller) */
 
     wr16le(&ctx->id_ctrl[320], 2);               /* KAS = 2 (200ms単位、値自体は非0であれば可) */
 
+    /* LPA = 0: **名前空間ごとの SMART も Command Effects ログも持たない。**
+     * 実装していないビットを立てるとホストがそのログを取りに来て失敗する。
+     * ELPE は 0's based なので 0 = Error Information を 1 エントリ保持する。 */
+    ctx->id_ctrl[NVME_ID_CTRL_OFF_LPA]  = 0;
+    ctx->id_ctrl[NVME_ID_CTRL_OFF_ELPE] = 0;
+
+    /* **OAES を立てないと Linux は AEN を有効化せず、Async Event Request を
+     * そもそも送ってこない**(`nvme_enable_aen()` が `ctrl->oaes` を見て
+     * 早期 return する。D2 の実測で AER が 1 度も飛んでこなかったのはこれ)。
+     * AERL は 0's based なので 0 = 同時 1 件。 */
+    wr32le(&ctx->id_ctrl[NVME_ID_CTRL_OFF_OAES], NVME_AEN_CFG_NS_ATTR);
+    ctx->id_ctrl[NVME_ID_CTRL_OFF_AERL] = 0;
+
     wr32le(&ctx->id_ctrl[536], 1u);              /* SGLS bit0 = SGL Supported */
+
+    /* **ONCS を立てないとホストはこのコマンドを発行しない。** 実測で
+     * `oncs=0` のときは `blkdiscard` がカーネルの ioctl 段階で弾かれていた
+     * (「実装する」と「広告する」はワンセット)。 */
+    wr16le(&ctx->id_ctrl[NVME_ID_CTRL_OFF_ONCS],
+           NVME_CTRL_ONCS_DSM | NVME_CTRL_ONCS_WRITE_ZEROES);
 
     {
         const char *subnqn = NVMET_SUBNQN;
@@ -160,7 +201,9 @@ static void nvmet_build_id_ctrl(nvmet_ctx_t *ctx)
         volatile_fast_copy(&ctx->id_ctrl[768], (const volatile uint8_t *)subnqn, len);
     }
 
-    wr32le(&ctx->id_ctrl[516], 1);               /* NN: namespace count = 1 */
+    /* NN は「取りうる最大 nsid」。**実際に有効な数ではない**(未使用の nsid が
+     * あってもよく、ホストは CNS=0x02 で有効なものを引く)。 */
+    wr32le(&ctx->id_ctrl[516], NVMET_NSID_MAX);
 
     ctx->id_ctrl[512] = (6u << 4) | 6u;          /* SQES: 64バイト固定 */
     ctx->id_ctrl[513] = (4u << 4) | 4u;          /* CQES: 16バイト固定 */
@@ -197,6 +240,7 @@ static void nvmet_build_id_ctrl_disc(nvmet_ctx_t *ctx)
     nvmet_copy_padded(&ctx->id_ctrl_disc[24], "RPi5 Discovery Controller", 40); /* MN */
     nvmet_copy_padded(&ctx->id_ctrl_disc[64], "1.0", 8);                     /* FR */
     ctx->id_ctrl_disc[77] = 6;                   /* MDTS */
+    wr32le(&ctx->id_ctrl_disc[80], NVME_VS_1_3_0); /* VER */
 
     wr16le(&ctx->id_ctrl_disc[78], 1);            /* CNTLID */
     ctx->id_ctrl_disc[111] = 2;                  /* CNTRLTYPE = 2 (Discovery controller) */
@@ -274,6 +318,38 @@ static void nvmet_build_disc_log(nvmet_ctx_t *ctx, const netaddr_t *addr)
 }
 
 /*=================================================================
+ * 名前空間の EUI-64 / NGUID を組み立てる。
+ *
+ * **全 0 は「識別子を持たない」の意味になる**ので、Linux は名前空間の同一性を
+ * 判断できずスキャンをやり直す。実在の OUI を騙らないよう、先頭バイトに
+ * ローカル管理ビット(bit1)を立てた 0x02 を置き、末尾 2 バイトに NSID を
+ * 入れて名前空間ごとに異なる値にする(D8 で名前空間が増えても衝突しない)。
+ *
+ * 引数:
+ *   out  - 書き込み先(EUI-64 は 8 バイト、NGUID は 16 バイト)
+ *   nsid - 名前空間 ID
+ * コール元:
+ *   nvmet_build_id_ns() / nvmet_build_ns_desc_list()
+ * ===============================================================*/
+static void nvmet_ns_eui64(uint8_t *out, uint32_t nsid)
+{
+    static const uint8_t base[6] = { 0x02, 0x00, 0x00, 'N', 'V', 'M' };
+    for (unsigned i = 0; i < 6; i++) out[i] = base[i];
+    out[6] = (uint8_t)((nsid >> 8) & 0xFFu);
+    out[7] = (uint8_t)(nsid & 0xFFu);
+}
+
+static void nvmet_ns_nguid(uint8_t *out, uint32_t nsid)
+{
+    static const uint8_t base[14] = { 0x02, 0x00, 0x00, 0x00,
+                                      'V', 'F', 'I', 'O', 'N', 'V', 'M', 'E',
+                                      0x00, 0x00 };
+    for (unsigned i = 0; i < 14; i++) out[i] = base[i];
+    out[14] = (uint8_t)((nsid >> 8) & 0xFFu);
+    out[15] = (uint8_t)(nsid & 0xFFu);
+}
+
+/*=================================================================
  * Identify Namespace 応答(4096 バイト)を組み立てる。NSZE/NCAP/NUSE と
  * LBA フォーマットを設定する。
  *
@@ -282,17 +358,267 @@ static void nvmet_build_disc_log(nvmet_ctx_t *ctx, const netaddr_t *addr)
  * コール元:
  *   nvmet_job_start()
  * ===============================================================*/
-static void nvmet_build_id_ns(nvmet_ctx_t *ctx)
+static void nvmet_build_id_ns(nvmet_ctx_t *ctx, uint32_t nsid)
 {
-    nvmet_zero(ctx->id_ns, sizeof(ctx->id_ns));
-    wr64le(&ctx->id_ns[0],  NVMET_NS_LBA_COUNT);  /* NSZE */
-    wr64le(&ctx->id_ns[8],  NVMET_NS_LBA_COUNT);  /* NCAP */
-    wr64le(&ctx->id_ns[16], 0);                   /* NUSE */
-    ctx->id_ns[26]  = 0;                          /* FLBAS: LBA Format Index = 0 */
-    ctx->id_ns[130] = 9;                          /* LBAF[0].ds = 9 (512B = 2^9) */
+    nvmet_ns_t *ns = &ctx->ns[nsid - 1u];
+    uint8_t    *p  = ns->id_ns;
+
+    nvmet_zero(p, sizeof(ns->id_ns));
+    wr64le(&p[0],  ns->lba_count);   /* NSZE */
+    wr64le(&p[8],  ns->lba_count);   /* NCAP */
+    wr64le(&p[16], 0);               /* NUSE */
+    p[26]  = 0;                      /* FLBAS: LBA Format Index = 0 */
+    p[130] = 9;                      /* LBAF[0].ds = 9 (512B = 2^9) */
+
+    /* DLFEAT bit2:0 = 001b = **Deallocate した領域を読むと 0 が返る**。
+     * ゼロ埋めする実装と整合させる(ここが 0 だと「読み出し値は不定」の
+     * 意味になり、ホストは discard 後の内容を信用しない)。 */
+    p[NVME_ID_NS_OFF_DLFEAT] = 0x01u;
+
+    /* **CNS=0x03(記述子リスト)と同じ値をここにも入れる。** 片方だけに
+     * 入れるとホストが「識別子が食い違う名前空間」と見なす。
+     * **nsid ごとに違う値**になるので、名前空間が増えても衝突しない。 */
+    nvmet_ns_nguid(&p[NVME_ID_NS_OFF_NGUID], nsid);
+    nvmet_ns_eui64(&p[NVME_ID_NS_OFF_EUI64], nsid);
 }
 
-static void nvmet_build_cqe(nvme_cqe_t *cqe, uint16_t cid,
+/*=================================================================
+ * nsid から名前空間を引く。
+ *
+ * **「範囲外」と「範囲内だが未使用」は区別する。** 前者は Invalid Namespace
+ * or Format、後者は Identify Namespace ならゼロ埋めで正常完了(SPDK の
+ * `_nvmf_ctrlr_get_ns_safe()` と同じ切り分け)。
+ *
+ * 引数:
+ *   ctx  - ターゲットコンテキスト
+ *   nsid - コマンドの nsid フィールド
+ * 戻り値:
+ *   有効な名前空間、または NULL(0 / 範囲外 / ブロードキャスト / 未使用)
+ * コール元:
+ *   nvmet_admin_dispatch() / nvmet_io_dispatch_cmd() / 受信パーサ
+ * ===============================================================*/
+static nvmet_ns_t *nvmet_ns_get(nvmet_ctx_t *ctx, uint32_t nsid)
+{
+    if (nsid < 1u || nsid > NVMET_NSID_MAX) return NULL;
+    nvmet_ns_t *ns = &ctx->ns[nsid - 1u];
+    return ns->active ? ns : NULL;
+}
+
+/* nsid が「このコントローラが持ちうる範囲」に入っているか(未使用でも真)。 */
+static int nvmet_nsid_in_range(uint32_t nsid)
+{
+    return (nsid >= 1u && nsid <= NVMET_NSID_MAX);
+}
+
+/*=================================================================
+ * SMART の 128bit カウンタを 1 つ書く。上位 8 バイトは 0。
+ *
+ * **必ず 16 バイトぶんゼロにしてから下位を書く。** 上位に残骸があると
+ * 値が桁ごと跳ねる(ホストは 128bit として読む)。
+ *
+ * 引数:
+ *   dst - 書き込み先(16 バイト)
+ *   v   - 値
+ * コール元:
+ *   nvmet_build_smart_log()
+ * ===============================================================*/
+static void nvmet_wr128le(uint8_t *dst, uint64_t v)
+{
+    wr64le(&dst[0], v);
+    wr64le(&dst[8], 0);
+}
+
+/*=================================================================
+ * SMART / Health Information ログ(LID=0x02、512 バイト)を組み立てる。
+ *
+ * **温度はケルビン。** 0 のままだと nvme-cli が -273℃(= 0 K)と表示する
+ * (実装前の実測がまさにそれ)。data_units_* は 512 バイト x 1000 単位で
+ * 切り上げ、host_reads/writes はコマンド数。
+ *
+ * nsid は見ない。**per-namespace の SMART は持たない**(LPA bit0 = 0)ので、
+ * どの nsid で来てもコントローラ全体の値を返すのが正しい。
+ *
+ * 引数:
+ *   ctx - ターゲットコンテキスト
+ *   buf - 書き込み先(512 バイト以上)
+ * コール元:
+ *   nvmet_admin_dispatch()
+ * ===============================================================*/
+static void nvmet_build_smart_log(nvmet_ctx_t *ctx, uint8_t *buf)
+{
+    nvmet_zero(buf, NVME_SMART_LOG_LEN);
+
+    buf[NVME_SMART_OFF_CRIT_WARN]    = 0;
+    wr16le(&buf[NVME_SMART_OFF_TEMP], 300u);   /* 300 K = 約 27℃ */
+    buf[NVME_SMART_OFF_AVAIL_SPARE]  = 100;
+    buf[NVME_SMART_OFF_SPARE_THRESH] = 10;
+    buf[NVME_SMART_OFF_PERCENT_USED] = 0;
+
+    /* 512 バイト x 1000 = 512000 バイトで 1 単位。切り上げる。 */
+    uint64_t dur = (ctx->stat_read_bytes  + 511999ull) / 512000ull;
+    uint64_t duw = (ctx->stat_write_bytes + 511999ull) / 512000ull;
+    nvmet_wr128le(&buf[NVME_SMART_OFF_DATA_UNITS_READ], dur);
+    nvmet_wr128le(&buf[NVME_SMART_OFF_DATA_UNITS_WRIT], duw);
+    nvmet_wr128le(&buf[NVME_SMART_OFF_HOST_READS],  ctx->stat_read_cmds);
+    nvmet_wr128le(&buf[NVME_SMART_OFF_HOST_WRITES], ctx->stat_write_cmds);
+
+    nvmet_wr128le(&buf[NVME_SMART_OFF_CTRL_BUSY_TIME], 0);
+    nvmet_wr128le(&buf[NVME_SMART_OFF_POWER_CYCLES],   1);
+    /* プロセス起動からの経過時間。timer_now() は ns。 */
+    nvmet_wr128le(&buf[NVME_SMART_OFF_POWER_ON_HOURS],
+                  (timer_now() - ctx->start_tick) / (3600ull * 1000000000ull));
+    nvmet_wr128le(&buf[NVME_SMART_OFF_UNSAFE_SHUTDN], 0);
+    nvmet_wr128le(&buf[NVME_SMART_OFF_MEDIA_ERRORS],  0);
+    nvmet_wr128le(&buf[NVME_SMART_OFF_NUM_ERR_LOG],   ctx->error_count);
+}
+
+/*=================================================================
+ * 保留中の Async Event Request を 1 件完了させる。
+ *
+ * CQE の DW0 は **bit2:0 = Event Type / bit15:8 = Event Info /
+ * bit23:16 = Log Page Identifier**。**完了させたら cid はもう使えない**ので
+ * 保留を落とす(ホストはすぐ次の AER を発行してくる)。
+ *
+ * **ホストが Set Features(FID=0x0B)で有効化していないイベントは送らない。**
+ * 送ると仕様違反で、ホストは知らないイベントの扱いに困る。
+ *
+ * 引数:
+ *   ctx      - ターゲットコンテキスト
+ *   type     - Event Type(NVME_AER_*)
+ *   info     - Event Info
+ *   lid      - 続けて読ませるログページ
+ *   cfg_bit  - このイベントに対応する aen_config のビット
+ * 戻り値:
+ *   1=送った、0=送らなかった(保留が無い / ホストが無効にしている)
+ * コール元:
+ *   nvmet_ns_set_active()
+ * ===============================================================*/
+static int nvmet_aer_complete(nvmet_ctx_t *ctx, uint32_t type, uint32_t info,
+                              uint32_t lid, uint32_t cfg_bit)
+{
+    if (!ctx->aer_pending) return 0;
+    if ((ctx->aen_config & cfg_bit) == 0) return 0;
+
+    nvme_cqe_t cqe;
+    uint32_t   dw0 = (type & 0x7u) | ((info & 0xFFu) << 8) | ((lid & 0xFFu) << 16);
+    nvmet_build_cqe(ctx, &cqe, ctx->aer_cid, dw0, 0);
+    ctx->aer_pending = 0;
+    if (nvmet_tcp_send_resp(&ctx->admin, &cqe) != 0) {
+        uart_printf("[!] nvmet: AER完了の送信に失敗\n");
+        return 0;
+    }
+    uart_printf("[nvmet:%s] 非同期イベント通知 (type=%u info=0x%x lid=0x%x cid=%u)\n",
+                ctx->label, type, info, lid, ctx->aer_cid);
+    return 1;
+}
+
+/*=================================================================
+ * Changed Namespace List(LID=0x04)を組み立てる。
+ *
+ * **読み出したらクリアする**のが仕様(RFC ではなく NVMe Base Spec)。
+ * クリアしないとホストは同じ変更を何度も見て再スキャンを繰り返す。
+ * 1024 個を超えたら先頭に 0xFFFFFFFF を置いて「全部見直せ」を意味する。
+ *
+ * 引数:
+ *   ctx - ターゲットコンテキスト
+ *   buf - 書き込み先(4096 バイト)
+ * コール元:
+ *   nvmet_admin_dispatch()
+ * ===============================================================*/
+static void nvmet_build_changed_ns_log(nvmet_ctx_t *ctx, uint8_t *buf)
+{
+    nvmet_zero(buf, NVME_MAX_CHANGED_NAMESPACES * 4u);
+    if (ctx->changed_nsid_count > NVME_MAX_CHANGED_NAMESPACES) {
+        wr32le(&buf[0], NVMET_NSID_BROADCAST);
+    } else {
+        for (uint32_t i = 0; i < ctx->changed_nsid_count; i++) {
+            wr32le(&buf[i * 4u], ctx->changed_nsid[i]);
+        }
+    }
+    ctx->changed_nsid_count = 0;   /* 読み出したらクリア */
+}
+
+/*=================================================================
+ * CNS=0x06(I/O Command Set specific Identify Controller、CSI=NVM)の応答を
+ * 組み立てる。レイアウトは Linux の `struct nvme_id_ctrl_nvm`。
+ *
+ * **Linux はここから discard の上限を読む**(`nvme_init_non_mdts_limits()` が
+ * `dmrl` / `dmrsl` を `max_discard_segments` / `max_hw_discard_sectors` へ
+ * 反映する)。広告しないと 1 コマンドで名前空間全体(268MB)の Deallocate が
+ * 飛んできて、その memset のあいだジョブスケジューラが止まる。
+ *
+ * 引数:
+ *   buf - 4096 バイトの書き込み先
+ * コール元:
+ *   nvmet_admin_dispatch()
+ * ===============================================================*/
+static void nvmet_build_id_ctrl_nvm(uint8_t *buf)
+{
+    nvmet_zero(buf, 4096);
+    buf[NVME_ID_CTRL_NVM_OFF_DMRL] = (uint8_t)NVMET_DSM_MAX_RANGES_ADV;
+    wr32le(&buf[NVME_ID_CTRL_NVM_OFF_DMRSL], NVMET_DSM_MAX_RANGE_LBAS);
+    wr64le(&buf[NVME_ID_CTRL_NVM_OFF_DMSL],  NVMET_DSM_MAX_TOTAL_LBAS);
+    /* VSL / WZSL / WUSL は 0 =「MDTS と同じ上限」の意味。Verify と
+     * Write Uncorrectable は実装していないので広告もしない(ONCS で off)。 */
+}
+
+/*=================================================================
+ * CNS=0x03 の記述子リストへ TLV を 1 つ追加する。
+ *
+ * 形式は {NIDT(1), NIDL(1), 予約(2), 値(NIDL バイト)} の連結で、**16 バイト
+ * 境界へ揃えるのではなく詰めて並べる**。終端はゼロ埋めのまま(NIDT=0)。
+ *
+ * 引数:
+ *   buf  - リストの先頭
+ *   off  - 書き込み位置(進めて返す)
+ *   nidt - 識別子の型(NVME_NIDT_*)
+ *   nid  - 値
+ *   nidl - 値の長さ
+ * コール元:
+ *   nvmet_build_ns_desc_list()
+ * ===============================================================*/
+static void nvmet_add_ns_desc(uint8_t *buf, uint32_t *off, uint8_t nidt,
+                              const uint8_t *nid, uint8_t nidl)
+{
+    uint8_t *d = &buf[*off];
+    d[0] = nidt;
+    d[1] = nidl;
+    d[2] = 0;
+    d[3] = 0;
+    for (uint8_t i = 0; i < nidl; i++) d[NVME_NIDT_HDR_LEN + i] = nid[i];
+    *off += NVME_NIDT_HDR_LEN + nidl;
+}
+
+/*=================================================================
+ * エラー応答を Error Information ログ(LID=0x01)へ 1 件記録する。
+ *
+ * ELPE は 0(= 1 エントリ)を広告しているので、保持するのは直近の 1 件だけ。
+ * 累計は `error_count` が持ち、SMART の num_err_log_entries に載る。
+ *
+ * status_field には **CQE の status ワードをそのまま**入れる(bit0 が phase の
+ * 位置に来る 16bit)。Linux の nvmet も `status << 1` を両方へ入れており、
+ * nvme-cli は表示するときに 1 ビット右へ寄せる。
+ *
+ * 引数:
+ *   ctx    - ターゲットコンテキスト
+ *   cid    - コマンド id
+ *   status - CQE の status ワード(非ゼロ)
+ * コール元:
+ *   nvmet_build_cqe()
+ * ===============================================================*/
+static void nvmet_record_error(nvmet_ctx_t *ctx, uint16_t cid, uint16_t status)
+{
+    ctx->error_count++;
+    nvmet_zero(ctx->error_slot, sizeof(ctx->error_slot));
+    wr64le(&ctx->error_slot[NVME_ERR_OFF_COUNT], ctx->error_count);
+    wr16le(&ctx->error_slot[NVME_ERR_OFF_SQID],  ctx->err_sqid);
+    wr16le(&ctx->error_slot[NVME_ERR_OFF_CMDID], cid);
+    wr16le(&ctx->error_slot[NVME_ERR_OFF_STATUS], status);
+    wr64le(&ctx->error_slot[NVME_ERR_OFF_LBA],   ctx->err_lba);
+    wr32le(&ctx->error_slot[NVME_ERR_OFF_NSID],  ctx->err_nsid);
+}
+
+static void nvmet_build_cqe(nvmet_ctx_t *ctx, nvme_cqe_t *cqe, uint16_t cid,
                             uint32_t result, uint16_t status)
 {
     nvmet_zero(cqe, sizeof(*cqe));
@@ -302,6 +628,82 @@ static void nvmet_build_cqe(nvme_cqe_t *cqe, uint16_t cid,
     wr16le(&cqe->sq_id, 0);
     wr16le(&cqe->cid, cid);
     wr16le(&cqe->status, status);
+    /* **エラー応答は必ずここを通る**ので、記録もここに置けば取りこぼさない
+     * (呼び出し側 50 箇所にフックを配るより確実)。 */
+    if (status != 0) nvmet_record_error(ctx, cid, status);
+}
+
+/*=================================================================
+ * Get Features(opcode 0x0A)で返す現在値を求める。
+ *
+ * **対応していない FID はここで弾いて Invalid Field in Command で返す。**
+ * 「知らない FID にも成功を返す」とホストは設定できたつもりで先へ進むので、
+ * どこで食い違ったのかが分からなくなる(Set Features も同じ関数で判定する)。
+ *
+ * Discovery コントローラが持つのは KATO と AEN だけ(SPDK の
+ * nvmf_ctrlr_get_features() と同じ切り分け。IO も名前空間も無いので
+ * Number of Queues と Volatile Write Cache には意味が無い)。
+ *
+ * 引数:
+ *   ctx - ターゲットコンテキスト
+ *   fid - Feature Identifier(cdw10 bit7:0)
+ *   out - 現在値の書き込み先(未対応なら触らない)
+ * 戻り値:
+ *   0=対応、-1=未対応
+ * コール元:
+ *   nvmet_admin_dispatch()
+ * ===============================================================*/
+static int nvmet_feat_current(const nvmet_ctx_t *ctx, uint32_t fid, uint32_t *out)
+{
+    if (ctx->is_discovery && fid != NVME_FEAT_KATO && fid != NVME_FEAT_ASYNC_EVENT) {
+        return -1;
+    }
+
+    switch (fid) {
+    case NVME_FEAT_NUM_QUEUES:
+        /* Set Features の応答と同じ 0's based の規約。NSQA=NCQA=0 = 各 1 本。
+         * **ここを素の本数(1)にすると 2 本要求されたことになる。** */
+        *out = 0u;
+        return 0;
+    case NVME_FEAT_VOLATILE_WC:
+        /* Identify Controller の VWC=0(揮発書き込みキャッシュ無し)と揃える。 */
+        *out = 0u;
+        return 0;
+    case NVME_FEAT_ASYNC_EVENT:
+        *out = ctx->aen_config;
+        return 0;
+    case NVME_FEAT_KATO:
+        *out = ctx->kato_ms;
+        return 0;
+    default:
+        return -1;
+    }
+}
+
+/*=================================================================
+ * Get Features(Select=11b = supported capabilities)が DW0 で返す能力ビット。
+ *
+ * **「現在値」を返してはいけない場面なので専用に持つ。** 保存領域を持たない
+ * ので Saveable は常に 0、名前空間ごとの Feature も無いので NS Specific も 0。
+ * Changeable は **Set Features で実際に受理して反映するものだけ** 1 にする。
+ *
+ * 引数:
+ *   fid - Feature Identifier
+ * 戻り値:
+ *   DW0 に載せる能力ビット
+ * コール元:
+ *   nvmet_admin_dispatch()
+ * ===============================================================*/
+static uint32_t nvmet_feat_capabilities(uint32_t fid)
+{
+    switch (fid) {
+    case NVME_FEAT_NUM_QUEUES:
+    case NVME_FEAT_ASYNC_EVENT:
+    case NVME_FEAT_KATO:
+        return NVME_FEAT_CAP_CHANGEABLE;
+    default:
+        return 0u;   /* Volatile Write Cache は キャッシュが無いので変更できない */
+    }
 }
 
 /*=================================================================
@@ -323,6 +725,16 @@ static int nvmet_admin_dispatch(nvmet_ctx_t *ctx, const nvme_sqe_t *sqe,
     uint32_t   opcode = rd32le(&sqe->cdw0) & 0xFFu;
     nvme_cqe_t cqe;
 
+    /* **Keep Alive はどのコマンドでも延命する。** Keep Alive(0x18)だけを
+     * 見ると、admin が忙しくて Keep Alive が遅れたときに切ってしまう。 */
+    ctx->last_cmd_tick = timer_now();
+
+    /* エラーを Error Information ログへ残すための文脈(admin は qid=0)。
+     * **Fabrics コマンドは nsid のワードを fctype に使う**ので入れない。 */
+    ctx->err_sqid = 0;
+    ctx->err_nsid = (opcode == NVME_FABRIC_CMD) ? 0u : rd32le(&sqe->nsid);
+    ctx->err_lba  = 0;
+
     ts_log(TS_MK(TS_FILE_NVMET, TS_FUNC_nvmet_admin_dispatch, 0),
            (opcode == NVME_FABRIC_CMD)
                ? ((rd32le(&sqe->nsid) & 0xFFu) << 8) | opcode
@@ -342,15 +754,21 @@ static int nvmet_admin_dispatch(nvmet_ctx_t *ctx, const nvme_sqe_t *sqe,
                 if (data != NULL && dlen >= 512u) {
                     ctx->is_discovery = nvmet_nqn_is_discovery(&data[256]);
                 }
+                /* **KATO は Connect の cdw12(ミリ秒)。** これまで読み捨てて
+                 * いたが、Get Features(FID=0x0F)が返す値なので保存する。
+                 * 0 = Keep Alive 無効(Discovery は通常 0 で繋いでくる)。
+                 * タイマとして強制するのは D7。 */
+                ctx->kato_ms    = rd32le(&sqe->cdw12);
+                ctx->aen_config = 0;
                 /* 通常のサブシステムのときだけ IO キューの受け皿を用意する
                  * (Discovery コントローラは admin のみ)。 */
                 if (!ctx->is_discovery) ctx->io_armed = 1;
-                nvmet_build_cqe(&cqe, ctx->admin.last_cid, 1u, 0);
+                nvmet_build_cqe(ctx, &cqe, ctx->admin.last_cid, 1u, 0);
                 uart_printf("[nvmet:%s] Fabrics Connect (qid=0, admin) 受理 (ctrlr_id=1%s)\n",
                             ctx->label, ctx->is_discovery ? ", Discovery コントローラ" : "");
             } else {
                 uart_printf("[!] nvmet: adminキューで想定外のqid=%u\n", qid);
-                nvmet_build_cqe(&cqe, ctx->admin.last_cid, 0u, (uint16_t)NVMET_SC_GENERIC_ERROR);
+                nvmet_build_cqe(ctx, &cqe, ctx->admin.last_cid, 0u, (uint16_t)NVMET_SC_GENERIC_ERROR);
             }
             nvmet_tcp_send_resp(&ctx->admin, &cqe);
         } else if (fctype == NVME_FABRIC_FCTYPE_PROPERTY_SET) {
@@ -370,65 +788,244 @@ static int nvmet_admin_dispatch(nvmet_ctx_t *ctx, const nvme_sqe_t *sqe,
                             ctx->label, ctx->cc, ctx->cc_en,
                             (unsigned)((ctx->cc & NVME_CC_SHN_MASK) >> 14));
             }
-            nvmet_build_cqe(&cqe, ctx->admin.last_cid, 0u, 0);
+            nvmet_build_cqe(ctx, &cqe, ctx->admin.last_cid, 0u, 0);
             nvmet_tcp_send_resp(&ctx->admin, &cqe);
         } else if (fctype == NVME_FABRIC_FCTYPE_PROPERTY_GET) {
             uint32_t offset = rd32le(&sqe->cdw11);
             if (offset == NVME_REG_CAP) {
                 uint32_t cap_lo = 0xFFu | (0x1Eu << 24);
-                nvmet_build_cqe(&cqe, ctx->admin.last_cid, cap_lo, 0);
+                nvmet_build_cqe(ctx, &cqe, ctx->admin.last_cid, cap_lo, 0);
                 wr32le(&cqe.dw1, 0x20u);
                 nvmet_tcp_send_resp(&ctx->admin, &cqe);
             } else {
                 uint32_t value = 0;
                 if (offset == NVME_REG_CC) {
                     value = ctx->cc;
+                } else if (offset == NVME_REG_VS) {
+                    /* **0 のままだとホストは「1.0 未満」と見なし、
+                     * CNS=0x03(名前空間の識別子)を取りに来ない。** */
+                    value = NVME_VS_1_3_0;
                 } else if (offset == NVME_REG_CSTS) {
                     value = (ctx->cc_en ? NVME_CSTS_RDY : 0u) |
                             (ctx->shutdown_complete ? NVME_CSTS_SHST_CMPLT : 0u);
                 }
-                nvmet_build_cqe(&cqe, ctx->admin.last_cid, value, 0);
+                nvmet_build_cqe(ctx, &cqe, ctx->admin.last_cid, value, 0);
                 nvmet_tcp_send_resp(&ctx->admin, &cqe);
             }
         } else {
             uart_printf("[!] nvmet: 未対応のFabricsコマンド (fctype=0x%x)\n", fctype);
-            nvmet_build_cqe(&cqe, ctx->admin.last_cid, 0u, (uint16_t)NVMET_SC_GENERIC_ERROR);
+            nvmet_build_cqe(ctx, &cqe, ctx->admin.last_cid, 0u, (uint16_t)NVMET_SC_GENERIC_ERROR);
             nvmet_tcp_send_resp(&ctx->admin, &cqe);
         }
         return 0;
     }
 
     if (opcode == NVME_ADM_CMD_IDENTIFY) {
-        uint32_t cns = rd32le(&sqe->cdw10) & 0xFFu;
-        nvmet_build_cqe(&cqe, ctx->admin.last_cid, 0u, 0);
+        uint32_t cns  = rd32le(&sqe->cdw10) & 0xFFu;
+        uint32_t nsid = rd32le(&sqe->nsid);
+        nvmet_build_cqe(ctx, &cqe, ctx->admin.last_cid, 0u, 0);
+
+        /* Discovery コントローラが持つのは Identify Controller だけ
+         * (名前空間が無いので他の CNS には返すものが無い)。 */
+        if (ctx->is_discovery && cns != NVME_IDENTIFY_CNS_CONTROLLER) {
+            uart_printf("[!] nvmet: DiscoveryでのIdentify CNS=0x%x\n", cns);
+            nvmet_build_cqe(ctx, &cqe, ctx->admin.last_cid, 0u, (uint16_t)NVMET_SC_INVALID_FIELD);
+            nvmet_tcp_send_resp(&ctx->admin, &cqe);
+            return 0;
+        }
+
         if (cns == NVME_IDENTIFY_CNS_CONTROLLER) {
             /* Discovery コントローラは CNTRLTYPE / SUBNQN / NN が違う別の応答。 */
             const uint8_t *idc = ctx->is_discovery ? ctx->id_ctrl_disc : ctx->id_ctrl;
             nvmet_tcp_send_c2h(&ctx->admin, ctx->admin.last_cid, &cqe, idc, sizeof(ctx->id_ctrl), 1);
-        } else if (cns == NVME_IDENTIFY_CNS_NAMESPACE) {
-            nvmet_tcp_send_c2h(&ctx->admin, ctx->admin.last_cid, &cqe, ctx->id_ns, sizeof(ctx->id_ns), 1);
-        } else {
-            uart_printf("[!] nvmet: 未対応のIdentify CNS=0x%x\n", cns);
-            nvmet_build_cqe(&cqe, ctx->admin.last_cid, 0u, (uint16_t)NVMET_SC_GENERIC_ERROR);
-            nvmet_tcp_send_resp(&ctx->admin, &cqe);
+            return 0;
         }
+
+        if (cns == NVME_IDENTIFY_CNS_NAMESPACE || cns == NVME_IDENTIFY_CNS_CS_NAMESPACE) {
+            /* **nsid を見る。** 0 / 範囲外 / ブロードキャストは
+             * Invalid Namespace or Format、**範囲内だが未使用ならゼロ埋めで
+             * 正常完了**(エラーではない。SPDK の `_nvmf_ctrlr_get_ns_safe()`)。 */
+            if (!nvmet_nsid_in_range(nsid)) {
+                uart_printf("[!] nvmet: Identify CNS=0x%x の nsid=%u が範囲外\n", cns, nsid);
+                nvmet_build_cqe(ctx, &cqe, ctx->admin.last_cid, 0u, (uint16_t)NVMET_SC_INVALID_NS);
+                nvmet_tcp_send_resp(&ctx->admin, &cqe);
+                return 0;
+            }
+            nvmet_ns_t *ns = nvmet_ns_get(ctx, nsid);
+            /* CNS=0x05(NVM コマンドセット固有)は**拡張 LBA も保護情報も
+             * 持たないのでゼロ埋めが正しい応答**。未使用の nsid も同じ。 */
+            if (ns == NULL || cns == NVME_IDENTIFY_CNS_CS_NAMESPACE) {
+                nvmet_zero(ctx->id_scratch, sizeof(ctx->id_scratch));
+                nvmet_tcp_send_c2h(&ctx->admin, ctx->admin.last_cid, &cqe,
+                                    ctx->id_scratch, sizeof(ctx->id_scratch), 1);
+                return 0;
+            }
+            nvmet_tcp_send_c2h(&ctx->admin, ctx->admin.last_cid, &cqe,
+                                ns->id_ns, sizeof(ns->id_ns), 1);
+            return 0;
+        }
+
+        if (cns == NVME_IDENTIFY_CNS_NS_ACTIVE_LIST) {
+            /* **nsid は「この値より大きい NSID を昇順に並べよ」の意味**で、
+             * 対象の名前空間を指すのではない(ホストは 0 から始めて続きを
+             * 読む)。0xFFFFFFFE 以上は続きが存在しえないので無効。 */
+            if (nsid >= 0xFFFFFFFEu) {
+                nvmet_build_cqe(ctx, &cqe, ctx->admin.last_cid, 0u, (uint16_t)NVMET_SC_INVALID_NS);
+                nvmet_tcp_send_resp(&ctx->admin, &cqe);
+                return 0;
+            }
+            nvmet_zero(ctx->id_scratch, sizeof(ctx->id_scratch));
+            uint32_t off = 0;
+            for (uint32_t id = 1u; id <= NVMET_NSID_MAX; id++) {
+                if (id <= nsid) continue;
+                if (nvmet_ns_get(ctx, id) == NULL) continue;   /* 未使用は載せない */
+                wr32le(&ctx->id_scratch[off], id);
+                off += 4u;
+            }
+            nvmet_tcp_send_c2h(&ctx->admin, ctx->admin.last_cid, &cqe,
+                                ctx->id_scratch, sizeof(ctx->id_scratch), 1);
+            return 0;
+        }
+
+        if (cns == NVME_IDENTIFY_CNS_CS_CONTROLLER) {
+            /* CSI は cdw11 bit31:24。NVM 以外(ZNS など)は持っていない。 */
+            uint32_t csi = (rd32le(&sqe->cdw11) >> 24) & 0xFFu;
+            if (csi != NVME_CSI_NVM) {
+                uart_printf("[!] nvmet: Identify CNS=0x06 の CSI=0x%x は未対応\n", csi);
+                nvmet_build_cqe(ctx, &cqe, ctx->admin.last_cid, 0u, (uint16_t)NVMET_SC_INVALID_FIELD);
+                nvmet_tcp_send_resp(&ctx->admin, &cqe);
+                return 0;
+            }
+            nvmet_build_id_ctrl_nvm(ctx->id_scratch);
+            nvmet_tcp_send_c2h(&ctx->admin, ctx->admin.last_cid, &cqe,
+                                ctx->id_scratch, sizeof(ctx->id_scratch), 1);
+            return 0;
+        }
+
+        if (cns == NVME_IDENTIFY_CNS_NS_DESC_LIST) {
+            /* 範囲外は Invalid Namespace or Format、**範囲内だが未使用は
+             * Invalid Field**(記述子リストには「識別子なし」を表す形が
+             * 無いため。SPDK も同じ切り分け)。 */
+            if (!nvmet_nsid_in_range(nsid)) {
+                uart_printf("[!] nvmet: Identify CNS=0x03 の nsid=%u が範囲外\n", nsid);
+                nvmet_build_cqe(ctx, &cqe, ctx->admin.last_cid, 0u, (uint16_t)NVMET_SC_INVALID_NS);
+                nvmet_tcp_send_resp(&ctx->admin, &cqe);
+                return 0;
+            }
+            if (nvmet_ns_get(ctx, nsid) == NULL) {
+                uart_printf("[!] nvmet: Identify CNS=0x03 の nsid=%u は未使用\n", nsid);
+                nvmet_build_cqe(ctx, &cqe, ctx->admin.last_cid, 0u, (uint16_t)NVMET_SC_INVALID_FIELD);
+                nvmet_tcp_send_resp(&ctx->admin, &cqe);
+                return 0;
+            }
+            /* **Linux はこのリストで名前空間の同一性を判断する。**
+             * CSI(NIDT=4)は NVM コマンドセット = 0 で、値が全 0 の記述子は
+             * 載せないのが慣例(SPDK も同じ)なので EUI-64 と NGUID だけ。 */
+            nvmet_zero(ctx->id_scratch, sizeof(ctx->id_scratch));
+            uint8_t  nid[16];
+            uint32_t off = 0;
+            nvmet_ns_eui64(nid, nsid);
+            nvmet_add_ns_desc(ctx->id_scratch, &off, NVME_NIDT_EUI64, nid, 8u);
+            nvmet_ns_nguid(nid, nsid);
+            nvmet_add_ns_desc(ctx->id_scratch, &off, NVME_NIDT_NGUID, nid, 16u);
+            /* 残りはゼロのまま = NIDT=0 で終端。 */
+            nvmet_tcp_send_c2h(&ctx->admin, ctx->admin.last_cid, &cqe,
+                                ctx->id_scratch, sizeof(ctx->id_scratch), 1);
+            return 0;
+        }
+
+        /* **Invalid Field in Command で返す(以前は Invalid Opcode だった)。**
+         * ホストから見て「Identify が無い」のか「その CNS が無い」のかが
+         * 区別できるようになる。 */
+        uart_printf("[!] nvmet: 未対応のIdentify CNS=0x%x\n", cns);
+        nvmet_build_cqe(ctx, &cqe, ctx->admin.last_cid, 0u, (uint16_t)NVMET_SC_INVALID_FIELD);
+        nvmet_tcp_send_resp(&ctx->admin, &cqe);
         return 0;
     }
 
     if (opcode == NVME_ADM_CMD_SET_FEATURES) {
-        uint32_t fid = rd32le(&sqe->cdw10) & 0xFFu;
-        if (fid == 0x07u) {
-            nvmet_build_cqe(&cqe, ctx->admin.last_cid, 0x00000000u, 0);  /* NSQA=0, NCQA=0 (0's based) = SQ/CQ各1本 */
+        uint32_t cdw10 = rd32le(&sqe->cdw10);
+        uint32_t fid   = cdw10 & 0xFFu;
+        uint32_t save  = (cdw10 >> 31) & 1u;   /* SV: 不揮発領域へ保存せよ */
+        uint32_t val   = rd32le(&sqe->cdw11);
+        uint32_t cur   = 0;
+
+        if (save) {
+            /* 保存領域を持たない(Identify Controller の OACS bit4 = 0)。
+             * SPDK の nvmf_ctrlr_set_features() と同じ扱い。 */
+            nvmet_build_cqe(ctx, &cqe, ctx->admin.last_cid, 0u, (uint16_t)NVMET_SC_FEAT_NOT_SAVEABLE);
+            nvmet_tcp_send_resp(&ctx->admin, &cqe);
+            return 0;
+        }
+        /* **以前はどんな FID でも成功を返していた。** ホストは設定できたつもりで
+         * 先へ進むので、Get Features(D2)を入れた今は必ず食い違う。 */
+        if (nvmet_feat_current(ctx, fid, &cur) != 0) {
+            uart_printf("[!] nvmet: 未対応のSet Features FID=0x%x\n", fid);
+            nvmet_build_cqe(ctx, &cqe, ctx->admin.last_cid, 0u, (uint16_t)NVMET_SC_INVALID_FIELD);
+            nvmet_tcp_send_resp(&ctx->admin, &cqe);
+            return 0;
+        }
+
+        switch (fid) {
+        case NVME_FEAT_NUM_QUEUES:
+            /* 要求値は無視して常にこちらの本数を返す(SPDK と同じ)。 */
+            nvmet_build_cqe(ctx, &cqe, ctx->admin.last_cid, 0x00000000u, 0);  /* NSQA=0, NCQA=0 (0's based) = SQ/CQ各1本 */
             nvmet_tcp_send_resp(&ctx->admin, &cqe);
             return 1;
+        case NVME_FEAT_ASYNC_EVENT:
+            ctx->aen_config = val;
+            nvmet_build_cqe(ctx, &cqe, ctx->admin.last_cid, ctx->aen_config, 0);
+            break;
+        case NVME_FEAT_KATO:
+            /* **KATO=0(Keep Alive を無効化する要求)は専用のエラーで返す。**
+             * Fabrics の Keep Alive は Connect の cdw12 で決まるもので、
+             * あとから 0 にして止めることはできない。 */
+            if (val == 0u) {
+                nvmet_build_cqe(ctx, &cqe, ctx->admin.last_cid, 0u, (uint16_t)NVMET_SC_KA_INVALID);
+                break;
+            }
+            /* KAS の粒度へ切り上げてから受理し、受理した値を DW0 で返す。 */
+            ctx->kato_ms = ((val + NVMET_KATO_GRANULARITY_MS - 1u) / NVMET_KATO_GRANULARITY_MS)
+                           * NVMET_KATO_GRANULARITY_MS;
+            nvmet_build_cqe(ctx, &cqe, ctx->admin.last_cid, ctx->kato_ms, 0);
+            break;
+        default:
+            /* Volatile Write Cache: キャッシュが無いので受理するだけ。 */
+            nvmet_build_cqe(ctx, &cqe, ctx->admin.last_cid, cur, 0);
+            break;
         }
-        nvmet_build_cqe(&cqe, ctx->admin.last_cid, 0u, 0);
+        nvmet_tcp_send_resp(&ctx->admin, &cqe);
+        return 0;
+    }
+
+    if (opcode == NVME_ADM_CMD_GET_FEATURES) {
+        uint32_t cdw10 = rd32le(&sqe->cdw10);
+        uint32_t fid   = cdw10 & 0xFFu;
+        uint32_t sel   = (cdw10 >> 8) & 0x7u;
+        uint32_t value = 0;
+
+        if (nvmet_feat_current(ctx, fid, &value) != 0) {
+            uart_printf("[!] nvmet: 未対応のGet Features FID=0x%x\n", fid);
+            nvmet_build_cqe(ctx, &cqe, ctx->admin.last_cid, 0u, (uint16_t)NVMET_SC_INVALID_FIELD);
+        } else if (sel == NVME_FEAT_SEL_SAVED) {
+            /* **current の値を返してはいけない。** 保存領域を持たないので
+             * 「保存された値」は存在しない。Set Features の SV=1 と同じ理由で
+             * Feature Identifier Not Saveable を返す。 */
+            nvmet_build_cqe(ctx, &cqe, ctx->admin.last_cid, 0u, (uint16_t)NVMET_SC_FEAT_NOT_SAVEABLE);
+        } else if (sel == NVME_FEAT_SEL_SUPPORTED) {
+            nvmet_build_cqe(ctx, &cqe, ctx->admin.last_cid, nvmet_feat_capabilities(fid), 0);
+        } else if (sel > NVME_FEAT_SEL_SUPPORTED) {
+            nvmet_build_cqe(ctx, &cqe, ctx->admin.last_cid, 0u, (uint16_t)NVMET_SC_INVALID_FIELD);  /* 100b-111b は予約 */
+        } else {
+            /* current と default は同じ値(既定値を別に持たない)。 */
+            nvmet_build_cqe(ctx, &cqe, ctx->admin.last_cid, value, 0);
+        }
         nvmet_tcp_send_resp(&ctx->admin, &cqe);
         return 0;
     }
 
     if (opcode == NVME_ADM_CMD_KEEP_ALIVE) {
-        nvmet_build_cqe(&cqe, ctx->admin.last_cid, 0u, 0);
+        nvmet_build_cqe(ctx, &cqe, ctx->admin.last_cid, 0u, 0);
         nvmet_tcp_send_resp(&ctx->admin, &cqe);
         return 0;
     }
@@ -454,7 +1051,7 @@ static int nvmet_admin_dispatch(nvmet_ctx_t *ctx, const nvme_sqe_t *sqe,
             uint32_t send  = (bytes < avail) ? bytes : avail;
             uart_printf("[nvmet:%s] Get Log Page: Discovery (lpo=%u 要求=%u 返却=%u numrec=%u)\n",
                         ctx->label, lpo, bytes, send, NVMET_DISC_NUMREC);
-            nvmet_build_cqe(&cqe, ctx->admin.last_cid, 0u, 0);
+            nvmet_build_cqe(ctx, &cqe, ctx->admin.last_cid, 0u, 0);
             if (send == 0u) {
                 /* 範囲外 -- データ無しで正常完了させる(エラーにはしない)。 */
                 nvmet_tcp_send_resp(&ctx->admin, &cqe);
@@ -465,12 +1062,55 @@ static int nvmet_admin_dispatch(nvmet_ctx_t *ctx, const nvme_sqe_t *sqe,
             return 0;
         }
 
-        /* それ以外の LID はエラー情報も SMART も持たないので、要求された長さの
-         * ゼロ埋めを返す。ホスト(nvme-cli / カーネル)はこれを正常応答として
-         * 扱う。返さないと接続後の Get Log Page でエラーになる。 */
+        if (lid == NVME_LOG_LID_CHANGED_NS) {
+            /* **AER で通知したあと、ホストは必ずこれを読みに来る。**
+             * 返せないと「通知は来たが何が変わったか分からない」で止まる。 */
+            nvmet_build_changed_ns_log(ctx, ctx->log_page);
+            uint32_t log_len = NVME_MAX_CHANGED_NAMESPACES * 4u;
+            uint32_t avail   = (lpo < log_len) ? (log_len - lpo) : 0u;
+            uint32_t send    = (bytes < avail) ? bytes : avail;
+            nvmet_build_cqe(ctx, &cqe, ctx->admin.last_cid, 0u, 0);
+            if (send == 0u) {
+                nvmet_tcp_send_resp(&ctx->admin, &cqe);
+            } else {
+                nvmet_tcp_send_c2h(&ctx->admin, ctx->admin.last_cid, &cqe,
+                                    &ctx->log_page[lpo], send, 1);
+            }
+            return 0;
+        }
+
+        if (lid == NVME_LOG_LID_SMART || lid == NVME_LOG_LID_ERROR) {
+            /* 実体のあるログはいったん log_page へ組み立て、LPO と要求長で
+             * 切り出す(Discovery と同じ扱い)。 */
+            uint32_t log_len;
+            if (lid == NVME_LOG_LID_SMART) {
+                nvmet_build_smart_log(ctx, ctx->log_page);
+                log_len = NVME_SMART_LOG_LEN;
+            } else {
+                /* ELPE=0 = 1 エントリ。エラーが 1 件も無ければ error_count=0 の
+                 * まま = 「未使用のエントリ」を意味する。 */
+                nvmet_zero(ctx->log_page, NVME_ERROR_SLOT_LEN);
+                volatile_fast_copy(ctx->log_page, ctx->error_slot, NVME_ERROR_SLOT_LEN);
+                log_len = NVME_ERROR_SLOT_LEN;
+            }
+            uint32_t avail = (lpo < log_len) ? (log_len - lpo) : 0u;
+            uint32_t send  = (bytes < avail) ? bytes : avail;
+            nvmet_build_cqe(ctx, &cqe, ctx->admin.last_cid, 0u, 0);
+            if (send == 0u) {
+                nvmet_tcp_send_resp(&ctx->admin, &cqe);
+            } else {
+                nvmet_tcp_send_c2h(&ctx->admin, ctx->admin.last_cid, &cqe,
+                                    &ctx->log_page[lpo], send, 1);
+            }
+            return 0;
+        }
+
+        /* それ以外の LID は持っていないので、要求された長さのゼロ埋めを返す。
+         * ホスト(nvme-cli / カーネル)はこれを正常応答として扱う。返さないと
+         * 接続後の Get Log Page でエラーになる。 */
         if (bytes > sizeof(ctx->log_page)) bytes = sizeof(ctx->log_page);
         for (uint32_t i = 0; i < bytes; i++) ctx->log_page[i] = 0;
-        nvmet_build_cqe(&cqe, ctx->admin.last_cid, 0u, 0);
+        nvmet_build_cqe(ctx, &cqe, ctx->admin.last_cid, 0u, 0);
         nvmet_tcp_send_c2h(&ctx->admin, ctx->admin.last_cid, &cqe,
                             ctx->log_page, bytes, 1);
         return 0;
@@ -478,16 +1118,25 @@ static int nvmet_admin_dispatch(nvmet_ctx_t *ctx, const nvme_sqe_t *sqe,
 
     if (opcode == NVME_ADM_CMD_ASYNC_EVENT) {
         /* 非同期イベント要求は「イベントが起きるまで完了させない」のが正しい
-         * 挙動(実コントローラも同じ)。ここで成功を返すとホストが即座に
-         * 再発行して無限ループになる。このターゲットはイベントを生成しない
-         * ので、受理だけして CQE を返さず放置する。切断時は接続ごと消える。 */
-        uart_printf("[nvmet:%s] Async Event Request を受理(イベント発生まで保留)\n",
-                    ctx->label);
+         * 挙動。ここで成功を返すとホストが即座に再発行して無限ループになる。
+         * **cid を覚えておき、イベントが起きたら nvmet_aer_complete() で
+         * 完了させる。** 保留は AERL=0(0's based)= 同時 1 個まで。 */
+        if (ctx->aer_pending) {
+            /* 上限超過は専用のエラー。黙って捨てるとホストは永久に待つ。 */
+            uart_printf("[!] nvmet: Async Event Request が上限(1件)を超過\n");
+            nvmet_build_cqe(ctx, &cqe, ctx->admin.last_cid, 0u, (uint16_t)NVMET_SC_ASYNC_LIMIT);
+            nvmet_tcp_send_resp(&ctx->admin, &cqe);
+            return 0;
+        }
+        ctx->aer_pending = 1;
+        ctx->aer_cid     = ctx->admin.last_cid;
+        uart_printf("[nvmet:%s] Async Event Request を受理 (cid=%u、イベント発生まで保留)\n",
+                    ctx->label, ctx->aer_cid);
         return 0;
     }
 
     uart_printf("[!] nvmet: 未対応のadminコマンド (opcode=0x%x)\n", opcode);
-    nvmet_build_cqe(&cqe, ctx->admin.last_cid, 0u, (uint16_t)NVMET_SC_GENERIC_ERROR);
+    nvmet_build_cqe(ctx, &cqe, ctx->admin.last_cid, 0u, (uint16_t)NVMET_SC_GENERIC_ERROR);
     nvmet_tcp_send_resp(&ctx->admin, &cqe);
     return 0;
 }
@@ -520,6 +1169,10 @@ typedef struct {
     uint8_t           data_buf[NVMET_ADMIN_DATA_BUF_MAX] __attribute__((aligned(64)));
     int               linger_armed;   /* IOキュー切断後、相手がadminを閉じるのを待っている */
     uint64_t          linger_ticks;   /* その待ち開始時刻(NVMET_ADMIN_LINGER_MS で打ち切る) */
+    /* Keep Alive の判定に使う「前回見た IO コマンド数」。**IO の hot path に
+     * 時刻読み出しを足さずに「相手が生きている」を知るため**、D5 で入れた
+     * SMART のカウンタが進んだかどうかで代用する。 */
+    uint64_t          kato_last_io_count;
 } nvmet_admin_job_ctx_t;
 
 static nvmet_admin_job_ctx_t s_admin_job_pool[NVMET_MAX_INSTANCES];
@@ -569,7 +1222,17 @@ static job_result_t nvmet_admin_session_finish(job_t *self, nvmet_admin_job_ctx_
     ctx->cc                = 0;
     ctx->cc_en             = 0;
     ctx->shutdown_complete = 0;
+    ctx->kato_ms           = 0;
+    ctx->aen_config        = 0;
+    /* **保留中の AER はセッションと一緒に捨てる。** 次のホストは自分が
+     * 出していない cid の CQE を受け取ることになる。 */
+    ctx->aer_pending       = 0;
+    ctx->aer_notify_ns     = 0;
+    /* **kato_expired はここでリセットしない。** IO ジョブがまだ見ていない
+     * (この関数は旗を立てた直後に呼ばれる)。消費するのは IO ジョブ側。 */
+    ctx->last_cmd_tick     = 0;
     jc->linger_armed       = 0;
+    jc->kato_last_io_count = 0;
     self->state = NADM_ST_ARM;
     return JOB_WAITING;
 }
@@ -600,9 +1263,59 @@ static job_result_t nvmet_admin_job_step(job_t *self)
      * **どの受信 state に居ても linger を開始できるよう switch の外で見る**
      * -- 受信途中で ARM へ戻ると PDU のヘッダだけ読んでコマンドを捨てること
      * になり、まさにそれで CC.SHN を落としていた。 */
-    if (ctx->session_done && !jc->linger_armed) {
-        jc->linger_armed = 1;
-        jc->linger_ticks = timer_now();
+    if (ctx->session_done) {
+        if ((nvmet_admin_state_t)self->state == NADM_ST_ARM ||
+            (nvmet_admin_state_t)self->state == NADM_ST_ACCEPT_WAIT) {
+            /* **admin が先に畳んだ場合、IO ジョブが後から立てる session_done は
+             * 前のセッションの残骸。** 捨てないと linger が始まり、10 秒後に
+             * 「相手が閉じない」として**次の(正常な)セッションを畳んでしまう**。
+             * D7(Keep Alive タイムアウト)で admin が先に畳む経路ができて
+             * 初めて露呈した -- それまでは必ず IO のほうが先に終わっていた。 */
+            ctx->session_done = 0;
+        } else if (!jc->linger_armed) {
+            jc->linger_armed = 1;
+            jc->linger_ticks = timer_now();
+        }
+    }
+
+    /* ---- Keep Alive タイマ(D7)----------------------------------------
+     * **KATO=0 は「Keep Alive 無効」**。Discovery コントローラは通常 0 で
+     * 繋いでくるので、ここで回すと接続直後に切ってしまう。
+     *
+     * 延命の契機は admin のコマンド受信(`last_cmd_tick`)と、**IO が流れて
+     * いること**。IO は hot path なので時刻を読まず、**D5 で入れた SMART の
+     * コマンド数カウンタが進んだかどうか**で代用する(追加コストはゼロ)。
+     * これが無いと「IO は流れているのに admin が詰まっている」ときに切れる。
+     *
+     * `timeout_ms()` は 64bit 除算を含むが、ここは冷たい経路(admin ジョブの
+     * step)なので問題ない。 */
+    if (ctx->kato_ms != 0 && !ctx->kato_expired &&
+        ctx->admin.tcp.state == TCP_ESTABLISHED) {
+        uint64_t io_count = ctx->stat_read_cmds + ctx->stat_write_cmds;
+        if (io_count != jc->kato_last_io_count) {
+            jc->kato_last_io_count = io_count;
+            ctx->last_cmd_tick     = timer_now();
+        } else if (timeout_ms(ctx->last_cmd_tick, ctx->kato_ms)) {
+            uart_printf("[!] nvmet:%s: Keep Alive タイムアウト (KATO=%u ms) -- "
+                        "セッションを畳みます\n", ctx->label, ctx->kato_ms);
+            /* **IO キューは IO ジョブ自身に畳ませる**(別ジョブが握って
+             * いるコネクションを横から閉じると、受信 upcall の解除が
+             * 抜ける)。旗を立てて次の tick に任せる。 */
+            ctx->kato_expired = 1;
+            return nvmet_admin_session_finish(self, jc, ctx, "Keep Alive タイムアウト");
+        }
+    }
+
+    /* **名前空間の変化をホストへ通知するのはここ。** シェル(core0)が
+     * `nvmens` で旗を立て、admin キューを持っているこのジョブが送る。
+     * 保留中の AER が無い / ホストが AEN を無効にしているなら旗は残したまま
+     * (次に AER が来たときに送る)。 */
+    if (ctx->aer_notify_ns && ctx->aer_pending &&
+        ctx->admin.tcp.state == TCP_ESTABLISHED) {
+        if (nvmet_aer_complete(ctx, NVME_AER_NOTICE, NVME_AER_NOTICE_NS_CHANGED,
+                               NVME_LOG_LID_CHANGED_NS, NVME_AEN_CFG_NS_ATTR)) {
+            ctx->aer_notify_ns = 0;
+        }
     }
 
     switch ((nvmet_admin_state_t)self->state) {
@@ -861,6 +1574,64 @@ static job_result_t nvmet_admin_job_step(job_t *self)
 }
 
 /*=================================================================
+ * LBA 範囲を 1 つゼロで埋める(Write Zeroes と Deallocate の実体)。
+ *
+ * 引数:
+ *   ctx  - ターゲットコンテキスト
+ *   slba - 開始 LBA
+ *   nlb  - 論理ブロック数(**0's based ではない実数**)
+ * 戻り値:
+ *   0=成功、-1=名前空間の外
+ * コール元:
+ *   nvmet_io_dispatch_cmd()
+ * ===============================================================*/
+static int nvmet_zero_lba_range(nvmet_ns_t *ns, uint64_t slba, uint64_t nlb)
+{
+    if (nlb == 0) return 0;
+    /* **範囲外は必ずここで止める。** RAM ディスクなので、はみ出した書き込みは
+     * そのまま隣のメンバ(別の名前空間や id_ctrl)のメモリ破壊になる。 */
+    if (slba > ns->lba_count || nlb > ns->lba_count - slba) return -1;
+    volatile_fast_zero(&ns->disk[slba * NVMET_LBA_SIZE], (size_t)nlb * NVMET_LBA_SIZE);
+    return 0;
+}
+
+/*=================================================================
+ * Dataset Management の範囲リストを処理する。
+ *
+ * Deallocate(cdw11 bit2 = AD)が立っているときだけ実際にゼロで埋める。
+ * IDR / IDW はアクセスパターンのヒントなので何もしない(SPDK も同じ)。
+ *
+ * 引数:
+ *   ctx    - ターゲットコンテキスト
+ *   ranges - 16 バイト x nr の範囲リスト
+ *   nr     - 範囲数(**呼び出し側で 0's based から直してある**)
+ *   attr   - cdw11
+ * 戻り値:
+ *   0=成功、-1=範囲が名前空間の外
+ * コール元:
+ *   nvmet_io_dispatch_cmd()
+ * ===============================================================*/
+static int nvmet_dsm_apply(nvmet_ctx_t *ctx, nvmet_ns_t *ns, const uint8_t *ranges,
+                           uint32_t nr, uint32_t attr)
+{
+    if (!(attr & NVME_DSMGMT_AD)) return 0;
+
+    for (uint32_t i = 0; i < nr; i++) {
+        const uint8_t *r = &ranges[i * NVME_DSM_RANGE_LEN];
+        /* **NLB は 0's based ではない**(nvme_types.h のコメント参照)。 */
+        uint32_t nlb  = rd32le(&r[NVME_DSM_OFF_NLB]);
+        uint64_t slba = rd64le(&r[NVME_DSM_OFF_SLBA]);
+        if (nvmet_zero_lba_range(ns, slba, nlb) != 0) {
+            uart_printf("[!] nvmet: DSM範囲が名前空間外 (range=%u slba=%u nlb=%u)\n",
+                        i, (uint32_t)slba, nlb);
+            ctx->err_lba = slba;   /* Error Information ログに載せる LBA */
+            return -1;
+        }
+    }
+    return 0;
+}
+
+/*=================================================================
  * 進行中の write コマンド(R2T を出してデータ待ち)のスロットを 1 つ確保する。
  *
  * 引数:
@@ -940,7 +1711,7 @@ typedef enum {
 /* push型受信のパーサ相(nvmet_io_rx_upcall()、2026-08-13)。 */
 typedef enum { PRX_HDR, PRX_PSH, PRX_HDGST, PRX_DATA, PRX_DDGST } nvmet_prx_phase_t;
 
-#define NVMET_READY_RING 64u
+/* NVMET_READY_RING は nvmet.h(ctx->dsm_stage[] と段数を合わせるため)。 */
 #define NVMET_READY_CMD  0u   /* CapsuleCmd受信完了(hdr/sqe/data配置済み) */
 #define NVMET_READY_H2C  1u   /* H2CDataラウンド受信完了 */
 typedef struct {
@@ -1110,7 +1881,7 @@ static job_result_t nvmet_io_job_h2c_validate(job_t *self, nvmet_io_job_ctx_t *j
         return nvmet_io_job_end(self, ctx, 1, "desync検出(write_len超過)");
     }
     jc->h2c_slot = slot;
-    nvmet_tcp_xfer_reset(&jc->xfer, &ctx->ram_disk[pw->slba * NVMET_LBA_SIZE + jc->datao], jc->datal);
+    nvmet_tcp_xfer_reset(&jc->xfer, &pw->disk[pw->slba * NVMET_LBA_SIZE + jc->datao], jc->datal);
     self->state = NIO_ST_RECV_H2C_DATA;
     return JOB_WAITING;
 }
@@ -1127,18 +1898,29 @@ static job_result_t nvmet_io_job_h2c_validate(job_t *self, nvmet_io_job_ctx_t *j
  *   cid      - コマンド id
  *   dlen     - in-capsule データ長
  *   incap_committed - in-capsule データを既に RAM ディスクへ書き込み済みか
+ *   data     - in-capsule データが実際に置かれた場所(Dataset Management の
+ *              範囲リストがここに来る。write は RAM ディスクへ直接置いている
+ *              ので使わない)
  * コール元:
  *   nvmet_io_job_step_impl()
  * ===============================================================*/
 static void nvmet_io_dispatch_cmd(nvmet_ctx_t *ctx, const uint8_t *hdr_buf,
                                    const uint8_t *sqe_buf, uint16_t cid,
-                                   uint32_t dlen, int incap_committed)
+                                   uint32_t dlen, int incap_committed,
+                                   const uint8_t *data)
 {
     nvme_sqe_t sqe;
     volatile_fast_copy((volatile uint8_t *)&sqe,
                         (const volatile uint8_t *)sqe_buf, NVME_SQE_LEN);
-    uint32_t   opcode = rd32le(&sqe.cdw0) & 0xFFu;
-    nvme_cqe_t cqe;
+    uint32_t    opcode = rd32le(&sqe.cdw0) & 0xFFu;
+    nvme_cqe_t  cqe;
+    nvmet_ns_t *ns;   /* nsid から引いた対象の名前空間(下の else-if で確定)*/
+
+    /* エラーを Error Information ログへ残すための文脈(IO は qid=1)。
+     * LBA を持つコマンドだけが、エラーを返す直前に err_lba を入れる。 */
+    ctx->err_sqid = 1;
+    ctx->err_nsid = (opcode == NVME_FABRIC_CMD) ? 0u : rd32le(&sqe.nsid);
+    ctx->err_lba  = 0;
 
     {
         volatile ts_nvme_pdu_t info = {0};
@@ -1157,43 +1939,61 @@ static void nvmet_io_dispatch_cmd(nvmet_ctx_t *ctx, const uint8_t *hdr_buf,
         uint32_t fctype = rd32le(&sqe.nsid) & 0xFFu;
         if (fctype == NVME_FABRIC_FCTYPE_CONNECT) {
             ctx->io_connected = 1;
-            nvmet_build_cqe(&cqe, cid, ctx->ctrlr_id, 0);
+            nvmet_build_cqe(ctx, &cqe, cid, ctx->ctrlr_id, 0);
             uart_printf("[nvmet:%s] Fabrics Connect (qid=1, IO) 受理\n", ctx->label);
         } else {
             uart_printf("[!] nvmet: IOキューで想定外のFabricsコマンド (fctype=0x%x)\n", fctype);
-            nvmet_build_cqe(&cqe, cid, 0u, (uint16_t)NVMET_SC_GENERIC_ERROR);
+            nvmet_build_cqe(ctx, &cqe, cid, 0u, (uint16_t)NVMET_SC_GENERIC_ERROR);
         }
         nvmet_tcp_send_resp(&ctx->io, &cqe);
     } else if (!ctx->cc_en) {
         uart_printf("[!] nvmet: CC.EN=0のためIOコマンドを拒否 (opcode=0x%x)\n", opcode);
-        nvmet_build_cqe(&cqe, cid, 0u, (uint16_t)NVMET_SC_GENERIC_ERROR);
+        nvmet_build_cqe(ctx, &cqe, cid, 0u, (uint16_t)NVMET_SC_GENERIC_ERROR);
+        nvmet_tcp_send_resp(&ctx->io, &cqe);
+    } else if (opcode == NVME_IO_CMD_FLUSH) {
+        /* 名前空間の実体は RAM ディスクで揮発性キャッシュを持たないため、
+         * Flush は成功を返すだけでよい(仕様上も準拠)。返さないとホスト側で
+         * fsync/sync が失敗する。**nsid=0xFFFFFFFF(全名前空間)で来ることが
+         * あるので、ここは名前空間の解決より前に置く。** */
+        nvmet_build_cqe(ctx, &cqe, cid, 0u, 0);
+        nvmet_tcp_send_resp(&ctx->io, &cqe);
+    } else if ((ns = nvmet_ns_get(ctx, rd32le(&sqe.nsid))) == NULL) {
+        /* Read / Write / Write Zeroes / DSM は必ず 1 つの名前空間を指す。
+         * **ゼロクリアされた領域を返してはいけない**(ホストが実在しない
+         * 名前空間を使い始める)。 */
+        uart_printf("[!] nvmet: IOコマンドのnsid=%u が無効 (opcode=0x%x)\n",
+                    rd32le(&sqe.nsid), opcode);
+        nvmet_build_cqe(ctx, &cqe, cid, 0u, (uint16_t)NVMET_SC_INVALID_NS);
         nvmet_tcp_send_resp(&ctx->io, &cqe);
     } else if (opcode == NVME_IO_CMD_READ) {
         uint64_t slba    = (uint64_t)rd32le(&sqe.cdw10) | ((uint64_t)rd32le(&sqe.cdw11) << 32);
         uint32_t nlb     = (rd32le(&sqe.cdw12) & 0xFFFFu) + 1u;
         uint64_t end_lba = slba + nlb;
         ts_log(TS_MK(TS_FILE_NVMET, TS_FUNC_nvmet_io_dispatch_cmd, 1), nlb * NVMET_LBA_SIZE);
+        ctx->err_lba = slba;
 
-        if (end_lba > NVMET_NS_LBA_COUNT) {
+        if (end_lba > ns->lba_count) {
             uart_printf("[!] nvmet: Read範囲外 (slba=%u nlb=%u)\n", (uint32_t)slba, nlb);
-            nvmet_build_cqe(&cqe, cid, 0u, (uint16_t)NVMET_SC_GENERIC_ERROR);
+            nvmet_build_cqe(ctx, &cqe, cid, 0u, (uint16_t)NVMET_SC_GENERIC_ERROR);
             nvmet_tcp_send_resp(&ctx->io, &cqe);
         } else if ((uint64_t)nlb * NVMET_LBA_SIZE > NVMET_MAX_TRANSFER_BYTES) {
             uart_printf("[!] nvmet: Read転送量がMDTS超過 (slba=%u nlb=%u)\n",
                         (uint32_t)slba, nlb);
-            nvmet_build_cqe(&cqe, cid, 0u, (uint16_t)NVMET_SC_GENERIC_ERROR);
+            nvmet_build_cqe(ctx, &cqe, cid, 0u, (uint16_t)NVMET_SC_GENERIC_ERROR);
             nvmet_tcp_send_resp(&ctx->io, &cqe);
         } else {
-            nvmet_build_cqe(&cqe, cid, 0u, 0);
+            ctx->stat_read_bytes += (uint64_t)nlb * NVMET_LBA_SIZE;   /* SMART の data_units_read */
+            ctx->stat_read_cmds++;
+            nvmet_build_cqe(ctx, &cqe, cid, 0u, 0);
             /* ダイジェスト有効時もゼロコピーのまま送れる
              * (nvmet_tcp_send_c2h_async() が送信元から直接 CRC を算出する)。 */
             int c2h_rc = nvmet_tcp_send_c2h_async(&ctx->io, cid,
-                                                   &ctx->ram_disk[slba * NVMET_LBA_SIZE],
+                                                   &ns->disk[slba * NVMET_LBA_SIZE],
                                                    nlb * NVMET_LBA_SIZE);
             if (c2h_rc != 0) {
                 uart_printf("[!] nvmet: C2HData送信失敗、エラー応答を試みる "
                             "(slba=%u nlb=%u)\n", (uint32_t)slba, nlb);
-                nvmet_build_cqe(&cqe, cid, 0u, (uint16_t)NVMET_SC_GENERIC_ERROR);
+                nvmet_build_cqe(ctx, &cqe, cid, 0u, (uint16_t)NVMET_SC_GENERIC_ERROR);
                 nvmet_tcp_send_resp(&ctx->io, &cqe);
             }
         }
@@ -1203,54 +2003,92 @@ static void nvmet_io_dispatch_cmd(nvmet_ctx_t *ctx, const uint8_t *hdr_buf,
         uint64_t end_lba   = slba + nlb;
         uint32_t write_len = nlb * NVMET_LBA_SIZE;
         ts_log(TS_MK(TS_FILE_NVMET, TS_FUNC_nvmet_io_dispatch_cmd, 2), write_len);
+        ctx->err_lba = slba;
 
         if (dlen > 0) {
             if (incap_committed) {
                 ctx->write_incapsule_count++;
-                nvmet_build_cqe(&cqe, cid, 0u, 0);
+                ctx->stat_write_bytes += write_len;   /* SMART の data_units_written */
+                ctx->stat_write_cmds++;
+                nvmet_build_cqe(ctx, &cqe, cid, 0u, 0);
             } else {
                 uart_printf("[!] nvmet: Write範囲外/過大 (slba=%u nlb=%u)\n", (uint32_t)slba, nlb);
-                nvmet_build_cqe(&cqe, cid, 0u, (uint16_t)NVMET_SC_GENERIC_ERROR);
+                nvmet_build_cqe(ctx, &cqe, cid, 0u, (uint16_t)NVMET_SC_GENERIC_ERROR);
             }
             nvmet_tcp_send_resp(&ctx->io, &cqe);
-        } else if (end_lba > NVMET_NS_LBA_COUNT || write_len > NVMET_IO_DATA_BUF_MAX) {
+        } else if (end_lba > ns->lba_count || write_len > NVMET_IO_DATA_BUF_MAX) {
             uart_printf("[!] nvmet: Write範囲外/過大 (slba=%u nlb=%u)\n", (uint32_t)slba, nlb);
-            nvmet_build_cqe(&cqe, cid, 0u, (uint16_t)NVMET_SC_GENERIC_ERROR);
+            nvmet_build_cqe(ctx, &cqe, cid, 0u, (uint16_t)NVMET_SC_GENERIC_ERROR);
             nvmet_tcp_send_resp(&ctx->io, &cqe);
         } else {
             int slot = nvmet_pending_write_alloc(ctx);
             if (slot < 0) {
                 uart_printf("[!] nvmet: 同時書き込み上限(%u件)を超過、"
                             "コマンドを拒否 (cid=%u)\n", NVMET_MAX_PENDING_WRITES, cid);
-                nvmet_build_cqe(&cqe, cid, 0u, (uint16_t)NVMET_SC_GENERIC_ERROR);
+                nvmet_build_cqe(ctx, &cqe, cid, 0u, (uint16_t)NVMET_SC_GENERIC_ERROR);
                 nvmet_tcp_send_resp(&ctx->io, &cqe);
             } else {
                 ctx->write_h2c_count++;
+                ctx->stat_write_bytes += write_len;   /* SMART の data_units_written */
+                ctx->stat_write_cmds++;
                 ctx->pending_writes[slot].in_use    = 1;
                 ctx->pending_writes[slot].cid       = cid;
                 ctx->pending_writes[slot].slba      = slba;
                 ctx->pending_writes[slot].write_len = write_len;
                 ctx->pending_writes[slot].received  = 0;
+                ctx->pending_writes[slot].disk      = ns->disk;
 
                 uint32_t max_h2c = nvmet_tcp_max_h2c_data(&ctx->io);
                 uint32_t round   = (write_len > max_h2c) ? max_h2c : write_len;
                 if (nvmet_tcp_send_r2t(&ctx->io, cid, 0, round) != 0) {
                     uart_printf("[!] nvmet: R2T送信失敗 (cid=%u)\n", cid);
                     ctx->pending_writes[slot].in_use = 0;
-                    nvmet_build_cqe(&cqe, cid, 0u, (uint16_t)NVMET_SC_GENERIC_ERROR);
+                    nvmet_build_cqe(ctx, &cqe, cid, 0u, (uint16_t)NVMET_SC_GENERIC_ERROR);
                     nvmet_tcp_send_resp(&ctx->io, &cqe);
                 }
             }
         }
-    } else if (opcode == NVME_IO_CMD_FLUSH) {
-        /* 名前空間の実体は RAM ディスクで揮発性キャッシュを持たないため、
-         * Flush は成功を返すだけでよい(仕様上も準拠)。返さないとホスト側で
-         * fsync/sync が失敗する。 */
-        nvmet_build_cqe(&cqe, cid, 0u, 0);
+    } else if (opcode == NVME_IO_CMD_WRITE_ZEROES) {
+        /* データ転送を伴わないので C2H も R2T も出さない。cdw12 の NLB は
+         * **0's based**(DSM の範囲リストの NLB とは違う)。 */
+        uint64_t slba = (uint64_t)rd32le(&sqe.cdw10) | ((uint64_t)rd32le(&sqe.cdw11) << 32);
+        uint32_t nlb  = (rd32le(&sqe.cdw12) & 0xFFFFu) + 1u;
+        ctx->err_lba = slba;
+
+        if (nvmet_zero_lba_range(ns, slba, nlb) != 0) {
+            uart_printf("[!] nvmet: Write Zeroes範囲外 (slba=%u nlb=%u)\n", (uint32_t)slba, nlb);
+            nvmet_build_cqe(ctx, &cqe, cid, 0u, (uint16_t)NVMET_SC_LBA_RANGE);
+        } else {
+            nvmet_build_cqe(ctx, &cqe, cid, 0u, 0);
+        }
+        nvmet_tcp_send_resp(&ctx->io, &cqe);
+    } else if (opcode == NVME_IO_CMD_DSM) {
+        /* NR(cdw10 bit7:0)は **0's based**。範囲リストは 16 バイト x NR で
+         * ホストから送られてくる。 */
+        uint32_t nr    = (rd32le(&sqe.cdw10) & 0xFFu) + 1u;
+        uint32_t attr  = rd32le(&sqe.cdw11);
+        uint32_t need  = nr * NVME_DSM_RANGE_LEN;
+
+        if (data == NULL || dlen == 0) {
+            /* **Linux は discard を in-capsule で送ってくる**(rq_data_dir が
+             * WRITE で、16 バイトは ioccsz にまず収まる)。R2T 経路は
+             * pending_writes が write 専用の作りなので用意していない。
+             * 黙って成功を返すと「消したつもり」になるので必ずエラーにする。 */
+            uart_printf("[!] nvmet: DSMにin-capsuleデータが無い(R2T経路は未対応, nr=%u)\n", nr);
+            nvmet_build_cqe(ctx, &cqe, cid, 0u, (uint16_t)NVMET_SC_INVALID_FIELD);
+        } else if (dlen < need || need > NVMET_DSM_STAGE_BYTES) {
+            uart_printf("[!] nvmet: DSMのデータ長が不足 (nr=%u 必要=%u 受信=%u)\n",
+                        nr, need, dlen);
+            nvmet_build_cqe(ctx, &cqe, cid, 0u, (uint16_t)NVMET_SC_SGL_LEN_INVALID);
+        } else if (nvmet_dsm_apply(ctx, ns, data, nr, attr) != 0) {
+            nvmet_build_cqe(ctx, &cqe, cid, 0u, (uint16_t)NVMET_SC_LBA_RANGE);
+        } else {
+            nvmet_build_cqe(ctx, &cqe, cid, 0u, 0);
+        }
         nvmet_tcp_send_resp(&ctx->io, &cqe);
     } else {
         uart_printf("[!] nvmet: 未対応のIOコマンド (opcode=0x%x)\n", opcode);
-        nvmet_build_cqe(&cqe, cid, 0u, (uint16_t)NVMET_SC_GENERIC_ERROR);
+        nvmet_build_cqe(ctx, &cqe, cid, 0u, (uint16_t)NVMET_SC_GENERIC_ERROR);
         nvmet_tcp_send_resp(&ctx->io, &cqe);
     }
 }
@@ -1294,13 +2132,13 @@ static void nvmet_io_dispatch_h2c(nvmet_ctx_t *ctx, int h2c_slot,
         if (nvmet_tcp_send_r2t(&ctx->io, pw->cid, pw->received, round) != 0) {
             uart_printf("[!] nvmet: R2T送信失敗 (cid=%u)\n", pw->cid);
             nvme_cqe_t cqe;
-            nvmet_build_cqe(&cqe, pw->cid, 0u, (uint16_t)NVMET_SC_GENERIC_ERROR);
+            nvmet_build_cqe(ctx, &cqe, pw->cid, 0u, (uint16_t)NVMET_SC_GENERIC_ERROR);
             nvmet_tcp_send_resp(&ctx->io, &cqe);
             pw->in_use = 0;
         }
     } else {
         nvme_cqe_t cqe;
-        nvmet_build_cqe(&cqe, pw->cid, 0u, 0);
+        nvmet_build_cqe(ctx, &cqe, pw->cid, 0u, 0);
         nvmet_tcp_send_resp(&ctx->io, &cqe);
         pw->in_use = 0;
     }
@@ -1325,6 +2163,9 @@ static void nvmet_ready_push_cmd(nvmet_io_job_ctx_t *jc)
     rd->cid             = jc->prx_cid;
     rd->dlen            = jc->prx_data_need;
     rd->incap_committed = jc->prx_incap_committed;
+    /* データが実際に置かれた場所。dispatch が読むのは DSM の範囲リストだけ
+     * (write は RAM ディスクへ直接置いてある)。 */
+    rd->data_dst        = (uint8_t *)jc->prx_data_dst;
     __asm__ volatile("" ::: "memory");
     jc->ready_head++;
 }
@@ -1403,12 +2244,26 @@ static void nvmet_prx_dispatch(nvmet_io_job_ctx_t *jc, nvmet_ctx_t *ctx)
         }
         jc->prx_incap_committed = 0;
         jc->prx_data_dst = (volatile uint8_t *)jc->data_buf;
+        if (jc->prx_data_need > 0 && opcode == NVME_IO_CMD_DSM &&
+            jc->prx_data_need <= NVMET_DSM_STAGE_BYTES) {
+            /* **Dataset Management の範囲リストは dispatch まで生かす必要がある**
+             * (write と違い、受信した時点では何もできない)。共有の data_buf に
+             * 置くと、次のコマンドが届いた時点で上書きされる。ready-ring の
+             * スロットと 1 対 1 の置き場へ落とす -- このスロットは
+             * nvmet_ready_push_cmd() が使うのと同じ番号で、dispatch されるまで
+             * 再利用されない。 */
+            jc->prx_data_dst =
+                (volatile uint8_t *)ctx->dsm_stage[jc->ready_head % NVMET_READY_RING];
+        }
         if (jc->prx_data_need > 0 && opcode == NVME_IO_CMD_WRITE) {
+            /* **nsid を見て名前空間を選ぶ。** 無効なら RAM ディスクへ直接置く
+             * 最適化をやめ、dispatch にエラーを返させる(data_buf 行き)。 */
+            nvmet_ns_t *wns = nvmet_ns_get(ctx, rd32le(&jc->prx_psh[4]));
             uint64_t slba = (uint64_t)rd32le(&jc->prx_psh[40]) | ((uint64_t)rd32le(&jc->prx_psh[44]) << 32);
             uint32_t nlb  = (rd32le(&jc->prx_psh[48]) & 0xFFFFu) + 1u;
             uint32_t wl   = nlb * NVMET_LBA_SIZE;
-            if (wl == jc->prx_data_need && (slba + nlb) <= NVMET_NS_LBA_COUNT) {
-                jc->prx_data_dst = (volatile uint8_t *)&ctx->ram_disk[slba * NVMET_LBA_SIZE];
+            if (wns != NULL && wl == jc->prx_data_need && (slba + nlb) <= wns->lba_count) {
+                jc->prx_data_dst = (volatile uint8_t *)&wns->disk[slba * NVMET_LBA_SIZE];
                 jc->prx_incap_committed = 1;
             }
         }
@@ -1436,7 +2291,7 @@ static void nvmet_prx_dispatch(nvmet_io_job_ctx_t *jc, nvmet_ctx_t *ctx)
             jc->prx_error = 1; return;
         }
         jc->prx_h2c_slot = slot;
-        jc->prx_data_dst = (volatile uint8_t *)&ctx->ram_disk[pw->slba * NVMET_LBA_SIZE + jc->prx_datao];
+        jc->prx_data_dst = (volatile uint8_t *)&pw->disk[pw->slba * NVMET_LBA_SIZE + jc->prx_datao];
         if (jc->prx_datal == 0) {
             nvmet_prx_finish_pdu(jc);
         } else {
@@ -1590,6 +2445,18 @@ static job_result_t nvmet_io_job_step_impl(job_t *self)
         return nvmet_io_job_end(self, ctx, io_open, "job stopでキャンセル");
     }
 
+    /* admin ジョブが Keep Alive タイムアウトを検出した(D7)。**自分の
+     * コネクションは自分で畳む** -- upcall の解除など後始末が
+     * nvmet_io_job_end() に集約してあるため。**旗はここで消費する**
+     * (admin 側で消すと、この tick が回る前に消えてしまう)。 */
+    if (ctx->kato_expired) {
+        ctx->kato_expired = 0;
+        if ((nvmet_io_state_t)self->state != NIO_ST_WAIT_ADMIN_READY) {
+            int io_open = ((nvmet_io_state_t)self->state >= NIO_ST_ICREQ_RECV);
+            return nvmet_io_job_end(self, ctx, io_open, "Keep Aliveタイムアウト");
+        }
+    }
+
     if((uint32_t)self->state != 0x10)
         ts_log(TS_MK(TS_FILE_NVMET, TS_FUNC_nvmet_io_job_step_impl, 10), (uint32_t)self->state);
 
@@ -1697,7 +2564,7 @@ static job_result_t nvmet_io_job_step_impl(job_t *self)
             nvmet_ready_t *rd = &jc->ready[jc->ready_tail % NVMET_READY_RING];
             uint64_t dsp0 = timer_now();
             if (rd->kind == NVMET_READY_CMD) {
-                nvmet_io_dispatch_cmd(ctx, rd->hdr, rd->sqe, rd->cid, rd->dlen, rd->incap_committed);
+                nvmet_io_dispatch_cmd(ctx, rd->hdr, rd->sqe, rd->cid, rd->dlen, rd->incap_committed, rd->data_dst);
             } else {
                 nvmet_io_dispatch_h2c(ctx, rd->h2c_slot, rd->hdr, rd->cccid, rd->ttag, rd->datao, rd->datal);
             }
@@ -1753,11 +2620,12 @@ static job_result_t nvmet_io_job_step_impl(job_t *self)
         jc->cmd_data_dst = jc->data_buf;
         jc->incap_write_committed = 0;
         if (jc->dlen > 0 && (rd32le(&jc->sqe_buf[0]) & 0xFFu) == NVME_IO_CMD_WRITE) {
+            nvmet_ns_t *wns    = nvmet_ns_get(ctx, rd32le(&jc->sqe_buf[4]));   /* nsid */
             uint64_t slba      = (uint64_t)rd32le(&jc->sqe_buf[40]) | ((uint64_t)rd32le(&jc->sqe_buf[44]) << 32);
             uint32_t nlb       = (rd32le(&jc->sqe_buf[48]) & 0xFFFFu) + 1u;
             uint32_t write_len = nlb * NVMET_LBA_SIZE;
-            if (write_len == jc->dlen && (slba + nlb) <= NVMET_NS_LBA_COUNT) {
-                jc->cmd_data_dst = (uint8_t *)&ctx->ram_disk[slba * NVMET_LBA_SIZE];
+            if (wns != NULL && write_len == jc->dlen && (slba + nlb) <= wns->lba_count) {
+                jc->cmd_data_dst = (uint8_t *)&wns->disk[slba * NVMET_LBA_SIZE];
                 jc->incap_write_committed = 1;
             }
         }
@@ -1828,7 +2696,7 @@ static job_result_t nvmet_io_job_step_impl(job_t *self)
             jc->pull_copy_base_ns = now;   /* 次コマンドの基準 */
         }
         nvmet_io_dispatch_cmd(ctx, jc->hdr_buf, jc->sqe_buf, jc->cid,
-                               jc->dlen, jc->incap_write_committed);
+                               jc->dlen, jc->incap_write_committed, jc->cmd_data_dst);
         nvmet_tcp_xfer_reset(&jc->xfer, jc->hdr_buf, NVME_TCP_HDR_LEN);
         self->state = NIO_ST_RECV_PDU_HDR;
         return JOB_WAITING;
@@ -1885,7 +2753,7 @@ static job_result_t nvmet_io_job_step_impl(job_t *self)
         {
             nvmet_pending_write_t *pw = &ctx->pending_writes[jc->h2c_slot];
             if (nvmet_tcp_verify_ddgst(&ctx->io,
-                                        &ctx->ram_disk[pw->slba * NVMET_LBA_SIZE + jc->datao],
+                                        &pw->disk[pw->slba * NVMET_LBA_SIZE + jc->datao],
                                         jc->datal, jc->dgst_buf) != 0) {
                 nvmet_tcp_xfer_reset(&jc->xfer, jc->hdr_buf, NVME_TCP_HDR_LEN);
                 self->state = NIO_ST_RECV_PDU_HDR;
@@ -2006,11 +2874,36 @@ int nvmet_job_start(nvmet_ctx_t *ctx, uint16_t port, netif_t *bound_ctx, const c
     ctx->write_incapsule_count = 0;
     ctx->write_h2c_count       = 0;
 
+    /* SMART / Error Information の統計。**ここでしか 0 に戻さない**
+     * (ホストが繋ぎ直しても実コントローラの通電中統計は続く)。 */
+    ctx->start_tick       = timer_now();
+    ctx->stat_read_bytes  = 0;
+    ctx->stat_write_bytes = 0;
+    ctx->stat_read_cmds   = 0;
+    ctx->stat_write_cmds  = 0;
+    ctx->error_count      = 0;
+    nvmet_zero(ctx->error_slot, sizeof(ctx->error_slot));
+
+    /* 名前空間。**既定で有効なのは nsid=1 だけ**で、nsid=2 は `nvmens add 2`
+     * で後から生やす(D6 の AER をそこで発火させる)。 */
+    ctx->ns[0].active    = 1;
+    ctx->ns[0].lba_count = NVMET_NS1_LBA_COUNT;
+    ctx->ns[0].disk      = ctx->ram_disk;
+    ctx->ns[1].active    = 0;
+    ctx->ns[1].lba_count = NVMET_NS2_LBA_COUNT;
+    ctx->ns[1].disk      = ctx->ram_disk2;
+
+    ctx->aer_pending        = 0;
+    ctx->aer_notify_ns      = 0;
+    ctx->kato_expired       = 0;
+    ctx->last_cmd_tick      = 0;
+    ctx->changed_nsid_count = 0;
+
     ctx->listen_port  = port;   /* Discovery Log Page の trsvcid に載せる */
     ctx->is_discovery = 0;
     nvmet_build_id_ctrl(ctx);
     nvmet_build_id_ctrl_disc(ctx);
-    nvmet_build_id_ns(ctx);
+    for (uint32_t id = 1u; id <= NVMET_NSID_MAX; id++) nvmet_build_id_ns(ctx, id);
 
     uart_printf("[nvmet:%s] adminキュー接続待ち (port=%u)\n", label, (unsigned)port);
 
@@ -2046,4 +2939,88 @@ int nvmet_job_start(nvmet_ctx_t *ctx, uint16_t port, netif_t *bound_ctx, const c
         job_pin_to_core(io_job, bound_ctx->owner_core);
     }
     return 0;
+}
+
+/*=================================================================
+ * 名前空間を有効化 / 無効化する(シェルの `nvmens` から呼ぶ)。
+ *
+ * **変更したら Changed Namespace List へ積んで AER を完了させる。** これが
+ * D6(非同期イベント)の唯一の発火点で、ホストはこの通知を受けて
+ * `nvme_queue_scan()` を回し、CNS=0x02 を引き直して /dev/nvmeXnY を
+ * 生やす/消す。通知しなければホストは永久に気付かない。
+ *
+ * 無効化するときは実体をゼロで埋める。**再度有効にしたときに前の内容が
+ * 見えるのは「新しい名前空間」として正しくない。**
+ *
+ * 引数:
+ *   ctx    - ターゲットコンテキスト
+ *   nsid   - 名前空間 ID
+ *   active - 1=有効化、0=無効化
+ * 戻り値:
+ *   0=変更した、-1=範囲外か既にその状態
+ * コール元:
+ *   シェルの nvmens コマンド
+ * ===============================================================*/
+int nvmet_ns_set_active(nvmet_ctx_t *ctx, uint32_t nsid, int active)
+{
+    if (!nvmet_nsid_in_range(nsid)) {
+        uart_printf("[!] nvmens: nsid=%u は範囲外(1〜%u)\n", nsid, NVMET_NSID_MAX);
+        return -1;
+    }
+    nvmet_ns_t *ns = &ctx->ns[nsid - 1u];
+    if (ns->active == active) {
+        uart_printf("[!] nvmens: nsid=%u は既に%s\n", nsid, active ? "有効" : "無効");
+        return -1;
+    }
+
+    if (active) {
+        volatile_fast_zero(ns->disk, (size_t)ns->lba_count * NVMET_LBA_SIZE);
+        nvmet_build_id_ns(ctx, nsid);
+    }
+    ns->active = active;
+    uart_printf("[nvmet:%s] 名前空間 nsid=%u を%s (%u LBA)\n",
+                ctx->label, nsid, active ? "追加" : "削除",
+                (unsigned)ns->lba_count);
+
+    /* Changed Namespace List へ積む(読み出されるまで保持)。 */
+    if (ctx->changed_nsid_count < NVME_MAX_CHANGED_NAMESPACES) {
+        ctx->changed_nsid[ctx->changed_nsid_count] = nsid;
+    }
+    ctx->changed_nsid_count++;
+
+    /* **ここでは送らない。** この関数はシェル(core0)から呼ばれるが、
+     * admin キューへの送信は admin ジョブ(core1)の担当。旗だけ立てる。 */
+    ctx->aer_notify_ns = 1;
+    if (!ctx->aer_pending) {
+        uart_printf("[nvmet:%s] (保留中の AER が無いので通知は次の AER まで待つ)\n",
+                    ctx->label);
+    }
+    return 0;
+}
+
+/*=================================================================
+ * 名前空間の一覧を表示する(シェルの `nvmens`)。
+ *
+ * 引数:
+ *   ctx - ターゲットコンテキスト
+ * コール元:
+ *   シェルの nvmens コマンド
+ * ===============================================================*/
+void nvmet_ns_show(nvmet_ctx_t *ctx)
+{
+    uart_printf("nvmens: nsid  状態    サイズ\n");
+    for (uint32_t id = 1u; id <= NVMET_NSID_MAX; id++) {
+        nvmet_ns_t *ns = &ctx->ns[id - 1u];
+        uart_printf("        %-5u %-7s %u LBA (%u MiB)\n",
+                    id, ns->active ? "有効" : "無効",
+                    (unsigned)ns->lba_count,
+                    (unsigned)(ns->lba_count * NVMET_LBA_SIZE / (1024u * 1024u)));
+    }
+    if (ctx->aer_pending) {
+        uart_printf("  AER: 保留中 (cid=%u) / 未読の変更 %u 件 / AEN 設定 0x%x\n",
+                    ctx->aer_cid, ctx->changed_nsid_count, ctx->aen_config);
+    } else {
+        uart_printf("  AER: 保留なし / 未読の変更 %u 件 / AEN 設定 0x%x\n",
+                    ctx->changed_nsid_count, ctx->aen_config);
+    }
 }
