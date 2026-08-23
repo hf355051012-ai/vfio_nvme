@@ -27,6 +27,10 @@ typedef enum {
     NVMER_ST_WAIT_ID_CTRL,
     NVMER_ST_SEND_ID_NS,
     NVMER_ST_WAIT_ID_NS,
+    NVMER_ST_IOQ_CM_SPAWN,
+    NVMER_ST_IOQ_CM_WAIT,
+    NVMER_ST_IOQ_SEND_CONNECT,
+    NVMER_ST_IOQ_WAIT_CONNECT,
     NVMER_ST_SEND_WRITE,
     NVMER_ST_WAIT_WRITE,
     NVMER_ST_SEND_READ,
@@ -41,6 +45,13 @@ typedef enum {
 
 typedef struct {
     rdma_cm_ctx_t cm;   /* CM確立(established後、cm.dev/cm.rc_qpが本命のQP) */
+    /* IO キュー(qid=1)は **別の CM 接続と別の QP** になる。
+     * Linux は admin キューで IO コマンドを受け付けない
+     * (opcode 0x02 は admin では Get Log Page になる)ので、
+     * 実ホストと相互運用するにはこちらが要る。 */
+    rdma_cm_ctx_t io_cm;
+    int bench_peeked;    /* read データの先頭を一度だけ表示するための印 */
+    int io_queue_ready;  /* 1=以後の IO は io_cm.rc_qp を使う */
 
     uint16_t cntlid;
     uint32_t lba_size;
@@ -111,5 +122,10 @@ typedef struct {
 void nvme_rdma_set_remote_target(int enable, uint32_t ip, const uint8_t mac[6],
                                  uint16_t port, const char *subnqn);
 const nvme_rdma_remote_t *nvme_rdma_remote_target(void);
+
+/* Identify Namespace が信用できない相手向けの手動上書き。
+ * lba_size=0 で解除。**正常な相手には使わないこと。** */
+void nvme_rdma_set_ns_override(uint32_t lba_size, uint64_t nsze);
+void nvme_rdma_get_ns_override(uint32_t *lba_size, uint64_t *nsze);
 
 #endif /* NVME_RDMA_H */

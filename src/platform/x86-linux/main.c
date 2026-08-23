@@ -5398,6 +5398,34 @@ static void shell_dispatch(char *line, int s0, int s1)
         while (*a >= '0' && *a <= '9') { v = v * 10u + (unsigned)(*a - '0'); a++; }
         s_dev1.roce_gid_vlan = (uint16_t)v;
         uart_printf("gidvlan: PF1 の GID VLAN = %u (0=無効)\n", v);
+    } else if (strncmp(line, "rdmans", 6) == 0) {
+        /* rdmans [<lba_size> <nsze>] | off
+         * Identify Namespace の値を手で上書きする。**相手の Identify が
+         * 信用できないときだけの逃げ道**(Pi5 の nvmet は DMA 非コヒーレントな
+         * 環境で Identify の中身を正しく返せない)。 */
+        char *arg = line + 6;
+        while (*arg == ' ') arg++;
+        if (*arg == 0) {
+            uint32_t lb = 0; uint64_t nz = 0;
+            nvme_rdma_get_ns_override(&lb, &nz);
+            if (lb == 0) uart_printf("rdmans: 上書きなし(Identify の値を使います)\n");
+            else uart_printf("rdmans: lba_size=%u nsze=%u ブロック\n", lb, (unsigned)nz);
+        } else if (strncmp(arg, "off", 3) == 0) {
+            nvme_rdma_set_ns_override(0, 0);
+            uart_printf("rdmans: 上書きを解除しました\n");
+        } else {
+            char *tok[4];
+            unsigned nt = shell_tokenize(arg, tok, 4);
+            if (nt < 2) {
+                uart_printf("使い方: rdmans <lba_size> <nszeブロック数> | off\n");
+            } else {
+                uint32_t lb = (uint32_t)strtoul(tok[0], 0, 0);
+                uint64_t nz = (uint64_t)strtoull(tok[1], 0, 0);
+                nvme_rdma_set_ns_override(lb, nz);
+                uart_printf("rdmans: lba_size=%u nsze=%u ブロック で上書きします\n",
+                            lb, (unsigned)nz);
+            }
+        }
     } else if (strncmp(line, "rdmatarget", 10) == 0) {
         /* rdmatarget                       -- 現在の設定を表示
          * rdmatarget off                   -- 解除(同一プロセス内のターゲットへ戻す)

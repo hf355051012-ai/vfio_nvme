@@ -33,6 +33,22 @@ static volatile uint8_t *nvmer_ramdisk_slot1(void)
 /* 外部ホストのターゲット設定。nvmer_build_connect() が subnqn を、
  * nvme_rdma_run_bench() が宛先を見るので、両方より前に置く。 */
 static nvme_rdma_remote_t s_remote;
+
+/* Identify Namespace の値を手で上書きする(0=上書きしない)。 */
+static uint32_t s_ns_ovr_lba_size;
+static uint64_t s_ns_ovr_nsze;
+
+void nvme_rdma_set_ns_override(uint32_t lba_size, uint64_t nsze)
+{
+    s_ns_ovr_lba_size = lba_size;
+    s_ns_ovr_nsze = nsze;
+}
+
+void nvme_rdma_get_ns_override(uint32_t *lba_size, uint64_t *nsze)
+{
+    if (lba_size) *lba_size = s_ns_ovr_lba_size;
+    if (nsze) *nsze = s_ns_ovr_nsze;
+}
 #define NVME_RDMA_CTRL_READY_POLL_MAX 20u
 #define NVME_RDMA_CTRL_READY_POLL_MS 100u
 #define NVME_RDMA_CMD_TIMEOUT_MS    5000u
@@ -55,6 +71,23 @@ static void nvmer_copy_str_v(volatile uint8_t *dst, uint32_t field_len, const ch
         dst[i] = (uint8_t)src[i];
         i++;
     }
+}
+
+/*=================================================================
+ * いまコマンドを流すべき QP を返す。IO キューが確立していれば
+ * そちら、まだなら admin キュー。**mkey も QP ごとに違う**(PD が別)ので、
+ * keyed SGL に入れる鍵もここから取ること。
+ *
+ * 引数:
+ *   ctx - initiator コンテキスト
+ * 戻り値:
+ *   使うべき QP
+ * コール元:
+ *   nvmer_build_*(), nvmer_post_send/recv(), nvmer_wait_exec()
+ * ===============================================================*/
+static mlx5_qp_t *nvmer_qp(nvme_rdma_ctx_t *ctx)
+{
+    return ctx->io_queue_ready ? &ctx->io_cm.rc_qp : &ctx->cm.rc_qp;
 }
 
 /*=================================================================
@@ -117,14 +150,17 @@ static uint32_t nvmer_build_connect(nvme_rdma_ctx_t *ctx, uint16_t qid, const ch
     wr16le(&b[2], ctx->cur_cid);
     wr32le(&b[4], NVME_FABRIC_FCTYPE_CONNECT);
     nvmer_set_ksgl(&b[24], mlx5_dma_addr((const void *)(uintptr_t)&b[64]), 1024u,
-                   ctx->cm.rc_qp.mkey);
+                   nvmer_qp(ctx)->mkey);
     wr32le(&b[40], (uint32_t)qid << 16);
     wr32le(&b[44], (uint32_t)(NVME_RDMA_QSIZE - 1) & 0xFFFFu);
     wr32le(&b[48], 0);
 
     volatile uint8_t *cd = &b[64];
     for (unsigned i = 0; i < 16; i++) cd[i] = NVME_RDMA_HOST_ID[i];
-    wr16le(&cd[16], 0xFFFFu); /* cntlid: dynamic */
+    /* cntlid: admin キューは 0xFFFF(dynamic)、IO キューは admin の
+     * Connect 応答でもらった値。**違うと相手はどのコントローラの
+     * キューか判別できず Connect Invalid Parameters で落とす。** */
+    wr16le(&cd[16], (qid == 0u) ? 0xFFFFu : ctx->cntlid);
     nvmer_copy_str_v(&cd[256], 256u, subnqn);
     nvmer_copy_str_v(&cd[512], 256u, NVME_RDMA_HOST_NQN);
     /* **送るのは SQE の 64 バイトだけ。** data は b[64..1087] に置いたまま
@@ -205,7 +241,7 @@ static uint32_t nvmer_build_identify(nvme_rdma_ctx_t *ctx, uint8_t cns, uint32_t
     wr32le(&b[0], NVME_ADM_CMD_IDENTIFY | ((uint32_t)NVME_PSDT_SGL_MPTR_CONTIGUOUS << 8));
     wr16le(&b[2], ctx->cur_cid);
     wr32le(&b[4], nsid);
-    nvmer_set_ksgl(&b[24], mlx5_dma_addr((const void *)(uintptr_t)dest), dest_len, ctx->cm.rc_qp.mkey);
+    nvmer_set_ksgl(&b[24], mlx5_dma_addr((const void *)(uintptr_t)dest), dest_len, nvmer_qp(ctx)->mkey);
     wr32le(&b[40], (uint32_t)cns);
     uart_printf("\n");
     return 64u;
@@ -237,7 +273,7 @@ static uint32_t nvmer_build_io_ex(nvme_rdma_ctx_t *ctx, volatile uint8_t *out, u
     wr32le(&b[0], (uint32_t)opcode | ((uint32_t)NVME_PSDT_SGL_MPTR_CONTIGUOUS << 8));
     wr16le(&b[2], cid);
     wr32le(&b[4], nsid);
-    nvmer_set_ksgl(&b[24], mlx5_dma_addr((const void *)(uintptr_t)buf), total_len, ctx->cm.rc_qp.mkey);
+    nvmer_set_ksgl(&b[24], mlx5_dma_addr((const void *)(uintptr_t)buf), total_len, nvmer_qp(ctx)->mkey);
     wr32le(&b[40], (uint32_t)(slba & 0xFFFFFFFFu));
     wr32le(&b[44], (uint32_t)(slba >> 32));
     wr32le(&b[48], (uint32_t)(nlb - 1u) & 0xFFFFu);
@@ -296,7 +332,7 @@ static uint32_t nvmer_build_io(nvme_rdma_ctx_t *ctx, uint8_t opcode, uint32_t ns
  * ===============================================================*/
 static int nvmer_post_recv(nvme_rdma_ctx_t *ctx)
 {
-    return mlx5_qp_post_recv(ctx->cm.dev, &ctx->cm.rc_qp, (void *)(uintptr_t)ctx->recv_buf,
+    return mlx5_qp_post_recv(ctx->cm.dev, nvmer_qp(ctx), (void *)(uintptr_t)ctx->recv_buf,
                              sizeof(ctx->recv_buf));
 }
 
@@ -312,7 +348,7 @@ static int nvmer_post_recv(nvme_rdma_ctx_t *ctx)
 static void nvmer_post_send(nvme_rdma_ctx_t *ctx, uint32_t len)
 {
     dcache_clean_range((const void *)(uintptr_t)ctx->send_buf, len);
-    mlx5_qp_post_send(ctx->cm.dev, &ctx->cm.rc_qp, (const void *)(uintptr_t)ctx->send_buf, len);
+    mlx5_qp_post_send(ctx->cm.dev, nvmer_qp(ctx), (const void *)(uintptr_t)ctx->send_buf, len);
     ctx->send_done = 0;
     ctx->recv_done = 0;
     ctx->cmd_deadline = timer_now();
@@ -335,7 +371,7 @@ static int nvmer_wait_exec(nvme_rdma_ctx_t *ctx)
         int is_send = 0;
         uint32_t recv_len = 0;
         uint8_t synd = 0;
-        int rc = mlx5_qp_poll_cqe(ctx->cm.dev, &ctx->cm.rc_qp, &is_send, &recv_len, &synd);
+        int rc = mlx5_qp_poll_cqe(ctx->cm.dev, nvmer_qp(ctx), &is_send, &recv_len, &synd);
         if (rc < 0) {
             uart_printf("[!] nvme-rdma: CQEエラー syndrome=0x%02x\n", synd);
             return -1;
@@ -391,7 +427,7 @@ static unsigned s_pl_rq_head, s_pl_rq_tail;
  * ===============================================================*/
 static int nvmer_pl_post_recv_slot(nvme_rdma_ctx_t *ctx, unsigned slot)
 {
-    if (mlx5_qp_post_recv(ctx->cm.dev, &ctx->cm.rc_qp, (void *)(uintptr_t)s_pl_recv_bufs[slot],
+    if (mlx5_qp_post_recv(ctx->cm.dev, nvmer_qp(ctx), (void *)(uintptr_t)s_pl_recv_bufs[slot],
                           sizeof(s_pl_recv_bufs[slot])) != 0) {
         return -1;
     }
@@ -598,24 +634,110 @@ job_result_t nvme_rdma_connect_job_step(job_t *self)
         uint16_t status = rd16le(&ctx->recv_buf[14]);
         if (nvme_cqe_status_code(status) != 0) return nvmer_fail(ctx, "Identify Namespace: 応答エラー");
         dcache_invalidate_range((const void *)(uintptr_t)ctx->id_ns, NVME_RDMA_ID_BUF_LEN);
-        for (unsigned i = 0; i < 16u; i++) uart_printf(" %02x", (unsigned)ctx->recv_buf[i]);
-        uart_printf("\n");
-        for (unsigned r = 0; r < 2u; r++) {
-            for (unsigned i = 0; i < 16u; i++)
-                uart_printf(" %02x", (unsigned)ctx->id_ns[r * 16u + i]);
-            uart_printf("\n");
-        }
         dcache_invalidate_range((const void *)(uintptr_t)ctx->id_ns, NVME_RDMA_ID_BUF_LEN);
         uint8_t flbas = (uint8_t)(ctx->id_ns[NVME_ID_NS_OFF_FLBAS] & 0x0Fu);
         uint32_t lbaf_off = NVME_ID_NS_OFF_LBAF0 + (uint32_t)flbas * 4u;
         uint8_t ds = ctx->id_ns[lbaf_off + 2];
         ctx->lba_size = (uint32_t)1u << ds;
         ctx->nsze = rd64le(&ctx->id_ns[0]);
-        uart_printf("[nvme-rdma] Identify Namespace完了 (lba_size=%u バイト nsze=%u ブロック)\n",
-                    ctx->lba_size, (unsigned)ctx->nsze);
+        if (s_ns_ovr_lba_size != 0u) {
+            ctx->lba_size = s_ns_ovr_lba_size;
+            ctx->nsze = s_ns_ovr_nsze;
+            uart_printf("[nvme-rdma] Identify Namespaceを手動値で上書き "
+                        "(lba_size=%u nsze=%u)\n", ctx->lba_size, (unsigned)ctx->nsze);
+        } else if (ctx->lba_size < 512u || ctx->lba_size > 65536u ||
+                   (ctx->lba_size & (ctx->lba_size - 1u)) != 0u || ctx->nsze == 0u) {
+            /* **値がありえないときは黙って進まない。** そのまま使うと
+             * LBA が範囲外になって「Write の応答エラー」としか見えない。 */
+            uart_printf("[!] nvme-rdma: Identify Namespace の値が不正 "
+                        "(lba_size=%u nsze=%u)。rdmans で上書きしてください\n",
+                        ctx->lba_size, (unsigned)ctx->nsze);
+        } else {
+            uart_printf("[nvme-rdma] Identify Namespace完了 (lba_size=%u バイト nsze=%u ブロック)\n",
+                        ctx->lba_size, (unsigned)ctx->nsze);
+        }
         ctx->cur_cid++;
         ctx->reusable = 1;
         ctx->established_generation = ctx->cm.dev->bringup_generation;
+        /* **実ホストは admin キューで IO コマンドを受け付けない。**
+         * opcode 0x02 は admin だと Get Log Page になるので、
+         * qid=1 の接続を別に立ててから IO を流す。 */
+        if (s_remote.enabled && !ctx->io_queue_ready) {
+            self->state = NVMER_ST_IOQ_CM_SPAWN;
+            return JOB_WAITING;
+        }
+        self->state = nvmer_resume_state_after_identify(ctx);
+        return JOB_WAITING;
+    }
+
+    case NVMER_ST_IOQ_CM_SPAWN: {
+        /* GSI(QP1)はポートに 1 つしか置けないので admin のものを使い回す。
+         * RC QP は qp_index=1 側(qp2_* の DMA バッファ)を使う。 */
+        for (unsigned i = 0; i < sizeof(ctx->io_cm); i++) ((uint8_t *)&ctx->io_cm)[i] = 0;
+        dcache_clean_range((const void *)&ctx->io_cm, sizeof(ctx->io_cm));
+        ctx->io_cm.dev         = ctx->cm.dev;
+        ctx->io_cm.gsi_qp      = ctx->cm.gsi_qp;
+        ctx->io_cm.reuse_gsi   = 1;
+        ctx->io_cm.rc_qp_index = 1;
+        ctx->io_cm.is_active   = 1;
+        ctx->io_cm.skip_ping   = 1;
+        ctx->io_cm.own_ip      = ctx->cm.own_ip;
+        ctx->io_cm.peer_ip     = ctx->cm.peer_ip;
+        for (unsigned i = 0; i < 6u; i++) {
+            ctx->io_cm.own_mac[i]  = ctx->cm.own_mac[i];
+            ctx->io_cm.peer_mac[i] = ctx->cm.peer_mac[i];
+        }
+        for (unsigned i = 0; i < 16u; i++) {
+            ctx->io_cm.own_gid[i]  = ctx->cm.own_gid[i];
+            ctx->io_cm.peer_gid[i] = ctx->cm.peer_gid[i];
+        }
+        ctx->io_cm.service_port = ctx->cm.service_port;
+        ctx->io_cm.src_port     = (uint16_t)(ctx->cm.src_port + 1u);
+        ctx->io_cm.hrqsize      = NVME_RDMA_QSIZE;
+        ctx->io_cm.hsqsize      = NVME_RDMA_QSIZE - 1u;
+        ctx->io_cm.cntlid       = ctx->cntlid;   /* IO キューでは実値を載せる */
+        ctx->io_cm.nvme_qid     = 1u;
+        {
+            job_t *cmjob = job_spawn(rdma_cm_job_step, &ctx->io_cm, "nvme-rdma-io-cm");
+            if (!cmjob) return nvmer_fail(ctx, "IOキュー用CMジョブ生成失敗");
+            cmjob->state = RDMA_CM_ST_ACTIVE_SETUP;
+        }
+        self->state = NVMER_ST_IOQ_CM_WAIT;
+        return JOB_WAITING;
+    }
+
+    case NVMER_ST_IOQ_CM_WAIT: {
+        if (ctx->io_cm.failed) return nvmer_fail(ctx, "IOキューのCM確立失敗");
+        if (!ctx->io_cm.established) return JOB_WAITING;
+        uart_printf("[nvme-rdma] IOキューのRC QP確立 (qpn=%u)\n", ctx->io_cm.rc_qp.qpn);
+        ctx->io_queue_ready = 1;   /* 以後の post/poll は IO QP へ */
+        self->state = NVMER_ST_IOQ_SEND_CONNECT;
+        return JOB_WAITING;
+    }
+
+    case NVMER_ST_IOQ_SEND_CONNECT: {
+        if (nvmer_post_recv(ctx) != 0) return nvmer_fail(ctx, "post_recv(IO Connect)失敗");
+        {
+            const char *subnqn = (s_remote.enabled && s_remote.subnqn[0]) ? s_remote.subnqn
+                                                                         : NVMET_RDMA_SUBNQN;
+            uint32_t len = nvmer_build_connect(ctx, 1u, subnqn);
+            nvmer_post_send(ctx, len);
+        }
+        self->state = NVMER_ST_IOQ_WAIT_CONNECT;
+        return JOB_WAITING;
+    }
+
+    case NVMER_ST_IOQ_WAIT_CONNECT: {
+        int rc = nvmer_wait_exec(ctx);
+        if (rc == 0) return JOB_WAITING;
+        if (rc < 0) return nvmer_fail(ctx, "IOキューのFabrics Connect失敗");
+        {
+            uint16_t status = rd16le(&ctx->recv_buf[14]);
+            if (nvme_cqe_status_code(status) != 0)
+                return nvmer_fail(ctx, "IOキューのFabrics Connect: 応答エラー");
+        }
+        uart_printf("[nvme-rdma] IOキューのFabrics Connect完了 (qid=1)\n");
+        ctx->cur_cid++;
         self->state = nvmer_resume_state_after_identify(ctx);
         return JOB_WAITING;
     }
@@ -730,6 +852,7 @@ job_result_t nvme_rdma_connect_job_step(job_t *self)
         ctx->bench_start_ticks = timer_now();
         ctx->bench_count = 0;
         ctx->bench_bytes = 0;
+        ctx->bench_peeked = 0;
         uart_printf("[nvme-rdma] パイプライン化ループ開始 (depth=%u)\n", qdepth);
         self->state = NVMER_ST_PIPELINE_LOOP;
         return JOB_WAITING;
@@ -742,17 +865,17 @@ job_result_t nvme_rdma_connect_job_step(job_t *self)
             int is_send = 0;
             uint32_t recv_len = 0;
             uint8_t synd = 0;
-            int rc = mlx5_qp_poll_cqe(ctx->cm.dev, &ctx->cm.rc_qp, &is_send, &recv_len, &synd);
+            int rc = mlx5_qp_poll_cqe(ctx->cm.dev, nvmer_qp(ctx), &is_send, &recv_len, &synd);
             if (rc == 0) break;
             if (rc < 0) {
                 uint32_t hw_rq = 0, sw_rq = 0;
                 uint16_t hw_sq = 0, sw_sq = 0;
-                mlx5_qp_query_counters(ctx->cm.dev, &ctx->cm.rc_qp, &hw_rq, &sw_rq, &hw_sq, &sw_sq);
-                uint8_t last_op = mlx5_qp_last_cqe_opcode(ctx->cm.dev, &ctx->cm.rc_qp);
+                mlx5_qp_query_counters(ctx->cm.dev, nvmer_qp(ctx), &hw_rq, &sw_rq, &hw_sq, &sw_sq);
+                uint8_t last_op = mlx5_qp_last_cqe_opcode(ctx->cm.dev, nvmer_qp(ctx));
                 uart_printf("[!] nvme-rdma pipeline: CQEエラー syndrome=0x%02x cqe_opcode=0x%x is_send=%d "
                             "rq_head=%u rq_tail=%u hw_rq=%u sw_rq=%u hw_sq=%u sw_sq=%u sq_pc=%u cq_cc=%u\n",
                             synd, last_op, is_send, s_pl_rq_head, s_pl_rq_tail, hw_rq, sw_rq, hw_sq, sw_sq,
-                            ctx->cm.rc_qp.sq_pc, ctx->cm.rc_qp.cq_cc);
+                            nvmer_qp(ctx)->sq_pc, nvmer_qp(ctx)->cq_cc);
                 return nvmer_fail(ctx, "pipeline CQEエラー");
             }
             if (is_send) continue;
@@ -762,6 +885,16 @@ job_result_t nvme_rdma_connect_job_step(job_t *self)
             dcache_invalidate_range((const void *)(uintptr_t)s_pl_recv_bufs[slot], recv_len);
             uint16_t status = rd16le(&s_pl_recv_bufs[slot][14]);
             if (nvme_cqe_status_code(status) == 0) {
+                if (ctx->bench_is_read && !ctx->bench_peeked) {
+                    /* **最初の read 応答だけ、受け取ったデータの先頭を出す。**
+                     * スループットだけ見ても「中身が合っているか」は分からない。 */
+                    ctx->bench_peeked = 1;
+                    dcache_invalidate_range((const void *)(uintptr_t)ctx->read_buf, 16u);
+                    uart_printf("[nvme-rdma] read 先頭16B:");
+                    for (unsigned k = 0; k < 16u; k++)
+                        uart_printf(" %02x", (unsigned)ctx->read_buf[k]);
+                    uart_printf("\n");
+                }
                 ctx->bench_count++;
                 ctx->bench_bytes += ctx->bench_chunk_bytes;
             } else {
@@ -784,7 +917,7 @@ job_result_t nvme_rdma_connect_job_step(job_t *self)
                                   nlb, data_buf, ctx->bench_chunk_bytes);
                 dcache_clean_range((const void *)(uintptr_t)s_pl_send_bufs[i], 64u);
                 if (nvmer_pl_post_recv_slot(ctx, i) != 0) return nvmer_fail(ctx, "pipeline post_recv失敗");
-                if (mlx5_qp_post_send(ctx->cm.dev, &ctx->cm.rc_qp, (const void *)(uintptr_t)s_pl_send_bufs[i],
+                if (mlx5_qp_post_send(ctx->cm.dev, nvmer_qp(ctx), (const void *)(uintptr_t)s_pl_send_bufs[i],
                                       64u) != 0) {
                     return nvmer_fail(ctx, "pipeline post_send失敗");
                 }
@@ -1042,6 +1175,11 @@ void nvme_rdma_run_bench(mlx5_dev_t *dev0, mlx5_dev_t *dev1, uint32_t duration_m
         init_job->state = nvmer_resume_state_after_identify(&s_init_ctx);
     } else {
         nvmer_quiesce_jobs(&s_init_ctx, &s_init_ctx.cm, 2000u);
+        /* IO キュー側の CM ジョブと QP も先に終わらせる。
+         * **残すと ctx をゼロクリアした後も回り続けて事故になる**
+         * (RDMA CM で踏んだ segfault と同じ形)。 */
+        nvmer_quiesce_jobs(&s_init_ctx, &s_init_ctx.io_cm, 2000u);
+        nvmer_destroy_qp_if_valid(s_init_ctx.io_cm.dev, &s_init_ctx.io_cm.rc_qp);
         nvmer_destroy_qp_if_valid(s_init_ctx.cm.dev, &s_init_ctx.cm.rc_qp);
         nvmer_destroy_qp_if_valid(s_init_ctx.cm.dev, s_init_ctx.cm.gsi_qp);
         for (uint32_t i = 0; i < sizeof(s_init_ctx); i++) ((uint8_t *)&s_init_ctx)[i] = 0;
