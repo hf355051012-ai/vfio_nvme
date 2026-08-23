@@ -1237,6 +1237,218 @@ static void shell_tcptstest(void)
 }
 
 /*=================================================================
+ * シェルの `tcpkeepalive`。TCP Keepalive(RFC 1122 4.2.3.6)の設定と統計。
+ *
+ * **既定値(2 時間 + 75 秒 x 9 回)を縮めたままにしないこと。**
+ * 縮めると「無通信だが生きている」正常な接続を切ってしまう。
+ *
+ * 引数:
+ *   args - on / off / "<idle秒> <間隔秒> <回数>"。省略時は現在値と統計
+ * コール元:
+ *   shell_dispatch()
+ * ===============================================================*/
+static void shell_tcpkeepalive(char *args)
+{
+    while (*args == ' ') args++;
+    if (strncmp(args, "on", 2) == 0) {
+        g_tcp_keepalive_enable = 1;
+    } else if (strncmp(args, "off", 3) == 0) {
+        g_tcp_keepalive_enable = 0;
+    } else if (*args >= '0' && *args <= '9') {
+        /* "<idle秒> <間隔秒> <回数>" を空白区切りで順に読む。 */
+        const char *p = args;
+        for (unsigned f = 0; f < 3u && *p; f++) {
+            uint32_t v = (uint32_t)atoi(p);
+            if (f == 0) g_tcp_keepalive_idle_ms  = v * 1000u;
+            if (f == 1) g_tcp_keepalive_intvl_ms = v * 1000u;
+            if (f == 2) g_tcp_keepalive_probes   = v;
+            while (*p && *p != ' ') p++;
+            while (*p == ' ') p++;
+        }
+    }
+    uart_printf("tcpkeepalive: %s -- 無通信 %us で probe、%us 間隔で %u 回まで\n",
+                g_tcp_keepalive_enable ? "有効" : "無効",
+                (unsigned)(g_tcp_keepalive_idle_ms / 1000u),
+                (unsigned)(g_tcp_keepalive_intvl_ms / 1000u),
+                (unsigned)g_tcp_keepalive_probes);
+    uart_printf("tcpkeepalive: probe 送出=%u / 相手の probe に応答=%u / 応答無しで切断=%u\n",
+                (unsigned)g_tcp_keepalive_probe_count,
+                (unsigned)g_tcp_keepalive_reply_count,
+                (unsigned)g_tcp_keepalive_drop_count);
+}
+
+/*=================================================================
+ * シェルの `ackdrop`。次に送る「データを持たないセグメント」を N 個捨てる。
+ *
+ * `txdrop` はデータを持つセグメントしか捨てないので、Keepalive の probe や
+ * その応答を落として**「相手が無反応」を作る**にはこちらが要る。
+ * **戻し忘れると純 ACK が消えて通信が壊れる**(N は使うたびに減る)。
+ *
+ * 引数:
+ *   args - N。省略時は残りと累計を表示
+ * コール元:
+ *   shell_dispatch()
+ * ===============================================================*/
+static void shell_ackdrop(char *args)
+{
+    while (*args == ' ') args++;
+    if (*args >= '0' && *args <= '9') {
+        g_tcp_ack_drop_next = (uint32_t)atoi(args);
+    }
+    uart_printf("ackdrop: 残り %u 個を破棄(累計 %u)\n",
+                (unsigned)g_tcp_ack_drop_next, (unsigned)g_tcp_ack_dropped_count);
+}
+
+/*=================================================================
+ * シェルの `keepalivetest`。TCP Keepalive(段階 26 = C4)の検証。
+ *
+ *   [1] 陰性対照 -- 無通信でも相手が応えるなら切れない(probe は飛ぶ)
+ *   [2] 陽性対照 -- 応答を `ackdrop` で落とすと probes 回で畳まれる
+ *   [3] 相手の probe に ACK を返している(返さないと Linux に切られる)
+ *
+ * **陰性対照が無いと「ただのタイムアウト」と区別がつかない**(D7 と同じ)。
+ * 設定は必ず元へ戻す。
+ *
+ * コール元:
+ *   shell_dispatch()
+ * ===============================================================*/
+static void shell_keepalivetest(void)
+{
+    const uint16_t port = 6008u;
+    static tcp_conn_t s_srv, s_cli;
+
+    netif_t *peer = NULL;
+    netif_t *self = g_active_ctx;
+    uint8_t peer_ll[16];
+    peer = shell_peer_ll6(peer_ll);
+    if (!peer || !self) {
+        uart_printf("keepalivetest: 対向インターフェースが見つかりません(net init mlx5 が必要)\n");
+        return;
+    }
+    uint32_t peer_ip = (net_active_ip() == 0xC0A8650Au) ? 0xC0A8650Bu : 0xC0A8650Au;
+    netaddr_t dst4 = netaddr_v4(peer_ip);
+
+    uint32_t saved_enable = g_tcp_keepalive_enable;
+    uint32_t saved_idle   = g_tcp_keepalive_idle_ms;
+    uint32_t saved_intvl  = g_tcp_keepalive_intvl_ms;
+    uint32_t saved_probes = g_tcp_keepalive_probes;
+
+    /* 検証用に思い切り縮める。**終了時に必ず戻す。** */
+    g_tcp_keepalive_enable   = 1;
+    g_tcp_keepalive_idle_ms  = 300u;
+    g_tcp_keepalive_intvl_ms = 200u;
+    g_tcp_keepalive_probes   = 3u;
+
+    uart_printf("keepalivetest: client=%s server=%s port=%u "
+                "(無通信 %ums で probe、%ums 間隔で %u 回)\n",
+                self->name, peer->name, (unsigned)port,
+                (unsigned)g_tcp_keepalive_idle_ms,
+                (unsigned)g_tcp_keepalive_intvl_ms,
+                (unsigned)g_tcp_keepalive_probes);
+
+    int ok = 1;
+    int listener = tcp_listen(port, peer);
+    if (listener < 0) {
+        uart_printf("keepalivetest: NG -- tcp_listen 失敗\n");
+        goto restore;
+    }
+    s_srv.state = TCP_CLOSED;
+    s_cli.state = TCP_CLOSED;
+    tcp_accept_begin(listener, &s_srv);
+
+    netif_activate(self);
+    tcp_connect_begin_to(&s_cli, &dst4, port);
+    int established = 0;
+    for (uint64_t t0 = timer_now(); !timeout_ms(t0, 3000u); ) {
+        netif_activate(self);
+        int r = tcp_connect_poll(&s_cli);
+        net_poll_all_and_dispatch();
+        netif_activate(peer);
+        tcp_accept_ready_poll(listener);
+        if (r == 1) { established = 1; break; }
+        if (r < 0) break;
+    }
+    netif_activate(self);
+    if (!established) {
+        uart_printf("keepalivetest: NG -- 接続確立できず\n");
+        ok = 0;
+        goto cleanup;
+    }
+
+    /* ---- [1] 陰性対照: 相手が応えるなら切れない ---- */
+    uint32_t probe0 = g_tcp_keepalive_probe_count;
+    uint32_t reply0 = g_tcp_keepalive_reply_count;
+    uint32_t drop0  = g_tcp_keepalive_drop_count;
+    for (uint64_t t0 = timer_now(); !timeout_ms(t0, 2000u); ) {
+        netif_activate(self);
+        tcp_poll();
+        netif_activate(peer);
+        tcp_poll();
+    }
+    netif_activate(self);
+    uint32_t probes1 = g_tcp_keepalive_probe_count - probe0;
+    uint32_t replies1 = g_tcp_keepalive_reply_count - reply0;
+    int alive = (s_cli.state == TCP_ESTABLISHED && s_srv.state == TCP_ESTABLISHED);
+    uart_printf("keepalivetest: %s [1] 陰性対照 -- 2 秒放置して probe %u 個 / 応答 %u 個、"
+                "接続は %s\n",
+                (alive && probes1 > 0 && replies1 > 0) ? "OK" : "NG",
+                (unsigned)probes1, (unsigned)replies1,
+                alive ? "生存" : "切断された");
+    if (!alive || probes1 == 0 || replies1 == 0) ok = 0;
+    if (g_tcp_keepalive_drop_count != drop0) {
+        uart_printf("keepalivetest: NG [1] 応答があるのに切断されました\n");
+        ok = 0;
+    }
+
+    /* ---- [2] 陽性対照: 応答を落とすと畳まれる ---- */
+    uint32_t probe2 = g_tcp_keepalive_probe_count;
+    g_tcp_ack_drop_next = 200u;   /* probe とその応答をまとめて落とす */
+    uint64_t t2 = timer_now();
+    int closed = 0;
+    while (!timeout_ms(t2, 5000u)) {
+        netif_activate(self);
+        tcp_poll();
+        netif_activate(peer);
+        tcp_poll();
+        if (s_cli.state != TCP_ESTABLISHED) { closed = 1; break; }
+    }
+    uint32_t elapsed_ms = (uint32_t)get_ms_from(t2);
+    g_tcp_ack_drop_next = 0;   /* **必ず戻す** */
+    netif_activate(self);
+    uart_printf("keepalivetest: %s [2] 陽性対照 -- 応答を落とすと %ums で畳まれた"
+                "(probe %u 個、期待 <=%ums)\n",
+                closed ? "OK" : "NG", (unsigned)elapsed_ms,
+                (unsigned)(g_tcp_keepalive_probe_count - probe2),
+                (unsigned)(g_tcp_keepalive_idle_ms +
+                           g_tcp_keepalive_intvl_ms * (g_tcp_keepalive_probes + 1u) + 1000u));
+    if (!closed) ok = 0;
+
+    /* ---- [3] 相手の probe に応えていたか ---- */
+    uart_printf("keepalivetest: %s [3] 相手の probe への ACK 応答 %u 回"
+                "(返さないと Linux 側から切られる)\n",
+                (replies1 > 0) ? "OK" : "NG", (unsigned)replies1);
+    if (replies1 == 0) ok = 0;
+
+cleanup:
+    netif_activate(self);  tcp_close(&s_cli);
+    netif_activate(peer);  tcp_close(&s_srv);
+    tcp_unlisten(listener);
+    netif_activate(self);
+
+restore:
+    g_tcp_keepalive_enable   = saved_enable;
+    g_tcp_keepalive_idle_ms  = saved_idle;
+    g_tcp_keepalive_intvl_ms = saved_intvl;
+    g_tcp_keepalive_probes   = saved_probes;
+    g_tcp_ack_drop_next      = 0;
+    uart_printf("keepalivetest: %s(設定は %us/%us/%u 回へ復元しました)\n",
+                ok ? "PASS" : "NG",
+                (unsigned)(g_tcp_keepalive_idle_ms / 1000u),
+                (unsigned)(g_tcp_keepalive_intvl_ms / 1000u),
+                (unsigned)g_tcp_keepalive_probes);
+}
+
+/*=================================================================
  * シェルの `sacktest`。SACK(段階 25 = C3b)の検証。
  *
  * **ロス率を振って曲線として比べる。** 単一の点で比べても意味が無い
@@ -4978,6 +5190,12 @@ static void shell_dispatch(char *line, int s0, int s1)
         shell_sacktest(line + 8);
     } else if (strncmp(line, "tcpsack", 7) == 0) {
         shell_tcpsack(line + 7);
+    } else if (strncmp(line, "keepalivetest", 13) == 0) {
+        shell_keepalivetest();
+    } else if (strncmp(line, "tcpkeepalive", 12) == 0) {
+        shell_tcpkeepalive(line + 12);
+    } else if (strncmp(line, "ackdrop", 7) == 0) {
+        shell_ackdrop(line + 7);
     } else if (strncmp(line, "qploop", 6) == 0) {
         shell_qploop(line + 6);
     } else if (strncmp(line, "nvmediscover", 12) == 0) {
@@ -5061,6 +5279,9 @@ static void shell_dispatch(char *line, int s0, int s1)
                     "  tcptstest                             ロス注入下でRTT推定が更新され続けるか(陰性対照つき)\n"
                     "  tcpsack [on|off]                      SACK(RFC 2018)の有効/無効+統計\n"
                     "  sacktest [N,N..]                      ロス率を振ってSACKとGo-Back-Nの再送数を比べる\n"
+                    "  tcpkeepalive [on|off|<idle秒> <間隔秒> <回数>] TCP Keepalive(既定 7200/75/9)+統計\n"
+                    "  keepalivetest                         Keepaliveのprobeと切断(陰性/陽性対照つき)\n"
+                    "  ackdrop [N]                           次のデータ無しセグメントをN個捨てる\n"
                     "  qploop [N]                            RC QPの作成/破棄をN回繰り返しFWリソース枯渇を見る\n"
                     "  nvmediscover [dump]                   Discovery Log Pageを取得(dumpで16進出力)\n"
                     "  nvmet [port] | jobs | help | quit    (↑↓で履歴呼び出し)\n"

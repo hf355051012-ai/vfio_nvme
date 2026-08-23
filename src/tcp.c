@@ -201,6 +201,28 @@ volatile uint32_t g_tcp_sack_use_tx = 1u;
 /* partial ACK で次の穴を送り直した回数。 */
 volatile uint32_t g_tcp_sack_partial_retx;
 
+/* Keepalive(RFC 1122 4.2.3.6)。**既定値は慣例どおり 2 時間 + 75 秒 x 9 回**。
+ * 短くすると「無通信だが生きている」正常な接続を切ってしまうので、
+ * 検証のとき以外は縮めないこと(`keepalivetest` は必ず元へ戻す)。
+ *
+ * ソケット API のある OS では SO_KEEPALIVE で個別に有効化する慣例だが、
+ * このスタックにはソケットオプションが無いので既定で有効にしてある
+ * (2 時間の無通信を検出するだけなので実害が無い)。 */
+volatile uint32_t g_tcp_keepalive_enable   = 1u;
+volatile uint32_t g_tcp_keepalive_idle_ms  = 7200000u;  /* 2 時間 */
+volatile uint32_t g_tcp_keepalive_intvl_ms = 75000u;    /* probe の間隔 */
+volatile uint32_t g_tcp_keepalive_probes   = 9u;        /* 諦めるまでの probe 数 */
+
+volatile uint32_t g_tcp_keepalive_probe_count;  /* 送った probe の総数 */
+volatile uint32_t g_tcp_keepalive_drop_count;   /* 応答が無くて畳んだ接続数 */
+volatile uint32_t g_tcp_keepalive_reply_count;  /* 相手の probe に ACK を返した数 */
+
+/* 純 ACK のロス注入(シェルの `ackdrop <N>`)。次に送るデータ無しの
+ * セグメントを N 個捨てる。**`txdrop` はデータを持つセグメントしか
+ * 捨てない**ので、Keepalive の probe や応答を落とすにはこちらが要る。 */
+volatile uint32_t g_tcp_ack_drop_next;
+volatile uint32_t g_tcp_ack_dropped_count;
+
 /* **実際に送り直したセグメントの数**。g_tcp_retransmit_count は「再送を
  * 始めた回数」なので、Go-Back-N と SACK の差(穴の後ろまで送り直すか)は
  * こちらでないと見えない。 */
@@ -358,6 +380,18 @@ typedef struct {
     uint8_t           sack_tx_count;
     uint8_t           sack_tx_recent;  /* 直近に触った添字(先頭に置く) */
     struct { uint32_t start, end; } sack_tx[TCP_SACK_TX_MAX];
+
+    /* Keepalive(RFC 1122 4.2.3.6)。**受信のたびに時刻を書かない** --
+     * ホットパスに置くのは「何か届いた」という 1 バイトの旗だけで、
+     * 時刻の読み出しと期限の判定は冷たい経路(tcp_keepalive_check())で行う。
+     *
+     * **D7 の「既にあるカウンタを冷たい経路から観測する」手はここでは使えない。**
+     * probe への応答は**データを運ばない純 ACK**なので、rcv_seq も snd_una も
+     * 進まない -- 既存のどのカウンタにも痕跡が残らない。スナップショット方式で
+     * 作ったところ、**応答が返っているのに接続を切った**(陰性対照で判明)。 */
+    volatile uint8_t  ka_seen;         /* 何か受け取った(冷たい経路が消費する) */
+    uint64_t          ka_idle_since;   /* 無通信になった時刻(0=まだ初期化前) */
+    uint32_t          ka_probes;       /* 応答が無いまま送った probe の数 */
 
     uint32_t          unacked_full_segments;
 
@@ -1453,6 +1487,12 @@ static int tcp_send_segment(tcp_conn_t *conn, tcp_priv_t *priv, uint8_t flags,
         g_tcp_synack_drop_next--;
         return 0;  /* 同じく「送ったことにして捨てる」(synackdrop) */
     }
+    if (data_len == 0u && (flags & (TCP_FLAG_SYN | TCP_FLAG_FIN | TCP_FLAG_RST)) == 0u &&
+        g_tcp_ack_drop_next != 0u) {
+        g_tcp_ack_drop_next--;
+        g_tcp_ack_dropped_count++;
+        return 0;  /* データ無しのセグメントを捨てる(ackdrop) */
+    }
 
     netif_t *conn_ctx = tcp_netif_for((const netaddr_t *)&conn->local_ip);
     if (conn_ctx) {
@@ -2115,6 +2155,68 @@ static void tcp_async_short_poll(tcp_conn_t *conn, tcp_priv_t *priv)
  * コール元:
  *   tcp_poll_once(), tcp_recv_internal(), tcp_accept_ready_poll()
  * ===============================================================*/
+/*=================================================================
+ * Keepalive(RFC 1122 4.2.3.6)。無通信のまま相手が消えた接続を検出する。
+ *
+ * 「相手が生きているか」は **rcv_seq(データが届いた)と snd_una(ACK が
+ * 届いた)が進んだか**で判定する -- 受信のたびに時刻を書くとホットパスに
+ * 時計が乗るため(A2 / D7 と同じ方針)。進まなくなってから idle_ms が
+ * 過ぎたら probe を送り、intvl_ms ごとに繰り返して probes 回で諦める。
+ *
+ * **未確認データがある接続には probe を送らない。** そちらは RTO の担当で、
+ * 重ねて叩いても意味が無い(相手の ACK を重複 ACK と数える経路にも触れる)。
+ *
+ * 引数:
+ *   core - 対象コア(自分のコネクションスロットだけ見る)
+ * コール元:
+ *   tcp_poll_once_ex()
+ * ===============================================================*/
+static void tcp_keepalive_check(unsigned core)
+{
+    uint64_t now = timer_now();
+    for (unsigned i = 0; i < TCP_MAX_CONNS; i++) {
+        tcp_conn_t *cn = s_conns[core][i];
+        if (cn == NULL || cn->state != TCP_ESTABLISHED) continue;
+        tcp_priv_t *priv = &s_priv[core][i];
+
+        /* 相手から何か来ていれば「生きている」。**probe への応答は純 ACK
+         * なので、データや累積 ACK の進みでは検出できない**(旗を使う理由)。 */
+        if (priv->ka_seen || priv->ka_idle_since == 0) {
+            priv->ka_seen       = 0;
+            priv->ka_idle_since = now;
+            priv->ka_probes     = 0;
+            continue;
+        }
+        /* 未確認データがあるなら RTO の担当。 */
+        if (tcp_seq_gt(cn->snd_seq, priv->snd_una)) continue;
+
+        uint32_t wait_ms = (priv->ka_probes == 0) ? g_tcp_keepalive_idle_ms
+                                                  : g_tcp_keepalive_intvl_ms;
+        if (!timeout_ms(priv->ka_idle_since, wait_ms)) continue;
+
+        if (priv->ka_probes >= g_tcp_keepalive_probes) {
+            uart_printf("[TCP] keepalive: 応答が %u 回無いのでコネクションを畳みます "
+                        "(local_port=%u remote_port=%u)\n",
+                        (unsigned)priv->ka_probes, cn->local_port, cn->remote_port);
+            g_tcp_keepalive_drop_count++;
+            cn->state = TCP_CLOSED;
+            s_conns[core][i] = NULL;
+            continue;
+        }
+
+        /* probe は「**1 バイト過去の seq を持つ 0 バイトのセグメント**」。
+         * 相手は既に受け取った範囲なので、必ず ACK を返す(RFC 1122)。 */
+        uint32_t saved = cn->snd_seq;
+        cn->snd_seq = saved - 1u;
+        tcp_send_segment(cn, priv, TCP_FLAG_ACK, NULL, 0);
+        cn->snd_seq = saved;
+
+        priv->ka_probes++;
+        priv->ka_idle_since = now;
+        g_tcp_keepalive_probe_count++;
+    }
+}
+
 static void tcp_poll_once_ex(int check_ctrl_c)
 {
     unsigned core = smp_core_index();
@@ -2134,10 +2236,14 @@ static void tcp_poll_once_ex(int check_ctrl_c)
 
     tcp_timewait_reap();
 
-    /* 待ち行列の掃除は 10 秒単位の話なので、ポーリング 1 回ごとに 32 本の
-     * リスナを走査する必要はない(この関数は受信ポーリングのたびに通る)。 */
-    static unsigned s_backlog_reap_tick;
-    if ((++s_backlog_reap_tick & 0xFFu) == 0u) tcp_backlog_reap();
+    /* 待ち行列の掃除と Keepalive は秒〜時間単位の話なので、ポーリング 1 回
+     * ごとに走査する必要はない(この関数は受信ポーリングのたびに通る)。
+     * 時刻の読み出しもこの中に閉じ込める。 */
+    static unsigned s_cold_tick;
+    if ((++s_cold_tick & 0xFFu) == 0u) {
+        tcp_backlog_reap();
+        if (g_tcp_keepalive_enable) tcp_keepalive_check(core);
+    }
 }
 
 /*=================================================================
@@ -2151,6 +2257,22 @@ static void tcp_poll_once_ex(int check_ctrl_c)
 static void tcp_poll_once(void)
 {
     tcp_poll_once_ex(1);
+}
+
+/*=================================================================
+ * 冷たい経路のポーリングを 1 回だけ回す(受信の取り込み、非同期送信の
+ * 再送、TIME_WAIT の掃除、待ち行列の回収、Keepalive の期限確認)。
+ * UART には触らない。
+ *
+ * `net_poll_all_and_dispatch()` だけでは**時間で動く処理が進まない**ので、
+ * 「何もせず待つ」テストはこちらを回す必要がある。
+ *
+ * コール元:
+ *   shell_keepalivetest()
+ * ===============================================================*/
+void tcp_poll(void)
+{
+    tcp_poll_once_ex(0);
 }
 
 /*=================================================================
@@ -2509,6 +2631,9 @@ static void tcp_priv_init(tcp_priv_t *priv, unsigned core)
     priv->sack_rx_count    = 0;
     priv->sack_tx_count    = 0;
     priv->sack_tx_recent   = 0;
+    priv->ka_seen          = 0;
+    priv->ka_idle_since    = 0;
+    priv->ka_probes        = 0;
     priv->ooo_count        = 0;
     priv->unacked_full_segments = 0;
     priv->unacked_consumed_bytes = 0;
@@ -4159,6 +4284,12 @@ void tcp_input_addr(const uint8_t *pkt, uint16_t len,
         return;
     }
 
+    /* Keepalive の「相手は生きている」印。**ホットパスに置くのはこの 1 バイトの
+     * store だけ**で、時刻の読み出しと期限の判定は冷たい経路が行う
+     * (tcp_keepalive_check())。probe への応答は純 ACK なので、ここで印を
+     * 付けないと**応答が返っていることを知る手段が無い**。 */
+    priv->ka_seen = 1;
+
     int hw_ok = eth_rx_hw_csum_ok();
     if(ts_log_mode()&TS_MODE_HOTPATH) ts_log(TS_MK(TS_FILE_TCP, TS_FUNC_tcp_input, 0), tcp_conn_arg(conn, len));
     if (!hw_ok) {
@@ -4314,6 +4445,18 @@ void tcp_input_addr(const uint8_t *pkt, uint16_t len,
             priv->fin_received = 1;
             if(ts_log_mode()&TS_MODE_HOTPATH) ts_log(TS_MK(TS_FILE_TCP, TS_FUNC_tcp_input, 4), tcp_conn_arg(conn, payload_len));
             uart_printf("[TCP] FIN受信、ACK返送してCLOSE_WAITへ遷移\n");
+        } else if (payload_len == 0 && (flags & TCP_FLAG_SYN) == 0 &&
+                   tcp_seq_lt(seq, conn->rcv_seq)) {
+            /* **相手の Keepalive probe(1 バイト過去の seq で 0 バイト)。**
+             * RFC 1122 4.2.3.6 は ACK を返すことを求める。返さないと、
+             * **相手はこちらが死んだと判断して接続を切る**(Linux は
+             * 既定で Keepalive を使う)。データを運ぶ経路だけで ACK を
+             * 返していたので、ここに来る 0 バイトのセグメントは黙殺していた。
+             *
+             * 「既に受け取った範囲の再送」もここに来るが、ACK を返すのは
+             * RFC 793 的にも正しい(相手にこちらの受信位置を伝える)。 */
+            g_tcp_keepalive_reply_count++;
+            tcp_send_segment(conn, priv, TCP_FLAG_ACK, NULL, 0);
         } else if (payload_len > 0) {
             uint32_t free_space = TCP_RX_BUF_SIZE - priv->rx_count;
             int accepted_inorder = 0;

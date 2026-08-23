@@ -56,9 +56,30 @@ extern volatile uint32_t g_tcp_sack_partial_retx;  /* partial ACK で穴を送�
  * 回数」なので、Go-Back-N と SACK の差はこちらでないと見えない。 */
 extern volatile uint32_t g_tcp_retransmit_segs;
 
+/* Keepalive(RFC 1122 4.2.3.6)。シェルの `tcpkeepalive`。
+ * **既定は慣例どおり 2 時間 + 75 秒 x 9 回。短くすると無通信だが生きている
+ * 接続を切ってしまう**ので、検証のとき以外は縮めないこと。 */
+extern volatile uint32_t g_tcp_keepalive_enable;
+extern volatile uint32_t g_tcp_keepalive_idle_ms;
+extern volatile uint32_t g_tcp_keepalive_intvl_ms;
+extern volatile uint32_t g_tcp_keepalive_probes;
+extern volatile uint32_t g_tcp_keepalive_probe_count;  /* 送った probe 数 */
+extern volatile uint32_t g_tcp_keepalive_drop_count;   /* 応答が無くて畳んだ数 */
+extern volatile uint32_t g_tcp_keepalive_reply_count;  /* 相手の probe に応えた数 */
+
+/* 純 ACK(データを持たないセグメント)のロス注入。Keepalive の probe や
+ * その応答を落として「相手が無反応」を作るのに使う(`txdrop` はデータを
+ * 持つセグメントしか捨てない)。シェルの `ackdrop <N>`。 */
+extern volatile uint32_t g_tcp_ack_drop_next;
+extern volatile uint32_t g_tcp_ack_dropped_count;
+
 uint32_t tcp_rx_buf_size(void);
 
 int  tcp_abort_requested(void);
+
+/* 冷たい経路のポーリングを 1 回(再送・TIME_WAIT・Keepalive の期限確認を
+ * 含む)。net_poll_all_and_dispatch() だけでは時間で動く処理が進まない。 */
+void tcp_poll(void);
 void tcp_clear_abort_request(void);
 
 #define TCP_HDR_LEN 20u
