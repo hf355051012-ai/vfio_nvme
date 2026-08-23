@@ -31,6 +31,31 @@ extern volatile uint32_t g_tcp_ts_rtt_samples;   /* TSecr から RTT を測っ�
 extern volatile uint32_t g_tcp_paws_drop_count;  /* PAWS で捨てたセグメント数 */
 extern volatile uint32_t g_tcp_rtt_update_count; /* RTT 推定を更新した総回数 */
 
+/* SACK(RFC 2018)を提案するか(シェルの `tcpsack on|off`)。0=提案しない
+ * (**段階 2 の Go-Back-N 一式へ戻る**。陰性対照)。 */
+extern volatile uint32_t g_tcp_sack_enable;
+extern volatile uint32_t g_tcp_sack_skipped_count; /* SACK 済みで送り直さずに済んだ数 */
+extern volatile uint32_t g_tcp_sack_sent_count;    /* SACK ブロックを載せた ACK の数 */
+extern volatile uint32_t g_tcp_sack_rx_count;      /* SACK オプションを読み取った回数 */
+extern volatile uint32_t g_tcp_sack_probe_count;   /* 判定を試みた回数(切り分け用) */
+extern volatile uint32_t g_tcp_sack_noinfo_count;  /* scoreboard が空だった回数 */
+extern volatile uint32_t g_tcp_sack_debug;         /* `tcpsack debug` で 8 回ダンプ */
+/* **重複 ACK がどの分岐で終わったかの内訳。** 「高速再送が 1 回も発火しない」
+ * ときに原因を切り分けるのはこれしかない(recover ガードが ISN 次第で
+ * 永久に効きっぱなしになるバグを、この内訳で見つけた)。 */
+extern volatile uint32_t g_tcp_dup_suppressed;     /* Go-Back-N 補正で消費 */
+extern volatile uint32_t g_tcp_dup_in_recovery;    /* 既に回復中(cwnd を膨らませただけ) */
+extern volatile uint32_t g_tcp_dup_recover_guard;  /* recover ガードで却下 */
+extern volatile uint32_t g_tcp_dup_rate_limited;   /* 1 RTT に 1 回の制限 */
+extern volatile uint32_t g_tcp_dup_threshold_hit;  /* 3 個そろって高速再送を要求 */
+extern volatile uint32_t g_tcp_fr_empty;           /* 要求されたのに 0 個しか送らなかった */
+extern volatile uint32_t g_tcp_sack_use_tx;        /* 0=再送だけ Go-Back-N に戻す */
+extern volatile uint32_t g_tcp_sack_partial_retx;  /* partial ACK で穴を送り直した回数 */
+
+/* **実際に送り直したセグメント数。** g_tcp_retransmit_count は「再送を始めた
+ * 回数」なので、Go-Back-N と SACK の差はこちらでないと見えない。 */
+extern volatile uint32_t g_tcp_retransmit_segs;
+
 uint32_t tcp_rx_buf_size(void);
 
 int  tcp_abort_requested(void);
@@ -176,6 +201,9 @@ int tcp_window_scaling_enabled(const tcp_conn_t *conn);
 /* 対象コネクションの Timestamps の状態と RTT 推定を返す(シェルの表示用)。
  * 戻り値 1=Timestamps 合意済み。srtt_us / rto_ms は NULL 可。 */
 int tcp_conn_ts_info(const tcp_conn_t *conn, uint64_t *srtt_us, uint32_t *rto_ms);
+
+/* 対象コネクションで SACK を合意しているか(シェルの表示用)。 */
+int tcp_conn_sack_enabled(const tcp_conn_t *conn);
 
 void tcp_debug_dump_rx(const tcp_conn_t *conn);
 

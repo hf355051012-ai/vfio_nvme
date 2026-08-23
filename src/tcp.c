@@ -59,6 +59,23 @@ void tcp_copy_stats_get(uint64_t *c2_ns, uint64_t *c2_by,
  * セグメントだけがリンク MTU を超えて NIC に無言で捨てられる)。 */
 #define TCP_TS_OPT_LEN      12u
 
+#define TCP_OPT_KIND_SACK_PERM 4u  /* SACK-Permitted (RFC 2018) */
+#define TCP_OPT_KIND_SACK      5u  /* SACK ブロック本体 */
+
+/* SACK-Permitted は kind+len の 2 バイト。4 バイト境界へ揃えるため NOP を
+ * 2 個付けて 4 バイトで送る。 */
+#define TCP_SACK_PERM_OPT_LEN  4u
+
+/* 1 つの ACK に載せる SACK ブロックの最大数。Timestamps(12)と同居すると
+ * 12 + (2 + 2 + 8*n) <= 40 から n <= 3。オプション領域の上限 40 バイトを
+ * 超えるとデータオフセット(4bit、最大 15 ワード = 60 バイト)に入らない。 */
+#define TCP_SACK_MAX_BLOCKS    3u
+
+/* 受信側で保持する「届いている区間」の数。穴の数だけあればよく、実際には
+ * 1〜2 個しか使わない。溢れたら古いものを捨てる(相手が余分に送り直す
+ * だけで、正しさは失われない)。 */
+#define TCP_SACK_TX_MAX        4u
+
 #define TCP_MSS_LOCAL           10182u
 #define TCP_MSS_DEFAULT_RFC879   536u  /* 相手がMSSオプションを付けなかった場合の既定値 */
 
@@ -140,6 +157,54 @@ volatile uint32_t g_tcp_paws_drop_count;
  * 再送したウィンドウの RTT を測れない**ので、ロス注入下でこの数を
  * Timestamps の有無で比べると効果がそのまま見える。 */
 volatile uint32_t g_tcp_rtt_update_count;
+
+/* SACK(RFC 2018)を提案するか(シェルの `tcpsack on|off`)。0 にすると
+ * SYN に SACK-Permitted を付けず、相手が付けてきても使わない。
+ * **無効にすると段階 2 の Go-Back-N 一式へ戻る**(陰性対照)。 */
+volatile uint32_t g_tcp_sack_enable = 1u;
+
+/* SACK 済みと分かって**送り直さずに済んだ**セグメント数。Go-Back-N なら
+ * 送っていたぶんなので、これがそのまま削減量になる。 */
+volatile uint32_t g_tcp_sack_skipped_count;
+
+/* 受信側として SACK ブロックを載せた ACK の数。 */
+volatile uint32_t g_tcp_sack_sent_count;
+
+/* 送信側として SACK オプションを読み取った回数(scoreboard の更新回数)。 */
+volatile uint32_t g_tcp_sack_rx_count;
+
+/* 一時的な切り分け用: SACK 判定を試みた回数と、scoreboard が空だった回数。 */
+volatile uint32_t g_tcp_sack_probe_count;
+volatile uint32_t g_tcp_sack_noinfo_count;
+/* `tcpsack debug` で 8 回だけ scoreboard と送信スロットをダンプする。
+ * **「SACK は届いているのに送信を省略できない」の原因(ブロックより先は
+ * まだ飛行中なのに送り直していた)はこのダンプで分かった。** */
+volatile uint32_t g_tcp_sack_debug;
+
+/* 重複 ACK がどの分岐で終わったかの内訳(`tcpsack` で表示)。
+ * **「高速再送が 1 回も発火しない」ときの切り分けはこれしかない。**
+ * recover ガードが ISN 次第で永久に効きっぱなしになるバグを、
+ * この内訳(重複 ACK 1292 個が全部 recover ガード行き)で見つけた。 */
+volatile uint32_t g_tcp_dup_suppressed;
+volatile uint32_t g_tcp_dup_in_recovery;
+volatile uint32_t g_tcp_dup_recover_guard;
+volatile uint32_t g_tcp_dup_threshold_hit;
+volatile uint32_t g_tcp_dup_rate_limited;
+
+/* 高速再送を要求されたのに 1 セグメントも送らなかった回数(切り分け用)。 */
+volatile uint32_t g_tcp_fr_empty;
+
+/* 切り分け用: SACK の情報を「再送を減らす」ために使うか。0 にすると
+ * 合意もブロック送出もしたまま、再送だけ Go-Back-N に戻る。 */
+volatile uint32_t g_tcp_sack_use_tx = 1u;
+
+/* partial ACK で次の穴を送り直した回数。 */
+volatile uint32_t g_tcp_sack_partial_retx;
+
+/* **実際に送り直したセグメントの数**。g_tcp_retransmit_count は「再送を
+ * 始めた回数」なので、Go-Back-N と SACK の差(穴の後ろまで送り直すか)は
+ * こちらでないと見えない。 */
+volatile uint32_t g_tcp_retransmit_segs;
 
 /*=================================================================
  * Timestamps オプションに入れる自分の時刻を返す。
@@ -275,6 +340,24 @@ typedef struct {
     uint8_t           ts_enabled;
     uint32_t          ts_recent;
     uint32_t          ts_last_ack_sent;
+
+    /* SACK(RFC 2018)。SYN で双方が SACK-Permitted を出したときだけ有効。
+     * sack_rx[] は**相手が「届いた」と言ってきた範囲**(送信側の scoreboard)で、
+     * 高速再送のときにここに入っている範囲を送り直さない。 */
+    uint8_t           sack_enabled;
+    uint8_t           sack_rx_count;
+    struct { uint32_t start, end; } sack_rx[TCP_SACK_MAX_BLOCKS];
+    /* 有効な ooo スロットの数。**純 ACK ごとに 64 スロットを走査しない**ため
+     * だけに持つ(0 なら SACK ブロックの組み立てを丸ごと省ける)。 */
+    unsigned          ooo_count;
+
+    /* 受信側として相手へ知らせる「届いている区間」。**順序不正セグメントを
+     * 置くたびに差分で更新する。** 送るたびに ooo[] 64 スロットから作り直すと
+     * 結合が O(n^3) になり、順序不正が数十個たまる read の経路で実測 2.5 倍
+     * 遅くなった(ACK 1 個ごとに 2 回呼ばれるため)。 */
+    uint8_t           sack_tx_count;
+    uint8_t           sack_tx_recent;  /* 直近に触った添字(先頭に置く) */
+    struct { uint32_t start, end; } sack_tx[TCP_SACK_TX_MAX];
 
     uint32_t          unacked_full_segments;
 
@@ -748,8 +831,10 @@ static void tcp_rtt_update(tcp_priv_t *priv, uint64_t measured_ticks)
  * 始まるようにする(NIC が読む先頭を揃える)。 */
 #define TCP_L4_OFFSET_V6 (ETH_HDR_LEN + IPV6_HDR_LEN)   /* 54 */
 /* オプション領域の最大長。SYN のとき MSS(4) + NOP+WScale(4) +
- * NOP+NOP+Timestamps(12) = 20 バイト。 */
-#define TCP_OPT_MAX_LEN  20u
+ * NOP+NOP+Timestamps(12) + NOP+NOP+SACK-Permitted(4) = 24 バイト。
+ * 確立後の純 ACK は Timestamps(12) + NOP+NOP+SACK 3 ブロック(28) = 40 で、
+ * こちらのほうが大きい(データオフセットの上限ちょうど)。 */
+#define TCP_OPT_MAX_LEN  40u
 #define TCP_SEG_BUF_RAW  (TCP_L4_OFFSET_V6 + TCP_HDR_LEN + TCP_OPT_MAX_LEN + TCP_MSS_LOCAL)
 #define TCP_SEG_BUF_SIZE (((TCP_SEG_BUF_RAW) + 63u) & ~63u)
 
@@ -1004,6 +1089,14 @@ static uint16_t tcp_wire_window(tcp_conn_t *conn, tcp_priv_t *priv, uint8_t flag
     uint32_t safe_window_cap = (ring_capacity_bytes >= TCP_RX_BUF_SIZE)
                                    ? TCP_RX_BUF_SIZE
                                    : (ring_capacity_bytes / 2u);
+    /* **順序不正で保持できる量より大きなウィンドウを広告しない。**
+     * rx_buf(16MB)は「順番どおり届いたデータ」の置き場で、穴が空いている
+     * 間に届く先のデータは ooo[] の 64 スロットにしか置けない。広告値だけ
+     * 大きいと、穴が 1 つできた瞬間に**受信側が自分で捨てる**ことになり、
+     * その損失は相手からは見えない(SACK では再送されず RTO 待ちになる)。
+     * 実測で 4136 個を捨てていた。 */
+    uint32_t ooo_capacity = (uint32_t)TCP_OOO_SLOTS * (uint32_t)conn->snd_mss;
+    if (safe_window_cap > ooo_capacity) safe_window_cap = ooo_capacity;
     uint32_t actual_window = TCP_RX_BUF_SIZE - priv->rx_count;
     if (actual_window > safe_window_cap) actual_window = safe_window_cap;
     if ((flags & TCP_FLAG_SYN) || !priv->wscale_enabled) {
@@ -1011,6 +1104,221 @@ static uint16_t tcp_wire_window(tcp_conn_t *conn, tcp_priv_t *priv, uint8_t flag
     }
     uint32_t scaled = actual_window >> TCP_RCV_WSCALE;
     return (scaled > 0xFFFFu) ? 0xFFFFu : (uint16_t)scaled;
+}
+
+typedef struct { uint32_t start, end; } tcp_sack_range_t;
+
+/*=================================================================
+ * 受信側として相手へ知らせる SACK ブロックを組み立てる。順序不正のまま
+ * 保持しているセグメント(ooo[])を連続する区間へまとめ、RFC 2018 に
+ * 従って**直近に受け取った区間を先頭**に置く。
+ *
+ * 引数:
+ *   priv / conn - 対象コネクションとプライベート状態
+ *   out         - 最大 TCP_SACK_MAX_BLOCKS 個の格納先
+ * 戻り値:
+ *   ブロック数(0 なら SACK オプションを載せない)
+ * コール元:
+ *   tcp_options_len(), tcp_build_options()
+ * ===============================================================*/
+static unsigned tcp_sack_collect(const tcp_priv_t *priv, const tcp_conn_t *conn,
+                                  tcp_sack_range_t out[TCP_SACK_MAX_BLOCKS])
+{
+    unsigned n = 0;
+    if (priv->sack_tx_count == 0u) return 0;
+
+    /* 直近に触った区間を先頭に置く(RFC 2018 4: 相手はこれで最新の状況を
+     * 必ず受け取れる -- 後ろのブロックは ACK が落ちると失われうる)。 */
+    unsigned first = priv->sack_tx_recent;
+    for (unsigned k = 0; k < priv->sack_tx_count && n < TCP_SACK_MAX_BLOCKS; k++) {
+        unsigned i = (k == 0) ? first : ((k <= first) ? (k - 1u) : k);
+        uint32_t s = priv->sack_tx[i].start;
+        uint32_t e = priv->sack_tx[i].end;
+        /* 累積 ACK で既に伝えた範囲は SACK に入れない(RFC 2018 4)。 */
+        if (!tcp_seq_lt(conn->rcv_seq, e)) continue;
+        if (tcp_seq_lt(s, conn->rcv_seq)) s = conn->rcv_seq;
+        out[n].start = s;
+        out[n].end   = e;
+        n++;
+    }
+    return n;
+}
+
+/*=================================================================
+ * 順序不正で受け取った区間を、受信側の「届いている区間」リストへ足す。
+ * 既存の区間と隣接/重複していれば伸ばし、その結果さらに別の区間と
+ * つながったら結合する。**1 セグメントあたり O(区間数)** で済ませるための
+ * 差分更新(送るたびに ooo[] から作り直すと ACK ごとに O(n^3) になる)。
+ *
+ * 引数:
+ *   priv     - コネクションのプライベート状態
+ *   seq, len - 受け取った区間
+ * コール元:
+ *   tcp_input_addr()
+ * ===============================================================*/
+static void tcp_sack_tx_add(tcp_priv_t *priv, uint32_t seq, uint16_t len)
+{
+    uint32_t s = seq, e = seq + len;
+    int idx = -1;
+    for (unsigned i = 0; i < priv->sack_tx_count; i++) {
+        if (!tcp_seq_lt(s, priv->sack_tx[i].start) && !tcp_seq_lt(priv->sack_tx[i].end, e)) {
+            idx = (int)i;  /* 既に含まれている */
+            break;
+        }
+        if (priv->sack_tx[i].end == s)   { priv->sack_tx[i].end = e;   idx = (int)i; break; }
+        if (priv->sack_tx[i].start == e) { priv->sack_tx[i].start = s; idx = (int)i; break; }
+    }
+    if (idx < 0) {
+        if (priv->sack_tx_count < TCP_SACK_TX_MAX) {
+            idx = (int)priv->sack_tx_count++;
+        } else {
+            /* 溢れた。直近のもの以外を 1 つ捨てる(相手が余分に送り直すだけ)。 */
+            idx = (int)((priv->sack_tx_recent + 1u) % TCP_SACK_TX_MAX);
+        }
+        priv->sack_tx[idx].start = s;
+        priv->sack_tx[idx].end   = e;
+    }
+    /* 伸びた結果ほかの区間とつながったら結合する。 */
+    for (unsigned j = 0; j < priv->sack_tx_count; ) {
+        if ((int)j == idx) { j++; continue; }
+        if (tcp_seq_lt(priv->sack_tx[idx].end, priv->sack_tx[j].start) ||
+            tcp_seq_lt(priv->sack_tx[j].end, priv->sack_tx[idx].start)) {
+            j++;
+            continue;
+        }
+        if (tcp_seq_lt(priv->sack_tx[j].start, priv->sack_tx[idx].start)) {
+            priv->sack_tx[idx].start = priv->sack_tx[j].start;
+        }
+        if (tcp_seq_lt(priv->sack_tx[idx].end, priv->sack_tx[j].end)) {
+            priv->sack_tx[idx].end = priv->sack_tx[j].end;
+        }
+        priv->sack_tx_count--;
+        priv->sack_tx[j] = priv->sack_tx[priv->sack_tx_count];
+        if (idx == (int)priv->sack_tx_count) idx = (int)j;  /* 末尾を動かした */
+        /* j はそのまま(入れ替えた要素を見る) */
+    }
+    priv->sack_tx_recent = (uint8_t)idx;
+}
+
+/*=================================================================
+ * 累積 ACK が進んだぶんを「届いている区間」リストから落とす。
+ *
+ * 引数:
+ *   priv    - コネクションのプライベート状態
+ *   rcv_seq - 新しい累積 ACK 位置
+ * コール元:
+ *   tcp_input_addr()
+ * ===============================================================*/
+static void tcp_sack_tx_trim(tcp_priv_t *priv, uint32_t rcv_seq)
+{
+    for (unsigned i = 0; i < priv->sack_tx_count; ) {
+        if (!tcp_seq_lt(rcv_seq, priv->sack_tx[i].end)) {
+            priv->sack_tx_count--;
+            priv->sack_tx[i] = priv->sack_tx[priv->sack_tx_count];
+            if (priv->sack_tx_recent >= priv->sack_tx_count) priv->sack_tx_recent = 0;
+            continue;  /* 入れ替えた要素をもう一度見る */
+        }
+        if (tcp_seq_lt(priv->sack_tx[i].start, rcv_seq)) priv->sack_tx[i].start = rcv_seq;
+        i++;
+    }
+}
+
+static inline unsigned tcp_sack_block_count(const tcp_priv_t *priv, const tcp_conn_t *conn)
+{
+    tcp_sack_range_t tmp[TCP_SACK_MAX_BLOCKS];
+    return tcp_sack_collect(priv, conn, tmp);
+}
+
+/*=================================================================
+ * [seq, seq+len) が「相手に届いている」と SACK で分かっているかを返す。
+ * 高速再送のときに、届いている範囲を送り直さないために使う。
+ *
+ * **範囲が丸ごと 1 つのブロックに収まっているときだけ真**にする。
+ * 部分的に届いている範囲は送り直す(分割して送る仕組みを増やすより、
+ * 1 セグメント余分に送るほうが安い)。
+ *
+ * 引数:
+ *   priv     - コネクションのプライベート状態
+ *   seq, len - 対象の範囲
+ * 戻り値:
+ *   1=送り直さなくてよい、0=送り直す
+ * コール元:
+ *   tcp_send(), tcp_async_poll(), tcp_async_short_poll()
+ * ===============================================================*/
+/*=================================================================
+ * SACK で「ここまでは相手に届いている」と分かっている一番先の seq を返す。
+ *
+ * **高速再送でどこまで送り直すかの上限になる。** この先はまだ飛行中で、
+ * 失われたかどうか分かっていない -- Go-Back-N はそこまで全部送り直すが、
+ * SACK があるならその必要は無い(RFC 6675 の考え方)。実測では、穴が
+ * 見つかった時点で未確認ウィンドウが 480KB あり、そのうち実際に失われて
+ * いたのは 32KB だけだった。
+ *
+ * 引数:
+ *   priv - コネクションのプライベート状態
+ * 戻り値:
+ *   最も先の SACK ブロックの右端。使える情報が無ければ 0
+ * コール元:
+ *   tcp_send(), tcp_async_poll(), tcp_async_short_poll()
+ * ===============================================================*/
+static inline uint32_t tcp_sack_high(const tcp_priv_t *priv)
+{
+    if (!priv->sack_enabled || priv->sack_rx_count == 0u || !g_tcp_sack_use_tx) return 0;
+    uint32_t high = 0;
+    int found = 0;
+    for (unsigned i = 0; i < priv->sack_rx_count; i++) {
+        uint32_t be = priv->sack_rx[i].end;
+        /* 累積 ACK より前のブロックは古い情報(相手はもう先へ進んでいる)。 */
+        if (!tcp_seq_lt(priv->snd_una, be)) continue;
+        if (!found || tcp_seq_lt(high, be)) { high = be; found = 1; }
+    }
+    return found ? high : 0u;
+}
+
+/*=================================================================
+ * SACK で「もう相手に届いている」と分かっているバイト数を返す。
+ *
+ * **輻輳ウィンドウと比べる「飛行中の量」から差し引くために要る**
+ * (RFC 6675 の pipe)。差し引かないと、回復中は未確認バイト数が
+ * cwnd を超えたままになり、**穴が埋まるまで新しいデータを 1 バイトも
+ * 送れなくなる**。Go-Back-N のときは大量の重複 ACK が cwnd を膨らませて
+ * いたので表面化しなかった。
+ *
+ * 引数:
+ *   priv - コネクションのプライベート状態
+ * 戻り値:
+ *   SACK 済みのバイト数(累積 ACK より先のぶんだけ)
+ * コール元:
+ *   tcp_send(), tcp_send_async_ex()
+ * ===============================================================*/
+static inline uint32_t tcp_sacked_bytes(const tcp_priv_t *priv)
+{
+    if (!priv->sack_enabled || priv->sack_rx_count == 0u) return 0;
+    uint32_t total = 0;
+    for (unsigned i = 0; i < priv->sack_rx_count; i++) {
+        uint32_t s = priv->sack_rx[i].start;
+        uint32_t e = priv->sack_rx[i].end;
+        if (!tcp_seq_lt(priv->snd_una, e)) continue;   /* 累積 ACK 済み */
+        if (tcp_seq_lt(s, priv->snd_una)) s = priv->snd_una;
+        total += e - s;
+    }
+    return total;
+}
+
+static inline int tcp_sack_covered(const tcp_priv_t *priv, uint32_t seq, uint32_t len)
+{
+    if (!priv->sack_enabled || len == 0u || !g_tcp_sack_use_tx) return 0;
+    if (priv->sack_rx_count == 0u) { g_tcp_sack_noinfo_count++; return 0; }
+    g_tcp_sack_probe_count++;
+    uint32_t end = seq + len;
+    for (unsigned i = 0; i < priv->sack_rx_count; i++) {
+        uint32_t bs = priv->sack_rx[i].start;
+        uint32_t be = priv->sack_rx[i].end;
+        /* 累積 ACK より前のブロックは古い情報なので使わない。 */
+        if (tcp_seq_lt(be, priv->snd_una)) continue;
+        if (!tcp_seq_lt(seq, bs) && !tcp_seq_lt(be, end)) return 1;
+    }
+    return 0;
 }
 
 /*=================================================================
@@ -1028,7 +1336,7 @@ static uint16_t tcp_wire_window(tcp_conn_t *conn, tcp_priv_t *priv, uint8_t flag
  *   tcp_send_segment(), tcp_send_segment_lso()
  * ===============================================================*/
 static inline uint8_t tcp_options_len(const tcp_conn_t *conn, const tcp_priv_t *priv,
-                                       uint8_t flags)
+                                       uint8_t flags, uint16_t data_len)
 {
     (void)conn;
     uint8_t len = 0;
@@ -1039,8 +1347,20 @@ static inline uint8_t tcp_options_len(const tcp_conn_t *conn, const tcp_priv_t *
         if ((flags & TCP_FLAG_ACK) ? priv->ts_enabled : (g_tcp_ts_enable != 0u)) {
             len = (uint8_t)(len + TCP_TS_OPT_LEN);
         }
-    } else if (priv->ts_enabled) {
-        len = TCP_TS_OPT_LEN;
+        if ((flags & TCP_FLAG_ACK) ? priv->sack_enabled : (g_tcp_sack_enable != 0u)) {
+            len = (uint8_t)(len + TCP_SACK_PERM_OPT_LEN);
+        }
+        return len;
+    }
+    if (priv->ts_enabled) len = TCP_TS_OPT_LEN;
+    /* **SACK ブロックはデータを運ばないセグメントにだけ載せる。**
+     * conn->snd_mss は SYN のときに決めた固定値なので、データを積んだ
+     * セグメントでオプションを増やすとリンク MTU を超えてしまう
+     * (Linux は毎回 MSS を計算し直すが、この実装はそうしていない)。
+     * ロスがあるときの受信側は純 ACK を出しているので実用上これで足りる。 */
+    if (priv->sack_enabled && data_len == 0u && (flags & TCP_FLAG_ACK)) {
+        unsigned n = tcp_sack_block_count(priv, conn);
+        if (n > 0) len = (uint8_t)(len + 4u + 8u * n);
     }
     return len;
 }
@@ -1058,10 +1378,11 @@ static inline uint8_t tcp_options_len(const tcp_conn_t *conn, const tcp_priv_t *
  *   tcp_send_segment(), tcp_send_segment_lso()
  * ===============================================================*/
 static void tcp_build_options(tcp_conn_t *conn, tcp_priv_t *priv, uint8_t flags,
-                               volatile uint8_t *tcph, uint8_t opt_len)
+                               volatile uint8_t *tcph, uint8_t opt_len, uint16_t data_len)
 {
     if (opt_len == 0) return;
-    unsigned o = TCP_HDR_LEN;
+    unsigned o   = TCP_HDR_LEN;
+    unsigned end = (unsigned)(TCP_HDR_LEN + opt_len);
     if (flags & TCP_FLAG_SYN) {
         tcph[o + 0] = TCP_OPT_KIND_MSS;
         tcph[o + 1] = 4;
@@ -1075,7 +1396,9 @@ static void tcp_build_options(tcp_conn_t *conn, tcp_priv_t *priv, uint8_t flags,
             o += 4u;
         }
     }
-    if (o < (unsigned)(TCP_HDR_LEN + opt_len)) {
+    if ((flags & TCP_FLAG_SYN) ?
+        ((flags & TCP_FLAG_ACK) ? priv->ts_enabled : (g_tcp_ts_enable != 0u)) :
+        priv->ts_enabled) {
         /* Timestamps。NOP 2 個で 4 バイト境界へ揃える(慣例)。 */
         tcph[o + 0] = TCP_OPT_KIND_NOP;
         tcph[o + 1] = TCP_OPT_KIND_NOP;
@@ -1085,6 +1408,35 @@ static void tcp_build_options(tcp_conn_t *conn, tcp_priv_t *priv, uint8_t flags,
         /* TSecr は「相手から最後に受け取った TSval」。まだ何も受け取って
          * いない能動 open の SYN では 0 を入れる(RFC 7323 3.2)。 */
         wr32be(tcph + o + 8, priv->ts_recent);
+        o += TCP_TS_OPT_LEN;
+    }
+    if (flags & TCP_FLAG_SYN) {
+        if (o < end) {
+            /* SACK-Permitted。こちらも NOP 2 個で 4 バイトに揃える。 */
+            tcph[o + 0] = TCP_OPT_KIND_NOP;
+            tcph[o + 1] = TCP_OPT_KIND_NOP;
+            tcph[o + 2] = TCP_OPT_KIND_SACK_PERM;
+            tcph[o + 3] = 2;
+            o += 4u;
+        }
+        return;
+    }
+    if (o < end && priv->sack_enabled && data_len == 0u && (flags & TCP_FLAG_ACK)) {
+        tcp_sack_range_t blk[TCP_SACK_MAX_BLOCKS];
+        unsigned n = tcp_sack_collect(priv, conn, blk);
+        if (n > 0) {
+            tcph[o + 0] = TCP_OPT_KIND_NOP;
+            tcph[o + 1] = TCP_OPT_KIND_NOP;
+            tcph[o + 2] = TCP_OPT_KIND_SACK;
+            tcph[o + 3] = (uint8_t)(2u + 8u * n);
+            o += 4u;
+            for (unsigned i = 0; i < n; i++) {
+                wr32be(tcph + o,     blk[i].start);
+                wr32be(tcph + o + 4, blk[i].end);
+                o += 8u;
+            }
+            g_tcp_sack_sent_count++;
+        }
     }
 }
 
@@ -1113,7 +1465,7 @@ static int tcp_send_segment(tcp_conn_t *conn, tcp_priv_t *priv, uint8_t flags,
         return -1;
     }
 
-    uint8_t opt_len = tcp_options_len(conn, priv, flags);
+    uint8_t opt_len = tcp_options_len(conn, priv, flags, data_len);
     uint16_t hdr_total = (uint16_t)(TCP_HDR_LEN + opt_len);  /* TCPヘッダ+オプション(データ抜き) */
     uint16_t seg_len = (uint16_t)(hdr_total + data_len);      /* IPペイロード全体(ヘッダ+データ) */
 
@@ -1144,7 +1496,7 @@ static int tcp_send_segment(tcp_conn_t *conn, tcp_priv_t *priv, uint8_t flags,
     if (flags & TCP_FLAG_ACK) priv->ts_last_ack_sent = conn->rcv_seq;
     wr16be(tcph + TCP_OFF_CHECKSUM, 0);  /* チェックサム計算前に0クリア */
     wr16be(tcph + TCP_OFF_URGENT, 0);
-    tcp_build_options(conn, priv, flags, tcph, opt_len);
+    tcp_build_options(conn, priv, flags, tcph, opt_len, data_len);
 
     /* HW チェックサムオフロードは v4/v6 共通で使える。種として書き込む疑似
      * ヘッダ部分和は tcp_checksum() が family ごとに正しい形で計算するし、
@@ -1263,7 +1615,7 @@ static int tcp_send_segment_lso(tcp_conn_t *conn, tcp_priv_t *priv,
     /* LSO でも Timestamps は要る(RFC 7323 は RST 以外の全セグメントに求める)。
      * NIC はヘッダをそのまま各セグメントへ複製するので、オプションも一緒に
      * 複製される(TSval が同じ値で並ぶのは正常)。 */
-    uint8_t  opt_len = tcp_options_len(conn, priv, TCP_FLAG_PSH | TCP_FLAG_ACK);
+    uint8_t  opt_len = tcp_options_len(conn, priv, TCP_FLAG_PSH | TCP_FLAG_ACK, 1u);
     uint16_t hdr_total = (uint16_t)(TCP_HDR_LEN + opt_len);
 
     unsigned l4_off = tcp_l4_off((const netaddr_t *)&conn->remote_ip);
@@ -1302,6 +1654,9 @@ static int tcp_send_segment_lso(tcp_conn_t *conn, tcp_priv_t *priv,
 
     uint32_t ring_capacity_bytes = (uint32_t)ETH_RX_RING_SIZE * (uint32_t)conn->snd_mss;
     uint32_t safe_window_cap = ring_capacity_bytes / 2u;
+    /* tcp_wire_window() と同じ理由で ooo[] の容量で頭打ちにする。 */
+    uint32_t ooo_capacity = (uint32_t)TCP_OOO_SLOTS * (uint32_t)conn->snd_mss;
+    if (safe_window_cap > ooo_capacity) safe_window_cap = ooo_capacity;
     uint32_t actual_window = TCP_RX_BUF_SIZE - priv->rx_count;
     if (actual_window > safe_window_cap) actual_window = safe_window_cap;
     uint16_t wire_window;
@@ -1314,7 +1669,7 @@ static int tcp_send_segment_lso(tcp_conn_t *conn, tcp_priv_t *priv,
     wr16be(tcph + TCP_OFF_WINDOW, wire_window);
     wr16be(tcph + TCP_OFF_URGENT, 0);
     wr16be(tcph + TCP_OFF_CHECKSUM, 0);  /* チェックサム計算前に0クリア */
-    tcp_build_options(conn, priv, TCP_FLAG_PSH | TCP_FLAG_ACK, tcph, opt_len);
+    tcp_build_options(conn, priv, TCP_FLAG_PSH | TCP_FLAG_ACK, tcph, opt_len, 1u);
 
     /* LSO は NIC が IPv4 ヘッダの total_length/ID を書き換える前提の機能で、
      * 現在の実装は IPv4 でしか使わない(v6 の呼び出し元は tcp_can_use_lso()
@@ -1558,9 +1913,44 @@ static void tcp_async_poll(tcp_conn_t *conn, tcp_priv_t *priv)
             if(ts_log_mode()&0x1) ts_log(TS_MK(TS_FILE_TCP, TS_FUNC_tcp_async_poll, 3), tcp_conn_arg(conn, priv->async_count));
             uint32_t fr_saved_snd_seq = conn->snd_seq;
             uint64_t fr_now = timer_now();
+            if (g_tcp_sack_debug && priv->sack_enabled) {
+                uart_printf("[SACKDBG] async una=%u count=%u mss=%u blocks=%u",
+                            priv->snd_una, priv->async_count, conn->snd_mss,
+                            (unsigned)priv->sack_rx_count);
+                for (unsigned bi = 0; bi < priv->sack_rx_count; bi++) {
+                    uart_printf(" [%u,%u)", priv->sack_rx[bi].start, priv->sack_rx[bi].end);
+                }
+                for (unsigned k = 0; k < priv->async_count && k < 4u; k++) {
+                    tcp_async_slot_t *ds = tcp_async_slot_at(priv, conn->owner_core,
+                                                             (priv->async_head + k) % priv->async_cap);
+                    uart_printf(" slot%u=(%u,+%u)", k, ds->seq, (unsigned)ds->len);
+                }
+                uart_printf("\n");
+                g_tcp_sack_debug--;
+            }
+            uint32_t fr_sack_high = tcp_sack_high(priv);
+            unsigned fr_sent = 0;
             for (unsigned k = 0; k < priv->async_count; k++) {
                 tcp_async_slot_t *rs = tcp_async_slot_at(priv, conn->owner_core,
                                                           (priv->async_head + k) % priv->async_cap);
+                /* **SACK ブロックより先はまだ飛行中**なので送り直さない。
+                 * Go-Back-N はここで未確認ウィンドウ全部を送り直していた。 */
+                if (fr_sack_high != 0u && !tcp_seq_lt(rs->seq, fr_sack_high)) {
+                    g_tcp_sack_skipped_count++;
+                    break;
+                }
+                /* 相手に届いていると分かっている範囲も送り直さない。
+                 * **ただし RTO タイマは押し直す。** 送らないままにすると
+                 * 古い sent_at が残り、「相手が確かに持っているスロット」で
+                 * RTO が発火する。RTO は scoreboard を捨てて Go-Back-N へ
+                 * 戻すので、そこから連鎖して回復が 200ms 単位で遅れる
+                 * (Go-Back-N のときは毎回全スロットを送り直していたので
+                 * タイマも一緒に押し直されており、表面化しなかった)。 */
+                if (tcp_sack_covered(priv, rs->seq, rs->len)) {
+                    g_tcp_sack_skipped_count++;
+                    rs->sent_at = fr_now;
+                    continue;
+                }
                 conn->snd_seq = rs->seq;
                 const uint8_t *fr_src = rs->ref ? rs->ref : rs->buf;
                 if (rs->len > conn->snd_mss) {
@@ -1570,10 +1960,18 @@ static void tcp_async_poll(tcp_conn_t *conn, tcp_priv_t *priv)
                                           fr_src, rs->len) != 0) break;
                 }
                 /* LSO スロットは HW が複数セグメントに分割するので、線上の
-                 * セグメント数で数える(相手はその数だけ ACK を返す)。 */
-                priv->dup_ack_suppress += ((uint32_t)rs->len + conn->snd_mss - 1u) / conn->snd_mss;
+                 * セグメント数で数える(相手はその数だけ ACK を返す)。
+                 * **SACK があるときは補正そのものが要らない**(穴だけを
+                 * 送り直すので、相手は重複 ACK ではなく新しい ACK を返す)。 */
+                if (!priv->sack_enabled) {
+                    priv->dup_ack_suppress +=
+                        ((uint32_t)rs->len + conn->snd_mss - 1u) / conn->snd_mss;
+                }
+                g_tcp_retransmit_segs += ((uint32_t)rs->len + conn->snd_mss - 1u) / conn->snd_mss;
+                fr_sent++;
                 rs->sent_at = fr_now;
             }
+            if (fr_sent == 0u) g_tcp_fr_empty++;
             conn->snd_seq = fr_saved_snd_seq;
             return;
         }
@@ -1604,7 +2002,14 @@ static void tcp_async_poll(tcp_conn_t *conn, tcp_priv_t *priv)
         } else {
             tcp_send_segment(conn, priv, TCP_FLAG_PSH | TCP_FLAG_ACK, rsrc, s->len);
         }
-        priv->dup_ack_suppress += ((uint32_t)s->len + conn->snd_mss - 1u) / conn->snd_mss;
+        /* SACK があるときは補正しない -- 相手は SACK ブロックで「どこが
+         * 抜けているか」を伝えてくるので、こちらの再送が生む重複 ACK を
+         * 差し引く必要が無い。**差し引くと重複 ACK を全部食い潰して高速再送が
+         * 一度も発火しなくなる**(実測で 1628 個の重複 ACK に対し発火 0)。 */
+        if (!priv->sack_enabled) {
+            priv->dup_ack_suppress += ((uint32_t)s->len + conn->snd_mss - 1u) / conn->snd_mss;
+        }
+        g_tcp_retransmit_segs += ((uint32_t)s->len + conn->snd_mss - 1u) / conn->snd_mss;
         conn->snd_seq = saved_snd_seq;
 
         s->sent_at = timer_now();
@@ -1643,13 +2048,25 @@ static void tcp_async_short_poll(tcp_conn_t *conn, tcp_priv_t *priv)
             if(ts_log_mode()&0x1) ts_log(TS_MK(TS_FILE_TCP, TS_FUNC_tcp_async_short_poll, 2), tcp_conn_arg(conn, priv->async_short_count));
             uint32_t fr_saved_snd_seq = conn->snd_seq;
             uint64_t fr_now = timer_now();
+            uint32_t fr_sack_high = tcp_sack_high(priv);
             for (unsigned k = 0; k < priv->async_short_count; k++) {
                 tcp_async_short_slot_t *rs =
                     &priv->async_short_slots[(priv->async_short_head + k) % TCP_ASYNC_SHORT_SLOTS];
+                if (fr_sack_high != 0u && !tcp_seq_lt(rs->seq, fr_sack_high)) {
+                    g_tcp_sack_skipped_count++;
+                    break;
+                }
+                if (tcp_sack_covered(priv, rs->seq, rs->len)) {
+                    g_tcp_sack_skipped_count++;
+                    rs->sent_at = fr_now;  /* 上と同じ理由(RTO の空振りを防ぐ) */
+                    continue;
+                }
                 conn->snd_seq = rs->seq;
                 if (tcp_send_segment(conn, priv, TCP_FLAG_PSH | TCP_FLAG_ACK,
                                       rs->buf, rs->len) != 0) break;
-                priv->dup_ack_suppress++;  /* short スロットは常に 1 セグメント */
+                /* short スロットは常に 1 セグメント。SACK があるときは補正不要。 */
+                if (!priv->sack_enabled) priv->dup_ack_suppress++;
+                g_tcp_retransmit_segs++;
                 rs->sent_at = fr_now;
             }
             conn->snd_seq = fr_saved_snd_seq;
@@ -1677,7 +2094,8 @@ static void tcp_async_short_poll(tcp_conn_t *conn, tcp_priv_t *priv)
         uint32_t saved_snd_seq = conn->snd_seq;
         conn->snd_seq = s->seq;
         tcp_send_segment(conn, priv, TCP_FLAG_PSH | TCP_FLAG_ACK, s->buf, s->len);
-        priv->dup_ack_suppress++;
+        if (!priv->sack_enabled) priv->dup_ack_suppress++;
+        g_tcp_retransmit_segs++;
         conn->snd_seq = saved_snd_seq;
 
         s->sent_at = timer_now();
@@ -1837,6 +2255,10 @@ static void tcp_parse_syn_options(tcp_conn_t *conn, tcp_priv_t *priv,
             priv->wscale_enabled = 1;
             priv->snd_wscale = peer_shift;
             uart_printf("[TCP] 相手のWindow Scaleオプション受信: shift=%u\n", peer_shift);
+        } else if (kind == TCP_OPT_KIND_SACK_PERM && opt_len == 2 && g_tcp_sack_enable) {
+            /* 相手が出してきたときだけ有効になる(SYN|ACK を組むのはこの後)。 */
+            priv->sack_enabled = 1;
+            uart_printf("[TCP] 相手のSACK-Permittedオプション受信\n");
         } else if (kind == TCP_OPT_KIND_TS && opt_len == 10 && g_tcp_ts_enable) {
             /* 相手が出してきたときだけ有効になる(SYN|ACK を組むのはこの後
              * なので、受動 open でもここで決まった値がそのまま使われる)。 */
@@ -1873,9 +2295,9 @@ static void tcp_parse_syn_options(tcp_conn_t *conn, tcp_priv_t *priv,
  * コール元:
  *   tcp_input_addr()
  * ===============================================================*/
-static int tcp_input_timestamps(tcp_conn_t *conn, tcp_priv_t *priv,
-                                 const volatile uint8_t *in, uint8_t hdr_len,
-                                 uint32_t seq, uint32_t *out_tsecr)
+static int tcp_input_options(tcp_conn_t *conn, tcp_priv_t *priv,
+                              const volatile uint8_t *in, uint8_t hdr_len,
+                              uint32_t seq, uint32_t *out_tsecr)
 {
     if (hdr_len <= TCP_HDR_LEN) return 1;  /* 相手が付けてこなかった */
 
@@ -1883,10 +2305,11 @@ static int tcp_input_timestamps(tcp_conn_t *conn, tcp_priv_t *priv,
     uint8_t olen = (uint8_t)(hdr_len - TCP_HDR_LEN);
     uint32_t tsval, tsecr;
 
-    if (olen >= TCP_TS_OPT_LEN &&
+    if (priv->ts_enabled && olen == TCP_TS_OPT_LEN &&
         o[0] == TCP_OPT_KIND_NOP && o[1] == TCP_OPT_KIND_NOP &&
         o[2] == TCP_OPT_KIND_TS  && o[3] == 10) {
-        /* 定番の並び(NOP NOP TS)。確立後はこれしか来ないので、走査せずに読む。 */
+        /* 定番の並び(NOP NOP TS)だけ。ロスが無ければ確立後はこれしか
+         * 来ないので、走査せずに読む(SACK ブロックが付くのは穴があるときだけ)。 */
         tsval = rd32be(o + 4);
         tsecr = rd32be(o + 8);
     } else {
@@ -1900,15 +2323,28 @@ static int tcp_input_timestamps(tcp_conn_t *conn, tcp_priv_t *priv,
             if ((uint8_t)(i + 1) >= olen) break;
             uint8_t l = o[i + 1];
             if (l < 2 || (uint8_t)(i + l) > olen) break;
-            if (kind == TCP_OPT_KIND_TS && l == 10) {
+            if (kind == TCP_OPT_KIND_TS && l == 10 && priv->ts_enabled) {
                 tsval = rd32be(o + i + 2);
                 tsecr = rd32be(o + i + 6);
                 found = 1;
-                break;
+            } else if (kind == TCP_OPT_KIND_SACK && priv->sack_enabled &&
+                       l >= 10 && ((l - 2u) % 8u) == 0u) {
+                /* 相手が「届いた」と言ってきた範囲。高速再送のときに
+                 * ここに入っている範囲は送り直さない。 */
+                unsigned n = (unsigned)(l - 2u) / 8u;
+                if (n > TCP_SACK_MAX_BLOCKS) n = TCP_SACK_MAX_BLOCKS;
+                priv->sack_rx_count = (uint8_t)n;
+                g_tcp_sack_rx_count++;
+                for (unsigned b = 0; b < n; b++) {
+                    priv->sack_rx[b].start = rd32be(o + i + 2 + 8u * b);
+                    priv->sack_rx[b].end   = rd32be(o + i + 6 + 8u * b);
+                }
             }
             i = (uint8_t)(i + l);
         }
-        if (!found) return 1;  /* 合意したのに付いていない。捨てずに受け入れる */
+        /* Timestamps が無効(SACK だけ合意)か、合意したのに付いていない
+         * ときはここで終わり。PAWS は Timestamps があってこそ。 */
+        if (!found) return 1;
     }
 
     /* R1: TSval が TS.Recent より古ければ「一周した古いセグメント」。
@@ -2069,6 +2505,11 @@ static void tcp_priv_init(tcp_priv_t *priv, unsigned core)
     priv->ts_enabled       = 0;
     priv->ts_recent        = 0;
     priv->ts_last_ack_sent = 0;
+    priv->sack_enabled     = 0;
+    priv->sack_rx_count    = 0;
+    priv->sack_tx_count    = 0;
+    priv->sack_tx_recent   = 0;
+    priv->ooo_count        = 0;
     priv->unacked_full_segments = 0;
     priv->unacked_consumed_bytes = 0;
     priv->last_ack_sent = 0;
@@ -2102,6 +2543,14 @@ static void tcp_cwnd_init(tcp_conn_t *conn, tcp_priv_t *priv)
     uint32_t floor_val = (two_mss > 4380u) ? two_mss : 4380u;
     priv->cwnd = (four_mss < floor_val) ? four_mss : floor_val;
     priv->ssthresh = 0xFFFFFFFFu;  /* 初回はロスがあるまで実質無制限(スロースタート主導) */
+    /* **recover は「まだ何も回復していない」= 今のシーケンス番号で初期化する。**
+     * 0 のままにすると、ISN が 2^31 以上のときに
+     * `tcp_seq_lt(snd_una, recover)` が真になり(符号付き差分で判定するため)、
+     * recover ガードが**そのコネクションの高速再送を永久に止める**。
+     * ISN は timer_now() の下位 32bit なので**約半分のコネクションが該当する**。
+     * 実測では 1292 個の重複 ACK が全部このガードで捨てられ、再送が
+     * すべて RTO 由来になっていた。 */
+    priv->recover = conn->snd_seq;
 }
 
 /*=================================================================
@@ -2388,10 +2837,12 @@ static void tcp_on_dup_ack(tcp_conn_t *conn, tcp_priv_t *priv)
     if (priv->dup_ack_suppress > 0u) {
         priv->dup_ack_suppress--;
         priv->dup_ack_count = 0;
+        g_tcp_dup_suppressed++;
         return;
     }
 
     if (priv->in_fast_recovery) {
+        g_tcp_dup_in_recovery++;
         /* 追加の dup ACK = 1 セグメントがネットワークから抜けた証拠なので、
          * その分だけ送信を許す(RFC 5681 のウィンドウ膨張)。 */
         priv->cwnd += mss;
@@ -2409,6 +2860,7 @@ static void tcp_on_dup_ack(tcp_conn_t *conn, tcp_priv_t *priv)
      * 来ても新しい回復を始めない。 */
     if (tcp_seq_lt(priv->snd_una, priv->recover)) {
         priv->dup_ack_count = 0;
+        g_tcp_dup_recover_guard++;
         return;
     }
 
@@ -2416,6 +2868,7 @@ static void tcp_on_dup_ack(tcp_conn_t *conn, tcp_priv_t *priv)
     if (priv->dup_ack_count != TCP_DUP_ACK_THRESHOLD) {
         return;  /* 1〜2 個目は順序入れ替えかもしれないので何もしない */
     }
+    g_tcp_dup_threshold_hit++;
 
     /* 高速再送は 1 RTT に 1 回まで。dup_ack_suppress で自分が生む重複 ACK を
      * 差し引いてもなお、見積もりの誤差(受信側は full-size セグメントを
@@ -2426,6 +2879,7 @@ static void tcp_on_dup_ack(tcp_conn_t *conn, tcp_priv_t *priv)
     uint64_t min_gap_us = priv->srtt_us ? priv->srtt_us : 200u;
     if (priv->fr_last_at != 0 && get_us_from(priv->fr_last_at) < min_gap_us) {
         priv->dup_ack_count = 0;
+        g_tcp_dup_rate_limited++;
         return;
     }
     priv->fr_last_at = timer_now();
@@ -2464,7 +2918,23 @@ static void tcp_on_new_ack(tcp_priv_t *priv, uint32_t ack)
 {
     priv->dup_ack_count = 0;
     if (!priv->in_fast_recovery) return;
-    if (tcp_seq_lt(ack, priv->recover)) return;  /* まだ送り直した範囲の途中 */
+    if (tcp_seq_lt(ack, priv->recover)) {
+        /* **partial ACK -- 回復の途中。** 穴が 2 つ以上あるか、送り直した
+         * ものまで失われた場合、ここで次の穴を送り直さないと RTO 待ちになる。
+         *
+         * 段階 2 では「Go-Back-N と組むと再送が爆発する」ので入れなかったが、
+         * SACK があるなら送り直すのは**本当に届いていない範囲だけ**なので
+         * 安全。ただし 1 RTT に 1 回までに抑える(高速再送と同じ制限)。 */
+        if (priv->sack_enabled && g_tcp_sack_use_tx) {
+            uint64_t min_gap_us = priv->srtt_us ? priv->srtt_us : 200u;
+            if (priv->fr_last_at == 0 || get_us_from(priv->fr_last_at) >= min_gap_us) {
+                priv->fr_last_at = timer_now();
+                priv->fast_retransmit_gen++;
+                g_tcp_sack_partial_retx++;
+            }
+        }
+        return;
+    }
 
     priv->cwnd = priv->ssthresh;
     priv->in_fast_recovery = 0;
@@ -2545,7 +3015,11 @@ int tcp_send(tcp_conn_t *conn, const void *buf, uint32_t len)
         }
 
         uint32_t usable_window = conn->snd_win;
-        if (priv->cwnd < usable_window) usable_window = priv->cwnd;
+        /* SACK 済みのぶんはもうネットワークに居ないので、輻輳ウィンドウとの
+         * 比較からは外す(RFC 6675 の pipe)。相手の広告ウィンドウ側は
+         * そのまま -- そのデータは相手の順序不正バッファを占めているため。 */
+        uint32_t cwnd_window = priv->cwnd + tcp_sacked_bytes(priv);
+        if (cwnd_window < usable_window) usable_window = cwnd_window;
         if (usable_window == 0) usable_window = 1u;
 
         if (tcp_seq_lt(snd_nxt, end_seq) && !tcp_seq_lt(snd_nxt, priv->snd_una + usable_window)) {
@@ -2624,9 +3098,32 @@ int tcp_send(tcp_conn_t *conn, const void *buf, uint32_t len)
             if (tcp_seq_lt(priv->snd_una, snd_nxt)) {
                 uint32_t resend_seq = priv->snd_una;
                 uint32_t resent = 0;
+                uint32_t fr_sack_high = tcp_sack_high(priv);
+                if (g_tcp_sack_debug && priv->sack_enabled) {
+                    uart_printf("[SACKDBG] bulk una=%u nxt=%u mss=%u blocks=%u",
+                                priv->snd_una, snd_nxt, conn->snd_mss,
+                                (unsigned)priv->sack_rx_count);
+                    for (unsigned bi = 0; bi < priv->sack_rx_count; bi++) {
+                        uart_printf(" [%u,%u)", priv->sack_rx[bi].start, priv->sack_rx[bi].end);
+                    }
+                    uart_printf("\n");
+                    g_tcp_sack_debug--;
+                }
                 while (tcp_seq_lt(resend_seq, snd_nxt)) {
                     uint32_t remain = snd_nxt - resend_seq;
                     uint16_t rchunk = (uint16_t)((remain > conn->snd_mss) ? conn->snd_mss : remain);
+                    /* **SACK ブロックより先はまだ飛行中**なので送り直さない
+                     * (Go-Back-N との一番大きな違いはここ)。 */
+                    if (fr_sack_high != 0u && !tcp_seq_lt(resend_seq, fr_sack_high)) {
+                        g_tcp_sack_skipped_count++;
+                        break;
+                    }
+                    /* 相手に届いていると分かっている範囲も飛ばす。 */
+                    if (tcp_sack_covered(priv, resend_seq, rchunk)) {
+                        g_tcp_sack_skipped_count++;
+                        resend_seq += rchunk;
+                        continue;
+                    }
                     conn->snd_seq = resend_seq;
                     if (tcp_send_segment(conn, priv, TCP_FLAG_PSH | TCP_FLAG_ACK,
                                           data + (resend_seq - base_seq), rchunk) != 0) {
@@ -2634,7 +3131,9 @@ int tcp_send(tcp_conn_t *conn, const void *buf, uint32_t len)
                     }
                     resend_seq += rchunk;
                     resent     += rchunk;
-                    priv->dup_ack_suppress++;  /* 1 チャンク = 1 セグメント */
+                    /* SACK があるときは自分の再送が重複 ACK を生まないので補正不要。 */
+                    if (!priv->sack_enabled) priv->dup_ack_suppress++;
+                    g_tcp_retransmit_segs++;
                 }
                 g_tcp_retransmit_count[smp_core_index()]++;
                 g_tcp_fast_retransmit_count[smp_core_index()]++;
@@ -2668,6 +3167,10 @@ int tcp_send(tcp_conn_t *conn, const void *buf, uint32_t len)
             priv->dup_ack_count    = 0;
             priv->recover          = priv->snd_una;  /* recover ガードを解除 */
             priv->fr_gen_bulk      = priv->fast_retransmit_gen;
+            /* **RTO では SACK の scoreboard を捨てる**(RFC 6675 5.1)。
+             * 相手が保持を撤回した(reneging)可能性があるので、届いたと
+             * 言われた範囲も含めて全部送り直す。 */
+            priv->sack_rx_count    = 0;
 
             rto_ms *= 2;
             if (rto_ms > TCP_MAX_RTO_MS) rto_ms = TCP_MAX_RTO_MS;
@@ -2684,7 +3187,8 @@ int tcp_send(tcp_conn_t *conn, const void *buf, uint32_t len)
                 /* TCP層の性能分析用: Go-Back-Nで実際に再送されたバイト数。 */
                 if(ts_log_mode()&0x1) ts_log(TS_MK(TS_FILE_TCP, TS_FUNC_tcp_send, 5), tcp_conn_arg(conn, rchunk));
                 resend_seq += rchunk;
-                priv->dup_ack_suppress++;  /* 高速再送と同じ理由(自分が生む重複ACKを差し引く) */
+                if (!priv->sack_enabled) priv->dup_ack_suppress++;
+                g_tcp_retransmit_segs++;
             }
             window_sent_at = timer_now();
             window_retransmitted = 1;
@@ -2882,7 +3386,11 @@ static int tcp_send_async_ex(tcp_conn_t *conn, const void *buf, uint16_t len, in
 
         uint32_t outstanding = conn->snd_seq - priv->snd_una;
         uint32_t usable_window = conn->snd_win;
-        if (priv->cwnd < usable_window) usable_window = priv->cwnd;
+        /* SACK 済みはパイプに居ない(RFC 6675)。 */
+        {
+            uint32_t cw = priv->cwnd + tcp_sacked_bytes(priv);
+            if (cw < usable_window) usable_window = cw;
+        }
         if (usable_window == 0) usable_window = 1u;
         uint32_t room = (usable_window > outstanding) ? (usable_window - outstanding) : 0u;
         while (room == 0) {
@@ -2893,7 +3401,10 @@ static int tcp_send_async_ex(tcp_conn_t *conn, const void *buf, uint16_t len, in
             }
             outstanding = conn->snd_seq - priv->snd_una;
             usable_window = conn->snd_win;
-            if (priv->cwnd < usable_window) usable_window = priv->cwnd;
+            {
+                uint32_t cw = priv->cwnd + tcp_sacked_bytes(priv);
+                if (cw < usable_window) usable_window = cw;
+            }
             if (usable_window == 0) usable_window = 1u;
             room = (usable_window > outstanding) ? (usable_window - outstanding) : 0u;
         }
@@ -3428,6 +3939,22 @@ int tcp_conn_ts_info(const tcp_conn_t *conn, uint64_t *srtt_us, uint32_t *rto_ms
 }
 
 /*=================================================================
+ * コネクションが SACK を合意しているかを返す。
+ *
+ * 引数:
+ *   conn - 対象コネクション
+ * 戻り値:
+ *   1=合意済み、0=未合意/不明
+ * コール元:
+ *   shell_sacktest()
+ * ===============================================================*/
+int tcp_conn_sack_enabled(const tcp_conn_t *conn)
+{
+    tcp_priv_t *priv = tcp_priv_for((tcp_conn_t *)conn);
+    return (priv && priv->sack_enabled) ? 1 : 0;
+}
+
+/*=================================================================
  * 受信 TCP セグメントを処理する。チェックサム検証(HW 検証済みなら省略)、
  * リスナーへの SYN 受け付け、既存コネクションの状態遷移、in-order データの
  * 配置(upcall か rx_buf)、順序不正セグメントの先読み保持、ACK 処理と
@@ -3682,9 +4209,9 @@ void tcp_input_addr(const uint8_t *pkt, uint16_t len,
      * PAWS(古いセグメントの検出)はここで行う -- RST より後に置いてあるので
      * RST は PAWS の対象外(相手を切れなくなるのを避ける)。 */
     uint32_t seg_tsecr = 0;
-    if (priv->ts_enabled &&
-        !tcp_input_timestamps(conn, priv, in, hdr_len, seq, &seg_tsecr)) {
-        return;  /* PAWS で破棄(ACK は tcp_input_timestamps() が返している) */
+    if ((priv->ts_enabled || priv->sack_enabled) &&
+        !tcp_input_options(conn, priv, in, hdr_len, seq, &seg_tsecr)) {
+        return;  /* PAWS で破棄(ACK は tcp_input_options() が返している) */
     }
 
     uint32_t prev_snd_win = conn->snd_win;  /* dup ACK 判定に要る(更新前の値) */
@@ -3794,6 +4321,8 @@ void tcp_input_addr(const uint8_t *pkt, uint16_t len,
                 accepted_inorder = 1;
                 tcp_deliver_data(priv, payload, payload_len);
                 conn->rcv_seq += payload_len;
+                /* 累積 ACK が進んだので、そこまでの区間は SACK で伝えない。 */
+                if (priv->sack_tx_count) tcp_sack_tx_trim(priv, conn->rcv_seq);
                 if(ts_log_mode()&TS_MODE_HOTPATH) ts_log(TS_MK(TS_FILE_TCP, TS_FUNC_tcp_input, 5), tcp_conn_arg(conn, payload_len));
 
                 for (;;) {
@@ -3805,6 +4334,8 @@ void tcp_input_addr(const uint8_t *pkt, uint16_t len,
                             tcp_deliver_data(priv, priv->ooo[i].buf, priv->ooo[i].len);
                             conn->rcv_seq += priv->ooo[i].len;
                             priv->ooo[i].valid = 0;
+                            if (priv->ooo_count > 0) priv->ooo_count--;
+                            if (priv->sack_tx_count) tcp_sack_tx_trim(priv, conn->rcv_seq);
                             spliced = 1;
                             break;
                         }
@@ -3831,6 +4362,8 @@ void tcp_input_addr(const uint8_t *pkt, uint16_t len,
                             priv->ooo[i].seq = seq;
                             priv->ooo[i].len = payload_len;
                             priv->ooo[i].valid = 1;
+                            priv->ooo_count++;
+                            if (priv->sack_enabled) tcp_sack_tx_add(priv, seq, payload_len);
                             /* ここは ts_log だけにしてある。以前は 1 セグメントごとに
                              * uart_printf していたが、高速再送(C2)を入れて順序不正の
                              * 到着が「異常」ではなく通常の回復過程になると、受信ホット

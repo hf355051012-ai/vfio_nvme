@@ -1037,15 +1037,20 @@ static void shell_synackdrop(char *args)
  * コール元:
  *   shell_tcptstest()
  * ===============================================================*/
-static int shell_tcpts_run(const char *label, netif_t *self, netif_t *srv_if,
+static int shell_loss_run(const char *label, netif_t *self, netif_t *srv_if,
                             const netaddr_t *dst, uint16_t port, unsigned rounds,
                             uint32_t drop_every, uint16_t *out_mss,
                             uint32_t *out_rtt, uint32_t *out_ts, uint32_t *out_retx,
-                            uint64_t *out_srtt)
+                            uint64_t *out_srtt, uint32_t *out_ms, uint8_t *out_sack)
 {
     static tcp_conn_t s_srv, s_cli;
-    static uint8_t tx[65536];
-    static uint8_t rx[65536];
+    /* **1 回の tcp_send() を大きくしないと、ロスを注入しても穴の後ろが
+     * 存在しない。** cwnd が小さいうちは「飛んだぶん = ウィンドウ全体」に
+     * なり、受信側に順序不正が 1 つも生じないので SACK も高速再送も出番が
+     * 無い(64KB で試したときは実際にそうなり、SACK ブロックが 1 個も
+     * 出なかった)。 */
+    static uint8_t tx[512u * 1024u];
+    static uint8_t rx[512u * 1024u];
 
     int listener = tcp_listen(port, srv_if);
     if (listener < 0) {
@@ -1076,7 +1081,8 @@ static int shell_tcpts_run(const char *label, netif_t *self, netif_t *srv_if,
         tcp_unlisten(listener);
         return 0;
     }
-    if (out_mss) *out_mss = s_cli.snd_mss;
+    if (out_mss)  *out_mss  = s_cli.snd_mss;
+    if (out_sack) *out_sack = (uint8_t)tcp_conn_sack_enabled(&s_cli);
 
     for (unsigned i = 0; i < sizeof(tx); i++) tx[i] = (uint8_t)(i * 13u + 7u);
 
@@ -1085,6 +1091,7 @@ static int shell_tcpts_run(const char *label, netif_t *self, netif_t *srv_if,
     uint32_t ts_before  = g_tcp_ts_rtt_samples;
     uint32_t retx_before = 0;
     for (unsigned c = 0; c < SMP_MAX_CORES; c++) retx_before += g_tcp_retransmit_count[c];
+    uint64_t run_start = timer_now();
 
     g_tcp_tx_drop_every = drop_every;
 
@@ -1130,6 +1137,7 @@ static int shell_tcpts_run(const char *label, netif_t *self, netif_t *srv_if,
         *out_retx = retx_after - retx_before;
     }
     if (out_srtt) tcp_conn_ts_info(&s_cli, out_srtt, NULL);
+    if (out_ms)   *out_ms = (uint32_t)get_ms_from(run_start);
 
     netif_activate(self);  tcp_close(&s_cli);
     netif_activate(srv_if); tcp_close(&s_srv);
@@ -1154,7 +1162,7 @@ static int shell_tcpts_run(const char *label, netif_t *self, netif_t *srv_if,
 static void shell_tcptstest(void)
 {
     const uint16_t port  = 6005u;
-    const unsigned rounds = 8u;    /* 64KB x 8 = 512KB */
+    const unsigned rounds = 4u;    /* 512KB x 4 = 2MB */
     const uint32_t drop  = 12u;    /* データセグメント 12 個に 1 個を捨てる */
 
     netif_t *peer = NULL;
@@ -1172,20 +1180,20 @@ static void shell_tcptstest(void)
     uint32_t saved_drop = g_tcp_tx_drop_every;
     uint32_t paws_before = g_tcp_paws_drop_count;
 
-    uart_printf("tcptstest: client=%s server=%s port=%u (64KB x %u、txdrop %u)\n",
+    uart_printf("tcptstest: client=%s server=%s port=%u (512KB x %u、txdrop %u)\n",
                 self->name, peer->name, (unsigned)port, rounds, (unsigned)drop);
 
     /* [1][2] Timestamps 有効 */
     g_tcp_ts_enable = 1;
     uint16_t mss_on = 0; uint32_t rtt_on = 0, ts_on = 0, retx_on = 0; uint64_t srtt_on = 0;
-    int ok_on = shell_tcpts_run("[有効]", self, peer, &dst4, port, rounds, drop,
-                                 &mss_on, &rtt_on, &ts_on, &retx_on, &srtt_on);
+    int ok_on = shell_loss_run("[有効]", self, peer, &dst4, port, rounds, drop,
+                                 &mss_on, &rtt_on, &ts_on, &retx_on, &srtt_on, NULL, NULL);
 
     /* [3] 陰性対照: Timestamps 無効 */
     g_tcp_ts_enable = 0;
     uint16_t mss_off = 0; uint32_t rtt_off = 0, ts_off = 0, retx_off = 0; uint64_t srtt_off = 0;
-    int ok_off = shell_tcpts_run("[無効]", self, peer, &dst4, port, rounds, drop,
-                                 &mss_off, &rtt_off, &ts_off, &retx_off, &srtt_off);
+    int ok_off = shell_loss_run("[無効]", self, peer, &dst4, port, rounds, drop,
+                                 &mss_off, &rtt_off, &ts_off, &retx_off, &srtt_off, NULL, NULL);
 
     g_tcp_ts_enable     = saved_ts;    /* **必ず元に戻す** */
     g_tcp_tx_drop_every = saved_drop;
@@ -1226,6 +1234,169 @@ static void shell_tcptstest(void)
     uart_printf("tcptstest: %s (tcpts を %s、txdrop を %u へ復元)\n",
                 ok ? "PASS" : "NG", g_tcp_ts_enable ? "有効" : "無効",
                 (unsigned)g_tcp_tx_drop_every);
+}
+
+/*=================================================================
+ * シェルの `sacktest`。SACK(段階 25 = C3b)の検証。
+ *
+ * **ロス率を振って曲線として比べる。** 単一の点で比べても意味が無い
+ * (段階 2 で「代表的でない条件で測って結論を出した」失敗をしている)。
+ * 各ロス率で 64KB x 8 を流し、SACK 有効/無効(= Go-Back-N)で
+ *   - 所要時間(= スループット)
+ *   - 再送回数(**ロス 1 個あたり何個送り直したか**)
+ * を並べる。
+ *
+ * 引数:
+ *   args - ロス率のリスト(省略時は 1000,200,50,12)
+ * コール元:
+ *   shell_dispatch()
+ * ===============================================================*/
+static void shell_sacktest(char *args)
+{
+    const uint16_t port   = 6006u;
+    const unsigned rounds = 4u;    /* 512KB x 4 = 2MB */
+    uint32_t drops[6] = { 1000u, 200u, 50u, 12u, 0u, 0u };
+    unsigned ndrops = 4u;
+
+    while (*args == ' ') args++;
+    if (*args >= '0' && *args <= '9') {
+        /* カンマ区切りのロス率リスト(atoi は ',' で止まる)。 */
+        const char *p = args;
+        ndrops = 0;
+        while (*p && ndrops < 6u) {
+            int v = atoi(p);
+            if (v > 0) drops[ndrops++] = (uint32_t)v;
+            while (*p && *p != ',') p++;
+            if (*p == ',') p++;
+        }
+        if (ndrops == 0) { ndrops = 1; drops[0] = 12u; }
+    }
+
+    uint8_t peer_ll[16];
+    netif_t *peer = shell_peer_ll6(peer_ll);
+    netif_t *self = g_active_ctx;
+    if (!peer || !self) {
+        uart_printf("sacktest: 対向インターフェースが見つかりません(net init mlx5 が必要)\n");
+        return;
+    }
+    uint32_t peer_ip = (net_active_ip() == 0xC0A8650Au) ? 0xC0A8650Bu : 0xC0A8650Au;
+    netaddr_t dst4 = netaddr_v4(peer_ip);
+
+    uint32_t saved_sack = g_tcp_sack_enable;
+    uint32_t saved_drop = g_tcp_tx_drop_every;
+
+    uart_printf("sacktest: client=%s server=%s port=%u (512KB x %u を各ロス率で)\n",
+                self->name, peer->name, (unsigned)port, rounds);
+    uart_printf("sacktest: %-8s %-6s %10s %8s %8s %10s\n",
+                "txdrop", "SACK", "所要ms", "破棄", "再送", "再送/破棄");
+
+    int ok = 1;
+    uint32_t retx_sack_total = 0, retx_gbn_total = 0;
+    uint32_t ms_sack_total = 0, ms_gbn_total = 0;
+    for (unsigned d = 0; d < ndrops; d++) {
+        for (int mode = 1; mode >= 0; mode--) {   /* 1=SACK 有効、0=Go-Back-N */
+            g_tcp_sack_enable = (uint32_t)mode;
+            for (unsigned c = 0; c < SMP_MAX_CORES; c++) g_tcp_tx_dropped_count[c] = 0;
+            uint32_t segs_before = g_tcp_retransmit_segs;
+            uint32_t retx = 0, ms = 0;
+            uint8_t  sack_on = 0;
+            if (!shell_loss_run("sacktest", self, peer, &dst4, port, rounds, drops[d],
+                                 NULL, NULL, NULL, &retx, NULL, &ms, &sack_on)) {
+                ok = 0;
+            }
+            uint32_t dropped = 0;
+            for (unsigned c = 0; c < SMP_MAX_CORES; c++) dropped += g_tcp_tx_dropped_count[c];
+            /* **見るのは「再送を始めた回数」ではなく「送り直したセグメント数」**。
+             * Go-Back-N は穴の後ろも全部送り直すので、そこに差が出る。 */
+            uint32_t segs = g_tcp_retransmit_segs - segs_before;
+            uart_printf("sacktest: %-8u %-6s %10u %8u %8u %10u/100\n",
+                        (unsigned)drops[d], sack_on ? "あり" : "なし",
+                        (unsigned)ms, (unsigned)dropped, (unsigned)segs,
+                        dropped ? (unsigned)((uint64_t)segs * 100u / dropped) : 0u);
+            (void)retx;
+            if (mode == 1) {
+                ms_sack_total += ms;
+                retx_sack_total += segs;
+                if (!sack_on) {
+                    uart_printf("sacktest: NG -- SACK を有効にしたのに合意できていません\n");
+                    ok = 0;
+                }
+            } else {
+                ms_gbn_total += ms;
+                retx_gbn_total += segs;
+                if (sack_on) {
+                    uart_printf("sacktest: NG -- SACK を無効にしたのに合意しています\n");
+                    ok = 0;
+                }
+            }
+        }
+    }
+
+    g_tcp_sack_enable   = saved_sack;   /* **必ず元に戻す** */
+    g_tcp_tx_drop_every = saved_drop;
+
+    uart_printf("sacktest: 合計 -- 所要 SACK あり=%ums / なし=%ums、"
+                "再送セグメント あり=%u / なし=%u\n",
+                (unsigned)ms_sack_total, (unsigned)ms_gbn_total,
+                (unsigned)retx_sack_total, (unsigned)retx_gbn_total);
+    /* **判定は所要時間で行う。** 再送セグメント数は「注入されたロスの数」が
+     * 走行ごとに違う(ロス注入は送ったセグメント数に比例する)ので、
+     * 有無の比較にそのまま使えない。回復が速くなったかどうかが見たいこと。 */
+    if (ok && ms_sack_total >= ms_gbn_total) {
+        uart_printf("sacktest: NG -- SACK を入れてもロス下の所要時間が縮んでいません\n");
+        ok = 0;
+    }
+    if (ok && g_tcp_sack_skipped_count == 0u) {
+        uart_printf("sacktest: NG -- 「SACK 済みなので送らない」が 1 度も起きていません\n");
+        ok = 0;
+    }
+    uart_printf("sacktest: %s (tcpsack を %s、txdrop を %u へ復元。送信省略=%u ブロック送出=%u)\n",
+                ok ? "PASS" : "NG", g_tcp_sack_enable ? "有効" : "無効",
+                (unsigned)g_tcp_tx_drop_every,
+                (unsigned)g_tcp_sack_skipped_count, (unsigned)g_tcp_sack_sent_count);
+}
+
+/*=================================================================
+ * シェルの `tcpsack`。SACK(RFC 2018)の有効/無効と統計。
+ *
+ * **コネクション単位で SYN のときに決まる**ので、切り替えても既存の
+ * コネクションには効かない。
+ *
+ * 引数:
+ *   args - on / off。省略時は現在値と統計を表示
+ * コール元:
+ *   shell_dispatch()
+ * ===============================================================*/
+static void shell_tcpsack(char *args)
+{
+    while (*args == ' ') args++;
+    if (strncmp(args, "on", 2) == 0) {
+        g_tcp_sack_enable = 1;
+    } else if (strncmp(args, "off", 3) == 0) {
+        g_tcp_sack_enable = 0;
+    } else if (strncmp(args, "debug", 5) == 0) {
+        g_tcp_sack_debug = 8;   /* 次の 8 回だけ scoreboard をダンプする */
+    } else if (strncmp(args, "report", 6) == 0) {
+        /* 合意もブロック送出もしたまま、再送だけ Go-Back-N に戻す
+         * (「SACK の何が効いて何が損なのか」を分けて測るため)。 */
+        g_tcp_sack_use_tx = 0;
+    } else if (strncmp(args, "use", 3) == 0) {
+        g_tcp_sack_use_tx = 1;
+    }
+    uart_printf("tcpsack: %s(次に張るコネクションから。既存のものは変わらない)\n",
+                g_tcp_sack_enable ? "有効" : "無効");
+    uart_printf("tcpsack: 送信省略=%u / ブロック送出=%u / ブロック受領=%u / 再送セグメント=%u\n",
+                (unsigned)g_tcp_sack_skipped_count, (unsigned)g_tcp_sack_sent_count,
+                (unsigned)g_tcp_sack_rx_count, (unsigned)g_tcp_retransmit_segs);
+    uart_printf("tcpsack: 判定を試みた=%u / scoreboard が空=%u\n",
+                (unsigned)g_tcp_sack_probe_count, (unsigned)g_tcp_sack_noinfo_count);
+    uart_printf("tcpsack: 空振りした高速再送=%u / partial ACK での再送=%u\n",
+                (unsigned)g_tcp_fr_empty, (unsigned)g_tcp_sack_partial_retx);
+    uart_printf("tcpsack: 重複ACKの行き先 -- 補正で消費=%u 回復中=%u recoverガード=%u "
+                "1RTT制限=%u 閾値到達=%u\n",
+                (unsigned)g_tcp_dup_suppressed, (unsigned)g_tcp_dup_in_recovery,
+                (unsigned)g_tcp_dup_recover_guard, (unsigned)g_tcp_dup_rate_limited,
+                (unsigned)g_tcp_dup_threshold_hit);
 }
 
 /*=================================================================
@@ -4326,6 +4497,8 @@ static void shell_txdrop(char *args)
             g_tcp_fast_retransmit_count[c] = 0;
             g_tcp_dup_ack_count[c]         = 0;
         }
+        g_tcp_retransmit_segs    = 0;
+        g_tcp_sack_skipped_count = 0;
     }
 
     uint32_t dropped = 0, retx = 0, fastretx = 0, dupack = 0;
@@ -4344,6 +4517,13 @@ static void shell_txdrop(char *args)
     uart_printf("txdrop: 破棄=%u 重複ACK=%u 再送=%u (うち高速再送=%u、残りはRTO由来=%u)\n",
                 (unsigned)dropped, (unsigned)dupack, (unsigned)retx,
                 (unsigned)fastretx, (unsigned)(retx - fastretx));
+    /* **送り直したセグメント数**。Go-Back-N と SACK の差はここに出る
+     * (再送を「何回始めたか」ではなく「何個送り直したか」)。 */
+    uart_printf("txdrop: 送り直したセグメント=%u (破棄 1 個あたり %u/100) "
+                "SACK で省略=%u\n",
+                (unsigned)g_tcp_retransmit_segs,
+                dropped ? (unsigned)((uint64_t)g_tcp_retransmit_segs * 100u / dropped) : 0u,
+                (unsigned)g_tcp_sack_skipped_count);
 }
 
 /*=================================================================
@@ -4794,6 +4974,10 @@ static void shell_dispatch(char *line, int s0, int s1)
         shell_tcptstest();
     } else if (strncmp(line, "tcpts", 5) == 0) {
         shell_tcpts(line + 5);
+    } else if (strncmp(line, "sacktest", 8) == 0) {
+        shell_sacktest(line + 8);
+    } else if (strncmp(line, "tcpsack", 7) == 0) {
+        shell_tcpsack(line + 7);
     } else if (strncmp(line, "qploop", 6) == 0) {
         shell_qploop(line + 6);
     } else if (strncmp(line, "nvmediscover", 12) == 0) {
@@ -4875,6 +5059,8 @@ static void shell_dispatch(char *line, int s0, int s1)
                     "  synackdrop [N]                        次のSYN|ACKをN個捨てる(握手のロス注入)\n"
                     "  tcpts [on|off]                        TCP Timestamps(RFC 7323)の有効/無効+統計\n"
                     "  tcptstest                             ロス注入下でRTT推定が更新され続けるか(陰性対照つき)\n"
+                    "  tcpsack [on|off]                      SACK(RFC 2018)の有効/無効+統計\n"
+                    "  sacktest [N,N..]                      ロス率を振ってSACKとGo-Back-Nの再送数を比べる\n"
                     "  qploop [N]                            RC QPの作成/破棄をN回繰り返しFWリソース枯渇を見る\n"
                     "  nvmediscover [dump]                   Discovery Log Pageを取得(dumpで16進出力)\n"
                     "  nvmet [port] | jobs | help | quit    (↑↓で履歴呼び出し)\n"
