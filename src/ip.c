@@ -10,6 +10,7 @@
 #include "smp.h"
 #include "pmtu.h"
 #include "netaddr.h"
+#include "ipfrag.h"
 
 /* [切り分け] Ethernet RX へ複製されて来た RoCEv2(UDP 4791)を数える。 */
 volatile uint32_t g_roce_rx_seen;
@@ -115,27 +116,6 @@ void ip_handle_frame(const uint8_t *payload, size_t len, const uint8_t *src_mac)
         return;
     }
 
-    /* 断片化されたデータグラムは再構成しない。ここで弾かないと、断片を
-     * 完全なデータグラムとして上位へ渡してしまい、TCP/ICMP が壊れたペイロード
-     * を読む(MTU が揃ったループバックでは起きないが実ネットワークでは起きる)。
-     * MF(bit13)が立っているか、フラグメントオフセット(bit12-0)が非 0 なら断片。
-     * 破棄する前に観測フックへ渡す -- 再構成しないので、送信側の分割が
-     * RFC 791 どおりかを確かめる手段がこれしか無い(`fragtest`)。 */
-    uint16_t flags_frag = rd16be(in + IP_OFF_FLAGS_FRAG);
-    if ((flags_frag & 0x2000u) != 0u || (flags_frag & 0x1FFFu) != 0u) {
-        if (s_frag_observer) {
-            s_frag_observer(rd16be(in + IP_OFF_ID),
-                            (uint16_t)((flags_frag & 0x1FFFu) * 8u),
-                            (flags_frag & 0x2000u) != 0u,
-                            in[IP_OFF_PROTOCOL],
-                            payload + sizeof(ip_header_t),
-                            (uint16_t)(total_len - sizeof(ip_header_t)));
-            return;  /* 観測中はログを出さない(断片ごとに 1 行出ると読めない) */
-        }
-        uart_printf("[IP] 断片化データグラムは未対応 (flags_frag=0x%04X) 破棄\n", flags_frag);
-        return;
-    }
-
     uint32_t dst_ip = rd32be(in + IP_OFF_DST_IP);
     if (dst_ip != NET_SELF_IP) {
         return;
@@ -151,6 +131,34 @@ void ip_handle_frame(const uint8_t *payload, size_t len, const uint8_t *src_mac)
     size_t hdr_len = sizeof(ip_header_t);
     size_t ip_payload_len = (size_t)total_len - hdr_len;
     const uint8_t *ip_payload = payload + hdr_len;
+
+    /* 断片化されたデータグラムは組み立ててから上位へ渡す。**断片のまま
+     * 渡してはいけない**(TCP/ICMP が壊れたペイロードを読む)。MF(bit13)が
+     * 立っているか、フラグメントオフセット(bit12-0)が非 0 なら断片。
+     *
+     * 観測フックは残してある -- `fragtest` が「送信側の分割が RFC 791
+     * どおりか」を断片単位で確かめるのに使う。**組み立てを実装した今は
+     * 素通しの覗き見**にしてあるので、フックを付けたまま往復もできる。 */
+    uint16_t flags_frag = rd16be(in + IP_OFF_FLAGS_FRAG);
+    if ((flags_frag & 0x2000u) != 0u || (flags_frag & 0x1FFFu) != 0u) {
+        uint32_t frag_off = (uint32_t)(flags_frag & 0x1FFFu) * 8u;
+        int      more     = (flags_frag & 0x2000u) != 0u;
+        if (s_frag_observer) {
+            s_frag_observer(rd16be(in + IP_OFF_ID), (uint16_t)frag_off, more,
+                            protocol, ip_payload, (uint16_t)ip_payload_len);
+        }
+        netaddr_t fs = netaddr_v4(ip_from_octets(src_ip[0], src_ip[1], src_ip[2], src_ip[3]));
+        netaddr_t fd = netaddr_v4(dst_ip);
+        const uint8_t *whole = NULL;
+        uint32_t whole_len = 0;
+        if (!ipfrag_input(&fs, &fd, rd16be(in + IP_OFF_ID), protocol,
+                          frag_off, more, ip_payload, (uint32_t)ip_payload_len,
+                          &whole, &whole_len)) {
+            return;  /* まだそろっていない */
+        }
+        ip_payload     = whole;
+        ip_payload_len = whole_len;
+    }
 
     if (protocol == IP_PROTO_ICMP) {
         icmp_handle(ip_payload, ip_payload_len, src_ip, src_mac);

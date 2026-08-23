@@ -341,11 +341,26 @@ static int mlx5_net_post_frame(mlx5_net_state_t *st, const eth_frag_t *frags, un
      * そこが本物の UDP チェックサム欄なので気付けない)。実機で
      * 「4000 バイト中 4 バイトだけ化ける」という形で踏んだ。上位層の
      * チェックサムは分割前にソフトウェアで計算済みなので、外して問題ない。
-     * LSO 経路は TCP 専用で断片を送らないため、そちらは触らない。 */
+     * LSO 経路は TCP 専用で断片を送らないため、そちらは触らない。
+     *
+     * **IPv4 の断片も同じ**(2026-08-23 に追加)。理屈は IPv6 と全く同じで、
+     * HW は断片の先頭を L4 ヘッダとみなす。**受信側の組み立てを実装するまで
+     * 誰も踏まなかった** -- 断片は届いた端から捨てていたので、送ったものが
+     * 壊れていても分からなかった。組み立てた瞬間に
+     * 「[UDP] チェックサム不正」として出た。 */
     uint8_t cs_flags = 0xC0u;
     if (header_src[12] == 0x86u && header_src[13] == 0xDDu &&
         header_src[ETH_HDR_LEN + 6u] == 44u /* IPV6_NH_FRAGMENT */) {
         cs_flags = 0x40u;
+    } else if (header_src[12] == 0x08u && header_src[13] == 0x00u) {
+        /* IPv4: flags_frag(オフセット 6-7)の MF(0x20)かオフセット(下位 13bit)が
+         * 非 0 なら断片。L3 チェックサムは HW に任せてよい(IP ヘッダは断片
+         * ごとに完結している)ので L4 だけ外す。 */
+        uint16_t ff = ((uint16_t)header_src[ETH_HDR_LEN + 6u] << 8) |
+                       header_src[ETH_HDR_LEN + 7u];
+        if ((ff & 0x2000u) != 0u || (ff & 0x1FFFu) != 0u) {
+            cs_flags = 0x40u;
+        }
     }
     wqe[20] = cs_flags;
 

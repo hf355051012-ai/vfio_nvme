@@ -10,6 +10,7 @@
 #include "tcp.h"
 #include "udp.h"
 #include "pmtu.h"
+#include "ipfrag.h"
 
 #define ICMPV6_OFF_TYPE     0u
 #define ICMPV6_OFF_CODE     1u
@@ -2051,29 +2052,17 @@ static int ipv6_skip_ext_headers(const volatile uint8_t *in, size_t total,
         if (nh == IPV6_NH_NONE) return 0;   /* 上位ヘッダ無し(RFC 8200 4.7) */
 
         if (nh == IPV6_NH_FRAGMENT) {
-            /* **再構成は実装していない**(IPv4 側と同じ方針)。捨てたことは
-             * 必ずログに出す -- 黙って捨てると「たまに通信できない」になる。
-             * 捨てる直前に観測フックへ渡すのも IPv4 と同じで、**送信側の
-             * 断片化はこれでしか確かめられない**。 */
+            /* **ここでは組み立てない。** 組み立てた結果は別のバッファに
+             * 入るので、フレーム内のオフセットで返すこの関数では表せない。
+             * 「Fragment ヘッダの位置」を返して、呼び出し側(ipv6_handle_frame)
+             * に組み立てさせ、完成したバッファで上位へ入り直させる。 */
             if (off + IPV6_FRAG_HDR_LEN > total) {
                 uart_printf("[IPv6] Fragment ヘッダが途中で切れている -- 破棄\n");
                 return 0;
             }
-            uint16_t offlg = rd16be(in + off + 2u);
-            uint32_t fid   = rd32be(in + off + 4u);
-            uint8_t  fnh   = in[off];
-            uint16_t flen  = (uint16_t)(total - off - IPV6_FRAG_HDR_LEN);
-            if (s_ipv6_frag_observer) {
-                s_ipv6_frag_observer(fid, (uint16_t)(offlg & IPV6_FRAG_OFF_MASK),
-                                     (offlg & IPV6_FRAG_MORE) ? 1 : 0, fnh,
-                                     (const uint8_t *)(in + off + IPV6_FRAG_HDR_LEN), flen);
-            } else {
-                uart_printf("[IPv6] Fragment ヘッダ付き(id=%u off=%u more=%d)-- "
-                            "再構成未実装なので破棄\n", (unsigned)fid,
-                            (unsigned)(offlg & IPV6_FRAG_OFF_MASK),
-                            (offlg & IPV6_FRAG_MORE) ? 1 : 0);
-            }
-            return 0;
+            *nh_io = IPV6_NH_FRAGMENT;
+            *off_io = off;
+            return 1;
         }
         if (nh != IPV6_NH_HOPOPTS && nh != IPV6_NH_ROUTING && nh != IPV6_NH_DSTOPTS) {
             uart_printf("[IPv6] 未対応の next_header=%u 無視\n", nh);
@@ -2193,6 +2182,37 @@ void ipv6_handle_frame(const uint8_t *payload, size_t len, const uint8_t *src_ma
     }
     const uint8_t *body = payload + off;
     uint16_t body_len = (uint16_t)((size_t)plen + IPV6_HDR_LEN - off);
+
+    if (nh == IPV6_NH_FRAGMENT) {
+        /* Fragment ヘッダ(8 バイト)= {next header, 予約, オフセット+M(16bit),
+         * 識別子(32bit)}。**元の上位プロトコル番号はここに移っている**
+         * (IPv6 ヘッダ側は 44 になる)。 */
+        uint8_t  fnh   = in[off];
+        uint16_t offlg = rd16be(in + off + 2u);
+        uint32_t fid   = rd32be(in + off + 4u);
+        uint32_t foff  = (uint32_t)(offlg & IPV6_FRAG_OFF_MASK);
+        int      more  = (offlg & IPV6_FRAG_MORE) ? 1 : 0;
+        const uint8_t *fdata = payload + off + IPV6_FRAG_HDR_LEN;
+        uint32_t flen = (uint32_t)((size_t)plen + IPV6_HDR_LEN - off - IPV6_FRAG_HDR_LEN);
+
+        /* 観測フックは残してある(`ext6test` が断片単位で形を確かめる)。
+         * 組み立てを実装した今は素通しの覗き見。 */
+        if (s_ipv6_frag_observer) {
+            s_ipv6_frag_observer(fid, (uint16_t)foff, more, fnh, fdata, (uint16_t)flen);
+        }
+
+        netaddr_t fs = netaddr_v6(src);
+        netaddr_t fd = netaddr_v6(dst);
+        const uint8_t *whole = NULL;
+        uint32_t whole_len = 0;
+        if (!ipfrag_input(&fs, &fd, fid, fnh, foff, more, fdata, flen,
+                          &whole, &whole_len)) {
+            return;  /* まだそろっていない */
+        }
+        nh       = fnh;
+        body     = whole;
+        body_len = (uint16_t)whole_len;
+    }
 
     if (nh == IPV6_NH_ICMPV6) {
         ipv6_handle_icmpv6(body, body_len, src, dst,

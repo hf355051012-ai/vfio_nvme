@@ -13,6 +13,7 @@
 #include "udp.h"
 #include "netif.h"
 #include "pmtu.h"
+#include "ipfrag.h"
 #include "job.h"
 #include "nvme.h"
 #include "nvmet.h"
@@ -367,6 +368,10 @@ static void shell_ping6(void)
 
 static volatile uint32_t s_udptest_rx;
 static volatile uint16_t s_udptest_len;
+/* 受け取ったバイトの総和。**断片を組み立てた結果が正しいか**を長さだけで
+ * なく中身でも見るために要る(長さが合っていても、順番を取り違えたり
+ * 穴を埋め損ねたりすれば総和がずれる)。 */
+static volatile uint32_t s_udptest_sum;
 
 /*=================================================================
  * `udptest` が待ち受けるポートの受信ハンドラ。受信を記録するだけ。
@@ -383,8 +388,11 @@ static void shell_udptest_handler(const uint8_t *data, size_t len,
                                    const netaddr_t *src, uint16_t src_port,
                                    const uint8_t *src_mac)
 {
-    (void)data; (void)src_mac;
+    (void)src_mac;
     s_udptest_len = (uint16_t)len;
+    uint32_t sum = 0;
+    for (size_t i = 0; i < len; i++) sum += data[i];
+    s_udptest_sum = sum;
     s_udptest_rx++;
     if (src->family == NETADDR_V6) {
         uart_printf("[udptest] 受信 %u バイト (from IPv6 ...:%02x%02x:%u)\n",
@@ -1342,6 +1350,75 @@ static void shell_tcptstest(void)
 }
 
 /*=================================================================
+ * シェルの `fragrecv`。UDP ポートを開いて待ち、届いたデータグラムの長さと
+ * バイトの総和を報告する。
+ *
+ * **外部ホストに断片化させて送らせるための受け皿。** 自作 ↔ 自作の
+ * `fragtest` では送信側も自作なので、両側が同じ間違い方をしていると
+ * 検出できない(CRC32C で踏んだ穴と同じ形)。Linux に分割させて、
+ * こちらが組み立てられることを確かめるのがいちばん強い。
+ *
+ * 引数:
+ *   args - "<ポート> <秒>"(既定 7777 / 15 秒)
+ * コール元:
+ *   shell_dispatch()
+ * ===============================================================*/
+static void shell_fragrecv(char *args)
+{
+    uint16_t port = 7777u;
+    uint32_t secs = 15u;
+    while (*args == ' ') args++;
+    if (*args >= '0' && *args <= '9') {
+        port = (uint16_t)atoi(args);
+        while (*args && *args != ' ') args++;
+        while (*args == ' ') args++;
+        if (*args >= '0' && *args <= '9') secs = (uint32_t)atoi(args);
+    }
+    if (udp_bind(port, shell_udptest_handler) != 0) {
+        uart_printf("fragrecv: udp_bind 失敗 (port=%u)\n", port);
+        return;
+    }
+    uint32_t before = s_udptest_rx;
+    uint32_t c0 = 0, d0 = 0, t0c = 0, a0 = 0;
+    ipfrag_stats(&c0, &d0, &t0c, &a0);
+    uart_printf("fragrecv: ポート %u で %u 秒待ちます(断片化して送ってください)\n",
+                port, secs);
+    for (uint64_t t0 = timer_now(); !timeout_ms(t0, secs * 1000u); ) {
+        net_poll_all_and_dispatch();
+        job_scheduler_tick();
+    }
+    uint32_t c1 = 0, d1 = 0, t1c = 0, a1 = 0;
+    ipfrag_stats(&c1, &d1, &t1c, &a1);
+    uart_printf("fragrecv: 受信 %u 個(最後の長さ=%u 総和=%u)/ 組み立て完了=%u "
+                "破棄=%u 時間切れ=%u\n",
+                (unsigned)(s_udptest_rx - before), (unsigned)s_udptest_len,
+                (unsigned)s_udptest_sum, (unsigned)(c1 - c0), (unsigned)(d1 - d0),
+                (unsigned)(t1c - t0c));
+    udp_unbind(port);
+}
+
+/*=================================================================
+ * シェルの `fragstat`。受信側の IP 断片組み立ての統計。
+ *
+ * 引数:
+ *   args - "clear" で組み立て途中を捨てる
+ * コール元:
+ *   shell_dispatch()
+ * ===============================================================*/
+static void shell_fragstat(char *args)
+{
+    while (*args == ' ') args++;
+    if (strncmp(args, "clear", 5) == 0) {
+        ipfrag_reset();
+        uart_printf("fragstat: 組み立て途中を破棄しました\n");
+    }
+    uint32_t completed = 0, dropped = 0, timeouts = 0, active = 0;
+    ipfrag_stats(&completed, &dropped, &timeouts, &active);
+    uart_printf("fragstat: 組み立て完了=%u / 破棄=%u / 時間切れ=%u / 進行中=%u\n",
+                (unsigned)completed, (unsigned)dropped, (unsigned)timeouts, (unsigned)active);
+}
+
+/*=================================================================
  * シェルの `hdgstcorrupt`。次に送るヘッダダイジェストを N 個わざと壊す。
  *
  * **相手が誤りを検出して TermReq を返してくるかを確かめる唯一の手段。**
@@ -2203,9 +2280,18 @@ static void shell_fragtest(char *args)
         if (!middle) ok = 0;
     }
 
-    /* ---- [3] UDP 経由(計画が実害ありとしている経路)---- */
+    /* ---- [3][4] UDP 経由(計画が実害ありとしている経路)----
+     * **[4] は受信側の組み立て。** 対向 PF でポートを待ち受けておけば、
+     * 分割して送ったデータグラムが**組み立てられて上位へ届く**ところまで
+     * 一気通貫で確かめられる(組み立てが無かった頃は [3] の観測フックで
+     * 「分割されたこと」しか言えなかった)。 */
     const uint16_t udp_payload = 10000u;
     s_frag_count = 0; s_frag_overflow = 0;
+    if (udp_bind(7777u, shell_udptest_handler) != 0) {
+        uart_printf("fragtest: NG [4] udp_bind 失敗\n");
+        ok = 0;
+    }
+    uint32_t rx_before = s_udptest_rx;
     if (udp_send(dst_ip, dst_mac, 7777u, 7777u, tx, udp_payload) != 0) {
         uart_printf("fragtest: NG [3] udp_send が失敗\n");
         ok = 0;
@@ -2218,7 +2304,19 @@ static void shell_fragtest(char *args)
                         s_frag_seen[0].protocol, IP_PROTO_UDP);
             ok = 0;
         }
+        uint32_t want_sum = 0;
+        for (unsigned i = 0; i < udp_payload; i++) want_sum += tx[i];
+        int got     = (s_udptest_rx != rx_before);
+        int len_ok  = got && (s_udptest_len == udp_payload);
+        int sum_ok  = got && (s_udptest_sum == want_sum);
+        uart_printf("fragtest: %s [4] 受信側が組み立てて上位へ渡す "
+                    "(受信=%d 長さ=%u/%u 総和=%s)\n",
+                    (got && len_ok && sum_ok) ? "OK" : "NG", got,
+                    got ? (unsigned)s_udptest_len : 0u, (unsigned)udp_payload,
+                    sum_ok ? "一致" : "不一致");
+        if (!got || !len_ok || !sum_ok) ok = 0;
     }
+    udp_unbind(7777u);
 
     ip_set_frag_observer(NULL);
     s_frag_dump = 0;
@@ -3366,7 +3464,10 @@ static void shell_ext6test(char *args)
         if (!good) ok = 0;
     }
 
-    /* ---- [6] Fragment ヘッダ付きは破棄され、観測フックには届く ---- */
+    /* ---- [6] 最初の断片だけでは上位へ渡らない(組み立ての途中)----
+     * **組み立てを実装した後もこの検査は成立する。** 注入するのは
+     * 「M=1 / offset=0」の 1 個だけなので、最終断片が来ておらず完成しない。
+     * 完成させたときに届くことは [7b] で見る。 */
     s_ext6_count = 0; s_ext6_overflow = 0;
     ipv6_set_frag_observer(shell_ext6_frag_observer);
     {
@@ -3381,7 +3482,7 @@ static void shell_ext6test(char *args)
         int good = (!delivered) && (s_ext6_count == 1u) &&
                    (s_ext6_seen[0].id == 0xABCD1234u) && (s_ext6_seen[0].more == 1) &&
                    (s_ext6_seen[0].off == 0u) && (s_ext6_seen[0].nh == IPV6_NH_UDP);
-        uart_printf("ext6test: %s [6] Fragment 付きは上位へ渡さない(受信=%d)、"
+        uart_printf("ext6test: %s [6] 最初の断片だけでは上位へ渡さない(受信=%d)、"
                     "断片として観測できる(%u 個 / id=0x%08x more=%d nh=%u)\n",
                     good ? "OK" : "NG", delivered, s_ext6_count,
                     s_ext6_count ? (unsigned)s_ext6_seen[0].id : 0u,
@@ -3406,6 +3507,7 @@ static void shell_ext6test(char *args)
         s_ext6_count = 0; s_ext6_overflow = 0;
         for (unsigned i = 0; i < sizeof(s_ext6_reasm); i++) s_ext6_reasm[i] = 0;
 
+        uint32_t rx_before = s_udptest_rx;
         netif_activate(self);
         int sent = udp_send6(peer_ll, peer_mac, port, port, big, (uint16_t)sizeof(big));
         for (uint64_t t0 = timer_now(); !timeout_ms(t0, 300u); ) net_poll_all_and_dispatch();
@@ -3444,6 +3546,21 @@ static void shell_ext6test(char *args)
                     good ? "OK" : "NG", test_mtu, s_ext6_count,
                     s_ext6_count ? s_ext6_seen[0].len : 0u, want_chunk, has_middle, match);
         if (!good) ok = 0;
+
+        /* **受信側の組み立て。** 対向 PF は同じポートを待ち受けているので、
+         * 3 つに割れた UDP データグラムが 1 つに戻って上位へ届くはず。
+         * 組み立てが無かった頃は「断片として観測できた」までしか言えなかった。 */
+        uint32_t want_sum = 0;
+        for (unsigned i = 0; i < sizeof(big); i++) want_sum += big[i];
+        int got    = (s_udptest_rx != rx_before);
+        int len_ok = got && (s_udptest_len == (uint16_t)sizeof(big));
+        int sum_ok = got && (s_udptest_sum == want_sum);
+        uart_printf("ext6test: %s [7b] 受信側が組み立てて上位へ渡す "
+                    "(受信=%d 長さ=%u/%u 総和=%s)\n",
+                    (got && len_ok && sum_ok) ? "OK" : "NG", got,
+                    got ? (unsigned)s_udptest_len : 0u, (unsigned)sizeof(big),
+                    sum_ok ? "一致" : "不一致");
+        if (!got || !len_ok || !sum_ok) ok = 0;
     }
 
     /* ---- [8] 陰性対照: MTU 以下は分割しない ---- */
@@ -5370,6 +5487,10 @@ static void shell_dispatch(char *line, int s0, int s1)
         uart_printf("nvmet: ターゲット常駐起動 (pf1, port %u) -- 接続待ち\n", port);
     } else if (strncmp(line, "tcpdisconnect", 13) == 0) {
         shell_tcpdisconnect();
+    } else if (strncmp(line, "fragrecv", 8) == 0) {
+        shell_fragrecv(line + 8);
+    } else if (strncmp(line, "fragstat", 8) == 0) {
+        shell_fragstat(line + 8);
     } else if (strncmp(line, "hdgstcorrupt", 12) == 0) {
         shell_hdgstcorrupt(line + 12);
     } else if (strncmp(line, "termtest", 8) == 0) {
@@ -5493,6 +5614,8 @@ static void shell_dispatch(char *line, int s0, int s1)
                     "  tcpdisconnect                         内蔵イニシエータのセッションを閉じる(外部接続の前に)\n"
                     "  hdgstcorrupt [t|i] [N]                ヘッダダイジェストをN個わざと壊す(TermReqの検証)\n"
                     "  termtest                              NVMe/TCP Terminate Connection Request(陰性対照つき)\n"
+                    "  fragrecv [ポート] [秒]                UDPを待ち受けて長さと総和を報告(外部から断片化して送る用)\n"
+                    "  fragstat [clear]                      受信側のIP断片組み立ての統計\n"
                     "  qploop [N]                            RC QPの作成/破棄をN回繰り返しFWリソース枯渇を見る\n"
                     "  nvmediscover [dump]                   Discovery Log Pageを取得(dumpで16進出力)\n"
                     "  nvmet [port] | jobs | help | quit    (↑↓で履歴呼び出し)\n"
