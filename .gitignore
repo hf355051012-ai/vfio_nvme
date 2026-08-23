@@ -11,3 +11,7 @@ tags
 # docs/spec.html だけを公開する。SPEC.md を直したら
 # tools/build_spec_html.sh で docs/spec.html を作り直してコミットすること。
 *.md
+
+# 開発補助スクリプトも公開しない(ローカルには残す)
+clang_calltree.py
+tools/
