@@ -1231,6 +1231,10 @@ traddr:  192.168.101.11</code></pre></div>
 <p>理由は <a href="#ch6">第 6 章</a> で触れた<strong>キャッシュとの整合</strong>です。Pi5 の PCIe は「装置とキャッシュの整合を自動でとらない」設定になっており、 相手のプログラムは<strong>「装置に渡す」と宣言したあとで CPU が中身を書いて いる</strong>ため、装置は書かれる前の古いメモリを読んでしまいます。 <strong>CPU の書き込みを伴わない書き込み方向だけが正しく動く</strong>、という 非対称がその証拠です。</p>
 <p><strong>自作側の問題でないことは独立に確かめました。</strong> 同じ相手に <strong>Linux 純正のホストを接続しても</strong>同じ壊れ方をし、 「識別名が空だ」と言って接続を諦めます。</p>
 <p><strong>過去には動いていました。</strong> 100 ギガビットの別のカードを使い、 2 つのポートを直結していた時期には、NVMe-oF RDMA のベンチマークが完走 していました。<code>README.md</code> の性能表にある RDMA の数値はそのときのものです。 <strong>ただしその構成でも、フレームがワイヤを通っていたのか内部で折り返して いたのかは区別できていませんでした</strong>(区別する手段が無かったため)。</p>
+<h5>切断を相手に伝えていないので、繋ぎ直しが拒否される</h5>
+<p><strong>接続を閉じるとき、接続管理の「切断要求」を送っていません。</strong> そのため相手側には前の接続が残ったままになり、<strong>次の接続要求が 「古い接続がある」という理由で拒否される</strong>ことがあります。</p>
+<p>当たりやすい理由が 2 つ重なっています。相手の Linux は <strong>(装置の識別子, キュー番号)の組</strong>で前の接続を探しますが、 こちらは QP を作り直すたびに<strong>同じキュー番号が再利用される</strong>ためです。</p>
+<p>その場での回避は、<strong>相手側でターゲットのポートを付け直す</strong>ことです (そのターゲットの全接続が落ちます)。<strong>本筋の直し方は切断要求と その応答の実装</strong>で、まだ手を付けていません(<a href="#ch28">第 28 章</a> 28.4)。</p>
 <h4>15.8 未検証のまま残っている実装</h4>
 <p>RoCEv2 が現構成で動かせないため、<strong>ターゲット側の RDMA 実装 (<code>nvmet_rdma.c</code>)には、TCP 側に入れた切断処理の改善が入っていません。</strong></p>
 <p>具体的には <a href="#ch16">第 16 章</a> で説明する 2 件(接続を閉じる順序の扱いと、 シャットダウン状態の報告)です。<strong>動かせるようになったら同じ手当てが 必要</strong>、という状態で止まっています。</p>
@@ -1578,13 +1582,19 @@ if (ctx-&gt;aer_notify_ns &amp;&amp; ctx-&gt;aer_pending) {
 <p>起動直後の 1 回目は、キャッシュが温まっていないぶん低く出ます。 <strong>同じセッションで連続して測り、定常値を比べます。</strong></p>
 <p><strong>(4) ばらつきが大きい項目があります</strong></p>
 <p>特に<strong>書き込みの 8 キロバイト</strong>は、同じバイナリ・同じセッションでも 942 / 0.01 / 595 MiB/s といった桁違いのばらつきが出ることがあります (0.01 の回は自己修復する既知の現象)。<strong>性能の退行判定にこの項目は 使えません。</strong> 64K / 256K と読み出しの 8K で判断します。</p>
+<p><strong>(5) この環境には性能の「モード」が 2 つあります</strong></p>
+<p><strong>プロセスを起動し直すたびに、どちらかの状態へ落ち着きます。</strong></p>
+<div class="tablewrap"><table><thead><tr><th>呼び名</th><th>読み出し 8K</th><th>読み出し 64K</th></tr></thead><tbody><tr><td>X</td><td>遅い</td><td><strong>速い</strong>(Y の 1.25 倍)</td></tr><tr><td>Y</td><td><strong>速い</strong>(X の 1.15 倍)</td><td>遅い</td></tr></tbody></table></div>
+<p><strong>同じバイナリでも起動ごとに変わります</strong>(同じ実行ファイルを 3 回 起動して X / X / Y になりました)。原因は分かっていません。</p>
+<p>厄介なのは、<strong>ビルドを変えると必ず起動し直しになる</strong>ことです。 素朴に変更前後を測ると、<strong>コードの差ではなくモードの差を見てしまいます。</strong></p>
+<blockquote><p><strong>見分け方</strong>: 「8K が上がったのに 64K が下がった」という<strong>不自然な 向きの差</strong>が出たら、まずこれを疑ってください。<strong>複数回起動して、 同じモードどうしで比べます。</strong></p></blockquote>
 <h4>22.3 比較対象</h4>
 <p><code>~/script/linux_loopback.sh</code> というスクリプト(リポジトリ外)で、 Linux 側の実装を同じ書式で測れます。</p>
 <div class="tablewrap"><table><thead><tr><th>呼び名</th><th>中身</th></tr></thead><tbody><tr><td>kernel</td><td>Linux カーネルの NVMe-oF ターゲット + イニシエータ + fio</td></tr><tr><td>spdk</td><td>SPDK(ユーザ空間のストレージフレームワーク)</td></tr><tr><td>独自</td><td>このプロジェクト</td></tr></tbody></table></div>
 <p><strong>この比較は対等ではありません。</strong> Linux 側はネットワーク名前空間を経由した 本物の TCP スタックを通っています。<strong>順位そのものより、 「変更の前後で同じ列を比べる」ことに意味があります。</strong></p>
 <h4>22.4 性能に触る変更をするときの手順</h4>
 <p>このリポジトリで守られている作法です。</p>
-<ol><li><strong>同じセッション内で変更前後を比べる。</strong> 実行ごとに 4〜20% ばらつく 環境なので、日をまたいだ比較は無意味です。</li><li><strong>単発の比較で結論を出さない。</strong> 連続して複数回測ります。</li><li><strong>5% 以上の変化があったら <code>README.md</code> の表を更新する。</strong> 5% 未満はばらつきの範囲として扱います。</li></ol>
+<ol><li><strong>同じセッション内で変更前後を比べる。</strong> 実行ごとに 4〜20% ばらつく 環境なので、日をまたいだ比較は無意味です。</li><li><strong>単発の比較で結論を出さない。</strong> 連続して複数回測ります。</li><li><strong>同じセッション内で切り替えられる設定は、交互に測る。</strong> 「有効を 2 回 → 無効を 2 回」の順で測って <strong>16% 落ちた</strong>ように 見えたものが、<strong>交互に測ると差が消えました</strong>(タイムスタンプの 検証。<a href="#ch10">第 10 章</a> 10.9)。接続を張り直せば決まる設定 (チェック値・タイムスタンプ・SACK・IPv4/IPv6)は交互に測れます。</li><li><strong>起動し直しが要る比較(= ビルドを変えた比較)は、同じモードどうしで 比べる。</strong> 上の 22.2 (5) です。</li><li><strong>5% 以上の変化があったら <code>README.md</code> の表を更新する。</strong> 5% 未満はばらつきの範囲として扱います。</li></ol>
 <h4>22.5 ソースのどこを読むか</h4>
 <div class="tablewrap"><table><thead><tr><th>知りたいこと</th><th>見るファイル</th></tr></thead><tbody><tr><td>ベンチマークの実装</td><td><code>src/platform/x86-linux/main.c</code> の <code>shell_tcpbench()</code> / <code>shell_rdmabench()</code></td></tr><tr><td>時刻の取得</td><td><code>src/timer.c</code>、<code>src/platform/x86-linux/hal_timer.c</code></td></tr><tr><td>詳細な時間計測(リングバッファ)</td><td><code>src/timestamp.c</code></td></tr></tbody></table></div>
 <hr>
@@ -1734,7 +1744,15 @@ done</code></pre></div>
 <h4>27.4 状態を変える検査は必ず元に戻す</h4>
 <p><code>arptest</code>(有効期間)、<code>routetest</code>(経路)、<code>pmtutest</code>(経路 MTU)、 <code>nudtest</code>(有効期間)、<code>backlogtest</code>(待ち行列の深さと SYN|ACK の破棄)、 <code>tcptstest</code>(タイムスタンプの有効/無効とロス注入)、 <code>sacktest</code>(SACK の有効/無効とロス注入)、 <code>termtest</code>(チェック値の破壊)は、 <strong>いずれも設定を書き換えてから元に戻します</strong>。途中で失敗しても復元します。</p>
 <p>ただし完全ではありません。経路 MTU の消去は、 <strong>すでに確立している接続のセグメントサイズを元に戻しません</strong>。 接続を張り直す必要があります。</p>
-<h4>27.5 ソースのどこを読むか</h4>
+<h4>27.5 検査は、その前に何をしたかに引きずられる</h4>
+<p><strong>検査が失敗したとき、まず疑うのは実装ではなく「直前まで何をしていたか」 です。</strong> 実際に 2 つの形で踏みました。</p>
+<p><strong>(1) ロスを注入する検査は、長い連続実行の後だと落ちます</strong></p>
+<p><code>tcptstest</code> と <code>sacktest</code> を、13 個の検査を通した後に走らせると 「3 回目の送信に失敗」「所要時間が縮んでいない」で失敗します。 <strong>プロセスを起動し直すと、どちらも通ります。</strong></p>
+<p><strong>(2) 外部の機械と繋いだ残骸が、内部の検査を壊します</strong></p>
+<p>Pi5 からルータ広告を受けた直後だと、対向ポートに<strong>外から設定された ゲートウェイ</strong>が残っています。すると自作どうしの検査が、同じリンクに いる相手宛のフレームまでゲートウェイへ向けてしまいます (Pi5 はルータではないので「届かない」と返してきます)。</p>
+<p><strong><a href="#ch8">第 8 章</a> の経路選択を入れた後は、「宛先は同じリンクにいる」 という暗黙の前提が、検査ごとに壊れうる</strong>ということです。 現在は検査側が対向ポートのゲートウェイも退避・復元します。</p>
+<blockquote><p><strong>したがって、検査が失敗したら「起動し直して再現するか」を先に 確かめます。</strong> 再現しないなら、直すべきは実装ではなく検査の前提です。</p></blockquote>
+<h4>27.6 ソースのどこを読むか</h4>
 <p>検査コマンドはすべて <code>src/platform/x86-linux/main.c</code> にあります (約 4,600 行のうち、かなりの部分がこれらです)。 <code>shell_</code> で始まる関数を探してください。</p>
 <hr>
 <h2 class="parthead" id="part-7">第 VIII 部 実装状況</h2>
@@ -1749,7 +1767,7 @@ done</code></pre></div>
 <div class="tablewrap"><table><thead><tr><th>項目</th><th>状態</th><th>備考</th></tr></thead><tbody><tr><td>PDU の送受信、in-capsule、R2T</td><td><strong>確認済</strong></td><td></td></tr><tr><td>ダイジェスト(CRC32C)</td><td><strong>確認済</strong></td><td></td></tr><tr><td><strong>Terminate Connection Request</strong></td><td><strong>確認済</strong></td><td>致命的な誤りを理由つきで伝える。<strong>Linux が <code>Received C2HTermReq (FES = Header Digest Error)</code> と解釈するところまで確認</strong>(<a href="#ch14">第 14 章</a> 14.4)</td></tr><tr><td>Discovery</td><td><strong>確認済</strong></td><td></td></tr><tr><td>Identify(CNS 6 種)</td><td><strong>確認済</strong></td><td>Linux の <code>nvme-cli</code> で確認</td></tr><tr><td>Get / Set Features</td><td><strong>確認済</strong></td><td>同上、陰性対照つき</td></tr><tr><td>Write Zeroes / Dataset Management</td><td><strong>確認済</strong></td><td><code>blkdiscard</code> と <code>fstrim</code> まで確認</td></tr><tr><td>SMART / エラー情報ログ</td><td><strong>確認済</strong></td><td>カウンタの増加とエラー記録まで確認</td></tr><tr><td>非同期イベント(AER)</td><td><strong>確認済</strong></td><td>名前空間の増減で発火、Linux が再スキャン</td></tr><tr><td>Keep Alive タイマ</td><td><strong>確認済</strong></td><td>リンクを落として時間切れ、陰性対照つき</td></tr><tr><td>複数名前空間</td><td><strong>確認済</strong></td><td><code>/dev/nvme0n2</code> が生え、内容が混ざらない</td></tr><tr><td><strong>IO コマンドの無効な名前空間 ID</strong></td><td><strong>未検証</strong></td><td><strong>ホスト経由では叩けない。</strong> Linux が「コマンド中の nsid とデバイスの nsid が違う」とカーネルの入口で弾き、複数名前空間があると汎用の受け渡しも拒否する。<strong>名前空間の解決そのものは動いている</strong>(サイズの違う 2 つで範囲検査が別々に効くこと、内容が混ざらないことで確認済み)。未到達なのは「無効だったときにどの状態コードを返すか」の 1 分岐だけ</td></tr><tr><td><strong>認証(DH-HMAC-CHAP / TLS)</strong></td><td><strong>未実装</strong></td><td><a href="#ch28">第 28.5 節</a></td></tr></tbody></table></div>
 <h4>28.4 NVMe-oF RDMA / RoCEv2</h4>
 <p><strong>ここが一番、状態を分けて書く必要がある部分です。</strong></p>
-<div class="tablewrap"><table><thead><tr><th>項目</th><th>状態</th><th>備考</th></tr></thead><tbody><tr><td><strong>RoCEv2 のパケットが相手に届き、解釈されること</strong></td><td><strong>確認済(2 ノード間)</strong></td><td>OptiPlex から Raspberry Pi 5 へ送ると、<strong>Pi5 側の UDP 4791 番のカウンタが増え、Pi5 の Linux が接続管理の応答(REJ)を返してくる</strong>。つまり Ethernet・IP・UDP・IB ヘッダ・CM の中身まで、<strong>相手の正規実装が解釈できる形になっている</strong></td></tr><tr><td><strong>同じカードの 2 ポート間(ループバック)</strong></td><td><strong>不可能</strong></td><td><strong>このカードの制約</strong>。宛先の MAC か IP が自装置のものだと、ファームウェアが内部で処理しようとして消える。<strong>Linux 純正のドライバでも同じように失敗する</strong>ので、自作の不具合ではない(<a href="#ch15">第 15 章</a> 15.6)</td></tr><tr><td><strong>NVMe-oF RDMA のエンドツーエンド</strong></td><td><strong>確認済(2 ノード間)</strong></td><td>自作イニシエータ → Pi5 の Linux ターゲット。接続・入出力キューの確立・読み書きまで通り、<strong>書き込んだ 4 メガバイトが相手側で完全一致</strong>(<a href="#ch15">第 15 章</a> 15.7)</td></tr><tr><td><strong>同、読み出しの中身</strong></td><td><strong>相手側の都合で未確認</strong></td><td>転送は成立するが返る中身が壊れる。<strong>Pi5 の装置とキャッシュの整合の問題</strong>で、Linux 純正のホストを繋いでも同じ壊れ方をする(<a href="#ch15">第 15 章</a> 15.7)</td></tr><tr><td>(参考)過去の構成での動作</td><td>—</td><td>100 ギガビットの別カードで 2 ポートを直結していた時期には、ベンチマークが完走していた。<code>README.md</code> の RDMA の数値はそのときのもの。<strong>ただしその構成でも、ワイヤを通っていたのか内部で折り返していたのかは区別できていなかった</strong></td></tr><tr><td><strong>ターゲット側 RDMA の切断処理の改善</strong></td><td><strong>未実装</strong></td><td>TCP 側に入れた 2 件(接続を閉じる順序、シャットダウン状態の報告。<a href="#ch16">第 16 章</a> 16.3)が <strong><code>nvmet_rdma.c</code> には入っていない</strong>。RoCEv2 を動かせないので検証できないため。<strong>動くようになったら同じ手当てが必要</strong></td></tr></tbody></table></div>
+<div class="tablewrap"><table><thead><tr><th>項目</th><th>状態</th><th>備考</th></tr></thead><tbody><tr><td><strong>RoCEv2 のパケットが相手に届き、解釈されること</strong></td><td><strong>確認済(2 ノード間)</strong></td><td>OptiPlex から Raspberry Pi 5 へ送ると、<strong>Pi5 側の UDP 4791 番のカウンタが増え、Pi5 の Linux が接続管理の応答(REJ)を返してくる</strong>。つまり Ethernet・IP・UDP・IB ヘッダ・CM の中身まで、<strong>相手の正規実装が解釈できる形になっている</strong></td></tr><tr><td><strong>同じカードの 2 ポート間(ループバック)</strong></td><td><strong>不可能</strong></td><td><strong>このカードの制約</strong>。宛先の MAC か IP が自装置のものだと、ファームウェアが内部で処理しようとして消える。<strong>Linux 純正のドライバでも同じように失敗する</strong>ので、自作の不具合ではない(<a href="#ch15">第 15 章</a> 15.6)</td></tr><tr><td><strong>NVMe-oF RDMA のエンドツーエンド</strong></td><td><strong>確認済(2 ノード間)</strong></td><td>自作イニシエータ → Pi5 の Linux ターゲット。接続・入出力キューの確立・読み書きまで通り、<strong>書き込んだ 4 メガバイトが相手側で完全一致</strong>(<a href="#ch15">第 15 章</a> 15.7)</td></tr><tr><td><strong>同、読み出しの中身</strong></td><td><strong>相手側の都合で未確認</strong></td><td>転送は成立するが返る中身が壊れる。<strong>Pi5 の装置とキャッシュの整合の問題</strong>で、Linux 純正のホストを繋いでも同じ壊れ方をする(<a href="#ch15">第 15 章</a> 15.7)</td></tr><tr><td>(参考)過去の構成での動作</td><td>—</td><td>100 ギガビットの別カードで 2 ポートを直結していた時期には、ベンチマークが完走していた。<code>README.md</code> の RDMA の数値はそのときのもの。<strong>ただしその構成でも、ワイヤを通っていたのか内部で折り返していたのかは区別できていなかった</strong></td></tr><tr><td><strong>接続管理の切断要求(DREQ / DREP)</strong></td><td><strong>未実装</strong></td><td>閉じたことを相手に伝えないので、相手側に前の接続が残る。<strong>次の接続要求が「古い接続がある」として拒否される</strong>ことがある。当座は相手側でターゲットのポートを付け直す(<a href="#ch15">第 15 章</a> 15.7)</td></tr><tr><td><strong>ターゲット側 RDMA の切断処理の改善</strong></td><td><strong>未実装</strong></td><td>TCP 側に入れた 2 件(接続を閉じる順序、シャットダウン状態の報告。<a href="#ch16">第 16 章</a> 16.3)が <strong><code>nvmet_rdma.c</code> には入っていない</strong>。RoCEv2 を動かせないので検証できないため。<strong>動くようになったら同じ手当てが必要</strong></td></tr></tbody></table></div>
 <h4>28.5 認証について</h4>
 <p>NVMe-oF の実運用では、<strong>接続時の認証</strong>が必要です。方式は 2 つあります。</p>
 <ul><li><strong>DH-HMAC-CHAP</strong>: 合言葉による認証。HMAC-SHA256 と Diffie-Hellman 鍵交換が要ります。</li><li><strong>TLS 1.3</strong>: TCP の上に暗号化の層を追加。鍵交換・証明書・AES-GCM の一式が要ります。</li></ul>
