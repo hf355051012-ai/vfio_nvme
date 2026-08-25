@@ -281,6 +281,7 @@ html{scroll-behavior:smooth}
 <li><a href="#appendix-a" data-target="appendix-a"><span class="num">A</span><span class="lbl">用語集</span></a></li>
 <li><a href="#appendix-b" data-target="appendix-b"><span class="num">B</span><span class="lbl">ファイル索引</span></a></li>
 <li><a href="#appendix-c" data-target="appendix-c"><span class="num">C</span><span class="lbl">参考にした仕様と実装</span></a></li>
+<li><a href="#appendix-d" data-target="appendix-d"><span class="num"></span><span class="lbl">付録 D ドライバが読み書きするレジスタ</span></a></li>
 </ul></li>
       </ul>
     </div>
@@ -297,7 +298,7 @@ html{scroll-behavior:smooth}
 <ul><li>ポインタ・構造体・ビット演算は分かる</li><li><code>malloc()</code> は知っているが、ハードウェアがメモリを直接読み書きする話は知らない</li><li>ソケット通信は書いたことがあるかもしれないが、通信路の上を実際にどんな バイト列が流れているかは知らない</li><li>SSD やネットワークカードの「中の人」が何をしているかは知らない</li></ul>
 <p>という人が、<strong>最初から順番に読んで、途中で知らない言葉に出会わずに</strong> 最後まで到達できることを目標にしています。</p>
 <h4>読み方</h4>
-<ul><li><strong>最初から順に読むこと</strong>を前提に書いています。専門用語は必ず「初めて出て くる場所」で説明し、それ以降は説明済みのものとして使います。</li><li>略語や専門用語には、各章の最初の 1 回だけ <a href="#appendix-a">用語集</a> への リンクを張ってあります。忘れたら飛んでください。</li><li>各章の終わりに <strong>「ソースのどこを読むか」</strong> という節があります。文書と 実際のコードを行き来するための道しるべです。</li><li><strong>左に章の一覧を出したいときは <code>docs/spec.html</code></strong>(この文書から生成した HTML 版)。 章の絞り込みと、いま読んでいる章のハイライトが付きます。</li><li>急いでいる人は、<a href="#ch1">第 1 章</a>(何をするソフトか)と <a href="#ch17">第 17 章</a>(全体アーキテクチャ)と <a href="#ch20">第 20 章</a>(1 つの I/O を 最後まで追う)だけでも全体像がつかめます。</li></ul>
+<ul><li><strong>最初から順に読むこと</strong>を前提に書いています。専門用語は必ず「初めて出て くる場所」で説明し、それ以降は説明済みのものとして使います。</li><li>略語や専門用語には、各章の最初の 1 回だけ <a href="#appendix-a">用語集</a> への リンクを張ってあります。忘れたら飛んでください。</li><li>各章の終わりに <strong>「ソースのどこを読むか」</strong> という節があります。文書と 実際のコードを行き来するための道しるべです。</li><li><strong>状態を持つ主要な処理には、章ごとに「状態遷移」の節</strong>を置いてあります (近隣キャッシュ 7.7 / 断片の組み立て 8.5 / TCP 10.13 / MLD と SLAAC 11.5 / NVMe/TCP 14.5〜14.6 / RDMA と QP 15.9 / ジョブ 18.6)。図と、 <strong>各状態でやること・次へ移る条件</strong>の表が組になっています。</li><li><strong>ハードウェアのレジスタは <a href="#appendix-d">付録 D</a> に全部並べて</strong>あります。 番地・ビットの意味・実際に書いている値の一覧です。</li><li><strong>左に章の一覧を出したいときは <code>docs/spec.html</code></strong>(この文書から生成した HTML 版)。 章の絞り込みと、いま読んでいる章のハイライトが付きます。</li><li>急いでいる人は、<a href="#ch1">第 1 章</a>(何をするソフトか)と <a href="#ch17">第 17 章</a>(全体アーキテクチャ)と <a href="#ch20">第 20 章</a>(1 つの I/O を 最後まで追う)だけでも全体像がつかめます。</li></ul>
 <h4>関連する文書</h4>
 <p>このリポジトリには 4 つの文書があります。役割が違います。</p>
 <div class="tablewrap"><table><thead><tr><th>文書</th><th>誰のためか</th><th>何が書いてあるか</th></tr></thead><tbody><tr><td><strong><code>SPEC.md</code>(この文書)</strong></td><td><strong>前提知識の無い読者</strong></td><td><strong>仕組みの説明。前提知識から順に積み上げる</strong></td></tr><tr><td><code>README.md</code></td><td>このソフトを使う人</td><td>構成の要約、ビルド手順、最新の性能値</td></tr><tr><td><code>CLAUDE.md</code></td><td>開発を引き継ぐ人</td><td>作業手順と、実機で実際に踏んだ落とし穴</td></tr><tr><td><code>PLAN_protocol_gaps.md</code></td><td>開発を引き継ぐ人</td><td>未実装項目の計画と、各段階の実装記録</td></tr></tbody></table></div>
@@ -681,7 +682,28 @@ mmio_write64(uar + DOORBELL_OFFSET, packed_value);  /* ③ 鳴らす */</code></
                     To Receive To Send</code></pre></div>
 <p><strong>どのパラメータをどの遷移で設定するかが決まっています。</strong> たとえば 「相手から同時に何個の RDMA 読み出しを受け付けるか」という設定は <strong>INIT→RTR でしか反映されません</strong>。RTR→RTS で書いても FW は保持しません。</p>
 <blockquote><p><strong>実際に踏んだ不具合</strong>: この設定を間違った遷移で書いていたため、 相手が 2 個目の読み出しを投げた瞬間にエラーになる、という問題が ありました。これを直したことで<strong>書き込み性能が 2.3 倍</strong>になっています (<a href="#ch15">第 15 章</a> で詳述)。</p></blockquote>
-<h4>5.9 ソースのどこを読むか</h4>
+<h4>5.9 このドライバが読み書きするレジスタ</h4>
+<p>ここまで「レジスタを叩く」と書いてきましたが、<strong>実際に触っている番地は そう多くありません。</strong> 4 種類あり、性格がまったく違います。</p>
+<div class="tablewrap"><table><thead><tr><th>種類</th><th>どこにあるか</th><th>何に使うか</th><th>一覧</th></tr></thead><tbody><tr><td><strong>PCI コンフィグ空間</strong></td><td>デバイスごとの 4096 バイト。VFIO 経由で読み書き</td><td>DMA の許可、PCIe リンク速度の確認</td><td><a href="#appendix-d">付録 D</a> D.1</td></tr><tr><td><strong>初期化セグメント</strong></td><td>BAR0 の先頭 512 バイト。MMIO</td><td>起動待ち、コマンドキューの登録、呼び鈴</td><td>D.2</td></tr><tr><td><strong>UAR(呼び鈴)</strong></td><td>BAR0 の中の 4096 バイト単位の窓。MMIO</td><td>「WQE を置いた」と伝える(5.4)</td><td>D.3</td></tr><tr><td><strong>PRM レジスタ</strong></td><td><strong>番地ではない。</strong> コマンドで番号を指定して読み書きする</td><td>ポートの up / MTU / 統計 / 温度</td><td>D.4</td></tr></tbody></table></div>
+<p><strong>最後の 1 つが分かりにくいところです。</strong> ポートを up にするのも MTU を 変えるのも、<strong>MMIO の番地に書くのではなく、「ACCESS_REG というコマンドで 0x5006 番のレジスタを書け」とカードに依頼</strong>します。番地空間ではなく <strong>カードの中にある名前付きの設定表</strong>だと思ってください。</p>
+<p>つまりこのドライバの設定作業は、ほとんどが <strong><a href="#term-cmdq">コマンドキュー</a> 経由</strong>です。MMIO で直接触るのは「起動の最初」と「呼び鈴」だけです。</p>
+<div class="codewrap"><pre><code>  CPU が直接 MMIO で触るもの
+    |
+    +-- (D.2) 初期化セグメント
+    |          起動が終わったか / コマンドキューの番地 / コマンドの呼び鈴
+    |
+    +-- (D.3) UAR と BlueFlame
+               送信キューの呼び鈴
+
+  コマンド経由で触るもの
+    |
+    +-- (D.5) オブジェクトの作成と破棄
+    |          UAR / PD / MKey / CQ / SQ / RQ / TIS / TIR / QP / フロー表
+    |
+    +-- (D.4) PRM レジスタ
+               PAOS(ポート up)/ PMTU / PPCNT / MPCNT / MTMP</code></pre></div>
+<p><strong>ビットの意味と実際に書いている値は <a href="#appendix-d">付録 D</a> に全部 並べてあります。</strong></p>
+<h4>5.10 ソースのどこを読むか</h4>
 <div class="tablewrap"><table><thead><tr><th>知りたいこと</th><th>見るファイル</th></tr></thead><tbody><tr><td>bring-up の全体、コマンドキュー</td><td><code>src/mlx5.c</code>(約 4,300 行。<code>mlx5_hca_bringup()</code> が入口)</td></tr><tr><td>QP の作成・状態遷移・WQE 組み立て</td><td><code>src/mlx5_qp.c</code></td></tr><tr><td>Ethernet の送受信(上位から見た口)</td><td><code>src/mlx5_net.c</code></td></tr><tr><td>MMIO の補助関数</td><td><code>src/mmio.h</code></td></tr></tbody></table></div>
 <p><code>mlx5.c</code> だけは最適化を切って(<code>-O0</code> で)コンパイルされています。 <strong>理由は未解明です。</strong> <code>-O2</code> にすると bring-up の途中(ENABLE_HCA の直後の QUERY_ISSI というコマンド)が実機で毎回失敗し、<code>-O0</code> なら確実に成功する、 という現象があるためです。Makefile にその旨のコメントが残されています。</p>
 <hr>
@@ -788,7 +810,43 @@ rd32le(p)   /* リトルエンディアン版 */</code></pre></div>
 <p>自分が使おうとしている IP アドレスを、既に誰かが使っていないか確かめる 仕組みもあります。IPv4 では <a href="#term-arpprobe">ARP Probe</a>、IPv6 では <a href="#term-dad">DAD</a>(Duplicate Address Detection)と呼びます。</p>
 <p>やり方は「そのアドレスについて問い合わせを出し、返事が来たら使われている」 です。ポイントは<strong>送信元アドレスを空にして出す</strong>ことで、まだ自分のもので ないアドレスを名乗らないようにします。</p>
 <blockquote><p><strong>このカード特有の問題</strong>: このカードは<strong>マルチキャストやブロードキャストを 送信元にも返してきます</strong>(自分が出したものが自分に戻ってくる)。 重複アドレス検出を入れた途端、<strong>各ポートが「自分自身と衝突した」と 報告する</strong>ようになりました。対策として、送信元 MAC が自分なら応答も 集計もしない、という判定を入れています。</p></blockquote>
-<h4>7.7 ソースのどこを読むか</h4>
+<h4>7.7 状態遷移(近隣キャッシュのエントリ)</h4>
+<p>7.3〜7.5 で説明した動きを、1 つの図にまとめます。判定は <code>neigh_check_age()</code>(<code>src/netif.c</code>)の 1 関数に集約してあります。</p>
+<div class="codewrap"><pre><code>   ARP reply / NA を受信
+     |    expires_at = now + TTL(既定 60 秒)、probe_at = 0
+     v
+   +---------------+
+   | fresh         |  now &lt; expires_at
+   +---------------+  MAC を返すだけ。何も送らない
+     |
+     |  TTL 経過
+     v
+   +---------------+
+   | stale (DELAY) |  probe_at == 0 なら probe_at = now + TTL/12 を置き、
+   +---------------+  今回は黙って MAC を返す(確認要求は出さない)
+     |
+     |  DELAY を過ぎてから、また使われた
+     v
+   +---------------+
+   | stale + probe |  確認要求をユニキャストで送り、probe_at を TTL/60 先へ。
+   +---------------+  MAC は返し続ける(通信は止めない)
+     |
+     +--&gt; 応答が来た: fresh へ戻る(expires_at を入れ直す)
+     |
+     |  猶予(TTL/6)を過ぎても応答なし
+     v
+   +---------------+
+   | dead          |  無効化して「未登録」を返す。次の送信で最初から解決し直す
+   +---------------+</code></pre></div>
+<div class="tablewrap"><table><thead><tr><th>状態</th><th>判定条件</th><th>その状態でやること</th><th>次へ移る条件</th></tr></thead><tbody><tr><td><strong>fresh</strong></td><td><code>now &lt; expires_at</code></td><td>MAC を返す。<strong>時刻以外は何もしない</strong></td><td>TTL 経過</td></tr><tr><td><strong>stale(DELAY)</strong></td><td>期限切れ、かつ <code>probe_at == 0</code></td><td><code>probe_at</code> に DELAY(TTL/12)を設定し、MAC を返す</td><td>DELAY 経過後に<strong>また使われた</strong>とき</td></tr><tr><td><strong>stale + probe</strong></td><td>期限切れ、かつ <code>now &gt;= probe_at</code></td><td>確認要求を<strong>ユニキャストで</strong>送り、<code>probe_at</code> を TTL/60 先へ。MAC は返す</td><td>応答が来れば fresh、猶予切れで dead</td></tr><tr><td><strong>dead</strong></td><td><code>now &gt;= expires_at + TTL/6</code></td><td>エントリを無効化し、「未登録」を返す</td><td>(次の解決で fresh へ)</td></tr></tbody></table></div>
+<p><strong>状態を表すフィールドはありません。</strong> 持っているのは <code>expires_at</code> と <code>probe_at</code> という 2 つの時刻だけで、状態はそこから毎回計算します。 7.4 の「ホットパスに時計を置かない」と同じ考え方です。</p>
+<p>延命(fresh へ戻す)の<strong>きっかけは 2 つだけ</strong>です。</p>
+<ol><li><strong>ARP reply / NA を受け取った。</strong></li><li><strong>TCP の累積確認応答が前に進んだ</strong>(<a href="#ch10">第 10 章</a>)。相手が自分の データを受け取った証拠なので、確認要求より強い根拠になります。 受信ホットパスでは旗を 1 つ立てるだけにして、次の送信で消費します。</li></ol>
+<h5>重複アドレス検出の状態</h5>
+<p>こちらは 3 値の記録だけで、遷移というほどのものはありません (<code>netif_t.ipv4_dup</code> / <code>dad_state</code> / <code>ip6_global_dad</code>)。</p>
+<div class="tablewrap"><table><thead><tr><th>値</th><th>意味</th><th>いつ入るか</th></tr></thead><tbody><tr><td><strong>未実施</strong></td><td>まだ検査していない</td><td>起動直後。<strong>RA だけで作ったアドレスもここに留まる</strong>(7.6)</td></tr><tr><td><strong>衝突なし</strong></td><td>誰も名乗っていなかった</td><td>検査が応答なしで終わった</td></tr><tr><td><strong>衝突あり</strong></td><td>他のノードが使っていた</td><td>応答が返ってきた</td></tr></tbody></table></div>
+<p><strong>手動で設定したアドレスは、衝突ありでも使い続けます</strong>(7.6 の理由)。 一方、<strong>RA から自動で作ったアドレスは衝突を見つけたら使いません。</strong></p>
+<h4>7.8 ソースのどこを読むか</h4>
 <div class="tablewrap"><table><thead><tr><th>知りたいこと</th><th>見るファイル</th></tr></thead><tbody><tr><td>ARP(IPv4)</td><td><code>src/arp.c</code>、<code>src/arp.h</code></td></tr><tr><td>NDP(IPv6)と近隣キャッシュ</td><td><code>src/ipv6.c</code></td></tr><tr><td>キャッシュの有効期限の判定</td><td><code>src/arp.c</code> の <code>neigh_check_age()</code></td></tr><tr><td>動作確認コマンド</td><td><code>arptest</code>、<code>arpage</code>、<code>nudtest</code>、<code>dadtest</code>(<a href="#ch27">第 27 章</a>)</td></tr></tbody></table></div>
 <hr>
 <h3 class="chaphead" id="ch8">第 8 章 IP — 住所と道案内</h3>
@@ -837,7 +895,21 @@ rd32le(p)   /* リトルエンディアン版 */</code></pre></div>
 <p>このプロジェクトの実装では、次の点に注意しています。</p>
 <ul><li><strong>エラーの中の MTU 値の位置が IPv4 と IPv6 で違います。</strong> IPv4 は 「未使用 4 バイトの後半 2 バイト」、IPv6 は「4 バイト全体」です。 片方のつもりでもう片方を読むと、値が 0 になったり桁が狂ったりします。</li><li><strong>学習する宛先は「エラーの送信元」ではなく「元のパケットの宛先」です。</strong> 文句を言ってきたルータのアドレスを覚えても意味がありません。</li><li><strong>下げる方向にしか動かしません。</strong> 学習済みより大きい値の報告は無視します。 そうしないと、<strong>偽の大きい値を送り込むだけで学習を無効化できてしまいます。</strong></li><li><strong>床を設けます</strong>(IPv4 は 576、IPv6 は 1280 バイト)。それ未満は採用しません。</li></ul>
 <p>なお、覚えておく表は <a href="#ch7">第 7 章</a> の近隣キャッシュとは<strong>別に持っています</strong>。 近隣キャッシュのキーは「次ホップ」ですが、経路 MTU は「最終宛先」ごとの 性質だからです。同じ表に入れると、同じゲートウェイを通る別々の宛先の値が 混ざってしまいます。</p>
-<h4>8.5 ソースのどこを読むか</h4>
+<h4>8.5 状態遷移(断片の組み立て枠)</h4>
+<p>8.3 の組み立ては、<strong>同時に 4 個までの「組み立て中の枠」</strong>で行います (<code>src/ipfrag.c</code>。<strong>コアごとに独立</strong>なので排他が要りません)。 枠は次の状態を取ります。</p>
+<div class="codewrap"><pre><code>   [空き]  未使用の枠(コアごとに 4 個)
+     |
+     |  未知の(送信元, 宛先, 識別子, プロトコル)の断片が届いた
+     v
+   [組み立て中]  到着済みの位置を 8 バイト単位のビットで記録する
+     |
+     +--&gt; 穴が全部埋まった: 上位へ渡して枠を返す(= 空きへ戻る)
+     |
+     +--&gt; 30 秒経過: 時間切れ。次の断片が来たときに回収して空きへ戻る</code></pre></div>
+<div class="tablewrap"><table><thead><tr><th>状態</th><th>判定</th><th>次へ移る条件</th></tr></thead><tbody><tr><td><strong>空き</strong></td><td>未使用の枠</td><td>未知の(送信元, 宛先, 識別子, プロトコル)の断片が来た</td></tr><tr><td><strong>組み立て中</strong></td><td>到着済みの位置をビットで持つ</td><td>全部埋まった → 上位へ渡して<strong>空きに戻す</strong> / 30 秒経過 → 時間切れ</td></tr><tr><td><strong>時間切れ</strong></td><td>開始から 30 秒</td><td>回収して空きに戻す</td></tr></tbody></table></div>
+<p><strong>回収する専用の巡回処理はありません。</strong> 次の断片が来たときに、 <strong>先に古い枠を回収してから空きを探します</strong>。断片が二度と来なければ 回収する必要もないので、<strong>受信ホットパスに時計を足さずに済みます</strong>。 代償は、<code>fragstat</code> の「進行中」の数が実際より遅れて減ることだけです。</p>
+<p><strong>「空いている場所だけ埋める」のが安全上の要点</strong>です。重なった断片で <strong>あとから中身をすり替えられません</strong>(先に来たほうが勝ちます)。</p>
+<h4>8.6 ソースのどこを読むか</h4>
 <div class="tablewrap"><table><thead><tr><th>知りたいこと</th><th>見るファイル</th></tr></thead><tbody><tr><td>IPv4 の送受信、断片化</td><td><code>src/ip.c</code></td></tr><tr><td>IPv6 の送受信、拡張ヘッダ、NDP</td><td><code>src/ipv6.c</code>(約 2,400 行)</td></tr><tr><td>v4/v6 共通のアドレス型</td><td><code>src/netaddr.h</code></td></tr><tr><td>次ホップの判定</td><td><code>src/netif.h</code> の <code>netif_next_hop4()</code> / <code>netif_next_hop6()</code></td></tr><tr><td>経路 MTU の表</td><td><code>src/pmtu.c</code></td></tr><tr><td>動作確認コマンド</td><td><code>route</code>、<code>routetest</code>、<code>fragtest</code>、<code>pmtutest</code></td></tr></tbody></table></div>
 <hr>
 <h3 class="chaphead" id="ch9">第 9 章 ICMP — 「届かなかった」を伝える</h3>
@@ -998,7 +1070,81 @@ rd32le(p)   /* リトルエンディアン版 */</code></pre></div>
 <h4>10.12 この実装が持っていないもの</h4>
 <p>正直に書いておきます。次のものは実装していません。</p>
 <ul><li><strong><a href="#term-rack">RACK</a> や Tail Loss Probe</strong>: 「最後のほうのパケットが 失われた」場合の素早い検出。いまは時間切れ待ちになります。</li></ul>
-<h4>10.13 ソースのどこを読むか</h4>
+<h4>10.13 状態遷移(コネクション)</h4>
+<p>10.3 で「3 回の握手」と「4 回のやりとり」を説明しました。実装では <code>tcp_conn_t.state</code> が 9 つの値を取り、受信処理 (<code>tcp_input_addr()</code>)の <code>switch</code> がそれを進めます。</p>
+<div class="codewrap"><pre><code>   [1] 確立まで
+
+                     +------------+
+                     |   CLOSED   |
+                     +------------+
+                        |      |
+                        |      |
+              tcp_connect_begin() が SYN を送った  /  受け皿へ SYN が届いた
+                        |      |
+                        v      v
+          +------------+        +------------+
+          |  SYN_SENT  |        |  SYN_RCVD  |
+          +------------+        +------------+
+                        |      |
+              SYN|ACK を受けて ACK を返した  /  自分の SYN|ACK への ACK を受けた
+                        |      |
+                        v      v
+                   +-----------------+
+                   |   ESTABLISHED   |
+                   +-----------------+
+
+   [2] 切断まで
+
+                   +-----------------+
+                   |   ESTABLISHED   |
+                   +-----------------+
+                        |      |
+              自分から close() した  /  相手の FIN を受けて ACK を返した
+                        |      |
+                        v      v
+          +-------------+       +--------------+
+          | FIN_WAIT_1  |       |  CLOSE_WAIT  |
+          +-------------+       +--------------+
+              |       |                 |
+              |       |            close() して FIN を送った
+              |       |                 |
+              |       |                 v
+              |       |         +--------------+
+              |       |         |   LAST_ACK   |
+              |       |         +--------------+
+              |       |                 |
+              |       |            自分の FIN への ACK を受けた
+              |       |                 |
+              |  FIN も同時に受けた       |
+              |       |                 |
+     ACK を受けた      |                 |
+              |       |                 |
+              v       |                 |
+        +-------------+                 |
+        | FIN_WAIT_2  |                 |
+        +-------------+                 |
+              |                         |
+         相手の FIN を受けて ACK を返した  |
+              |                         |
+              v                         |
+        +-------------+                 |
+        |  TIME_WAIT  |                 |
+        +-------------+                 |
+              |                         |
+         4 秒(別表に登録して待つ)         |
+              |                         |
+              v                         v
+                     +------------+
+                     |   CLOSED   |
+                     +------------+</code></pre></div>
+<p>各状態でやることと、次へ移る条件です。</p>
+<div class="tablewrap"><table><thead><tr><th>状態</th><th>その状態でやること</th><th>次へ移る条件</th></tr></thead><tbody><tr><td><strong>CLOSED</strong></td><td>何もしない。スロットは未使用</td><td>能動 open で SYN_SENT、SYN 受信で SYN_RCVD</td></tr><tr><td><strong>SYN_SENT</strong></td><td>SYN を送って待つ。<strong>再送は 5 回、合計約 15.5 秒</strong></td><td>SYN|ACK かつ ACK が期待値 → ACK を返して ESTABLISHED</td></tr><tr><td><strong>SYN_RCVD</strong></td><td>SYN|ACK を送って待つ。<strong>同じ相手の SYN 再送には SYN|ACK を送り直す</strong>(10.8)</td><td>ACK が期待値 → ESTABLISHED(受け皿へ引き渡す)</td></tr><tr><td><strong>ESTABLISHED</strong></td><td>データの送受信、確認応答、再送、ウィンドウ更新 — この章のほぼ全部</td><td>FIN 受信 → ACK を返して CLOSE_WAIT / 自分から <code>close()</code> → FIN を送って FIN_WAIT_1</td></tr><tr><td><strong>CLOSE_WAIT</strong></td><td><strong>相手はもう送らないが、自分はまだ送れる。</strong> 受け取ったぶんの ACK は返す</td><td><code>close()</code> → FIN を送って LAST_ACK</td></tr><tr><td><strong>LAST_ACK</strong></td><td>自分の FIN への ACK を待つ</td><td>ACK が期待値 → CLOSED</td></tr><tr><td><strong>FIN_WAIT_1</strong></td><td>自分の FIN への ACK と、相手の FIN の両方を待つ</td><td>ACK → FIN_WAIT_2 / FIN → ACK を返して TIME_WAIT</td></tr><tr><td><strong>FIN_WAIT_2</strong></td><td>相手の FIN を待つ</td><td>FIN → ACK を返して TIME_WAIT</td></tr><tr><td><strong>TIME_WAIT</strong></td><td>遅れて届くセグメントを吸収する。<strong>4 秒</strong></td><td>時間切れ</td></tr></tbody></table></div>
+<h5>状態によらず先に判定するもの</h5>
+<p><code>switch</code> に入る前に、<strong>状態と無関係な判定が 3 つ</strong>あります。順序に意味が あります。</p>
+<ol><li><strong>RST の検証</strong>(10.7)。<strong>シーケンス番号が受信位置ちょうどのときだけ</strong> 受け入れて畳みます。窓内だが位置が違うなら確認の ACK を返し、窓外なら 捨てます。<strong>SYN_SENT だけは例外</strong>で、受信ウィンドウがまだ無いので 「自分の SYN を確認応答しているか」で判断します。</li><li><strong>PAWS</strong>(10.9)。古いタイムスタンプのセグメントを捨てます。 <strong>RST の判定より後</strong>に置いてあります — 先に置くと、相手が正当な RST を 送っても PAWS で捨ててしまい、接続を畳めなくなるからです。</li><li><strong>ウィンドウの更新</strong>。相手が広告した受け入れ余地を取り込みます。</li></ol>
+<h5>この実装ならではの 3 点</h5>
+<ul><li><strong>TIME_WAIT はコネクションの状態としてはほとんど使いません。</strong> <code>close()</code> は最後に必ず <code>CLOSED</code> にして枠を返し、代わりに <strong>4 つ組(相手 IP・相手ポート・自分のポート・自分の最終シーケンス番号)を 別の表へ 4 秒間登録</strong>します。枠は 12 本しかないので、閉じた接続に 枠を占有させないためです。遅れて届いたセグメントはこの表と照合します。</li><li><strong>能動 close は最大 2 秒だけ相手の FIN を待ちます</strong>(その間も受信処理は 回します)。待ち切れなければ上記の表に登録して先へ進みます。</li><li><strong>待ち行列(backlog)に居る間も SYN_RCVD → ESTABLISHED まで進みます</strong> (10.8)。受け皿が用意された時点で、状態も受信済みデータもまとめて 引き渡します。</li></ul>
+<h4>10.14 ソースのどこを読むか</h4>
 <div class="tablewrap"><table><thead><tr><th>知りたいこと</th><th>見るファイル</th></tr></thead><tbody><tr><td>TCP 全体</td><td><code>src/tcp.c</code>(約 3,400 行)、<code>src/tcp.h</code></td></tr><tr><td>受信の入口</td><td><code>tcp_input_addr()</code></td></tr><tr><td>送信の中心</td><td><code>tcp_send()</code></td></tr><tr><td>接続 1 本の状態</td><td><code>tcp_conn_t</code>(<a href="#ch19">第 19 章</a>で詳述)</td></tr><tr><td>待ち行列</td><td><code>tcp_listener_slot_t</code> の <code>pending[]</code>、<code>tcp_backlog_handoff()</code></td></tr><tr><td>ロスを注入する道具</td><td>シェルコマンド <code>txdrop</code> / <code>synackdrop</code>(<a href="#ch27">第 27 章</a>)</td></tr></tbody></table></div>
 <hr>
 <h3 class="chaphead" id="ch11">第 11 章 UDP と IPv6</h3>
@@ -1038,7 +1184,32 @@ rd32le(p)   /* リトルエンディアン版 */</code></pre></div>
 <p>実装時、<a href="#ch6">第 6 章</a> で触れたチェックサムのオフロードと、 大きなデータを NIC に分割させる機能(<a href="#term-lso">LSO</a>、<a href="#ch23">第 23 章</a>)を、 「NIC は IPv4 前提だろう」と考えて IPv6 では無効にしていました。</p>
 <p><strong>実測したら両方ともそのまま動きました。</strong> 無効にしていた間は、 IPv4 と比べて書き込みが 38%、読み出しが 47% 遅くなっていました。</p>
 <blockquote><p><strong>教訓</strong>: 「ハードウェアの機能は古い規格前提だろう」という推測で 機能を切ると、<strong>動くはずのものを落としたまま気付きません。</strong> 切る前に一度有効にして測るべきです。</p></blockquote>
-<h4>11.5 ソースのどこを読むか</h4>
+<h4>11.5 状態遷移(MLD の版と、アドレス自動設定)</h4>
+<p>IPv6 側で状態を持っているのは 2 つです。どちらも小さいので図は 1 つずつ です。</p>
+<h5>MLD の版(v1 互換モード)</h5>
+<p><strong>相手が古い版で尋ねてきたら、こちらも古い版で答えます。</strong> Linux のブリッジは<strong>既定が v1</strong> なので、実際にこの経路を通ります。</p>
+<div class="codewrap"><pre><code>   +------+
+   |  v2  |  既定。報告も応答も v2 の形で送る
+   +------+
+      |
+      |  v1 の問い合わせを受けた(ICMPv6 の長さ 24 バイトで判別する)
+      v
+   +------+
+   |  v1  |  互換モード。報告を v1 の形で送る
+   +------+  v1 の問い合わせを受けるたびに期限を 260 秒先へ延ばす
+      |
+      |  260 秒のあいだ v1 の問い合わせが一度も来なかった
+      v
+   ( v2 へ戻る )</code></pre></div>
+<p><strong>版の判定はメッセージの長さで行います</strong>(24 バイトなら v1、28 バイト 以上なら v2)。Linux も同じ判定をしています。</p>
+<p><strong>報告の宛先が版と種類で違う</strong>のが間違えやすいところです。</p>
+<div class="tablewrap"><table><thead><tr><th>送るもの</th><th>宛先</th></tr></thead><tbody><tr><td>v2 の報告</td><td><code>ff02::16</code>(すべての MLDv2 ルータ)</td></tr><tr><td>v1 の報告</td><td><strong>グループ自身</strong></td></tr><tr><td>v1 の離脱</td><td><code>ff02::2</code>(すべてのルータ)</td></tr></tbody></table></div>
+<h5>アドレスの自動設定(SLAAC)</h5>
+<p>こちらは「状態」というより<strong>アドレスが持つ 3 つの立場</strong>です。</p>
+<div class="tablewrap"><table><thead><tr><th>立場</th><th>どうやって決まるか</th><th>上書きされるか</th></tr></thead><tbody><tr><td><strong>リンクローカル</strong></td><td>MAC から毎回導出する。<strong>変数に持たない</strong></td><td>されない</td></tr><tr><td><strong>手動設定</strong></td><td><code>ip6addr</code> コマンド</td><td><strong>ルータ広告では上書きしない</strong>(外から来た広告で検査条件が壊れるのを防ぐ)</td></tr><tr><td><strong>自動設定</strong></td><td>ルータ広告のプレフィックス + MAC</td><td>期限が切れたら失効する</td></tr></tbody></table></div>
+<p><strong>期限の判定を送受信のたびに行うと重くなります</strong>(アドレスが自分のもの かどうかの判定は、受信フレームごとに通ります)。そこで <strong>期限を持つ アドレスがあるときだけ</strong>時刻を読むようにしてあります。手動設定と未設定は 期限を持たないので、<strong>判定のコストがゼロ</strong>です。</p>
+<blockquote><p><strong>偽の広告 1 通で他人のアドレスを失効させられない</strong>よう、 「残り 2 時間以下のアドレスの寿命を縮める広告は無視する」という規則 (RFC 4862)を入れてあります。<strong>これが無いと攻撃になります。</strong></p></blockquote>
+<h4>11.6 ソースのどこを読むか</h4>
 <div class="tablewrap"><table><thead><tr><th>知りたいこと</th><th>見るファイル</th></tr></thead><tbody><tr><td>UDP</td><td><code>src/udp.c</code></td></tr><tr><td>IPv6 全般、NDP、SLAAC、MLD、拡張ヘッダ</td><td><code>src/ipv6.c</code>(約 2,400 行)</td></tr><tr><td>動作確認コマンド</td><td><code>udptest</code>、<code>udptest6</code>、<code>ping6</code>、<code>tcp6test</code>、<code>slaactest</code>、<code>mldtest</code>、<code>ext6test</code></td></tr></tbody></table></div>
 <hr>
 <h2 class="parthead" id="part-3">第 IV 部 NVMe と NVMe over Fabrics</h2>
@@ -1172,7 +1343,181 @@ traddr:  192.168.101.11</code></pre></div>
 <div class="codewrap"><pre><code>nvme nvme0: Received C2HTermReq (FES = Header Digest Error)</code></pre></div>
 <p><strong>理由の番号を Linux が文字列に解釈しているので、PDU の並びも番号も 合っている</strong>と言えます。</p>
 <blockquote><p><strong>なぜ「判定をわざと失敗させる」必要があるのか。</strong> 送る側を壊すと、 Linux は誤りを検出しますが<strong>理由の PDU を送り返してはくれません</strong> (Linux のホストは黙って畳む実装)。<strong>こちらが送る側の経路を試すには、 こちらが「壊れている」と判定しなければならない</strong>、という理屈です。</p></blockquote>
-<h4>14.5 ソースのどこを読むか</h4>
+<h4>14.5 状態遷移(ターゲット側)</h4>
+<p>ターゲットは <strong>2 つのジョブ</strong>(<a href="#ch18">第 18 章</a>)で動きます。 <strong>管理キュー担当</strong>と<strong>入出力キュー担当</strong>です。どちらも 「1 tick で 1 歩進むステートマシン」で、<code>self-&gt;state</code> を書き換えながら 進みます。</p>
+<h5>管理キュー(<code>nvmet_admin_job_step()</code>)</h5>
+<div class="codewrap"><pre><code>   +--------------+
+   |     ARM      |  待ち受けの受け皿を用意する
+   +--------------+
+          |
+          v
+   +--------------+
+   | ACCEPT_WAIT  |  接続を待つ
+   +--------------+
+          |
+          v
+   +--------------+
+   | ICREQ_RECV   |  最初の挨拶を受ける
+   +--------------+
+          |
+          v
+   +--------------+
+   | ICRESP_SEND  |  挨拶を返す
+   +--------------+
+          |
+          v
+   +--------------+
+   |  RECV_HDR    |  PDU の共通ヘッダ 8 バイト
+   +--------------+
+      |        |
+      |        +--&gt; RECV_TERM
+      |               相手が伝えてきた致命的な誤りを読んで畳む
+      |
+      |  コマンドだった
+      v
+   +--------------+
+   |  RECV_SQE    |  命令 64 バイト
+   +--------------+
+          |
+          v
+   +--------------+
+   | RECV_HDGST   |  ヘッダのチェック値(あれば)
+   +--------------+
+          |
+          v
+   +--------------+
+   | RECV_DATA    |  同梱データ(あれば)
+   +--------------+
+          |
+          v
+   +--------------+
+   | RECV_DDGST   |  データのチェック値(あれば)
+   +--------------+
+          |
+          v
+   +--------------+
+   |  DISPATCH    |  命令を実行して応答を返し、RECV_HDR へ戻る
+   +--------------+</code></pre></div>
+<div class="tablewrap"><table><thead><tr><th>状態</th><th>やること</th><th>次へ移る条件</th></tr></thead><tbody><tr><td><strong>ARM</strong></td><td>待ち受けの受け皿を用意する</td><td>常に次へ</td></tr><tr><td><strong>ACCEPT_WAIT</strong></td><td>接続を待つ</td><td>接続完了 → ICREQ_RECV。Ctrl+C / 停止要求 → ジョブ終了</td></tr><tr><td><strong>ICREQ_RECV</strong></td><td>最初の挨拶(ICReq)を受ける</td><td>受信完了 → ICRESP_SEND。タイムアウトで畳む</td></tr><tr><td><strong>ICRESP_SEND</strong></td><td>挨拶を返す。<strong>ここでは入出力キューをまだ用意しない</strong>(<a href="#ch13">第 13 章</a> 13.3 の理由)</td><td>送信完了 → RECV_HDR</td></tr><tr><td><strong>RECV_HDR</strong></td><td>共通ヘッダ 8 バイトを読む</td><td>種別で分岐。コマンド → RECV_SQE、TermReq → RECV_TERM、それ以外 → 理由を伝えてヘッダから読み直し</td></tr><tr><td><strong>RECV_TERM</strong></td><td>相手が伝えてきた<strong>致命的な誤りの理由</strong>を読む(14.4)</td><td>読み終えたら畳む</td></tr><tr><td><strong>RECV_SQE</strong></td><td>命令 64 バイトを読む</td><td>チェック値あり → RECV_HDGST、データあり → RECV_DATA、どちらも無し → DISPATCH</td></tr><tr><td><strong>RECV_HDGST</strong></td><td>ヘッダのチェック値を照合</td><td><strong>不一致なら理由を伝えて畳む</strong>(次の PDU の位置が分からないので読み直せない)</td></tr><tr><td><strong>RECV_DATA</strong></td><td>同梱データを読む</td><td>データのチェック値あり → RECV_DDGST、なければ DISPATCH</td></tr><tr><td><strong>RECV_DDGST</strong></td><td>データのチェック値を照合</td><td>不一致ならヘッダから読み直し(致命的ではない)</td></tr><tr><td><strong>DISPATCH</strong></td><td>命令を実行して応答を返す</td><td>常に RECV_HDR へ戻る</td></tr></tbody></table></div>
+<p><strong><code>switch</code> の外に置いてある判定が 3 つ</strong>あります。<strong>どの状態にいても 効かせる必要がある</strong>ものです。</p>
+<div class="tablewrap"><table><thead><tr><th>判定</th><th>中身</th><th>なぜ外か</th></tr></thead><tbody><tr><td><strong>見送り(linger)</strong></td><td>入出力キューが切れても、管理キューは自分から閉じない</td><td>相手は切断のとき<strong>管理キューへ「電源を切る」と書いてくる</strong>。受信途中で捨てると相手が 60 秒待たされる(<a href="#ch16">第 16 章</a> 16.3)</td></tr><tr><td><strong>Keep Alive</strong></td><td>決められた時間コマンドが来なければ畳む</td><td>ケーブルが抜けたときの唯一の検出手段(<a href="#ch16">第 16 章</a>)</td></tr><tr><td><strong>非同期イベント</strong></td><td>名前空間の増減をホストへ通知する</td><td>通知の材料はシェルが作るが、<strong>送るのは管理キューを握っているこのジョブ</strong>でなければならない</td></tr></tbody></table></div>
+<h5>入出力キュー(<code>nvmet_io_job_step()</code>)</h5>
+<p>管理キューとほぼ同じ形ですが、<strong>入口と出口が違います。</strong></p>
+<div class="codewrap"><pre><code>   +--------------------+
+   |  WAIT_ADMIN_READY  |  管理キューが「用意してよい」と言うまで待つ
+   +--------------------+
+             |
+             v
+     ARM -&gt; ACCEPT_WAIT -&gt; ICREQ_RECV -&gt; ICRESP_SEND
+                                              |
+             +--------------------------------+
+             |                                |
+             v                                v
+   +--------------------+          +--------------------+
+   |     PUSH_RUN       |          |   RECV_PDU_HDR     |
+   +--------------------+          +--------------------+
+     押し込み型(既定)              引き取り型(予備)
+     受信のたびに解析され、          管理キューと同じ受信の列。
+     ジョブは解析済みの命令を        これに加えて書き込みデータ用の
+     実行するだけ                    列(RECV_H2C_*)がもう 1 本ある</code></pre></div>
+<ul><li><strong>押し込み型が既定</strong>です。TCP が受信したその場で解析関数が呼ばれ、 ジョブは「解析済みの命令が積まれた輪」を消化するだけになります (<a href="#ch20">第 20 章</a>)。</li><li>引き取り型(<code>g_nvmet_force_pull</code> を立てたときだけ通る予備の経路)は、管理キューと同じ「読んでは 進む」形です。<strong>命令用の列に加えて、書き込みデータ用の列 (<code>RECV_H2C_*</code>)がもう 1 本</strong>あります。</li></ul>
+<h5>押し込み型の解析(<code>nvmet_io_rx_upcall()</code>)</h5>
+<p>これは<strong>ジョブの状態ではなく、バイト列を食べ進む相</strong>です。到着した データは PDU の境界と無関係に切れているので、<strong>どこまで読んだかを 持ち越せる形</strong>でなければなりません。</p>
+<div class="codewrap"><pre><code>   +----------+
+   |   HDR    |  共通ヘッダ 8 バイト
+   +----------+
+        |
+        v
+   +----------+
+   |   PSH    |  型ごとの残り(命令なら 64 バイト)
+   +----------+
+        |
+        +--&gt; チェック値が無ければ、ここで命令を実行キューへ積む
+        |
+        v
+   +----------+
+   |  HDGST   |  ヘッダのチェック値 4 バイト
+   +----------+
+        |
+        |  照合できたら命令を実行キューへ積む
+        v
+   +----------+
+   |   DATA   |  置き場所へ直接コピーしつつ、同じ走査でチェック値も計算
+   +----------+
+        |
+        v
+   +----------+
+   |  DDGST   |  データのチェック値 4 バイト
+   +----------+
+        |
+        +--&gt; 1 つの PDU を読み終えた。HDR へ戻る</code></pre></div>
+<p><strong>データを一度も余分にコピーしない</strong>のが要点です。置き場所へ直接 書きながら、<strong>同じ 1 回の走査でチェック値も計算</strong>します (<a href="#ch23">第 23 章</a>)。</p>
+<h4>14.6 状態遷移(イニシエータ側)</h4>
+<p>繋ぎに行く側は<strong>接続を組み立てる列</strong>と、<strong>コマンド 1 つを往復させる列</strong>の 2 段になっています。</p>
+<h5>接続の組み立て(<code>nvme_connect_job_step()</code>)</h5>
+<div class="codewrap"><pre><code>   TCP_ADMIN_BEGIN -&gt; TCP_ADMIN_WAIT -&gt; ICRESP_ADMIN_RECV
+     (接続開始)         (確立待ち)        (挨拶の交換)
+                                                |
+                                                v
+                                  EXEC_FABRIC_CONNECT_ADMIN
+                                    管理キューの登録
+                                                |
+                                                v
+                                       EXEC_PROPSET_CC
+                                    「動け」と書く
+                                                |
+                                                v
+                              CSTS_POLL_EXEC &lt;-&gt; CSTS_POLL_WAIT
+                                    準備できるまで往復する
+                                                |
+                                                v
+                                     EXEC_IDENTIFY_CTRL
+                                                |
+                          +---------------------+---------------------+
+                          |                                           |
+                          v                                           v
+                  EXEC_IDENTIFY_NS                              EXEC_DISC_HDR
+                          |                                     (Discovery)
+                          v                                           |
+                  EXEC_SET_FEATURES                                    v
+                    キューを何本使うか                          EXEC_DISC_FULL
+                          |                                     一覧を取得して終了
+                          v
+   TCP_IO_WAIT -&gt; ICRESP_IO_RECV -&gt; EXEC_FABRIC_CONNECT_IO -&gt; 完了
+    (入出力キューの TCP)  (挨拶)      (入出力キューの登録)</code></pre></div>
+<p><strong>Discovery のときだけ枝が分かれます</strong>(<a href="#ch13">第 13 章</a> 13.3)。 一覧の取得は <strong>2 段構え</strong>で、先にヘッダだけ読んで件数を見てから 全体を読み直します(ホストの実装がそうするので、それに合わせています)。</p>
+<p><code>EXEC_</code> で始まる状態は、<strong>どれも下の「1 コマンドの往復」を 1 回動かす だけ</strong>です。同じ部品を状態ごとに使い回しています。</p>
+<h5>1 コマンドの往復(<code>nvme_exec_step()</code>)</h5>
+<div class="codewrap"><pre><code>   +------------+
+   |   SEND     |  命令(と同梱データ)を送る
+   +------------+
+         |
+         v
+   +------------+
+   |  RECV_HDR  |  返ってきた PDU の種別で 3 つに分かれる
+   +------------+
+      |    |    |
+      |    |    +--&gt; R2T_REST -&gt; SEND_H2C
+      |    |            「どこから何バイト送れ」を読み、その範囲を送る。
+      |    |            送り終えたら RECV_HDR へ戻る
+      |    |
+      |    +--&gt; C2H_REST -&gt; C2H_DATA -&gt; C2H_DDGST
+      |             読み出しデータを受け取る。
+      |             続きがあれば RECV_HDR へ戻る
+      |
+      |  応答だった
+      v
+   +------------+
+   |  RECV_CQE  |  完了通知を読む
+   +------------+
+         |
+         v
+   +------------+
+   |    DONE    |  呼び出し元が結果を取り出す
+   +------------+</code></pre></div>
+<div class="tablewrap"><table><thead><tr><th>状態</th><th>やること</th><th>次へ移る条件</th></tr></thead><tbody><tr><td><strong>SEND</strong></td><td>命令を送る(小さいデータは同梱)</td><td>送信完了 → RECV_HDR</td></tr><tr><td><strong>RECV_HDR</strong></td><td>共通ヘッダを読む</td><td>応答 → RECV_CQE、読み出しデータ → C2H_REST、催促 → R2T_REST</td></tr><tr><td><strong>RECV_CQE</strong></td><td>完了通知を読む。チェック値も照合</td><td>DONE</td></tr><tr><td><strong>RECV_C2H_REST / DATA / DDGST</strong></td><td>読み出しデータを受け取る</td><td>最後の PDU なら DONE、続くなら RECV_HDR</td></tr><tr><td><strong>RECV_R2T_REST</strong></td><td>「どこから何バイト送れ」を読む</td><td>SEND_H2C</td></tr><tr><td><strong>SEND_H2C</strong></td><td>指定された範囲を送る</td><td>RECV_HDR へ戻る</td></tr><tr><td><strong>DONE</strong></td><td>呼び出し元が結果を取り出す</td><td>—</td></tr></tbody></table></div>
+<p><strong>ベンチマークではこの往復を使いません。</strong> 1 コマンドずつ待つと 往復時間が丸見えになるので、<strong>複数のコマンドを同時に飛ばす専用の経路</strong> (<code>PL_RX_*</code> / <code>PL_READ_RX_*</code>)へ切り替えます(<a href="#ch20">第 20 章</a>)。 状態の並びは上とほぼ同じで、違うのは「どのコマンドの応答か」を コマンド番号で引き当てる点です。</p>
+<h4>14.7 ソースのどこを読むか</h4>
 <div class="tablewrap"><table><thead><tr><th>知りたいこと</th><th>見るファイル</th></tr></thead><tbody><tr><td>PDU の組み立て・解析(ターゲット)</td><td><code>src/nvmet_tcp.c</code></td></tr><tr><td>同(イニシエータ)</td><td><code>src/nvme_tcp.c</code></td></tr><tr><td>PDU の定数と TermReq の組み立て</td><td><code>src/nvme_tcp_pdu.h</code></td></tr><tr><td>CRC32C</td><td><code>src/crc32c.c</code></td></tr></tbody></table></div>
 <hr>
 <h3 class="chaphead" id="ch15">第 15 章 RDMA と RoCEv2</h3>
@@ -1238,7 +1583,96 @@ traddr:  192.168.101.11</code></pre></div>
 <h4>15.8 未検証のまま残っている実装</h4>
 <p>RoCEv2 が現構成で動かせないため、<strong>ターゲット側の RDMA 実装 (<code>nvmet_rdma.c</code>)には、TCP 側に入れた切断処理の改善が入っていません。</strong></p>
 <p>具体的には <a href="#ch16">第 16 章</a> で説明する 2 件(接続を閉じる順序の扱いと、 シャットダウン状態の報告)です。<strong>動かせるようになったら同じ手当てが 必要</strong>、という状態で止まっています。</p>
-<h4>15.9 ソースのどこを読むか</h4>
+<h4>15.9 状態遷移(接続管理と QP)</h4>
+<p>RDMA には<strong>状態機械が 2 つ重なっています。</strong> 片方は自分のコードが持つ 「接続の手続き」で、もう片方は<strong>カードの中にある QP そのものの状態</strong>です。 <strong>後者はコマンドでしか動かせません。</strong></p>
+<h5>接続管理(<code>rdma_cm_job_step()</code>)</h5>
+<p>TCP の握手にあたるやりとりを、専用の伝令用キュー(GSI)で行います。 <strong>繋ぎに行く側</strong>と<strong>待つ側</strong>で別の列を通ります。</p>
+<div class="codewrap"><pre><code>   繋ぎに行く側                          待つ側
+   ------------                          ------
+   ACTIVE_SETUP                          PASSIVE_SETUP
+     QP を作って受信を構える               QP を作って受信を構える
+        |                                    |
+        v                                    v
+   ACTIVE_SEND_REQ  ---- REQ ----------&gt;  PASSIVE_WAIT_REQ
+        |                                    |
+        v                                    v
+   ACTIVE_WAIT_REP                       PASSIVE_MODIFY_QP
+     2 秒で REQ を再送、3 回で断念          QP を INIT から RTR へ
+        ^                                    |
+        |                                    v
+        +---- REP -------------------------  PASSIVE_SEND_REP
+        |                                    |
+        v                                    v
+   ACTIVE_MODIFY_QP                      PASSIVE_WAIT_RTU
+     QP を INIT -&gt; RTR -&gt; RTS               RTU を待って QP を RTS へ
+        |                                    ^
+        v                                    |
+   ACTIVE_SEND_RTU  ---- RTU ----------------+
+        |                                    |
+        v                                    v
+   ACTIVE_PING_SEND                      PASSIVE_PING_WAIT
+   ACTIVE_PING_WAIT                        本命の QP で 1 個受け取ってみる
+     本命の QP で 1 個送ってみる
+        |                                    |
+        +----------------&gt; DONE_OK &lt;---------+
+                           DONE_FAIL</code></pre></div>
+<div class="tablewrap"><table><thead><tr><th>状態</th><th>やること</th><th>次へ移る条件</th></tr></thead><tbody><tr><td><strong>ACTIVE_SETUP</strong></td><td>本命の QP を作り、伝令用キューに受信を構える</td><td>常に次へ</td></tr><tr><td><strong>ACTIVE_SEND_REQ</strong></td><td>接続要求(REQ)を送る</td><td>送信できたら WAIT_REP</td></tr><tr><td><strong>ACTIVE_WAIT_REP</strong></td><td>返事を待つ。<strong>返ってきたものの種別を必ず見る</strong></td><td>承諾(REP)→ MODIFY_QP。<strong>拒否(REJ)→ 理由を表示して失敗</strong>。関係ないものは捨てて待ち直す。2 秒で REQ を再送、3 回で断念</td></tr><tr><td><strong>ACTIVE_MODIFY_QP</strong></td><td>QP を INIT→RTR→RTS まで進める</td><td>成功なら SEND_RTU</td></tr><tr><td><strong>ACTIVE_SEND_RTU</strong></td><td>「準備できた」(RTU)を送る</td><td>疎通確認をするなら PING_SEND、しないなら完了</td></tr><tr><td><strong>ACTIVE_PING_SEND / WAIT</strong></td><td><strong>本命の QP で実際に 1 個送って</strong>完了通知を待つ</td><td>3 秒で失敗</td></tr><tr><td><strong>PASSIVE_WAIT_REQ</strong></td><td>接続要求を待つ</td><td>REQ が来たら MODIFY_QP</td></tr><tr><td><strong>PASSIVE_MODIFY_QP</strong></td><td>相手の情報で QP を INIT→RTR へ</td><td>成功なら SEND_REP</td></tr><tr><td><strong>PASSIVE_SEND_REP</strong></td><td>承諾を返す</td><td>WAIT_RTU</td></tr><tr><td><strong>PASSIVE_WAIT_RTU</strong></td><td>「準備できた」を待ち、QP を RTS へ</td><td>疎通確認へ、または完了</td></tr></tbody></table></div>
+<blockquote><p><strong>REJ を無視していて 3 時間溶かしました。</strong> 「送ったのに何も返って こない」と思っていたのは、<strong>相手が明確に理由つきで断ってきていたのを 自分が捨てていた</strong>だけでした(<a href="#ch29">第 29 章</a>)。上表の 「返ってきたものの種別を必ず見る」はその教訓です。</p></blockquote>
+<h5>QP の状態(カードの中)</h5>
+<p>QP は<strong>作った直後は何も送れません。</strong> 決まった順序でコマンドを送り、 段階的に「使える状態」へ引き上げます。<strong>飛ばすこともまとめることも できません。</strong></p>
+<div class="codewrap"><pre><code>   CREATE_QP      RST2INIT_QP      INIT2RTR_QP       RTR2RTS_QP
+       |               |                |                 |
+       v               v                v                 v
+   +-------+       +-------+        +-------+         +-------+
+   |  RST  | ----&gt; | INIT  | -----&gt; |  RTR  | ------&gt; |  RTS  |
+   +-------+       +-------+        +-------+         +-------+
+                       |                |                 |
+                       |                |                 +-- 自分が投げられる
+                       |                |                 |   RDMA_READ の数
+                       |                |                 +-- 再送回数
+                       |                |                 +-- 送信の開始番号
+                       |                |
+                       |                +-- 相手の QP 番号と開始番号
+                       |                +-- 経路(MAC / IP)
+                       |                +-- **相手から受ける RDMA_READ の数**
+                       |
+                       +-- 保護ドメインを結びつける</code></pre></div>
+<div class="tablewrap"><table><thead><tr><th>遷移</th><th>ここでしか設定できないもの</th><th>間違えるとどうなるか</th></tr></thead><tbody><tr><td><strong>RST → INIT</strong></td><td>保護ドメイン、ポート番号</td><td>—</td></tr><tr><td><strong>INIT → RTR</strong></td><td>相手の QP 番号 / 開始番号、経路、<strong>受け付ける RDMA_READ の数</strong>、path MTU</td><td><strong>受け付ける数を RTS で設定しても保持されません。</strong> 相手が 2 本目の読み出しを投げた瞬間にエラーになります(15.3)</td></tr><tr><td><strong>RTR → RTS</strong></td><td><strong>自分が投げる RDMA_READ の数</strong>、再送回数、送信の開始番号</td><td>投げる数が 1 のままだと<strong>書き込みが直列化</strong>して速度が出ません(15.3)</td></tr></tbody></table></div>
+<p><strong>「どちらの向きの本数か」を取り違えたのが、書き込みが 2.3 倍になった 不具合の 1 つ</strong>です。設定できる場所が片方にしか無いので、間違えても コマンド自体は成功してしまいます。</p>
+<p>具体的にどのバイトへ何を書いているかは <a href="#appendix-d">付録 D</a> D.6 に 一覧があります。</p>
+<h5>イニシエータ全体の流れ</h5>
+<p>上の 2 つを部品として、NVMe-oF としての接続が組み上がります (<code>nvme_rdma.c</code>)。</p>
+<div class="codewrap"><pre><code>   CM_SPAWN -&gt; CM_WAIT
+     管理キューの接続管理(上の図が丸ごと入る)
+        |
+        v
+   SEND_CONNECT -&gt; WAIT_CONNECT
+     Fabrics Connect(管理キュー)
+        |
+        v
+   SEND_PROP_SET_CC -&gt; WAIT_PROP_SET_CC
+     「動け」と書く
+        |
+        v
+   SEND_PROP_GET_CSTS &lt;-&gt; CSTS_POLL_WAIT
+     準備できるまで繰り返す
+        |
+        v
+   SEND_ID_CTRL -&gt; WAIT_ID_CTRL -&gt; SEND_ID_NS -&gt; WAIT_ID_NS
+     相手を調べる
+        |
+        v
+   IOQ_CM_SPAWN -&gt; IOQ_CM_WAIT
+     入出力キュー用にもう 1 本(伝令用キューは使い回す)
+        |
+        v
+   IOQ_SEND_CONNECT -&gt; IOQ_WAIT_CONNECT
+     Fabrics Connect(入出力キュー)
+        |
+        v
+   SEND_WRITE / SEND_READ、または PIPELINE_SETUP -&gt; PIPELINE_LOOP</code></pre></div>
+<p><strong>入出力キューをもう 1 本立てるところが後から要ったもの</strong>です (15.7)。管理キューでは読み書きの命令が通らないので、 <strong>接続管理から QP まで一式をもう 1 組</strong>作ります。伝令用キューは ポートに 1 つしか置けないので、そこだけ使い回します。</p>
+<h4>15.10 ソースのどこを読むか</h4>
 <div class="tablewrap"><table><thead><tr><th>知りたいこと</th><th>見るファイル</th></tr></thead><tbody><tr><td>QP の作成・状態遷移・WQE</td><td><code>src/mlx5_qp.c</code></td></tr><tr><td>接続確立(CM)</td><td><code>src/rdma_cm.c</code></td></tr><tr><td>NVMe-oF RDMA イニシエータ</td><td><code>src/nvme_rdma.c</code></td></tr><tr><td>NVMe-oF RDMA ターゲット</td><td><code>src/nvmet_rdma.c</code></td></tr><tr><td>動作確認コマンド</td><td><code>bench</code>、<code>rocepeer</code>、<code>qploop</code></td></tr></tbody></table></div>
 <hr>
 <h3 class="chaphead" id="ch16">第 16 章 このターゲットが答えるコマンド</h3>
@@ -1357,11 +1791,11 @@ traddr:  192.168.101.11</code></pre></div>
 <ul><li>NVMe-oF ターゲットの admin キュー担当</li><li>NVMe-oF ターゲットの IO キュー担当</li><li>NVMe-oF イニシエータの接続担当</li><li>RDMA の接続管理(CM)担当</li></ul>
 <p>たとえばターゲットの admin キューのジョブは、次のような状態を持ちます。</p>
 <div class="codewrap"><pre><code>  ARM(待ち受けを張る)
-    → ACCEPT_WAIT(接続を待つ)
-    → ICREQ_RECV(初期化要求を受け取る)
-    → ICRESP_SEND(応答を返す)
-    → RECV_HDR ⇄ (コマンドを受け取って処理する、をずっと繰り返す)
-    → (切断されたら ARM へ戻る)</code></pre></div>
+    -&gt; ACCEPT_WAIT(接続を待つ)
+    -&gt; ICREQ_RECV(初期化要求を受け取る)
+    -&gt; ICRESP_SEND(応答を返す)
+    -&gt; RECV_HDR (コマンドを受け取って処理する、をずっと繰り返す)
+    -&gt; (切断されたら ARM へ戻る)</code></pre></div>
 <p><strong>「終わったら次のクライアントを待つ」</strong>ので、サーバのジョブは <code>JOB_DONE</code> をほとんど返しません。</p>
 <h4>18.4 この構造の弱点</h4>
 <p><strong>1 つのジョブが長時間 CPU を占有すると、他が止まります。</strong></p>
@@ -1374,7 +1808,28 @@ traddr:  192.168.101.11</code></pre></div>
 <div class="codewrap"><pre><code>unsigned job_cancel_by_ctx(const void *ctx);  /* このデータを使うジョブを止めて */
 unsigned job_count_by_ctx(const void *ctx);   /* まだ何個残っている? */</code></pre></div>
 <blockquote><p><strong>約束</strong>: <strong>ジョブが使っているデータ構造を作り直す前に、 それを参照しているジョブが 0 個になるまで待つこと。</strong></p></blockquote>
-<h4>18.6 ソースのどこを読むか</h4>
+<h4>18.6 状態遷移(ジョブそのもの)</h4>
+<p><strong>ジョブは 2 段の状態を持ちます。</strong> スケジューラが見る「枠の状態」と、 ジョブ自身が持つ「仕事の進み具合」です。<strong>後者はスケジューラから見えず、 <code>int state</code> という数字が 1 つあるだけ</strong>で、意味づけは各ジョブの <code>switch</code> が決めます(この章までに出てきた状態機械は全部これです)。</p>
+<div class="codewrap"><pre><code>   job_spawn()
+     |  枠を確保する。state=0、停止要求=なし
+     v
+   [使用中]  巡回の対象になる
+     |
+     |  このコアの担当なら step() が呼ばれる
+     v
+   [実行中]
+     |
+     +--&gt; step() が JOB_WAITING を返した: [使用中] へ戻る
+     |      (仕事の進み具合 state はジョブが自分で書き換える)
+     |
+     +--&gt; step() が JOB_DONE を返した: [未使用] へ。枠が空く
+
+   job_cancel_by_ctx() は停止要求の旗を立てるだけ。
+   止めるのはジョブ自身(次の step で畳む)。</code></pre></div>
+<div class="tablewrap"><table><thead><tr><th>枠の状態</th><th>意味</th><th>誰が変えるか</th></tr></thead><tbody><tr><td><strong>未使用</strong></td><td>空きスロット</td><td>完了時にスケジューラが戻す</td></tr><tr><td><strong>使用中</strong></td><td>巡回の対象</td><td><code>job_spawn()</code></td></tr><tr><td><strong>担当が決まっている</strong></td><td>特定のコアだけが回す</td><td><code>job_pin_to_core()</code> / <code>job_set_affinity()</code>(<a href="#ch21">第 21 章</a>)</td></tr><tr><td><strong>停止を要求された</strong></td><td>旗が立っているだけで、まだ動いている</td><td><code>job_cancel_by_ctx()</code></td></tr></tbody></table></div>
+<p><strong>停止が「要求」でしかないのが要点です。</strong> 他のコアが回しているジョブを 外から止めることはできません。<strong>旗を立てて、そのジョブが自分で畳むのを 待ちます。</strong></p>
+<blockquote><p><strong>これを待たずに踏んだ不具合</strong>: 接続管理のジョブが別のコアで回って いるところへ、その作業領域をゼロで埋めてしまい、<strong>ジョブが空っぽの 場所を読んで落ちました</strong>(<a href="#ch15">第 15 章</a>)。作業領域を作り直す前に <strong>「そこを参照しているジョブが 0 になるまで数える」</strong>必要があります。</p></blockquote>
+<h4>18.7 ソースのどこを読むか</h4>
 <div class="tablewrap"><table><thead><tr><th>知りたいこと</th><th>見るファイル</th></tr></thead><tbody><tr><td>スケジューラ本体</td><td><code>src/job.c</code>、<code>src/job.h</code>(合わせて約 280 行)</td></tr><tr><td>ジョブの実例(いちばん複雑)</td><td><code>src/nvmet.c</code> の <code>nvmet_io_job_step_impl()</code></td></tr><tr><td>動作中のジョブを見る</td><td>シェルコマンド <code>jobs</code></td></tr></tbody></table></div>
 <hr>
 <h3 class="chaphead" id="ch19">第 19 章 主要なデータ構造</h3>
@@ -1874,6 +2329,53 @@ tools/udp6_echo.py   … 断片化した UDP を組み立てさせる</code></pr
 <h4>C.4 この文書を書いた時点の状態</h4>
 <ul><li>ソース規模: 約 33,000 行(<code>.c</code> + <code>.h</code> + Makefile)</li><li>シェルコマンド: 41 個</li><li>実装状況: <a href="#ch28">第 28 章</a> の表</li><li>最新の性能値: <code>README.md</code></li></ul>
 <p><strong>実装を変更したら、この文書も更新してください。</strong> 特に <a href="#ch28">第 28 章</a> の表は、変更のたびに見直す必要があります。</p>
+<hr>
+<h3 class="chaphead" id="appendix-d">付録 D ドライバが読み書きするレジスタ</h3>
+<p><a href="#ch5">第 5 章</a> 5.9 で分類した 4 種類を、<strong>実際に読み書きしている番地と ビットの意味、書いている値</strong>まで並べます。<strong>ここに無い番地はこのドライバ では一切触っていません。</strong></p>
+<p><strong>この表は <code>src/mlx5.c</code> / <code>src/mlx5_qp.c</code> / <code>src/mlx5_net.c</code> / <code>src/platform/x86-linux/vfio.c</code> から起こしたものです。</strong> ビットの位置は Linux カーネルの <code>include/linux/mlx5/mlx5_ifc.h</code>(PRM の構造体定義)と 突き合わせてあります。<strong>推測で書いたものはありません。</strong></p>
+<h4>D.1 PCI コンフィグ空間</h4>
+<p>VFIO の「コンフィグ領域」への読み書きで触ります(<a href="#ch4">第 4 章</a>)。 <strong>BAR の番地そのものは書きません</strong> — カーネルが設定済みのものを、 VFIO 経由で mmap して使います。</p>
+<div class="tablewrap"><table><thead><tr><th>オフセット</th><th>名前</th><th>読/書</th><th>使っているビット</th><th>値と意味</th></tr></thead><tbody><tr><td><code>0x00</code></td><td>Vendor ID / Device ID</td><td>読</td><td>全 32 ビット</td><td><code>15b3:1015</code> = ConnectX-4 Lx であることの確認</td></tr><tr><td><code>0x04</code></td><td>Command</td><td><strong>書</strong></td><td><strong>bit1 = Memory Space Enable</strong>、<strong>bit2 = Bus Master Enable</strong></td><td>読んだ値に <code>0x6</code> を OR する。<strong>bit2 を立てないとカードが DMA できない</strong>(何も動かない)</td></tr><tr><td><code>0x06</code>(<code>0x04</code> の上位 16 ビット)</td><td>Status</td><td>読</td><td>bit4 = Capability List</td><td>0 なら以下の PCIe 情報は読めない</td></tr><tr><td><code>0x34</code></td><td>Capabilities Pointer</td><td>読</td><td>下位 2 ビットを落とす(<code>&amp;0xFC</code>)</td><td>拡張機能リストの先頭。ID が <code>0x10</code> の項目が PCIe Capability</td></tr><tr><td>PCIe+<code>0x08</code></td><td>Device Control</td><td>読</td><td>bit7:5 = MPS、bit14:12 = MRRS</td><td>1 回の転送の最大長。<code>monitor</code> で表示する</td></tr><tr><td>PCIe+<code>0x0A</code></td><td>Device Status</td><td>読</td><td>bit1 NonFatal / bit2 Fatal / bit3 UnsupReq(<code>&amp;0x0E</code>)</td><td><strong>1 つでも立っていればハードウェア異常</strong>として報告する</td></tr><tr><td>PCIe+<code>0x0C</code></td><td>Link Capabilities</td><td>読</td><td>bit3:0 = 最大速度、bit9:4 = 最大幅</td><td>期待値は Gen3 x8</td></tr><tr><td>PCIe+<code>0x12</code></td><td>Link Status</td><td>読</td><td>bit3:0 = 現在の速度、bit9:4 = 現在の幅</td><td><strong>最大値より低ければ性能が出ない</strong>ので監視対象にしている</td></tr></tbody></table></div>
+<h4>D.2 初期化セグメント(BAR0 の先頭)</h4>
+<p><strong>MMIO で直接読み書きする唯一の場所</strong>です。<strong>すべてビッグエンディアンの 32 ビット</strong>で、読み書きのたびにバイト順を入れ替えます。</p>
+<div class="tablewrap"><table><thead><tr><th>オフセット</th><th>名前</th><th>読/書</th><th>ビットの意味</th><th>書く値 / 見る条件</th></tr></thead><tbody><tr><td><code>0x000</code></td><td>fw_rev</td><td>読</td><td>ファームウェアの版</td><td><strong><code>0xFFFFFFFF</code> なら応答なし</strong>(バインドし損ねている)として起動を止める</td></tr><tr><td><code>0x004</code></td><td>cmdif_rev / fw_sub</td><td>読</td><td>上位 16 ビット = コマンド形式の版</td><td><strong>期待値 5</strong>。違えば以降の構造体の解釈が変わる</td></tr><tr><td><code>0x010</code></td><td>cmdq_addr_h</td><td><strong>書</strong></td><td>コマンドキューの物理アドレス上位 32 ビット</td><td>確保した 4096 バイトの物理アドレス</td></tr><tr><td><code>0x014</code></td><td>cmdq_addr_l_sz</td><td>読/<strong>書</strong></td><td>読: 下位 8 ビットが <code>log_sz&lt;&lt;4</code> と <code>log_stride</code>。書: 物理アドレス下位 32 ビット</td><td><strong>先に読んでエントリ数と 1 個の大きさを教わってから</strong>、同じ番地へアドレスを書く</td></tr><tr><td><code>0x018</code></td><td>cmd_dbell</td><td><strong>書</strong></td><td>発行したエントリ番号のビット</td><td><strong><code>1&lt;&lt;0</code></strong>。このドライバはエントリ 0 しか使わない(コマンドは 1 個ずつ)</td></tr><tr><td><code>0x1FC</code></td><td>initializing</td><td>読</td><td><strong>bit31 = 起動中</strong></td><td>0 になるまで待つ。<strong>5000 ミリ秒で打ち切り</strong>。待たずにコマンドを出すと必ず失敗する</td></tr><tr><td><code>0x23C</code></td><td>health syndrome</td><td>読</td><td>bit23:16</td><td><strong>非 0 ならファームウェア異常</strong>。<code>monitor</code> の表示に使う</td></tr></tbody></table></div>
+<h5>コマンドキューのエントリ(64 バイト)</h5>
+<p>番地ではなくメモリ上の構造ですが、<strong>ここを間違えるとコマンドが 1 つも 通らない</strong>ので併記します。</p>
+<div class="tablewrap"><table><thead><tr><th>フィールド</th><th>値</th><th>意味</th></tr></thead><tbody><tr><td><code>type</code></td><td><strong>7</strong></td><td>PCI 経由のコマンド、と決まっている</td></tr><tr><td><code>inlen</code> / <code>outlen</code></td><td>入出力の長さ</td><td>16 バイトを超える分は別のメールボックスに置く</td></tr><tr><td><code>in_ptr</code> / <code>out_ptr</code></td><td>メールボックスの物理アドレス</td><td>512 バイトずつの数珠つなぎ</td></tr><tr><td><code>token</code></td><td>0</td><td>応答の対応づけ用。1 個ずつ発行するので固定</td></tr><tr><td><code>sig</code></td><td><strong>自分以外の全バイトの XOR を反転した値</strong></td><td>ファームウェアが検算する</td></tr><tr><td><code>status_own</code></td><td><strong>bit0 = 所有権</strong>(1 = ファームウェア)、bit7:1 = 配送状態</td><td><strong>最後に bit0 を立てて渡し、0 に戻るまで待つ</strong>。以降ドライバは書き換えない</td></tr></tbody></table></div>
+<h4>D.3 UAR と doorbell record</h4>
+<p><strong>呼び鈴は 2 段階</strong>です(<a href="#ch5">第 5 章</a> 5.4)。片方は MMIO、もう片方は <strong>ただのメモリ</strong>で、性格が違います。</p>
+<div class="tablewrap"><table><thead><tr><th>場所</th><th>種類</th><th>何を書くか</th></tr></thead><tbody><tr><td>BAR0 + <code>uarn</code>×4096 + <strong><code>0x800</code></strong>(BlueFlame)</td><td><strong>MMIO</strong></td><td><strong>WQE の先頭 8 バイトそのもの</strong>。<strong>必ず 1 回の 64 ビット書き込みで</strong>行う</td></tr><tr><td>doorbell record(DMA メモリ)</td><td>メモリ</td><td>「どこまで積んだか」の通し番号(ビッグエンディアン 32 ビット)</td></tr></tbody></table></div>
+<p>doorbell record は用途ごとに置き場所が違います。</p>
+<div class="tablewrap"><table><thead><tr><th>対象</th><th>バイト位置</th><th>書く値</th></tr></thead><tbody><tr><td>Ethernet 送信キュー</td><td><code>[0..3]</code></td><td><strong>生産者カウンタ × 2</strong>(1 WQE が 64 バイトの枠を 2 つ占めるため)</td></tr><tr><td>Ethernet 受信キュー</td><td><code>[0..3]</code></td><td>積んだ受信バッファの数</td></tr><tr><td>QP の受信側</td><td><code>[0..3]</code></td><td>積んだ数</td></tr><tr><td>QP の送信側</td><td><strong><code>[4..7]</code></strong></td><td>積んだ数。<strong>受信側と 4 バイトずれた場所</strong>にある</td></tr><tr><td>完了キュー</td><td><code>[0..3]</code></td><td><strong>消費カウンタの下位 24 ビット</strong>(どこまで読んだか)</td></tr></tbody></table></div>
+<p><strong>順序が守られないと壊れます。</strong></p>
+<div class="codewrap"><pre><code>   1. WQE をメモリに書く
+   2. メモリバリア          &lt;- 1 が 3 より先に見えることを保証する
+   3. doorbell record を更新
+   4. メモリバリア
+   5. BlueFlame へ 64 ビット 1 回で書く</code></pre></div>
+<blockquote><p><strong>32 ビット 2 回に分けて書いていたために、数十万コマンドに 1 回だけ エラーが出ました。</strong> 同時に投げる読み出しの本数を 1 から 16 に増やして 呼び鈴の頻度が上がった途端に表面化しています(<a href="#ch5">第 5 章</a> 5.4)。</p></blockquote>
+<h4>D.4 ACCESS_REG 経由の PRM レジスタ</h4>
+<p><strong>番地ではなく「番号で指定する設定表」</strong>です。<code>ACCESS_REG</code>(opcode <code>0x805</code>)というコマンドの中に、<strong>レジスタ番号</strong>と<strong>読み(1)か書き(0)か</strong> を入れて発行します。</p>
+<div class="tablewrap"><table><thead><tr><th>番号</th><th>名前</th><th>用途</th><th>触っているフィールド</th></tr></thead><tbody><tr><td><code>0x5006</code></td><td><strong>PAOS</strong></td><td>ポートの up / down</td><td>書: <code>local_port=1</code>、<code>admin_status=1</code>(UP)、<strong><code>ase=1</code></strong>(この書き込みを有効にする印)。読: <code>admin_status</code> と <strong><code>oper_status</code>(1=UP)</strong></td></tr><tr><td><code>0x5003</code></td><td><strong>PMTU</strong></td><td>フレーム長の上限</td><td>読: <code>max_mtu</code>。書: <code>local_port=1</code>、<code>admin_mtu</code>。<strong>10240 を要求し、<code>max_mtu</code> を超えるならそこまで切り詰める</strong></td></tr><tr><td><code>0x5008</code></td><td><strong>PPCNT</strong></td><td>ポートの統計</td><td>グループ <code>0x00</code>(IEEE 802.3)と <code>0x12</code>(物理層)。カウンタ領域 248 バイトから <strong>FCS 誤り(+16)/ 整列誤り(+24)/ シンボル誤り(+104)</strong> を読む</td></tr><tr><td><code>0x9051</code></td><td><strong>MPCNT</strong></td><td>PCIe の統計</td><td>グループ <code>0x00</code>。<strong>CRC 誤り(+32 と +36)</strong>を読む</td></tr><tr><td><code>0x900A</code></td><td><strong>MTMP</strong></td><td>チップ温度</td><td>現在値(+6)/ 最高記録(+10)/ 上限(+14)。<strong>単位は 1/8 度</strong></td></tr></tbody></table></div>
+<p><strong><code>ase</code> を立て忘れると PAOS は黙って何もしません</strong>(コマンド自体は成功 します)。「ポートが上がらないのにエラーも出ない」という形になります。</p>
+<h4>D.5 オブジェクトを作る / 壊すコマンド</h4>
+<p>設定の大半はこちらです。<strong>bring-up はこの順に並んでいます</strong> (<a href="#ch5">第 5 章</a> 5.5)。</p>
+<div class="tablewrap"><table><thead><tr><th>opcode</th><th>コマンド</th><th>何をするか</th></tr></thead><tbody><tr><td><code>0x104</code></td><td>ENABLE_HCA</td><td>カードを目覚めさせる</td></tr><tr><td><code>0x10a</code> / <code>0x10b</code></td><td>QUERY_ISSI / SET_ISSI</td><td>インタフェースの版を合わせる(<strong>1 を選ぶ</strong>)</td></tr><tr><td><code>0x107</code> / <code>0x108</code></td><td>QUERY_PAGES / MANAGE_PAGES</td><td><strong>ファームウェアの作業用メモリを渡す</strong>。起動用と初期化用の 2 回</td></tr><tr><td><code>0x100</code> / <code>0x109</code></td><td>QUERY_HCA_CAP / SET_HCA_CAP</td><td>能力の問い合わせと確定。<strong>同時に受け付けられる RDMA_READ の本数</strong>もここで読む</td></tr><tr><td><code>0x102</code></td><td>INIT_HCA</td><td>初期化</td></tr><tr><td><code>0x802</code> / <code>0x803</code></td><td>ALLOC_UAR / DEALLOC_UAR</td><td>呼び鈴を書く窓</td></tr><tr><td><code>0x301</code></td><td>CREATE_EQ</td><td>異常通知の受け皿</td></tr><tr><td><code>0x800</code> / <code>0x801</code></td><td>ALLOC_PD / DEALLOC_PD</td><td>保護ドメイン</td></tr><tr><td><code>0x200</code> / <code>0x202</code></td><td>CREATE_MKEY / DESTROY_MKEY</td><td>メモリの使用許可証。<strong>破棄には鍵ではなく「番号」を渡す</strong>(鍵を 8 ビット右へ戻す)</td></tr><tr><td><code>0x400</code> / <code>0x401</code> / <code>0x402</code></td><td>CREATE_CQ / DESTROY_CQ / QUERY_CQ</td><td>完了キュー</td></tr><tr><td><code>0x816</code> / <code>0x912</code></td><td>ALLOC_TRANSPORT_DOMAIN / CREATE_TIS</td><td>送信の「型」</td></tr><tr><td><code>0x908</code> / <code>0x909</code> / <code>0x90b</code></td><td>CREATE_RQ / MODIFY_RQ / QUERY_RQ</td><td>受信キュー。<strong>MODIFY で RST から RDY</strong> にしないと受け取らない</td></tr><tr><td><code>0x900</code></td><td>CREATE_TIR</td><td>受信の「型」</td></tr><tr><td><code>0x904</code> / <code>0x905</code> / <code>0x907</code></td><td>CREATE_SQ / MODIFY_SQ / QUERY_SQ</td><td>送信キュー。同じく <strong>RST から RDY</strong> が要る</td></tr><tr><td><code>0x930</code> / <code>0x931</code> / <code>0x92f</code></td><td>CREATE / DESTROY_FLOW_TABLE、SET_FLOW_TABLE_ROOT</td><td>フローステアリングの表(<a href="#ch5">第 5 章</a> 5.7)</td></tr><tr><td><code>0x933</code> / <code>0x934</code></td><td>CREATE / DESTROY_FLOW_GROUP</td><td>表の中の分類</td></tr><tr><td><code>0x936</code> / <code>0x938</code></td><td>SET / DELETE_FLOW_TABLE_ENTRY</td><td><strong>「全部この受信キューへ」の 1 行</strong>を入れる</td></tr><tr><td><code>0x500</code> / <code>0x501</code></td><td>CREATE_QP / DESTROY_QP</td><td>QP</td></tr><tr><td><code>0x502</code> / <code>0x503</code> / <code>0x504</code></td><td>RST2INIT / INIT2RTR / RTR2RTS_QP</td><td><strong>QP の状態遷移</strong>(D.6)</td></tr><tr><td><code>0x50b</code></td><td>QUERY_QP</td><td>QP が何 WQE 処理したかを読む(診断)</td></tr><tr><td><code>0x754</code> / <code>0x755</code></td><td>QUERY / MODIFY_NIC_VPORT_CONTEXT</td><td>仮想ポートの設定(D.7)</td></tr><tr><td><code>0x760</code> / <code>0x761</code></td><td>QUERY / SET_ROCE_ADDRESS</td><td><strong>RoCEv2 の GID 表</strong>(IP と MAC の登録)</td></tr><tr><td><code>0x805</code></td><td>ACCESS_REG</td><td>D.4 の PRM レジスタ</td></tr></tbody></table></div>
+<p><strong>解放は依存の逆順</strong>でなければなりません: QP、MKey、CQ、PD、UAR の順です。 MKey は PD に属し、CQ は UAR を参照しているためです。</p>
+<h4>D.6 QP コンテキスト(QPC)で設定するフィールド</h4>
+<p><strong>QP の性能と正しさはほぼここで決まります。</strong> 状態遷移の図は <a href="#ch15">第 15 章</a> 15.9 にあります。位置は QPC の先頭からのバイト数です。</p>
+<div class="tablewrap"><table><thead><tr><th>遷移</th><th>位置</th><th>フィールド</th><th>書く値</th><th>意味</th></tr></thead><tbody><tr><td>RST→INIT</td><td><code>[5..7]</code></td><td>pd</td><td>保護ドメイン番号</td><td>どのメモリ許可証の下で動くか</td></tr><tr><td>RST→INIT</td><td><code>[11]</code> bit4</td><td>rlky</td><td><strong>1</strong></td><td>予約鍵でローカルメモリを参照してよい</td></tr><tr><td>INIT→RTR</td><td><code>[8]</code> bit7:5</td><td>mtu</td><td><strong>1=256 … 5=4096</strong>(範囲外は 1024 にする)</td><td>RDMA の 1 パケット長</td></tr><tr><td>INIT→RTR</td><td><code>[8]</code> bit4:0</td><td>log_msg_max</td><td><strong>20</strong>(= 1 MB)</td><td>1 メッセージの最大長</td></tr><tr><td>INIT→RTR</td><td><code>[21..23]</code></td><td>remote_qpn</td><td>相手の QP 番号</td><td>接続管理で教わった値</td></tr><tr><td>INIT→RTR</td><td><strong><code>[145]</code> bit7:5</strong></td><td><strong>log_rra_max</strong></td><td><strong>カードの能力そのまま(最大 4 = 16 本)</strong></td><td><strong>相手から受け付ける RDMA_READ の本数</strong>。<strong>ここでしか設定できない</strong></td></tr><tr><td>INIT→RTR</td><td><code>[148]</code> bit4:0</td><td>min_rnr_nak</td><td><strong>12</strong></td><td>相手に「少し待って」と言うときの時間</td></tr><tr><td>INIT→RTR</td><td><code>[149..151]</code></td><td>next_rcv_psn</td><td><strong>自分が接続管理で宣言した番号</strong></td><td>受信で期待する通し番号</td></tr><tr><td>INIT→RTR</td><td><code>[24..]</code></td><td>アドレスパス</td><td>相手 GID / 相手 MAC / UDP 送信元ポート</td><td><strong>RoCEv2 の経路そのもの</strong></td></tr><tr><td>RTR→RTS</td><td><code>[2]</code> bit4:3</td><td>pm_state</td><td><strong>MIGRATED</strong></td><td>経路移行の状態(固定)</td></tr><tr><td>RTR→RTS</td><td><strong><code>[113]</code> bit7:5</strong></td><td><strong>log_sra_max</strong></td><td><strong>自分の能力と相手の能力の小さいほう</strong></td><td><strong>自分が投げる RDMA_READ の本数</strong>。<strong>1 のままだと書き込みが直列化する</strong></td></tr><tr><td>RTR→RTS</td><td><code>[113]</code> bit2:0</td><td>retry_count</td><td><strong>7</strong></td><td>応答が無いときの再送回数</td></tr><tr><td>RTR→RTS</td><td><code>[114]</code> bit7:5</td><td>rnr_retry</td><td><strong>7</strong>(= 無限)</td><td>「待って」と言われたときの再試行</td></tr><tr><td>RTR→RTS</td><td><code>[121..123]</code></td><td>next_send_psn</td><td><strong>相手が宣言した番号</strong></td><td>送信に使う通し番号</td></tr><tr><td>RTR→RTS</td><td><code>[146]</code></td><td>rre / rwe</td><td><strong>1 / 1</strong>(rae=0)</td><td>相手からの読み出し・書き込みを許可(不可分操作は許可しない)</td></tr></tbody></table></div>
+<p><strong>開始番号の向きを取り違えやすい</strong>ので注意してください。 <strong>受信で期待するのは自分が宣言した番号、送信に使うのは相手が宣言した 番号</strong>です。逆にすると、接続はできるのに 1 パケット目で止まります。</p>
+<h4>D.7 仮想ポートの設定(NIC vport context)</h4>
+<p><code>MODIFY_NIC_VPORT_CONTEXT</code>(<code>0x755</code>)は、<strong>「どのフィールドを変えるか」 を指定するビット列</strong>と、<strong>値そのもの</strong>の 2 つを持ちます。片方だけ立てても 効きません。</p>
+<div class="tablewrap"><table><thead><tr><th>設定したいもの</th><th>どのフィールドか</th><th>値の位置</th><th>書く値</th><th>なぜ必要か</th></tr></thead><tbody><tr><td><strong>roce_en</strong></td><td><code>in[15]</code> に <code>0x02</code></td><td><code>in[259]</code> に <code>0x01</code></td><td>1</td><td><strong>立てないと RoCEv2 が一切動かない</strong></td></tr><tr><td><strong>promisc_mc</strong></td><td><code>in[15]</code> に <code>0x10</code></td><td><code>in[496]</code> に <code>0x40</code></td><td>1</td><td><strong>マルチキャストの受信</strong>。立てないと IPv6 の近隣探索が 1 フレームも届かない(<a href="#ch11">第 11 章</a>)</td></tr><tr><td>disable_uc_local_lb</td><td><code>in[14]</code> に <code>0x08</code></td><td><code>in[259]</code> に <code>0x02</code></td><td>(現在は書かない)</td><td>内部折り返しの抑止を試したが<strong>書けても効かなかった</strong>(<a href="#ch15">第 15 章</a> 15.6)</td></tr></tbody></table></div>
+<p>読み戻しは <code>QUERY_NIC_VPORT_CONTEXT</code>(<code>0x754</code>)の出力 16 バイト目からで、 先頭 32 ビットの <strong>bit29 = disable_mc_local_lb / bit30 = disable_uc_local_lb / bit31 = roce_en</strong> です。実測値は次のとおりでした。</p>
+<div class="tablewrap"><table><thead><tr><th>時点</th><th>先頭 32 ビット</th><th>roce_en</th><th>disable_uc_local_lb</th></tr></thead><tbody><tr><td>bring-up 直後</td><td><code>0x01000000</code></td><td>0</td><td>0</td></tr><tr><td>roce_en を書いた後</td><td><code>0x01000001</code></td><td><strong>1</strong></td><td>0</td></tr><tr><td>両方書いた後</td><td><code>0x01000003</code></td><td>1</td><td><strong>1</strong></td></tr></tbody></table></div>
+<p><strong>「書けていること」を読み戻しで確かめたうえで、症状が変わらないことを 確認しています。</strong> これが無いと「効かない」と「そもそも書けていない」を 区別できません。</p>
+<h4>D.8 NVMe コントローラのプロパティ</h4>
+<p>ここまでとは別の話で、<strong>NVMe 側にも「レジスタ」があります。</strong> ただし ネットワーク越しなので MMIO ではなく、<strong>Property Get / Property Set という コマンドでオフセットを指定</strong>して読み書きします(<a href="#ch13">第 13 章</a>)。 <strong>このターゲットが返す値</strong>を並べます。</p>
+<div class="tablewrap"><table><thead><tr><th>オフセット</th><th>名前</th><th>幅</th><th>ビットの意味</th><th>このターゲットの値</th></tr></thead><tbody><tr><td><code>0x00</code></td><td><strong>CAP</strong></td><td>8</td><td>bit15:0 = キューの深さ(0 起点)、bit31:24 = 起動待ちの上限、bit37 = NVM コマンドセット対応</td><td>深さ <strong>0xFF</strong>(= 256)、待ち上限 <strong>0x1E</strong>(= 15 秒)、NVM 対応 <strong>1</strong></td></tr><tr><td><code>0x08</code></td><td><strong>VS</strong></td><td>4</td><td>版(major.minor.tertiary)</td><td><strong>1.3.0</strong>。<strong>0 のままだとホストは 1.3 以降の問い合わせを一切してこない</strong>(<a href="#ch16">第 16 章</a>)</td></tr><tr><td><code>0x14</code></td><td><strong>CC</strong></td><td>4</td><td>bit0 = EN(動け)、bit15:14 = SHN(電源を切る)、bit19:16 と bit23:20 = 命令と応答の大きさ</td><td>ホストが<strong>書く</strong>側。<strong>SHN を受けたら CSTS に「完了」を立てる</strong></td></tr><tr><td><code>0x1C</code></td><td><strong>CSTS</strong></td><td>4</td><td>bit0 = RDY(準備できた)、bit1 = 致命的異常、bit3:2 = 電源断の状態</td><td>EN が立っていれば RDY=1。SHN を受けた後は <strong>RDY=0 かつ電源断=完了(<code>0x8</code>)</strong></td></tr></tbody></table></div>
+<blockquote><p><strong>CSTS を返していなかったために、切断のたびに 5 秒待たされていました。</strong> ホストは CC へ書いたあと CSTS が「完了」になるのを待ちます。 <a href="#ch16">第 16 章</a> 16.3 の切断の作法と合わせて、<strong>切断にかかる時間が 61 秒から 1 秒未満</strong>になりました。</p></blockquote>
     </div>
   </main>
 </div>
