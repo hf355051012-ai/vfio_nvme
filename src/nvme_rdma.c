@@ -71,6 +71,7 @@ static const uint8_t NVME_RDMA_HOST_ID[16] = {
 static int s_incapsule_off;
 
 void nvme_rdma_set_incapsule_disable(int off) { s_incapsule_off = off ? 1 : 0; }
+uint32_t nvme_rdma_icdsz(void);
 
 static void nvmer_zero_v(volatile uint8_t *p, uint32_t len)
 {
@@ -1036,6 +1037,9 @@ job_result_t nvme_rdma_connect_job_step(job_t *self)
 }
 
 static nvme_rdma_ctx_t s_init_ctx;
+
+/* 相手が広告した in-capsule 上限。`incapsule` の表示用。 */
+uint32_t nvme_rdma_icdsz(void) { return s_init_ctx.icdsz; }
 static nvmet_rdma_ctx_t s_target_ctx;
 static nvmet_rdma_ctrl_t s_target_ctrl;
 

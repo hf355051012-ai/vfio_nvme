@@ -5677,10 +5677,12 @@ static void shell_dispatch(char *line, int s0, int s1)
         while (*arg == ' ') arg++;
         if (strncmp(arg, "off", 3) == 0)     s_incapsule_disable = 1;
         else if (strncmp(arg, "on", 2) == 0) s_incapsule_disable = 0;
-        uart_printf("incapsule: %s (相手の広告=%u バイト、実効=%u バイト)\n",
-                    s_incapsule_disable ? "off (R2T 経路)" : "on",
-                    s_nvme_ctx.icdsz,
-                    s_incapsule_disable ? 0u : s_nvme_ctx.icdsz);
+        /* **TCP と RDMA で相手の広告値が違う**ので両方出す(片方だけ出すと、
+         * RDMA を測っているのに TCP 側の 0 が見えて「効いていない」と誤読する)。 */
+        uart_printf("incapsule: %s  TCP: 広告=%u 実効=%u / RDMA: 広告=%u 実効=%u (バイト)\n",
+                    s_incapsule_disable ? "off (R2T / keyed SGL 経路)" : "on",
+                    s_nvme_ctx.icdsz, s_incapsule_disable ? 0u : s_nvme_ctx.icdsz,
+                    nvme_rdma_icdsz(), s_incapsule_disable ? 0u : nvme_rdma_icdsz());
         nvme_set_incapsule_disable(s_incapsule_disable);
         nvme_rdma_set_incapsule_disable(s_incapsule_disable);
     } else if (strncmp(line, "nvmetrdma", 9) == 0) {

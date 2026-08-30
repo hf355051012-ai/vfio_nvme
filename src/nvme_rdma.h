@@ -142,5 +142,9 @@ void nvme_rdma_get_ns_override(uint32_t *lba_size, uint64_t *nsze);
 
 /* `incapsule off` で RDMA の in-capsule write も止める(A/B 用)。 */
 void nvme_rdma_set_incapsule_disable(int off);
+/* 相手が広告した in-capsule 上限(RDMA 側)。`incapsule` の表示用。 */
+uint32_t nvme_rdma_icdsz(void);
+/* 相手が広告した in-capsule 上限(RDMA 側)。`incapsule` の表示用。 */
+uint32_t nvme_rdma_icdsz(void);
 
 #endif /* NVME_RDMA_H */
