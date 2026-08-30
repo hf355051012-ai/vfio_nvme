@@ -39,6 +39,30 @@ _Static_assert(MLX5_QP_CQ_NUM_ENTRIES == 1024u, "MLX5_CQ_BUF_SIZE/MLX5_QP_CQE_SI
  *   nvme_rdma_connect_job_step(), nvmer_post_send()
  * ===============================================================*/
 int mlx5_qp_post_send(mlx5_dev_t *dev, mlx5_qp_t *qp, const void *data, uint32_t len) {
+    return mlx5_qp_post_send2(dev, qp, data, len, 0, 0);
+}
+
+/*=================================================================
+ * SEND を 2 つのバッファから 1 つのメッセージとして送る。data1 が NULL
+ * なら 1 バッファの通常の SEND。**NVMe-oF の in-capsule write** が
+ * 「64 バイトのコマンド + データ」を 1 メッセージで送るために要る
+ * (Linux の nvme_rdma_map_sg_inline() も sge[0]/sge[1] の 2 本)。
+ * data_seg が 1 本増えても ds_cnt は 3、WQE は 48 バイトなので
+ * 1 WQEBB(64 バイト)に収まる。
+ *
+ * 引数:
+ *   dev / qp    - 対象デバイスと QP
+ *   data0 / len0 - 1 本目(コマンド capsule)
+ *   data1 / len1 - 2 本目(データ。NULL なら付けない)
+ * 戻り値:
+ *   0=成功
+ * コール元:
+ *   mlx5_qp_post_send(), nvme_rdma.c の in-capsule write
+ * ===============================================================*/
+int mlx5_qp_post_send2(mlx5_dev_t *dev, mlx5_qp_t *qp, const void *data0, uint32_t len0,
+                       const void *data1, uint32_t len1) {
+    const void *data = data0;
+    uint32_t len = len0;
     uint32_t pc = qp->sq_pc;
     uint32_t idx = pc & 511u; // log_sq_size=9 -- 512 WQEBB
     volatile uint8_t *sq_base =
@@ -48,7 +72,7 @@ int mlx5_qp_post_send(mlx5_dev_t *dev, mlx5_qp_t *qp, const void *data, uint32_t
         wqe[i] = 0;
     }
 
-    const uint32_t ds_cnt = 2u; // ctrl_seg(1)+data_seg(1)、eth_seg無し(RC QPはHWがL2/L3/UDP/BTHを構成する)
+    const uint32_t ds_cnt = (data1 != 0) ? 3u : 2u; // ctrl_seg(1)+data_seg(1..2)、eth_seg無し(RC QPはHWがL2/L3/UDP/BTHを構成する)
     uint32_t opmod_idx_opcode = ((pc & 0xFFFFu) << 8) | MLX5_OPCODE_SEND;
     wqe[0] = (uint8_t)(opmod_idx_opcode >> 24);
     wqe[1] = (uint8_t)(opmod_idx_opcode >> 16);
@@ -76,6 +100,21 @@ int mlx5_qp_post_send(mlx5_dev_t *dev, mlx5_qp_t *qp, const void *data, uint32_t
     uint64_t data_pa = mlx5_dma_addr(data);
     for (unsigned b = 0; b < 8; b++) {
         wqe[24 + b] = (uint8_t)(data_pa >> (56 - 8 * b));
+    }
+
+    if (data1 != 0) { // 2本目のdata_seg(wqe[32..47])
+        wqe[32] = (uint8_t)(len1 >> 24);
+        wqe[33] = (uint8_t)(len1 >> 16);
+        wqe[34] = (uint8_t)(len1 >> 8);
+        wqe[35] = (uint8_t)len1;
+        wqe[36] = (uint8_t)(qp->mkey >> 24);
+        wqe[37] = (uint8_t)(qp->mkey >> 16);
+        wqe[38] = (uint8_t)(qp->mkey >> 8);
+        wqe[39] = (uint8_t)qp->mkey;
+        uint64_t d1_pa = mlx5_dma_addr(data1);
+        for (unsigned b = 0; b < 8; b++) {
+            wqe[40 + b] = (uint8_t)(d1_pa >> (56 - 8 * b));
+        }
     }
 
     volatile uint8_t *dbr = (volatile uint8_t *)(uintptr_t)mlx5_qp_dbr_addr(dev, qp);
@@ -108,7 +147,7 @@ int mlx5_qp_post_send(mlx5_dev_t *dev, mlx5_qp_t *qp, const void *data, uint32_t
     ts_info.ds_cnt = (uint8_t)ds_cnt;
     ts_info.qpn = qp->qpn;
     ts_info.counter = new_pc;
-    ts_info.len = len;
+    ts_info.len = len + len1;
     ts_log_rdma(TS_MK(TS_FILE_MLX5_QP, TS_FUNC_mlx5_qp_post_send, 0), &ts_info);
 
     return 0;

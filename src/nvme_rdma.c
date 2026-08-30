@@ -67,6 +67,11 @@ static const uint8_t NVME_RDMA_HOST_ID[16] = {
 };
 #define NVME_RDMA_HOST_NQN "nqn.2014-08.org.nvmexpress:uuid:b0b1b2b3-b4b5-b6b7-b8b9-babbbcbdbebf"
 
+/* `incapsule off` で in-capsule write を止める(A/B 用、TCP 側と共通の操作)。 */
+static int s_incapsule_off;
+
+void nvme_rdma_set_incapsule_disable(int off) { s_incapsule_off = off ? 1 : 0; }
+
 static void nvmer_zero_v(volatile uint8_t *p, uint32_t len)
 {
     for (uint32_t i = 0; i < len; i++) p[i] = 0;
@@ -122,6 +127,46 @@ static void nvmer_set_ksgl(volatile uint8_t *dptr, uint64_t addr, uint32_t len, 
     dptr[13] = (uint8_t)(key >> 16);
     dptr[14] = (uint8_t)(key >> 24);
     dptr[15] = (uint8_t)NVME_SGL_TYPE_KEYED_DATA_BLOCK;
+}
+
+/*=================================================================
+ * in-capsule 用の SGL descriptor(Data Block + Offset)を書く。
+ * **keyed SGL と形が違う** -- 長さ欄が 3 バイトではなく 4 バイトで、
+ * アドレス欄には相手が広告した ICDOFF(こちらは 0 のみ扱う)が入る。
+ *
+ * 引数:
+ *   dptr - 書き込み先(SQE 内 offset 24)
+ *   len  - capsule に載せるバイト数
+ * コール元:
+ *   nvmer_build_io_ex()
+ * ===============================================================*/
+static void nvmer_set_inline_sgl(volatile uint8_t *dptr, uint32_t len)
+{
+    wr64le(&dptr[0], 0u);      /* ICDOFF。相手が非 0 なら in-capsule は使わない */
+    wr32le(&dptr[8], len);
+    dptr[12] = 0; dptr[13] = 0; dptr[14] = 0;
+    dptr[15] = 0x01u;          /* Data Block(0x0)+ Offset(0x1) */
+}
+
+/*=================================================================
+ * このコマンドを in-capsule で送るか判定する。Linux の nvme_rdma_map_data()
+ * と同じ条件で、**IO キューの write だけ**が対象(admin キューの RECV は
+ * 64 バイト 1 本しか出ていないので、載せると相手が畳む)。
+ *
+ * 引数:
+ *   ctx / opcode / total_len - コンテキストとコマンド種別、データ長
+ * 戻り値:
+ *   1=in-capsule で送る、0=keyed SGL
+ * コール元:
+ *   nvmer_build_io_ex()
+ * ===============================================================*/
+static int nvmer_use_inline(nvme_rdma_ctx_t *ctx, uint8_t opcode, uint32_t total_len)
+{
+    if (s_incapsule_off) return 0;
+    if (opcode != (uint8_t)NVME_IO_CMD_WRITE) return 0;
+    if (!ctx->io_queue_ready) return 0;
+    if (ctx->icdsz == 0u || total_len == 0u || total_len > ctx->icdsz) return 0;
+    return 1;
 }
 
 /*=================================================================
@@ -281,7 +326,11 @@ static uint32_t nvmer_build_io_ex(nvme_rdma_ctx_t *ctx, volatile uint8_t *out, u
     wr32le(&b[0], (uint32_t)opcode | ((uint32_t)NVME_PSDT_SGL_MPTR_CONTIGUOUS << 8));
     wr16le(&b[2], cid);
     wr32le(&b[4], nsid);
-    nvmer_set_ksgl(&b[24], mlx5_dma_addr((const void *)(uintptr_t)buf), total_len, nvmer_qp(ctx)->mkey);
+    if (nvmer_use_inline(ctx, opcode, total_len)) {
+        nvmer_set_inline_sgl(&b[24], total_len);
+    } else {
+        nvmer_set_ksgl(&b[24], mlx5_dma_addr((const void *)(uintptr_t)buf), total_len, nvmer_qp(ctx)->mkey);
+    }
     wr32le(&b[40], (uint32_t)(slba & 0xFFFFFFFFu));
     wr32le(&b[44], (uint32_t)(slba >> 32));
     wr32le(&b[48], (uint32_t)(nlb - 1u) & 0xFFFFu);
@@ -353,13 +402,22 @@ static int nvmer_post_recv(nvme_rdma_ctx_t *ctx)
  * コール元:
  *   nvme_rdma_connect_job_step()
  * ===============================================================*/
-static void nvmer_post_send(nvme_rdma_ctx_t *ctx, uint32_t len)
+static void nvmer_post_send_data(nvme_rdma_ctx_t *ctx, uint32_t len,
+                                 const volatile uint8_t *data, uint32_t data_len)
 {
     dcache_clean_range((const void *)(uintptr_t)ctx->send_buf, len);
-    mlx5_qp_post_send(ctx->cm.dev, nvmer_qp(ctx), (const void *)(uintptr_t)ctx->send_buf, len);
+    /* **データはコピーせず 2 本目の SGE で送る。** capsule へ写すと
+     * 1 コマンドあたり data_len バイトの memcpy が hot path に乗る。 */
+    mlx5_qp_post_send2(ctx->cm.dev, nvmer_qp(ctx), (const void *)(uintptr_t)ctx->send_buf, len,
+                       (const void *)(uintptr_t)data, data_len);
     ctx->send_done = 0;
     ctx->recv_done = 0;
     ctx->cmd_deadline = timer_now();
+}
+
+static void nvmer_post_send(nvme_rdma_ctx_t *ctx, uint32_t len)
+{
+    nvmer_post_send_data(ctx, len, 0, 0);
 }
 
 /*=================================================================
@@ -621,6 +679,22 @@ job_result_t nvme_rdma_connect_job_step(job_t *self)
             mn[n] = 0;
             uart_printf("[nvme-rdma] Identify Controller完了 (model=\"%s\")\n", mn);
         }
+        /* in-capsule write が使えるかを相手の広告から決める。条件は Linux の
+         * nvme_rdma_setup_ctrl() と同じ 3 つ:
+         *   ICDOFF == 0 / SGLS bit20(SAOS)/ payload <= IOCCSZ*16 - 64。
+         * **KSDBDS(bit2)ではなく SAOS(bit20)を見ること。** */
+        {
+            uint32_t ioccsz = rd32le(&ctx->id_ctrl[1792]);
+            uint16_t icdoff = rd16le(&ctx->id_ctrl[1800]);
+            uint32_t sgls   = rd32le(&ctx->id_ctrl[536]);
+            ctx->icdsz = 0u;
+            if (icdoff == 0u && (sgls & (1u << 20)) != 0u && ioccsz > 4u) {
+                ctx->icdsz = (ioccsz - 4u) * 16u;
+                if (ctx->icdsz > NVME_RDMA_ICD_MAX) ctx->icdsz = NVME_RDMA_ICD_MAX;
+            }
+            uart_printf("[nvme-rdma] in-capsule write: %s (ioccsz=%u icdoff=%u sgls=0x%x -> %u バイト)\n",
+                        ctx->icdsz ? "使う" : "使わない", ioccsz, (unsigned)icdoff, sgls, ctx->icdsz);
+        }
         ctx->cur_cid++;
         self->state = NVMER_ST_SEND_ID_NS;
         return JOB_WAITING;
@@ -762,7 +836,11 @@ job_result_t nvme_rdma_connect_job_step(job_t *self)
         if (nvmer_post_recv(ctx) != 0) return nvmer_fail(ctx, "post_recv(Write)失敗");
         uint64_t slba = ctx->bench_enabled ? nvmer_next_lba(ctx, nlb) : 0u;
         uint32_t slen = nvmer_build_io(ctx, NVME_IO_CMD_WRITE, ctx->nsid, slba, nlb, ctx->write_buf, len);
-        nvmer_post_send(ctx, slen);
+        if (nvmer_use_inline(ctx, (uint8_t)NVME_IO_CMD_WRITE, len)) {
+            nvmer_post_send_data(ctx, slen, ctx->write_buf, len);
+        } else {
+            nvmer_post_send(ctx, slen);
+        }
         self->state = NVMER_ST_WAIT_WRITE;
         return JOB_WAITING;
     }
@@ -925,9 +1003,14 @@ job_result_t nvme_rdma_connect_job_step(job_t *self)
                                   nlb, data_buf, ctx->bench_chunk_bytes);
                 dcache_clean_range((const void *)(uintptr_t)s_pl_send_bufs[i], 64u);
                 if (nvmer_pl_post_recv_slot(ctx, i) != 0) return nvmer_fail(ctx, "pipeline post_recv失敗");
-                if (mlx5_qp_post_send(ctx->cm.dev, nvmer_qp(ctx), (const void *)(uintptr_t)s_pl_send_bufs[i],
-                                      64u) != 0) {
-                    return nvmer_fail(ctx, "pipeline post_send失敗");
+                {
+                    int inl = nvmer_use_inline(ctx, opcode, ctx->bench_chunk_bytes);
+                    if (mlx5_qp_post_send2(ctx->cm.dev, nvmer_qp(ctx),
+                                           (const void *)(uintptr_t)s_pl_send_bufs[i], 64u,
+                                           inl ? (const void *)(uintptr_t)data_buf : 0,
+                                           inl ? ctx->bench_chunk_bytes : 0u) != 0) {
+                        return nvmer_fail(ctx, "pipeline post_send失敗");
+                    }
                 }
                 s_pl_slots[i].in_use = 1;
                 s_pl_slots[i].cid = ctx->cur_cid;

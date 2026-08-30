@@ -45,6 +45,9 @@ typedef enum {
  * CQ 1024 なので 16 でも余裕がある(ターゲット側の NVMET_RDMA_MAX_PENDING も 16)。 */
 /* 同時 outstanding 数の上限。**SQ サイズ 128 エントリのリングでは 127 まで**
  * (head==tail を空と区別するため 1 枠空ける)。 */
+/* in-capsule で送るデータの上限。相手の広告がこれより大きくても切り詰める
+ * (送信バッファをこの大きさで持っているため)。 */
+#define NVME_RDMA_ICD_MAX 4096u
 #define NVME_RDMA_PL_QDEPTH_MAX 127u
 
 typedef struct {
@@ -67,6 +70,9 @@ typedef struct {
 
     volatile uint8_t write_buf[NVME_RDMA_BENCH_BUF_MAX] __attribute__((aligned(64)));
     volatile uint8_t read_buf[NVME_RDMA_BENCH_BUF_MAX] __attribute__((aligned(64)));
+    /* 相手が広告した in-capsule データの上限(バイト)。0=使えない。
+     * Identify Controller の IOCCSZ / ICDOFF / SGLS から決める。 */
+    uint32_t icdsz;
     volatile uint8_t id_ctrl[NVME_RDMA_ID_BUF_LEN] __attribute__((aligned(64)));
     volatile uint8_t id_ns[NVME_RDMA_ID_BUF_LEN] __attribute__((aligned(64)));
 
@@ -133,5 +139,8 @@ void nvme_rdma_set_ns_override(uint32_t lba_size, uint64_t nsze);
 /* 次の bench で RDMA の接続を張り直させる(CM のパラメータを変えたとき用)。 */
 void nvme_rdma_force_reconnect(void);
 void nvme_rdma_get_ns_override(uint32_t *lba_size, uint64_t *nsze);
+
+/* `incapsule off` で RDMA の in-capsule write も止める(A/B 用)。 */
+void nvme_rdma_set_incapsule_disable(int off);
 
 #endif /* NVME_RDMA_H */

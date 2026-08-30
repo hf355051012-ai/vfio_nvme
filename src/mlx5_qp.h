@@ -5,6 +5,10 @@
 #include "timestamp.h"
 
 int mlx5_qp_post_send(mlx5_dev_t *dev, mlx5_qp_t *qp, const void *data, uint32_t len);
+/* SEND を 2 バッファ(コマンド capsule + データ)から 1 メッセージとして送る。
+ * data1=NULL なら上と同じ。NVMe-oF の in-capsule write 用。 */
+int mlx5_qp_post_send2(mlx5_dev_t *dev, mlx5_qp_t *qp, const void *data0, uint32_t len0,
+                       const void *data1, uint32_t len1);
 
 int mlx5_qp_post_recv(mlx5_dev_t *dev, mlx5_qp_t *qp, void *buf, uint32_t buf_len);
 

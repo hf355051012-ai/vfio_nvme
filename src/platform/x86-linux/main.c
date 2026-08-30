@@ -5682,6 +5682,7 @@ static void shell_dispatch(char *line, int s0, int s1)
                     s_nvme_ctx.icdsz,
                     s_incapsule_disable ? 0u : s_nvme_ctx.icdsz);
         nvme_set_incapsule_disable(s_incapsule_disable);
+        nvme_rdma_set_incapsule_disable(s_incapsule_disable);
     } else if (strncmp(line, "nvmetrdma", 9) == 0) {
         /* nvmetrdma [<mac>]
          *
