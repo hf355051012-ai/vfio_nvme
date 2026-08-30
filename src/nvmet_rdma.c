@@ -42,20 +42,6 @@ static void nvmetr_zero_v64(volatile uint8_t *p, uint32_t len)
     for (uint32_t i = 0; i < n64; i++) p64[i] = 0;
 }
 
-/*=================================================================
- * in-capsule で届いた write データを RAM ディスクへ写す。受信バッファは
- * volatile なので memcpy は使えない。
- *
- * 引数:
- *   dst / src - 書き込み先 / 読み出し元、len - バイト数
- * コール元:
- *   nvmet_rdma_job_step()
- * ===============================================================*/
-static void nvmetr_copy_v(volatile uint8_t *dst, const volatile uint8_t *src, uint32_t len)
-{
-    for (uint32_t i = 0; i < len; i++) dst[i] = src[i];
-}
-
 static void nvmetr_copy_padded(volatile uint8_t *dst, const char *src, uint32_t field_len)
 {
     uint32_t src_len = 0;
@@ -913,9 +899,13 @@ job_result_t nvmet_rdma_job_step(job_t *self)
                                     need, recv_len);
                         ip->resp_status = NVMET_RDMA_SC_ERROR;
                     } else {
-                        nvmetr_copy_v(&ctx->ctrl->ram_disk[ip->io_slba * NVMET_RDMA_LBA_SIZE],
-                                      &ctx->pl.recv_bufs[slot][64u + ip->inline_off],
-                                      ip->ksgl_len);
+                        /* **バイト単位のループにしないこと。** このコピーは
+                         * ポーリングループの中なので、4KB を 1 バイトずつ写すと
+                         * 深さを上げたときに CQ を拾う手が止まる(実測で 4K
+                         * qd=128 が 153k -> 16k IOPS まで落ちた)。 */
+                        volatile_fast_copy(&ctx->ctrl->ram_disk[ip->io_slba * NVMET_RDMA_LBA_SIZE],
+                                           &ctx->pl.recv_bufs[slot][64u + ip->inline_off],
+                                           ip->ksgl_len);
                     }
                 }
                 if (ctx->pl.pending[slot].need_data_move) {

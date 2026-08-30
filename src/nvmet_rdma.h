@@ -21,7 +21,7 @@
  * ホストが上限まで出した瞬間に RQ が空になり、以後の CapsuleCmd が
  * RNR NAK でリトライに落ちる**(エラーは 1 つも出ず、ただ極端に遅くなる)。
  * 実機では qd=12 の 64k write が 830 -> 2 MiB/s に落ちた。 */
-#define NVMET_RDMA_MAX_PENDING 192u
+#define NVMET_RDMA_MAX_PENDING 256u
 
 /* Identify Controller の MAXCMD として広告する値(ホストの同時発行数の上限)。
  * SQ は 64 WQEBB なので、1 コマンドあたり最大 2 WQE として 32 まで。 */
