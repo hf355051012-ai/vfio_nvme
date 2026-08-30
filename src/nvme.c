@@ -9,7 +9,12 @@
 #include "netif.h"
 #include "crc32c.h"
 
-#define NVME_QSIZE               32u    /* admin/IO両queueのsqsize(Fabrics Connectで通知) */
+/* admin キューの sqsize。**Linux の nvmet は admin を NVME_AQ_DEPTH(32)で
+ * 上限判定する**ので超えてはいけない(RDMA では hsqsize で同じ検査がある)。 */
+#define NVME_QSIZE_ADMIN         32u
+/* IO キューの sqsize。相手の CAP.MQES 以内であればよい(自作ターゲットは 255)。
+ * **同時 outstanding 数 NVME_IO_QDEPTH より大きくすること。** */
+#define NVME_QSIZE_IO            256u
 #define NVME_ADMIN_CMD_TIMEOUT_MS 5000u
 #define NVME_IO_CMD_TIMEOUT_MS   10000u
 
@@ -492,7 +497,8 @@ static void nvme_build_fabrics_connect_sqe(nvme_sqe_t *sqe, uint16_t qid, uint32
     wr32le(&sqe->nsid, NVME_FABRIC_FCTYPE_CONNECT);  /* fctypeはnsidフィールドの下位バイトにオーバーレイされる */
     nvme_set_sgl_inline(sqe, connect_data_len);
     wr32le(&sqe->cdw10, (uint32_t)qid << 16);                 /* recfmt=0(下位16bit), qid(上位16bit) */
-    wr32le(&sqe->cdw11, (uint32_t)(NVME_QSIZE - 1) & 0xFFFFu); /* sqsize(0's based) */
+    uint32_t qsize = (qid == 0u) ? NVME_QSIZE_ADMIN : NVME_QSIZE_IO;
+    wr32le(&sqe->cdw11, (uint32_t)(qsize - 1u) & 0xFFFFu);    /* sqsize(0's based) */
     wr32le(&sqe->cdw12, 0u);
 }
 
@@ -824,6 +830,24 @@ static job_result_t nvme_connect_job_step(job_t *self)
             return JOB_WAITING;
         }
 
+        /* IOCCSZ(offset 1792、16 バイト単位)= SQE 64 + in-capsule データ。
+         * ICDOFF(offset 1800)は NVMe/TCP では 0 でなければならない
+         * (Linux の nvme_tcp_setup_ctrl() も 0 以外を拒否する)。
+         * **ここを読まないと write を in-capsule で送ってよいか分からない。** */
+        {
+            uint32_t ioccsz = rd32le(&jc->id_buf[1792]);
+            uint16_t icdoff = rd16le(&jc->id_buf[1800]);
+            uint32_t icd    = (ioccsz > 4u) ? ((ioccsz - 4u) * 16u) : 0u;
+            if (icdoff != 0u) {
+                uart_printf("[nvme] ICDOFF=%u は NVMe/TCP では 0 のはず -- "
+                            "in-capsule を使いません\n", (unsigned)icdoff);
+                icd = 0u;
+            }
+            ctx->icdsz = icd;
+            uart_printf("[nvme] IOCCSZ=%u (in-capsule データ上限 %u バイト)\n",
+                        ioccsz, ctx->icdsz);
+        }
+
         nvme_build_identify_sqe(&jc->sqe, (uint8_t)NVME_IDENTIFY_CNS_NAMESPACE, 1u);
         nvme_exec_begin(&jc->exec, &ctx->admin, &jc->sqe, NULL, 0, jc->id_buf, sizeof(jc->id_buf));
         self->state = NCONN_ST_EXEC_IDENTIFY_NS;
@@ -1051,16 +1075,47 @@ void nvme_build_read_sqe(nvme_sqe_t *sqe, uint32_t nsid, uint64_t slba, uint32_t
  * コール元:
  *   nvme_write_pipelined_run()
  * ===============================================================*/
-void nvme_build_write_sqe(nvme_sqe_t *sqe, uint32_t nsid, uint64_t slba, uint32_t nlb, uint32_t total_len)
+static int s_incapsule_off;
+
+/* 実行時の同時 outstanding 数(既定 8 = 従来の NVME_IO_QDEPTH)。 */
+static unsigned s_io_qd = 8u;
+
+void nvme_set_io_qdepth(unsigned d)
+{
+    if (d == 0u) d = 1u;
+    if (d > NVME_IO_QDEPTH) d = NVME_IO_QDEPTH;
+    s_io_qd = d;
+}
+
+unsigned nvme_io_qdepth(void) { return s_io_qd; }
+
+void nvme_set_incapsule_disable(int off) { s_incapsule_off = off ? 1 : 0; }
+
+void nvme_build_write_sqe(nvme_sqe_t *sqe, uint32_t nsid, uint64_t slba, uint32_t nlb,
+                          uint32_t total_len, int use_inline)
 {
     nvme_zero(sqe, sizeof(*sqe));
     wr32le(&sqe->cdw0, NVME_IO_CMD_WRITE | ((uint32_t)NVME_PSDT_SGL_MPTR_CONTIGUOUS << 8));
     wr32le(&sqe->nsid, nsid);
-    if (total_len > NVME_TCP_INLINE_DATA_MAX) {
-        nvme_set_sgl(sqe, total_len);
-    } else {
-        nvme_set_sgl_inline(sqe, total_len);
-    }
+    /* **SGL の宣言と実際の送り方を必ず一致させる。**
+     * この SQE を使う唯一の経路 nvme_write_pipelined_run() は
+     * nvme_tcp_send_cmd_async() で **データを付けずに** CapsuleCmd だけ送り、
+     * 相手の R2T を待ってから H2CData で払い出す。ここで in-capsule を
+     * 名乗ると「データがこの後に連結されている」と宣言したことになる。
+     *
+     * 以前は 8192 バイト以下で in-capsule を名乗っていた。自作ターゲットは
+     * SGL 型を見ずに常に R2T を返すので自作どうしでは表に出ないが、
+     * **Linux の nvmet-tcp は宣言どおり in-capsule データを待ち、以後の
+     * PDU を全部そのデータとして食う**(応答もエラーも返さず沈黙する)。
+     * CRC32C や NVMe-oF RDMA の接続で踏んだのと同型の「両側が同じ
+     * 間違い方をするので検出できない」不具合。
+     *
+     * 逆に in-capsule を使えるなら使う。**Linux の nvmet-tcp は
+     * 「長さが inline_data_size 以下の write は in-capsule のはず」と
+     * 決め打ちして R2T を送らない**(nvmet_tcp_queue_response())ので、
+     * 相手が in-capsule を広告している範囲では R2T 経路が成立しない。 */
+    if (use_inline) nvme_set_sgl_inline(sqe, total_len);
+    else            nvme_set_sgl(sqe, total_len);
     wr32le(&sqe->cdw10, (uint32_t)(slba & 0xFFFFFFFFu));
     wr32le(&sqe->cdw11, (uint32_t)(slba >> 32));
     wr32le(&sqe->cdw12, (uint32_t)(nlb - 1) & 0xFFFFu);
@@ -1071,6 +1126,7 @@ static volatile int    s_io_job_done = 0;
 typedef struct {
     int        in_use;   /* このスロットが現在1件のwriteを担当中か */
     int        sent;     /* SQEを送信済みか(R2T/RSP待ちの間だけ1) */
+    int        inline_data; /* 1=データを Command Capsule に載せて送った(R2Tは来ない) */
     int        done;     /* 完了(結果確定)したか -- in_useのままresultを取り出す猶予を与える */
     int        result;   /* 完了時のCQEステータス(0=success)、通信エラー等は-1 */
     uint16_t   cid;
@@ -1537,22 +1593,36 @@ int nvme_write_pipelined_run(nvme_ctx_t *ctx, uint32_t nsid, uint64_t lba,
                 s_pl_slots[i].in_use = 0;
             }
         }
+        /* **実行時の深さまでしか埋めない。** 以前は空いているスロットを全部
+         * 埋めていたので、同時数は常に配列の大きさだった。 */
+        unsigned inflight_w = 0;
         for (unsigned i = 0; i < NVME_IO_QDEPTH; i++) {
+            if (s_pl_slots[i].in_use) inflight_w++;
+        }
+        for (unsigned i = 0; i < NVME_IO_QDEPTH && inflight_w < s_io_qd; i++) {
             if (!s_pl_slots[i].in_use) {
+                inflight_w++;
                 s_pl_slots[i].in_use = 1;
                 s_pl_slots[i].sent   = 0;
                 s_pl_slots[i].done   = 0;
                 s_pl_slots[i].result = 0;
                 s_pl_slots[i].data   = buf;
                 s_pl_slots[i].len    = total_len;
-                nvme_build_write_sqe(&s_pl_slots[i].sqe, nsid, cur_lba, nlb, total_len);
+                s_pl_slots[i].inline_data =
+                    (!s_incapsule_off && ctx->icdsz >= total_len) ? 1 : 0;
+                nvme_build_write_sqe(&s_pl_slots[i].sqe, nsid, cur_lba, nlb, total_len,
+                                     s_pl_slots[i].inline_data);
                 cur_lba = nvme_bench_next_lba(ctx, cur_lba, lba, nlb);
             }
         }
         for (unsigned i = 0; i < NVME_IO_QDEPTH; i++) {
             if (s_pl_slots[i].in_use && !s_pl_slots[i].sent) {
                 uint16_t cid = 0;
-                if (nvme_tcp_send_cmd_async(&ctx->io, &s_pl_slots[i].sqe, &cid) != 0) {
+                int send_rc = s_pl_slots[i].inline_data
+                    ? nvme_tcp_send_cmd_inline_async(&ctx->io, &s_pl_slots[i].sqe,
+                                                     s_pl_slots[i].data, s_pl_slots[i].len, &cid)
+                    : nvme_tcp_send_cmd_async(&ctx->io, &s_pl_slots[i].sqe, &cid);
+                if (send_rc != 0) {
                     s_pl_slots[i].done   = 1;
                     s_pl_slots[i].result = -1;
                     continue;
@@ -2128,7 +2198,7 @@ int nvme_read_pipelined_run(nvme_ctx_t *ctx, uint32_t nsid, uint64_t lba,
             }
         }
         uint32_t rx_cap = tcp_rx_buf_size();
-        unsigned max_inflight = NVME_IO_QDEPTH;
+        unsigned max_inflight = s_io_qd;
         if (total_len > 0u && rx_cap > total_len) {
             uint32_t m = rx_cap / total_len;
             if (m > 0u) m -= 1u;               /* 1 転送分の headroom を残す */

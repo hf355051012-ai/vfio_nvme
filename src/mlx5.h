@@ -39,7 +39,20 @@
 #define MLX5_NET_TX_STAGE_SIZE MLX5_JUMBO_MAX_LEN
 #define MLX5_NET_TX_STAGE_TOTAL_SIZE ((uint64_t)MLX5_SQ_WQE_COUNT * MLX5_NET_TX_STAGE_SIZE)
 
-#define MLX5_QP_WQE_BUF_SIZE 8192u
+/* RC QP の WQE バッファ。**RQ 領域(256 x 16B = 4096)の直後が SQ 領域**という
+ * 固定レイアウトで、SQ は log_sq_size=9 = 512 WQEBB x 64B = 32768 バイト使う。
+ * qd=128 まで積めるようにするため 8192 から広げた(1 コマンドが SEND 2 WQEBB、
+ * ターゲット側は RDMA_READ/WRITE + SEND で最大 3 WQEBB 使う)。
+ * **GSI は別バッファ(MLX5_GSI_WQE_BUF_SIZE)なので影響しない。** */
+#define MLX5_QP_WQE_BUF_SIZE 65536u
+
+/* RC QP の WQ レイアウトと、CREATE_QP へ渡す PAS の枚数。
+ * **SQ を広げたら PAS の枚数も一緒に増やすこと。** 2 枚(RQ 1 + SQ 1)固定の
+ * まま SQ だけ 32KB にすると、FW が CREATE_QP を syndrome=0x002f50ca で
+ * 拒否する(実機で踏んだ)。log_page_size=0 なので 1 枚 = 4KB。 */
+#define MLX5_QP_RQ_BYTES  4096u                      /* log_rq_size=8 x 16B */
+#define MLX5_QP_SQ_BYTES  (512u * MLX5_SEND_WQE_BB)  /* log_sq_size=9 x 64B */
+#define MLX5_QP_WQ_PAGES  ((MLX5_QP_RQ_BYTES + MLX5_QP_SQ_BYTES + 4095u) / 4096u)
 #define MLX5_QP_DBR_SIZE     64u   // 実際に使うのは8B(RCV counter 4B+
 
 #define MLX5_GSI_WQE_BUF_SIZE 8192u

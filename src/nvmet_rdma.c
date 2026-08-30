@@ -13,10 +13,18 @@
 
 extern job_result_t nvme_rdma_connect_job_step(job_t *self);
 
-static nvmet_rdma_ctx_t s_standalone_ctx;
+static nvmet_rdma_ctx_t  s_standalone_ctx;      /* admin キュー(queue_id=0)*/
+static nvmet_rdma_ctrl_t s_standalone_ctrl;     /* admin/IO 共有のコントローラ状態 */
+static int      s_standalone_resident;
+static uint32_t s_standalone_resident_generation;
+
+/* IO キュー(queue_id=1)。admin の CM 確立を検出した時点で spawn する。
+ * self_label / peer_mac はコールバックに渡らないのでここへ控えておく。 */
 static nvmet_rdma_ctx_t s_standalone_io_ctx;
-static int s_standalone_resident;
-static int s_standalone_io_spawned;
+static int         s_standalone_io_spawned;
+static const char *s_standalone_self_label;
+static uint8_t     s_standalone_peer_mac[6];
+
 
 #define CM_DREQ_ATTR_ID 0x0015u
 #define CM_DREP_ATTR_ID 0x0016u
@@ -74,7 +82,7 @@ static void nvmetr_build_id_ctrl(nvmet_rdma_ctx_t *ctx)
     wr32le(&ctx->ctrl->id_ctrl[516], 1);                  /* NN: namespace count = 1 */
     ctx->ctrl->id_ctrl[512] = (6u << 4) | 6u;              /* SQES: 64バイト固定 */
     ctx->ctrl->id_ctrl[513] = (4u << 4) | 4u;              /* CQES: 16バイト固定 */
-    wr16le(&ctx->ctrl->id_ctrl[514], (uint16_t)NVMET_RDMA_MAX_PENDING); /* MAXCMD */
+    wr16le(&ctx->ctrl->id_ctrl[514], (uint16_t)NVMET_RDMA_MAXCMD); /* MAXCMD */
     wr32le(&ctx->ctrl->id_ctrl[1792], 64u / 16u);          /* IOCCSZ: SQE(64B)のみ、in-capsuleデータ無し */
     wr32le(&ctx->ctrl->id_ctrl[1796], NVME_CQE_LEN / 16u); /* IORCSZ: CQE(16B)分のみ */
     ctx->ctrl->id_ctrl[1803] = 1;                          /* MSDBD = 1 */
@@ -757,7 +765,14 @@ job_result_t nvmet_rdma_job_step(job_t *self)
         ctx->pl.rq_head = ctx->pl.rq_tail = 0;
         ctx->pl.sq_head = ctx->pl.sq_tail = 0;
         ctx->pl.rra_inflight = 0;
+        /* **CM で合意した INITIATOR_DEPTH を超えないこと。** 相手はこの値を
+         * max_dest_rd_atomic に設定しているので、超えた瞬間に
+         * REMOTE_INVAL_REQ_ERR(syndrome=0x12)が返る。 */
         ctx->pl.rra_max = mlx5_qp_max_concurrent_rdma_read(ctx->cm.dev);
+        if (ctx->cm.negotiated_initiator_depth != 0u &&
+            ctx->pl.rra_max > (uint32_t)ctx->cm.negotiated_initiator_depth) {
+            ctx->pl.rra_max = (uint32_t)ctx->cm.negotiated_initiator_depth;
+        }
         if (ctx->pl.rra_max == 0) ctx->pl.rra_max = 1; // 念のための安全弁(0除算/永久停止防止)
         ctx->pl.rra_pending_head = ctx->pl.rra_pending_tail = 0;
         for (unsigned i = 0; i < NVMET_RDMA_MAX_PENDING; i++) {
@@ -902,8 +917,160 @@ job_result_t nvmet_rdma_job_step(job_t *self)
     }
 }
 
-static nvmet_rdma_ctx_t s_standalone_ctx;      // admin queue(queue_id=0)
-static int s_standalone_resident;
+/*=================================================================
+ * 外部ホスト向けの常駐 NVMe-oF RDMA ターゲット。
+ *
+ * nvme_rdma.c の s_target_ctx(自作イニシエータとのループバック検証用)とは
+ * 完全に独立したインスタンスで、シェルの nvmetrdma コマンドから起動する。
+ * 相手が Linux ホストのときはこちらを使う。
+ *
+ * この一式は初期コミット時点で存在したが、シェルからの入口が無かったため
+ * 「未到達コード」として一括削除されていた(8d79bb2)。2 ノード構成で
+ * 「自作ターゲット <- Linux イニシエータ」を測れるようにするため復活させた。
+ * ===============================================================*/
+/*=================================================================
+ * 常駐ターゲットの RAM ディスク(256MB)を COHERENT DMA アリーナから確保する。
+ * nvme_rdma.c の nvmer_ramdisk_slot1() と同じ作りで、スロットだけ分ける
+ * (ループバック用ターゲットと同時に起動しても衝突しない)。
+ * ===============================================================*/
+static volatile uint8_t *nvmetr_ramdisk_slot0(void)
+{
+    static volatile uint8_t *s_rd0 = 0;
+    if (s_rd0 == 0) {
+        s_rd0 = (volatile uint8_t *)dma_alloc(NVMET_RDMA_RAMDISK_SLOT_SIZE,
+                                              0x200000ULL, DMA_COHERENT).cpu;
+    }
+    return s_rd0;
+}
 
-static nvmet_rdma_ctx_t s_standalone_io_ctx;
-static int s_standalone_io_spawned;
+/*=================================================================
+ * admin キューが established になった直後に 1 度だけ呼ばれる。IO キュー用の
+ * 2 本目の CM listener を立てる。
+ *
+ * GSI(QP1)は 1 PF に 1 つしか置けないので、admin が確立済みのものを
+ * ポインタのまま共有する(reuse_gsi)。値コピーにすると sq_pc/rq_pc/cq_cc が
+ * 二重管理になり、IO キューの REP が「送ったつもりでワイヤに出ない」という
+ * 静かな失敗を起こす(実機で踏んだ本物のバグ)。
+ * ===============================================================*/
+static void nvmetr_on_admin_established(nvmet_rdma_ctx_t *admin_ctx)
+{
+    if (!admin_ctx->enable_io_queue || s_standalone_io_spawned) return;
+
+    for (uint32_t i = 0; i < sizeof(s_standalone_io_ctx); i++) {
+        ((uint8_t *)&s_standalone_io_ctx)[i] = 0;
+    }
+    dcache_clean_range((const void *)&s_standalone_io_ctx, sizeof(s_standalone_io_ctx));
+
+    static const uint8_t dummy_mac[6] = {0, 0, 0, 0, 0, 0};
+    rdma_cm_fill_addr(&s_standalone_io_ctx.cm, admin_ctx->cm.dev, s_standalone_self_label,
+                      "__no_such_net_ctx__", 0u, 0u, dummy_mac, s_standalone_peer_mac);
+    /* fill_addr のゼロクリアの「後」に共有すること(先だと消える)。 */
+    s_standalone_io_ctx.cm.gsi_qp      = admin_ctx->cm.gsi_qp;
+    s_standalone_io_ctx.cm.reuse_gsi   = 1;
+    s_standalone_io_ctx.cm.rc_qp_index = 1;
+    s_standalone_io_ctx.cm.skip_ping   = 1;
+    s_standalone_io_ctx.cm.is_active   = 0;
+    s_standalone_io_ctx.ctrl           = admin_ctx->ctrl;  /* コントローラ状態は共有 */
+    s_standalone_io_ctx.queue_id       = 1;
+    s_standalone_io_ctx.pipeline_enabled = 1;
+
+    job_t *io_job = job_spawn(nvmet_rdma_job_step, &s_standalone_io_ctx, "nvmet-rdma-io");
+    if (!io_job) {
+        uart_printf("[!] nvmet-rdma: IOキュー用ジョブ生成失敗(ジョブテーブル満杯)\n");
+        return;
+    }
+    io_job->state = NVMETR_ST_CM_SPAWN;
+    job_pin_to_core(io_job, 1u);
+    s_standalone_io_spawned = 1;
+    uart_printf("[nvmet-rdma] IOキュー用のCM listenerを起動しました(GSIはadminと共有)\n");
+}
+
+/*=================================================================
+ * admin キューの切断を検出したときに 1 度だけ呼ばれる。NVMe-oF の意味論上、
+ * admin が切れれば同じコントローラの IO キューも意味を失うので道連れにする。
+ * GSI は admin 側が破棄するので、ここでは IO 自身の RC QP だけ返す。
+ * ===============================================================*/
+static void nvmetr_on_admin_disconnected(nvmet_rdma_ctx_t *admin_ctx)
+{
+    (void)admin_ctx;
+    if (!s_standalone_io_spawned) return;
+    nvmetr_destroy_qp_if_valid(s_standalone_io_ctx.cm.dev, &s_standalone_io_ctx.cm.rc_qp);
+    s_standalone_io_ctx.stop_requested = 1;
+    s_standalone_io_spawned = 0;
+    uart_printf("[nvmet-rdma] IOキューも道連れに終了させます\n");
+}
+
+/*=================================================================
+ * 常駐ターゲットを起動する(シェルの nvmetrdma コマンド)。
+ *
+ * 引数:
+ *   dev        - 待ち受けるポートの mlx5 デバイス
+ *   self_label - その netif 名("mlx5-pf1" 等)
+ *   peer_mac   - 相手の MAC。IBTA の CM メッセージに MAC は含まれないので、
+ *                REP を返す AV に使う値はここで渡すしかない(NULL ならゼロ)。
+ * コール元:
+ *   shell_dispatch()
+ * ===============================================================*/
+void nvmet_rdma_run_standalone(mlx5_dev_t *dev, const char *self_label, const uint8_t peer_mac[6])
+{
+    if (s_standalone_resident && !s_standalone_ctx.failed &&
+        s_standalone_resident_generation == dev->bringup_generation) {
+        uart_printf("[nvmet-rdma] 既に%sで稼働中です(接続待ち、または処理中)\n", self_label);
+        return;
+    }
+    if (s_standalone_resident) {
+        /* 前回のジョブを確実に止めてから作り直す。止めずに spawn すると
+         * 同一 ctx を 2 つのジョブが触る(RDMA CM の segfault と同型)。 */
+        s_standalone_ctx.stop_requested = 1;
+        if (s_standalone_io_spawned) s_standalone_io_ctx.stop_requested = 1;
+        job_cancel_by_ctx(&s_standalone_ctx.cm);
+        job_cancel_by_ctx(&s_standalone_io_ctx.cm);
+        uint64_t t0 = timer_now();
+        while (!timeout_ms(t0, 2000u)) job_scheduler_tick();
+        if (s_standalone_io_spawned) {
+            nvmetr_destroy_qp_if_valid(s_standalone_io_ctx.cm.dev, &s_standalone_io_ctx.cm.rc_qp);
+        }
+        nvmetr_destroy_qp_if_valid(s_standalone_ctx.cm.dev, &s_standalone_ctx.cm.rc_qp);
+        nvmetr_destroy_qp_if_valid(s_standalone_ctx.cm.dev, s_standalone_ctx.cm.gsi_qp);
+        s_standalone_resident   = 0;
+        s_standalone_io_spawned = 0;
+    }
+
+    for (uint32_t i = 0; i < sizeof(s_standalone_ctx); i++)  ((uint8_t *)&s_standalone_ctx)[i] = 0;
+    for (uint32_t i = 0; i < sizeof(s_standalone_ctrl); i++) ((uint8_t *)&s_standalone_ctrl)[i] = 0;
+    /* 上のゼロクリアは非 volatile 書き込みなので、recv_buf/id_ctrl/id_ns
+     * (DMA 宛先)にダーティなキャッシュラインが残る。最初の RECV を投稿する
+     * 前に必ずクリーンしておく。 */
+    dcache_clean_range((const void *)&s_standalone_ctx, sizeof(s_standalone_ctx));
+    dcache_clean_range((const void *)&s_standalone_ctrl, sizeof(s_standalone_ctrl));
+
+    static const uint8_t dummy_mac[6] = {0, 0, 0, 0, 0, 0};
+    const uint8_t *pm = (peer_mac != NULL) ? peer_mac : dummy_mac;
+    for (unsigned i = 0; i < 6; i++) s_standalone_peer_mac[i] = pm[i];
+    s_standalone_self_label = self_label;
+
+    rdma_cm_fill_addr(&s_standalone_ctx.cm, dev, self_label, "__no_such_net_ctx__",
+                      0u, 0u, dummy_mac, pm);
+    s_standalone_ctx.ctrl             = &s_standalone_ctrl;
+    s_standalone_ctrl.ram_disk        = nvmetr_ramdisk_slot0();
+    s_standalone_ctx.pipeline_enabled = 1;
+    s_standalone_ctx.enable_io_queue  = 1;
+    s_standalone_ctx.on_established   = nvmetr_on_admin_established;
+    s_standalone_ctx.on_disconnected  = nvmetr_on_admin_disconnected;
+    s_standalone_ctx.self_label       = self_label;
+    for (unsigned i = 0; i < 6; i++) s_standalone_ctx.peer_mac_fallback[i] = pm[i];
+
+    job_t *job = job_spawn(nvmet_rdma_job_step, &s_standalone_ctx, "nvmet-rdma-standalone");
+    if (!job) {
+        uart_printf("[!] nvmet-rdma: ジョブテーブル満杯\n");
+        return;
+    }
+    job->state = NVMETR_ST_CM_SPAWN;
+    if (smp_boot_core1() == 0) job_pin_to_core(job, 1u);
+    else uart_printf("[!] nvmet-rdma: core1起動に失敗、core0のまま動作します\n");
+
+    s_standalone_resident            = 1;
+    s_standalone_resident_generation = dev->bringup_generation;
+    uart_printf("[nvmet-rdma] %s で常駐ターゲットを開始しました(外部ホストの接続待ち)\n",
+                self_label);
+}

@@ -41,7 +41,11 @@ typedef enum {
     NVMER_ST_DONE_FAIL,
 } nvme_rdma_state_t;
 
-#define NVME_RDMA_PL_QDEPTH_MAX 15u
+/* RDMA パイプラインの同時 outstanding 数の上限。RQ 256 / SQ 64 WQEBB /
+ * CQ 1024 なので 16 でも余裕がある(ターゲット側の NVMET_RDMA_MAX_PENDING も 16)。 */
+/* 同時 outstanding 数の上限。**SQ サイズ 128 エントリのリングでは 127 まで**
+ * (head==tail を空と区別するため 1 枠空ける)。 */
+#define NVME_RDMA_PL_QDEPTH_MAX 127u
 
 typedef struct {
     rdma_cm_ctx_t cm;   /* CM確立(established後、cm.dev/cm.rc_qpが本命のQP) */
@@ -126,6 +130,8 @@ const nvme_rdma_remote_t *nvme_rdma_remote_target(void);
 /* Identify Namespace が信用できない相手向けの手動上書き。
  * lba_size=0 で解除。**正常な相手には使わないこと。** */
 void nvme_rdma_set_ns_override(uint32_t lba_size, uint64_t nsze);
+/* 次の bench で RDMA の接続を張り直させる(CM のパラメータを変えたとき用)。 */
+void nvme_rdma_force_reconnect(void);
 void nvme_rdma_get_ns_override(uint32_t *lba_size, uint64_t *nsze);
 
 #endif /* NVME_RDMA_H */

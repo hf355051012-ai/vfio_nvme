@@ -208,7 +208,7 @@ static void nvmet_build_id_ctrl(nvmet_ctx_t *ctx)
     ctx->id_ctrl[512] = (6u << 4) | 6u;          /* SQES: 64バイト固定 */
     ctx->id_ctrl[513] = (4u << 4) | 4u;          /* CQES: 16バイト固定 */
 
-    wr16le(&ctx->id_ctrl[514], 32);              /* MAXCMD = 32 */
+    wr16le(&ctx->id_ctrl[514], 128);             /* MAXCMD = 128(READY_RING 256 より小さくする)*/
 
     wr32le(&ctx->id_ctrl[1792], (64u + NVMET_IOCCSZ_MAX_BYTES) / 16u);
     wr32le(&ctx->id_ctrl[1796], NVME_CQE_LEN / 16u);                   /* IORCSZ: CQE(16B)分のみ */
@@ -258,7 +258,7 @@ static void nvmet_build_id_ctrl_disc(nvmet_ctx_t *ctx)
     /* NN = 0 のまま(Discovery コントローラは名前空間を持たない)。 */
     ctx->id_ctrl_disc[512] = (6u << 4) | 6u;      /* SQES */
     ctx->id_ctrl_disc[513] = (4u << 4) | 4u;      /* CQES */
-    wr16le(&ctx->id_ctrl_disc[514], 32);          /* MAXCMD */
+    wr16le(&ctx->id_ctrl_disc[514], 128);         /* MAXCMD */
 
     wr32le(&ctx->id_ctrl_disc[1792], (64u + NVMET_IOCCSZ_MAX_BYTES) / 16u);
     wr32le(&ctx->id_ctrl_disc[1796], NVME_CQE_LEN / 16u);

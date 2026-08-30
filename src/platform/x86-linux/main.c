@@ -17,6 +17,7 @@
 #include "job.h"
 #include "nvme.h"
 #include "nvmet.h"
+#include "nvmet_rdma.h"
 
 #include <stdint.h>
 #include <string.h>
@@ -220,6 +221,26 @@ static netif_t *shell_peer_ll6(uint8_t out[16]);
  * コール元:
  *   shell_tcpbench()
  * ===============================================================*/
+/* `tcptarget` で指定する外部 NVMe/TCP ターゲット。RDMA 側の `rdmatarget`
+ * (nvme_rdma.c の s_remote)と同じ役割で、**指定すると同一プロセス内の
+ * ターゲットを立てず、イニシエータだけを動かす**。
+ *
+ * これが無いと `tcpbench` は 192.168.101.11:4421(対向 PF)決め打ちで、
+ * 外部ホストのターゲットに対する NVMe/TCP の性能が測れない。 */
+typedef struct {
+    int      enabled;
+    uint32_t ip;
+    uint16_t port;
+    char     subnqn[224];
+} shell_tcp_remote_t;
+static shell_tcp_remote_t s_tcp_remote;
+/* `incapsule off` で in-capsule write を止める(A/B 用)。 */
+static int s_incapsule_disable;
+/* 現在張っているセッションがどの相手のものか(設定が変わったら張り直す)。 */
+static int      s_shell_tcp_was_remote;
+static uint32_t s_shell_tcp_sess_ip;
+static uint16_t s_shell_tcp_sess_port;
+
 /*=================================================================
  * 内蔵イニシエータの NVMe/TCP セッションを閉じ、常駐ターゲットが次の
  * クライアントを待つ状態へ戻るまで回す。
@@ -280,14 +301,24 @@ static int shell_ensure_tcp_session(uint8_t want_hdgst, uint8_t want_ddgst, uint
          s_shell_tcp_ipv6 != want_ipv6)) {
         shell_tcp_session_close("digest/IP版の設定が変わったのでセッションを張り直します");
     }
+    /* 接続先が変わったときも張り直す(digest/IP 版と同じ理由)。 */
+    if (s_shell_tcp_connected &&
+        (s_shell_tcp_was_remote != (s_tcp_remote.enabled ? 1 : 0) ||
+         (s_tcp_remote.enabled &&
+          (s_shell_tcp_sess_ip != s_tcp_remote.ip ||
+           s_shell_tcp_sess_port != s_tcp_remote.port)))) {
+        shell_tcp_session_close("接続先が変わったのでセッションを張り直します");
+    }
     if (s_shell_tcp_connected) return 0;
     s_nvme_ctx.req_hdgst = want_hdgst;
     s_nvme_ctx.req_ddgst = want_ddgst;
     netif_t *ctx0 = netif_find("mlx5-pf0");
     netif_t *ctx1 = netif_find("mlx5-pf1");
-    if (!ctx0 || !ctx1) { uart_printf("netif 未登録\n"); return -1; }
+    if (!ctx0) { uart_printf("netif 未登録\n"); return -1; }
+    /* 外部ターゲットのときは PF1 を使わない(相手ではなく遊んでいるポート)。 */
+    if (!s_tcp_remote.enabled && !ctx1) { uart_printf("netif 未登録\n"); return -1; }
 
-    if (!s_shell_nvmet_started) {
+    if (!s_tcp_remote.enabled && !s_shell_nvmet_started) {
         if (smp_boot_core1() == 0) netif_set_owner_core(ctx1, 1u);
         netif_activate(ctx1);
         if (nvmet_job_start(&s_x86_nvmet, 4421u, ctx1, "manual") != 0) {
@@ -300,6 +331,18 @@ static int shell_ensure_tcp_session(uint8_t want_hdgst, uint8_t want_ddgst, uint
     netif_activate(ctx0);
     static char subnqn[128] = "nqn.2014-08.org.nvmexpress:uuid:deadbeef-cafe-babe-dead-beefcafebabe";
     netaddr_t target;
+    if (s_tcp_remote.enabled) {
+        /* **外部ターゲット。** IPv6 指定は対向 PF のリンクローカルを前提に
+         * しているので併用できない(相手の v6 アドレスを持つ手段が無い)。 */
+        if (want_ipv6) {
+            uart_printf("tcpbench: tcptarget 指定中は ipv6 を使えません\n");
+            return -1;
+        }
+        target = netaddr_v4(s_tcp_remote.ip);
+        nvme_connect_job_start_addr(&s_nvme_ctx, &target, s_tcp_remote.port,
+                                    s_tcp_remote.subnqn[0] ? s_tcp_remote.subnqn : subnqn);
+        goto wait_connect;
+    }
     if (want_ipv6) {
         /* nvmet 側の listener はポートだけで待つ family 非依存の実装なので、
          * ターゲットには手を入れず、イニシエータが v6 で繋ぎに行くだけでよい。 */
@@ -313,6 +356,7 @@ static int shell_ensure_tcp_session(uint8_t want_hdgst, uint8_t want_ddgst, uint
         target = netaddr_v4(ip_from_octets(192, 168, 101, 11));
     }
     nvme_connect_job_start_addr(&s_nvme_ctx, &target, 4421u, subnqn);
+wait_connect:;
     uint64_t t = timer_now();
     while (s_nvme_ctx.busy) {
         job_scheduler_tick();
@@ -320,10 +364,14 @@ static int shell_ensure_tcp_session(uint8_t want_hdgst, uint8_t want_ddgst, uint
         if (timeout_ms(t, 15000u)) { uart_printf("tcpbench: connect タイムアウト\n"); return -1; }
     }
     if (s_nvme_ctx.lba_size == 0u) { uart_printf("tcpbench: lba_size=0\n"); return -1; }
-    s_shell_tcp_connected = 1;
-    s_shell_tcp_ipv6      = want_ipv6;
-    uart_printf("tcpbench: initiator 接続完了 (lba_size=%u, %s)\n",
-                s_nvme_ctx.lba_size, want_ipv6 ? "IPv6" : "IPv4");
+    s_shell_tcp_connected  = 1;
+    s_shell_tcp_ipv6       = want_ipv6;
+    s_shell_tcp_was_remote = s_tcp_remote.enabled ? 1 : 0;
+    s_shell_tcp_sess_ip    = s_tcp_remote.ip;
+    s_shell_tcp_sess_port  = s_tcp_remote.port;
+    uart_printf("tcpbench: initiator 接続完了 (lba_size=%u, %s%s)\n",
+                s_nvme_ctx.lba_size, want_ipv6 ? "IPv6" : "IPv4",
+                s_tcp_remote.enabled ? ", 外部ターゲット" : "");
     return 0;
 }
 
@@ -4645,6 +4693,7 @@ typedef struct {
     uint32_t qd;
     uint8_t  hdgst, ddgst;  /* NVMe/TCP のみ。RDMA には digest の概念が無い */
     uint8_t  ipv6;          /* NVMe/TCP のみ。1=対向のリンクローカルへ IPv6 で繋ぐ */
+    uint32_t runtime_ms;    /* 1 条件あたりの測定時間。`t<秒>` で上書きできる */
 } bench_plan_t;
 
 /*=================================================================
@@ -4661,10 +4710,11 @@ typedef struct {
  * ===============================================================*/
 static void bench_plan_parse(char *args, bench_plan_t *pl)
 {
-    char *tok[5];
-    unsigned nt = shell_tokenize(args, tok, 5);
+    char *tok[6];
+    unsigned nt = shell_tokenize(args, tok, 6);
     pl->qd = 8u; pl->do_r = 1; pl->do_w = 1;
     pl->hdgst = 0; pl->ddgst = 0; pl->ipv6 = 0;
+    pl->runtime_ms = 3000u;
 
     /* 先に digest キーワードを抜き取り、残りを従来通り位置引数として扱う。 */
     unsigned kept = 0;
@@ -4674,6 +4724,13 @@ static void bench_plan_parse(char *args, bench_plan_t *pl)
         if (strcmp(tok[i], "digest") == 0) { pl->hdgst = 1; pl->ddgst = 1; continue; }
         if (strcmp(tok[i], "ipv6") == 0)   { pl->ipv6 = 1; continue; }
         if (strcmp(tok[i], "ipv4") == 0)   { pl->ipv6 = 0; continue; }
+        /* `t<秒>` -- 1 条件あたりの測定時間。**Linux 側(fio / spdk_nvme_perf)と
+         * 同じ秒数で測るために要る**。位置引数と紛れないようキーワードにする。 */
+        if (tok[i][0] == 't' && tok[i][1] >= '0' && tok[i][1] <= '9') {
+            uint32_t sec = (uint32_t)atoi(tok[i] + 1);
+            if (sec) pl->runtime_ms = sec * 1000u;
+            continue;
+        }
         tok[kept++] = tok[i];
     }
     nt = kept;
@@ -4685,8 +4742,16 @@ static void bench_plan_parse(char *args, bench_plan_t *pl)
         pl->nchunks = 0;
         char *p = tok[0];
         while (*p && pl->nchunks < BENCH_MAX_CHUNKS) {
-            uint32_t kb = (uint32_t)atoi(p);
-            pl->chunks[pl->nchunks++] = (kb ? kb : 64u) * 1024u;
+            uint32_t v = (uint32_t)atoi(p);
+            /* 数字の直後の `b`/`B` は **バイト指定**(既定は KB)。
+             * 512 バイト = 1 LBA を測れるようにするために足した。
+             * KB 単位だけだと最小が 1KB で、**1 コマンドあたりのコストが
+             * いちばん効く条件を測れない**。 */
+            const char *q = p;
+            while (*q >= '0' && *q <= '9') q++;
+            int is_bytes = (*q == 'b' || *q == 'B');
+            if (is_bytes) pl->chunks[pl->nchunks++] = v ? v : 512u;
+            else          pl->chunks[pl->nchunks++] = (v ? v : 64u) * 1024u;
             while (*p && *p != ',') p++;
             if (*p == ',') p++;
         }
@@ -4808,8 +4873,14 @@ static void bench_summary(const char *transport, uint32_t qd, uint32_t runtime_m
             if (r[i].is_read != pass) continue;
 
             char bs[16], mib[24], iops[24], lat[24];
-            unsigned o = bench_u32_str(r[i].chunk / 1024u, bs, sizeof(bs));
-            if (o + 1u < sizeof(bs)) bs[o++] = 'k';
+            unsigned o;
+            if (r[i].chunk < 1024u) {   /* 1KB 未満はバイトで表示する */
+                o = bench_u32_str(r[i].chunk, bs, sizeof(bs));
+                if (o + 1u < sizeof(bs)) bs[o++] = 'b';
+            } else {
+                o = bench_u32_str(r[i].chunk / 1024u, bs, sizeof(bs));
+                if (o + 1u < sizeof(bs)) bs[o++] = 'k';
+            }
             bs[o] = 0;
 
             const char *rw = r[i].is_read ? "read" : "write";
@@ -4837,12 +4908,12 @@ static void bench_summary(const char *transport, uint32_t qd, uint32_t runtime_m
  * コール元:
  *   shell_tcpbench()
  * ===============================================================*/
-static void tcp_measure(uint32_t chunk, int is_read, bench_res_t *out)
+static void tcp_measure(uint32_t chunk, int is_read, uint32_t runtime_ms, bench_res_t *out)
 {
     uint32_t nlb = chunk / s_nvme_ctx.lba_size;
     uint32_t cnt = 0, el = 0; uint64_t by = 0;
-    if (is_read) nvme_read_pipelined_run(&s_nvme_ctx, 1u, 0u, s_nvmetcp_buf, nlb, 3000u, &cnt, &by, &el);
-    else         nvme_write_pipelined_run(&s_nvme_ctx, 1u, 0u, s_nvmetcp_buf, nlb, 3000u, &cnt, &by, &el);
+    if (is_read) nvme_read_pipelined_run(&s_nvme_ctx, 1u, 0u, s_nvmetcp_buf, nlb, runtime_ms, &cnt, &by, &el);
+    else         nvme_write_pipelined_run(&s_nvme_ctx, 1u, 0u, s_nvmetcp_buf, nlb, runtime_ms, &cnt, &by, &el);
     uart_printf("[tcp] chunk=%u %s: %u 回, %u ms\n", chunk, is_read ? "read " : "write", cnt, el);
     out->chunk      = chunk;
     out->is_read    = is_read;
@@ -4863,6 +4934,9 @@ static void tcp_measure(uint32_t chunk, int is_read, bench_res_t *out)
 static void shell_tcpbench(char *args)
 {
     bench_plan_t pl; bench_plan_parse(args, &pl);
+    /* **同時 outstanding 数は接続とは無関係**(コマンドの出し方だけの話)なので、
+     * セッションを張り直さずに変えられる。 */
+    nvme_set_io_qdepth(pl.qd);
     if (shell_ensure_tcp_session(pl.hdgst, pl.ddgst, pl.ipv6) != 0) return;
     if (pl.hdgst != s_nvme_ctx.io.hdgst || pl.ddgst != s_nvme_ctx.io.ddgst) {
         uart_printf("[!] tcpbench: digestの合意結果が要求と異なります "
@@ -4872,8 +4946,8 @@ static void shell_tcpbench(char *args)
     for (unsigned i = 0; i < sizeof(s_nvmetcp_buf); i++) s_nvmetcp_buf[i] = (uint8_t)(0x5au ^ (i * 7u));
     bench_res_t res[2u * BENCH_MAX_CHUNKS]; unsigned nr = 0;
     for (unsigned c = 0; c < pl.nchunks; c++) {
-        if (pl.do_w) tcp_measure(pl.chunks[c], 0, &res[nr++]);
-        if (pl.do_r) tcp_measure(pl.chunks[c], 1, &res[nr++]);
+        if (pl.do_w) tcp_measure(pl.chunks[c], 0, pl.runtime_ms, &res[nr++]);
+        if (pl.do_r) tcp_measure(pl.chunks[c], 1, pl.runtime_ms, &res[nr++]);
     }
     char transport[32];
     unsigned o = 0;
@@ -4885,7 +4959,7 @@ static void shell_tcpbench(char *args)
         for (unsigned k = 0; suffix[k] && o + 1u < sizeof(transport); k++) transport[o++] = suffix[k];
     }
     transport[o] = 0;
-    bench_summary(transport, NVME_IO_QDEPTH, 3000u, res, nr);
+    bench_summary(transport, nvme_io_qdepth(), pl.runtime_ms, res, nr);
 }
 
 /*=================================================================
@@ -4915,11 +4989,11 @@ static void shell_rdmabench(char *args)
             bench_res_t *e = &res[nr++];
             e->chunk = pl.chunks[c];
             e->is_read = is_read;
-            nvme_rdma_run_bench(&s_dev0, &s_dev1, 3000u, is_read, pl.chunks[c], qd,
+            nvme_rdma_run_bench(&s_dev0, &s_dev1, pl.runtime_ms, is_read, pl.chunks[c], qd,
                                 &e->bytes, &e->count, &e->elapsed_ms);
         }
     }
-    bench_summary("rocev2", qd, 3000u, res, nr);
+    bench_summary("rocev2", qd, pl.runtime_ms, res, nr);
 }
 
 /*=================================================================
@@ -5426,6 +5500,24 @@ static void shell_dispatch(char *line, int s0, int s1)
                             lb, (unsigned)nz);
             }
         }
+    } else if (strncmp(line, "rdmarra", 7) == 0) {
+        /* rdmarra [N]
+         *
+         * CM REQ で広告する RESPONDER_RESOURCES(= こちらが responder として
+         * 受け付ける同時 RDMA_READ 数)を手で固定する。0 で HCA 上限へ戻す。
+         *
+         * **NVMe-oF の write は target が host のメモリから RDMA_READ で引く**
+         * ので、この値が write の同時性の上限になる。**効いているかどうかを
+         * 交互に測って確かめるための恒久デバッグ機能**(txdrop と同じ扱い。
+         * 戻し忘れ注意)。値を変えると次の bench で接続を張り直す。 */
+        char *arg = line + 7;
+        while (*arg == ' ') arg++;
+        if (*arg) {
+            rdma_cm_set_responder_resources_override((uint8_t)atoi(arg));
+            nvme_rdma_force_reconnect();
+        }
+        uint8_t ov = rdma_cm_responder_resources_override();
+        uart_printf("rdmarra: %u%s\n", ov, ov ? " (手動)" : " (HCA 上限を使う)");
     } else if (strncmp(line, "rdmatarget", 10) == 0) {
         /* rdmatarget                       -- 現在の設定を表示
          * rdmatarget off                   -- 解除(同一プロセス内のターゲットへ戻す)
@@ -5570,6 +5662,63 @@ static void shell_dispatch(char *line, int s0, int s1)
         if (nvmet_ns_set_active(&s_x86_nvmet, nsid, add) == 0) {
             nvmet_ns_show(&s_x86_nvmet);
         }
+    } else if (strncmp(line, "incapsule", 9) == 0) {
+        /* incapsule [on|off]
+         *
+         * write を Command Capsule に載せる(in-capsule)か、R2T を待ってから
+         * H2CData で送るかを切り替える恒久デバッグ機能。txdrop / mld off と
+         * 同じ位置づけで、**off に戻し忘れると以後の測定が全部変わる**。
+         *
+         * 相手が Linux の nvmet-tcp のときは off にすると write が固まる
+         * (「長さが inline_data_size 以下の write は in-capsule のはず」と
+         * 決め打ちして R2T を送らないため)。自作ターゲット相手なら
+         * どちらでも通るので、この 2 つを交互に測れば A/B できる。 */
+        char *arg = line + 9;
+        while (*arg == ' ') arg++;
+        if (strncmp(arg, "off", 3) == 0)     s_incapsule_disable = 1;
+        else if (strncmp(arg, "on", 2) == 0) s_incapsule_disable = 0;
+        uart_printf("incapsule: %s (相手の広告=%u バイト、実効=%u バイト)\n",
+                    s_incapsule_disable ? "off (R2T 経路)" : "on",
+                    s_nvme_ctx.icdsz,
+                    s_incapsule_disable ? 0u : s_nvme_ctx.icdsz);
+        nvme_set_incapsule_disable(s_incapsule_disable);
+    } else if (strncmp(line, "nvmetrdma", 9) == 0) {
+        /* nvmetrdma [<mac>]
+         *
+         * 外部ホスト(Linux 等)向けの NVMe-oF RDMA ターゲットを PF1 で常駐
+         * 起動する。TCP 側の nvmet コマンドの RDMA 版。
+         *
+         * MAC を引数で渡すのは、IBTA の CM メッセージに L2 アドレスが一切
+         * 含まれないため。REQ からは相手の GID しか分からないので、REP を
+         * 返す AV に入れる宛先 MAC はこちらで与えるしかない(rdmatarget が
+         * MAC を要求するのと同じ理由)。省略すると Pi5 eth1 の値を使う。 */
+        char *arg = line + 9;
+        while (*arg == ' ') arg++;
+        uint8_t mac[6] = {0xb8, 0xce, 0xf6, 0x73, 0xbf, 0x7e};
+        if (*arg) {
+            const char *q = arg;
+            for (unsigned i = 0; i < 6u; i++) {
+                unsigned v = 0;
+                for (unsigned k = 0; k < 2u; k++) {
+                    char ch = *q;
+                    unsigned dg = 0;
+                    if (ch >= '0' && ch <= '9')      dg = (unsigned)(ch - '0');
+                    else if (ch >= 'a' && ch <= 'f') dg = (unsigned)(ch - 'a') + 10u;
+                    else if (ch >= 'A' && ch <= 'F') dg = (unsigned)(ch - 'A') + 10u;
+                    else break;
+                    v = (v << 4) | dg;
+                    q++;
+                }
+                mac[i] = (uint8_t)v;
+                if (*q == ':' || *q == '-') q++;
+            }
+        }
+        netif_t *ctx1 = netif_find("mlx5-pf1");
+        if (!ctx1) { uart_printf("nvmetrdma: mlx5-pf1 未登録\n"); return; }
+        netif_activate(ctx1);
+        uart_printf("nvmetrdma: peer mac=%02x:%02x:%02x:%02x:%02x:%02x\n",
+                    mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+        nvmet_rdma_run_standalone(&s_dev1, "mlx5-pf1", mac);
     } else if (strncmp(line, "nvmet", 5) == 0) {
         if (s_shell_nvmet_started) {
             uart_printf("nvmet: 既に常駐起動済み\n");
@@ -5587,6 +5736,61 @@ static void shell_dispatch(char *line, int s0, int s1)
         }
         s_shell_nvmet_started = 1;
         uart_printf("nvmet: ターゲット常駐起動 (pf1, port %u) -- 接続待ち\n", port);
+    } else if (strncmp(line, "tcptarget", 9) == 0) {
+        /* tcptarget                          -- 現在の設定を表示
+         * tcptarget off                      -- 解除(同一プロセス内のターゲットへ戻す)
+         * tcptarget <ip> [port] [subnqn]
+         *
+         * **外部ホストの NVMe/TCP ターゲットへ繋ぐための設定。** RDMA 側の
+         * `rdmatarget` と対になる。指定すると `tcpbench` は同一プロセス内の
+         * ターゲットを立てず、PF0 から相手へ繋ぎに行くだけになる。
+         * MAC が要らないのは、TCP は L2 の宛先を ARP で解決するため。 */
+        char *arg = line + 9;
+        while (*arg == ' ') arg++;
+        if (*arg == 0) {
+            if (!s_tcp_remote.enabled) {
+                uart_printf("tcptarget: 未設定(tcpbench は同一プロセス内のターゲットを使います)\n");
+            } else {
+                uart_printf("tcptarget: %u.%u.%u.%u:%u subnqn=%s\n",
+                            (unsigned)((s_tcp_remote.ip >> 24) & 0xFFu),
+                            (unsigned)((s_tcp_remote.ip >> 16) & 0xFFu),
+                            (unsigned)((s_tcp_remote.ip >> 8) & 0xFFu),
+                            (unsigned)(s_tcp_remote.ip & 0xFFu),
+                            (unsigned)s_tcp_remote.port,
+                            s_tcp_remote.subnqn[0] ? s_tcp_remote.subnqn : "(自作ターゲットの既定)");
+            }
+        } else if (strncmp(arg, "off", 3) == 0) {
+            s_tcp_remote.enabled = 0;
+            s_tcp_remote.ip = 0; s_tcp_remote.port = 0; s_tcp_remote.subnqn[0] = 0;
+            uart_printf("tcptarget: 解除しました\n");
+        } else {
+            char *tok[4];
+            unsigned nt = shell_tokenize(arg, tok, 4);
+            unsigned a = 0, b = 0, c = 0, d = 0;
+            const char *q = tok[0];
+            unsigned *slot[4] = { &a, &b, &c, &d };
+            for (unsigned i = 0; i < 4u; i++) {
+                unsigned v = 0;
+                while (*q >= '0' && *q <= '9') { v = v * 10u + (unsigned)(*q - '0'); q++; }
+                *slot[i] = v;
+                if (*q == '.') q++;
+            }
+            s_tcp_remote.ip   = ip_from_octets((uint8_t)a, (uint8_t)b, (uint8_t)c, (uint8_t)d);
+            s_tcp_remote.port = (nt >= 2) ? (uint16_t)atoi(tok[1]) : 4420u;
+            if (s_tcp_remote.port == 0) s_tcp_remote.port = 4420u;
+            s_tcp_remote.subnqn[0] = 0;
+            if (nt >= 3) {
+                unsigned k = 0;
+                while (tok[2][k] && k + 1u < sizeof(s_tcp_remote.subnqn)) {
+                    s_tcp_remote.subnqn[k] = tok[2][k]; k++;
+                }
+                s_tcp_remote.subnqn[k] = 0;
+            }
+            s_tcp_remote.enabled = 1;
+            uart_printf("tcptarget: %u.%u.%u.%u:%u へ繋ぎます (subnqn=%s)\n",
+                        a, b, c, d, (unsigned)s_tcp_remote.port,
+                        s_tcp_remote.subnqn[0] ? s_tcp_remote.subnqn : "(自作ターゲットの既定)");
+        }
     } else if (strncmp(line, "tcpdisconnect", 13) == 0) {
         shell_tcpdisconnect();
     } else if (strncmp(line, "fragrecv", 8) == 0) {

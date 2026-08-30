@@ -15,7 +15,16 @@
 
 #define NVMET_RDMA_SC_ERROR 0x0002u
 
-#define NVMET_RDMA_MAX_PENDING 16u
+/* パイプラインのスロット数 = **投稿しておく RECV の本数**。
+ * ホストへ広告する MAXCMD(下)より必ず大きくすること。**同じ値にすると
+ * ホストが上限まで出した瞬間に RQ が空になり、以後の CapsuleCmd が
+ * RNR NAK でリトライに落ちる**(エラーは 1 つも出ず、ただ極端に遅くなる)。
+ * 実機では qd=12 の 64k write が 830 -> 2 MiB/s に落ちた。 */
+#define NVMET_RDMA_MAX_PENDING 192u
+
+/* Identify Controller の MAXCMD として広告する値(ホストの同時発行数の上限)。
+ * SQ は 64 WQEBB なので、1 コマンドあたり最大 2 WQE として 32 まで。 */
+#define NVMET_RDMA_MAXCMD 128u
 
 typedef enum {
     NVMETR_ST_CM_SPAWN = 0,
@@ -133,6 +142,10 @@ struct nvmet_rdma_ctx {
     /* [関数ポインタ登録先] nvmetr_on_admin_disconnected(nvmet_rdma.c、s_standalone_ctxに登録)。 */
     void (*on_disconnected)(nvmet_rdma_ctx_t *self);
 };
+
+/* 外部ホスト向けの常駐 NVMe-oF RDMA ターゲットを起動する。
+ * peer_mac は REP を返すときの宛先 L2 アドレス(CM には含まれないため)。 */
+void nvmet_rdma_run_standalone(mlx5_dev_t *dev, const char *self_label, const uint8_t peer_mac[6]);
 
 job_result_t nvmet_rdma_job_step(job_t *self);
 

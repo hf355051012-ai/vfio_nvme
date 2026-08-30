@@ -40,7 +40,7 @@ _Static_assert(MLX5_QP_CQ_NUM_ENTRIES == 1024u, "MLX5_CQ_BUF_SIZE/MLX5_QP_CQE_SI
  * ===============================================================*/
 int mlx5_qp_post_send(mlx5_dev_t *dev, mlx5_qp_t *qp, const void *data, uint32_t len) {
     uint32_t pc = qp->sq_pc;
-    uint32_t idx = pc & 63u; // log_sq_size=6 -- 64 WQEBB
+    uint32_t idx = pc & 511u; // log_sq_size=9 -- 512 WQEBB
     volatile uint8_t *sq_base =
         (volatile uint8_t *)(uintptr_t)(mlx5_qp_wqe_addr(dev, qp) + 4096u); // SQ regionはRQ regionの直後
     volatile uint8_t *wqe = sq_base + (uint64_t)idx * MLX5_SEND_WQE_BB;
@@ -257,7 +257,7 @@ static int mlx5_qp_post_rdma_common(mlx5_dev_t *dev, mlx5_qp_t *qp, uint32_t opc
                                      void *local_data, uint32_t len,
                                      uint64_t remote_addr, uint32_t remote_rkey) {
     uint32_t pc = qp->sq_pc;
-    uint32_t idx = pc & 63u; // log_sq_size=6 -- 64 WQEBB
+    uint32_t idx = pc & 511u; // log_sq_size=9 -- 512 WQEBB
     volatile uint8_t *sq_base =
         (volatile uint8_t *)(uintptr_t)(mlx5_qp_wqe_addr(dev, qp) + 4096u);
     volatile uint8_t *wqe = sq_base + (uint64_t)idx * MLX5_SEND_WQE_BB;

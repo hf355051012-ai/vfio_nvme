@@ -27,6 +27,12 @@ typedef struct {
     int      io_connected;
     uint16_t ctrlr_id;
     uint32_t lba_size;   /* nvme_identify_ns()が設定する、現在のnamespaceのLBAサイズ(バイト) */
+    /* IO キューの Command Capsule に載せられる in-capsule データの上限
+     * (Identify Controller の IOCCSZ から算出。0=in-capsule 不可)。
+     * **これを見ずに R2T 経路へ倒すと Linux の nvmet-tcp とは通信できない** --
+     * 相手は「長さが inline_data_size 以下の write は in-capsule のはず」と
+     * 決め打ちして R2T を送らないため(nvmet_tcp_queue_response())。 */
+    uint32_t icdsz;
     uint64_t nsze;
     char     subnqn[NVME_SUBNQN_MAX];
 
@@ -78,7 +84,13 @@ int nvme_exec_step(nvme_exec_ctx_t *ec);
 void nvme_build_identify_sqe(nvme_sqe_t *sqe, uint8_t cns, uint32_t nsid);
 void nvme_build_get_log_page_sqe(nvme_sqe_t *sqe, uint8_t lid, uint32_t lpo, uint32_t bytes);
 void nvme_build_read_sqe(nvme_sqe_t *sqe, uint32_t nsid, uint64_t slba, uint32_t nlb, uint32_t total_len);
-void nvme_build_write_sqe(nvme_sqe_t *sqe, uint32_t nsid, uint64_t slba, uint32_t nlb, uint32_t total_len);
+void nvme_build_write_sqe(nvme_sqe_t *sqe, uint32_t nsid, uint64_t slba, uint32_t nlb,
+                          uint32_t total_len, int use_inline);
+/* 1 で in-capsule write を止め、R2T 経路へ倒す(A/B 用の恒久デバッグ機能)。 */
+void nvme_set_incapsule_disable(int off);
+/* NVMe/TCP の同時 outstanding 数(1..NVME_IO_QDEPTH)。 */
+void     nvme_set_io_qdepth(unsigned d);
+unsigned nvme_io_qdepth(void);
 
 void nvme_update_lba_size_from_id_ns(nvme_ctx_t *ctx, uint32_t nsid, const void *buf4096);
 
@@ -89,7 +101,10 @@ int nvme_connect_job_start_addr(nvme_ctx_t *ctx, const netaddr_t *addr, uint16_t
 /* IPv4 用の薄いラッパ。 */
 int nvme_connect_job_start(nvme_ctx_t *ctx, uint32_t ip, uint16_t port, const char *subnqn);
 
-#define NVME_IO_QDEPTH 8u
+/* NVMe/TCP パイプラインの **同時 outstanding 数の上限**(静的配列の大きさ)。
+ * 実際に使う本数は nvme_set_io_qdepth() で実行時に決める(既定 8)。
+ * 深さを振って測るために可変にしてある。 */
+#define NVME_IO_QDEPTH 128u
 
 int nvme_write_pipelined_run(nvme_ctx_t *ctx, uint32_t nsid, uint64_t lba,
                               const void *buf, uint32_t nlb, uint32_t duration_ms,

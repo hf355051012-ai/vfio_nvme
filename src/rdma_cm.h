@@ -48,6 +48,15 @@ typedef struct {
     uint32_t peer_rc_qpn;      // 相手のRC QPN(REQ/REPペイロードから学習)
     uint32_t peer_starting_psn; // 相手のnext_send_psn(REQ/REPペイロードから学習)
     uint8_t  peer_path_mtu;    // 相手がCM REQで広告したPATH_PACKET_PAYLOAD_MTU
+    /* CM REQ の RESPONDER_RESOURCES(相手が responder として受け付ける同時
+     * RDMA_READ 数)。**passive 側はこれを超えて RDMA_READ を投げてはならない。**
+     * 超えると相手が REMOTE_INVAL_REQ_ERR(syndrome=0x12)を返す。 */
+    uint8_t  peer_responder_resources;
+    uint8_t  peer_initiator_depth;   // 同 INITIATOR_DEPTH(相手が initiator として投げる数)
+    /* REP の INITIATOR_DEPTH として広告した値。**相手はこれを自分の QP の
+     * max_dest_rd_atomic に設定する**ので、こちらの同時 RDMA_READ 数の上限も
+     * これになる(nvmet_rdma.c の rra_max がこれを見る)。 */
+    uint8_t  negotiated_initiator_depth;
 
     uint16_t nvme_qid; // CM private data の nvme_rdma_cm_req.qid(0=admin)
 
@@ -82,6 +91,9 @@ typedef struct {
 job_result_t rdma_cm_job_step(job_t *self);
 
 uint16_t rdma_cm_recv_attr_id(const volatile uint8_t *recv_buf);
+/* CM REQ の RESPONDER_RESOURCES を手で固定する(0=HCA 上限)。A/B 測定用。 */
+void    rdma_cm_set_responder_resources_override(uint8_t v);
+uint8_t rdma_cm_responder_resources_override(void);
 
 void rdma_cm_fill_addr(rdma_cm_ctx_t *ctx, mlx5_dev_t *dev, const char *self_label,
                        const char *peer_label, uint32_t self_ip_fallback,

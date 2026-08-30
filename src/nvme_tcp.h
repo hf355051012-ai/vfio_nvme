@@ -51,6 +51,8 @@ int nvme_tcp_send_cmd(nvme_tcp_conn_t *c, const nvme_sqe_t *sqe,
                       const void *data, uint32_t dlen);
 
 int nvme_tcp_send_cmd_async(nvme_tcp_conn_t *c, const nvme_sqe_t *sqe, uint16_t *out_cid);
+int nvme_tcp_send_cmd_inline_async(nvme_tcp_conn_t *c, const nvme_sqe_t *sqe,
+                                   const void *data, uint32_t dlen, uint16_t *out_cid);
 
 /* コネクションを閉じる(tcp_close()をそのまま呼ぶ)。 */
 void nvme_tcp_close(nvme_tcp_conn_t *c);

@@ -301,6 +301,81 @@ int nvme_tcp_send_cmd_async(nvme_tcp_conn_t *c, const nvme_sqe_t *sqe, uint16_t 
 }
 
 /*=================================================================
+ * in-capsule データ付きの CapsuleCmd を非同期に送る。ヘッダを送った直後に
+ * データを連続してキューする(**PDU の途中に別 PDU を挟んではならない**)。
+ *
+ * nvme_tcp_send_cmd() の非同期版だが、データは静的バッファへ写さず
+ * tcp_send_async() へ直接渡す(256KB を毎回コピーしないため)。
+ *
+ * 引数:
+ *   c       - 送信先コネクション
+ *   sqe     - 送る SQE(SGL は in-capsule 型で組んであること)
+ *   data    - in-capsule データ
+ *   dlen    - そのバイト数
+ *   out_cid - 採番された command id の格納先
+ * 戻り値:
+ *   0=キューイング成功、-1=失敗
+ * コール元:
+ *   nvme_write_pipelined_run()
+ * ===============================================================*/
+int nvme_tcp_send_cmd_inline_async(nvme_tcp_conn_t *c, const nvme_sqe_t *sqe,
+                                   const void *data, uint32_t dlen, uint16_t *out_cid)
+{
+    static uint8_t s_icd_hdr[NVME_TCP_CMD_PDU_LEN + NVME_TCP_DGST_LEN]
+        __attribute__((aligned(64)));
+
+    uint16_t cid = c->next_cid++;
+    uint32_t hd  = nvme_tcp_hdgst_len(c);
+    uint32_t dd  = nvme_tcp_ddgst_len(c, dlen);
+    uint32_t data_off = NVME_TCP_CMD_PDU_LEN + hd;
+
+    /* **pdo/plen/flags を最終値にしてから append_hdgst() を呼ぶ。**
+     * ヘッダダイジェストは buf[0..hlen) 全体が対象なので、後から書き換えると
+     * 相手だけが静かに接続を切る(CLAUDE.md「再導入してはいけないバグ」)。 */
+    s_icd_hdr[0] = NVME_TCP_PDU_CMD;
+    s_icd_hdr[1] = (uint8_t)((c->hdgst ? NVME_TCP_F_HDGST : 0u) | (dd ? NVME_TCP_F_DDGST : 0u));
+    s_icd_hdr[2] = (uint8_t)NVME_TCP_CMD_PDU_LEN;
+    s_icd_hdr[3] = (uint8_t)data_off;
+    wr32le(&s_icd_hdr[4], data_off + dlen + dd);
+
+    volatile_fast_copy((volatile uint8_t *)&s_icd_hdr[NVME_TCP_HDR_LEN],
+                        (const volatile uint8_t *)sqe, NVME_SQE_LEN);
+    wr16le(&s_icd_hdr[NVME_TCP_HDR_LEN + 2], cid);
+
+    nvme_tcp_append_hdgst(c, s_icd_hdr, NVME_TCP_CMD_PDU_LEN);
+
+    if (tcp_send_async(&c->tcp, s_icd_hdr, (uint16_t)(NVME_TCP_CMD_PDU_LEN + hd)) < 0) {
+        uart_printf("[!] NVMe/TCP: CapsuleCmd(in-capsule)ヘッダ送信失敗 (cid=%u)\n", cid);
+        return -1;
+    }
+
+    const uint8_t *src = (const uint8_t *)data;
+    uint32_t queued = 0;
+    while (queued < dlen) {
+        uint32_t remaining = dlen - queued;
+        uint16_t chunk = (remaining > TCP_ASYNC_MAX_LEN) ? (uint16_t)TCP_ASYNC_MAX_LEN
+                                                         : (uint16_t)remaining;
+        int rc = tcp_send_async(&c->tcp, src + queued, chunk);
+        if (rc < 0) {
+            uart_printf("[!] NVMe/TCP: CapsuleCmd(in-capsule)データ送信失敗 (cid=%u off=%u)\n",
+                        cid, queued);
+            return -1;
+        }
+        queued += chunk;
+    }
+    if (dd) {
+        uint8_t d[NVME_TCP_DGST_LEN];
+        wr32le(d, ~crc32c(0xFFFFFFFFu, src, dlen));
+        if (tcp_send_async(&c->tcp, d, (uint16_t)NVME_TCP_DGST_LEN) < 0) {
+            uart_printf("[!] NVMe/TCP: CapsuleCmd(in-capsule)ダイジェスト送信失敗 (cid=%u)\n", cid);
+            return -1;
+        }
+    }
+    if (out_cid) *out_cid = cid;
+    return 0;
+}
+
+/*=================================================================
  * R2T で要求された [r2to, r2to+r2tl) を、明示的に渡したバッファから
  * H2CData PDU(NVME_TCP_H2C_CHUNK_MAX ごとに分割)として送出する下位実装。
  * cid も呼び出し元が明示するため、複数コマンドを同時に in-flight にできる。

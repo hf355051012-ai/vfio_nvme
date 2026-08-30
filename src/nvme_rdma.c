@@ -28,7 +28,15 @@ static volatile uint8_t *nvmer_ramdisk_slot1(void)
     return s_rd1;
 }
 
-#define NVME_RDMA_QSIZE               32u
+/* IO キューの hsqsize(0's based で送る)。admin は RDMA_CM_DEFAULT_HSQSIZE(31)
+ * のまま -- **相手は admin を NVME_AQ_DEPTH で上限判定する**。 */
+/* IO キューの hsqsize / sqsize(どちらも 0's based で送る)。
+ * **Linux の nvmet-rdma は MQES=127(= 128 エントリ)** なので 128 を超えられない
+ * (nvmet-tcp は NVMET_QUEUE_SIZE=1024 由来でずっと大きい)。超えると
+ * Fabrics Connect が "sqsize N is larger than MQES supported 127" で落ちる。
+ * admin は RDMA_CM_DEFAULT_HSQSIZE(31)のまま -- 相手は admin を
+ * NVME_AQ_DEPTH で別に上限判定する。 */
+#define NVME_RDMA_QSIZE               128u
 
 /* 外部ホストのターゲット設定。nvmer_build_connect() が subnqn を、
  * nvme_rdma_run_bench() が宛先を見るので、両方より前に置く。 */
@@ -1102,6 +1110,11 @@ static void nvmer_pin_target_to_core1(job_t *target_job)
  * コール元:
  *   shell_rdmabench()
  * ===============================================================*/
+void nvme_rdma_force_reconnect(void)
+{
+    s_init_ctx.reusable = 0;
+}
+
 void nvme_rdma_run_bench(mlx5_dev_t *dev0, mlx5_dev_t *dev1, uint32_t duration_ms,
                          int is_read, uint32_t chunk_bytes, uint32_t qdepth,
                          uint64_t *out_bytes, uint32_t *out_count,

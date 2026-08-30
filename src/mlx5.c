@@ -2546,7 +2546,7 @@ int mlx5_qp_create_rc(mlx5_dev_t *dev, mlx5_qp_t *qp, uint8_t qp_index) {
         dbr[i] = 0;
     }
 
-    uint8_t in[24 + MLX5_QPC_BYTES + 8 + 4 + 4 + 16];
+    uint8_t in[24 + MLX5_QPC_BYTES + 8 + 4 + 4 + 8 * MLX5_QP_WQ_PAGES];
     for (unsigned i = 0; i < sizeof(in); i++) {
         in[i] = 0;
     }
@@ -2561,7 +2561,7 @@ int mlx5_qp_create_rc(mlx5_dev_t *dev, mlx5_qp_t *qp, uint8_t qp_index) {
     qpc[7] = (uint8_t)qp->pdn; // pd(byte5-7)
     qpc[8] = (uint8_t)((IB_MTU_1024 << 5) | (20u & 0x1Fu)); // mtu(pos0-2)|log_msg_max(pos3-7)=20
     qpc[9] = (uint8_t)((8u & 0xFu) << 3); // log_rq_size=8(256エントリ)、log_rq_stride=0(pos5-7)
-    qpc[10] = (uint8_t)((6u & 0xFu) << 3); // log_sq_size=6(64 WQEBB)、no_sq=0
+    qpc[10] = (uint8_t)((9u & 0xFu) << 3); // log_sq_size=9(512 WQEBB)、no_sq=0
     qpc[13] = (uint8_t)(qp->uarn >> 16);
     qpc[14] = (uint8_t)(qp->uarn >> 8);
     qpc[15] = (uint8_t)qp->uarn; // uar_page(byte13-15)
@@ -2580,11 +2580,15 @@ int mlx5_qp_create_rc(mlx5_dev_t *dev, mlx5_qp_t *qp, uint8_t qp_index) {
 
     // wq_umem_valid=0(既に全体ゼロ初期化済み、物理アドレスpas[]方式を使う)。
     unsigned pas_off = 24 + MLX5_QPC_BYTES + 8 + 4 + 4; // = 272
-    uint64_t rq_pa = mlx5_dma_addr((volatile void *)(uintptr_t)wqe_buf);
-    uint64_t sq_pa = mlx5_dma_addr((volatile void *)(uintptr_t)(wqe_buf + 4096));
-    for (unsigned b = 0; b < 8; b++) {
-        in[pas_off + b] = (uint8_t)(rq_pa >> (56 - 8 * b));
-        in[pas_off + 8 + b] = (uint8_t)(sq_pa >> (56 - 8 * b));
+    /* **WQ 全体(RQ + SQ)を 4KB ページ単位で列挙する。** 以前は RQ の 1 枚と
+     * SQ の 1 枚だけを渡していたので、SQ が 4KB を超えた時点で FW が CREATE_QP を
+     * syndrome=0x002f50ca で拒否する(実機で踏んだ)。物理的に連続していなくても
+     * ページごとにアドレスを引き直すので正しい。 */
+    for (unsigned pg = 0; pg < MLX5_QP_WQ_PAGES; pg++) {
+        uint64_t pa = mlx5_dma_addr((volatile void *)(uintptr_t)(wqe_buf + pg * 4096u));
+        for (unsigned b = 0; b < 8; b++) {
+            in[pas_off + pg * 8u + b] = (uint8_t)(pa >> (56 - 8 * b));
+        }
     }
 
     uint8_t out[16 + 4];

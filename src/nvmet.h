@@ -65,7 +65,9 @@
 
 /* push 型受信の ready-ring の段数(`nvmet.c` が使う)。**Dataset Management の
  * 範囲リストを ring のスロットと 1 対 1 で置くためにここに出してある。** */
-#define NVMET_READY_RING 64u
+/* 受理済みコマンドのリング。**ホストへ広告する MAXCMD より大きくすること**
+ * (同じ値にすると上限ちょうどで詰まる -- nvmet_rdma で踏んだのと同型)。 */
+#define NVMET_READY_RING 256u
 
 /* Dataset Management の範囲リストの置き場(1 コマンドぶん)。
  * NR は 8bit + 0's based なので最大 256 範囲 x 16 バイト = 4096。 */

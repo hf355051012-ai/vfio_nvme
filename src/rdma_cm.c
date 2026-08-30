@@ -16,6 +16,12 @@
  * リスナが無いのか古い接続が残っているのかを切り分けられない。 */
 #define CM_REJ_STALE_CONN            10u
 #define CM_REJ_INVALID_SERVICE_ID     8u
+
+/* `rdmarra` で設定する RESPONDER_RESOURCES の手動固定値(0=HCA 上限)。 */
+static uint8_t s_rr_override;
+
+void rdma_cm_set_responder_resources_override(uint8_t v) { s_rr_override = v; }
+uint8_t rdma_cm_responder_resources_override(void) { return s_rr_override; }
 #define CM_REJ_CONSUMER_DEFINED      28u
 
 #define CM_REP_ATTR_ID 0x0013u
@@ -100,8 +106,30 @@ static void rdma_cm_build_req(rdma_cm_ctx_t *ctx) {
     p[32] = (uint8_t)(ctx->rc_qp.qpn >> 16);
     p[33] = (uint8_t)(ctx->rc_qp.qpn >> 8);
     p[34] = (uint8_t)ctx->rc_qp.qpn; // LOCAL_QPN(24bit)
-    p[35] = 4; // RESPONDER_RESOURCES(max_dest_rd_atomic、log_rra_max=2->4と揃える)
-    p[39] = 4; // INITIATOR_DEPTH(log_sra_max=2->4)
+    /* **ここを固定値にしてはいけない**(REP 側と同じ理由)。
+     *
+     * RESPONDER_RESOURCES は「こちらが responder として同時に受け付ける
+     * RDMA_READ 数」= 自 QP の max_dest_rd_atomic。**NVMe-oF の write は
+     * ターゲットがホストのメモリから RDMA_READ で引く構造**なので、
+     * ここを小さく広告すると**相手ターゲットがその本数までしかデータを
+     * 引き込めず、write のスループットがそこで頭打ちになる**。
+     * INIT2RTR / RTR2RTS では既に log_rra_max = min(cap, 4) = 16 本を
+     * 設定しているのに、CM では 4 と名乗っていた(食い違っていた)。
+     *
+     * INITIATOR_DEPTH は「こちらが initiator として投げる数」。相手は
+     * これを自分の max_dest_rd_atomic に設定する。 */
+    {
+        uint32_t res_cap = 1u << ((ctx->dev->log_max_ra_res_qp > 4u)
+                                  ? 4u : ctx->dev->log_max_ra_res_qp);
+        uint32_t ini_cap = mlx5_qp_max_concurrent_rdma_read(ctx->dev);
+        if (res_cap == 0u) res_cap = 1u;
+        if (ini_cap == 0u) ini_cap = 1u;
+        if (res_cap > 255u) res_cap = 255u;
+        if (ini_cap > 255u) ini_cap = 255u;
+        if (s_rr_override != 0u) res_cap = s_rr_override;
+        p[35] = (uint8_t)res_cap; // RESPONDER_RESOURCES(= INIT2RTR の log_rra_max)
+        p[39] = (uint8_t)ini_cap; // INITIATOR_DEPTH(= RTR2RTS の log_sra_max)
+    }
     p[43] = (uint8_t)(20u << 3); // REMOTE_CM_RESPONSE_TIMEOUT(pos0-4)=20、
     p[44] = (uint8_t)(ctx->rc_qp.local_psn >> 16);
     p[45] = (uint8_t)(ctx->rc_qp.local_psn >> 8);
@@ -162,8 +190,26 @@ static void rdma_cm_build_rep(rdma_cm_ctx_t *ctx) {
     p[20] = (uint8_t)(ctx->rc_qp.local_psn >> 16);
     p[21] = (uint8_t)(ctx->rc_qp.local_psn >> 8);
     p[22] = (uint8_t)ctx->rc_qp.local_psn; // STARTING_PSN(24bit)
-    p[24] = 4; // RESPONDER_RESOURCES
-    p[25] = 4; // INITIATOR_DEPTH
+    /* **ここを固定値にしてはいけない。** INITIATOR_DEPTH は「こちらが
+     * initiator として同時に投げる RDMA_READ 数」で、**相手はこの値を自分の
+     * QP の max_dest_rd_atomic に設定する**。4 固定のまま 16 本投げていたため、
+     * Linux ホストを繋ぐと数千コマンドに 1 回 REMOTE_INVAL_REQ_ERR
+     * (syndrome=0x12)で落ちていた(自作イニシエータは 4 本しか投げないので
+     * 自作どうしでは表に出ない)。
+     * 相手の RESPONDER_RESOURCES(受け付けられる数)とこちらの HCA 上限の
+     * 小さいほうを採る。 */
+    {
+        uint32_t own_cap = mlx5_qp_max_concurrent_rdma_read(ctx->dev);
+        if (own_cap == 0u)   own_cap = 1u;
+        if (own_cap > 255u)  own_cap = 255u;
+        uint32_t depth = own_cap;
+        if (ctx->peer_responder_resources != 0u && ctx->peer_responder_resources < depth) {
+            depth = ctx->peer_responder_resources;
+        }
+        ctx->negotiated_initiator_depth = (uint8_t)depth;
+        p[24] = (uint8_t)own_cap;  // RESPONDER_RESOURCES(こちらが受け付ける数)
+        p[25] = (uint8_t)depth;    // INITIATOR_DEPTH(こちらが投げる数)
+    }
     p[26] = (uint8_t)(14u << 3); // TARGET_ACK_DELAY(pos0-4)=14
     p[27] = (uint8_t)(7u << 5); // RNR_RETRY_COUNT(pos0-2)=7
     wr64be(&p[28], 0); // LOCAL_CA_GUID(プレースホルダ)
@@ -210,6 +256,8 @@ static void rdma_cm_parse_req(rdma_cm_ctx_t *ctx, const volatile uint8_t *recv_b
     ctx->peer_rc_qpn = ((uint32_t)p[32] << 16) | ((uint32_t)p[33] << 8) | p[34];
     ctx->peer_starting_psn = ((uint32_t)p[44] << 16) | ((uint32_t)p[45] << 8) | p[46];
     ctx->peer_path_mtu = (uint8_t)((p[50] >> 4) & 0x0Fu);
+    ctx->peer_responder_resources = p[35];
+    ctx->peer_initiator_depth     = p[39];
     for (unsigned i = 0; i < 16; i++) {
         ctx->peer_gid[i] = p[56 + i];
     }
