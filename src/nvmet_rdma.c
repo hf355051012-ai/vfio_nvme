@@ -525,6 +525,8 @@ static int nvmetr_pl_issue_rdma_read(nvmet_rdma_ctx_t *ctx, unsigned slot)
     return 0;
 }
 
+static int nvmetr_pl_send_response(nvmet_rdma_ctx_t *ctx, unsigned slot);
+
 /*=================================================================
  * スロットのデータ移動を開始する。read/Identify(ホストへ RDMA_WRITE)は
  * 無条件で即時発行、write(ホストから RDMA_READ)は RRA 上限に空きがある
@@ -558,6 +560,16 @@ static int nvmetr_pl_start_data_move(nvmet_rdma_ctx_t *ctx, unsigned slot)
         ctx->pl.sq_ops[ctx->pl.sq_tail % (NVMET_RDMA_MAX_PENDING * 2u)].is_resp_send = 0;
         ctx->pl.sq_ops[ctx->pl.sq_tail % (NVMET_RDMA_MAX_PENDING * 2u)].slot = slot;
         ctx->pl.sq_tail++;
+        /* **RDMA_WRITE の完了を待たずに、応答 SEND も続けて投稿する。**
+         * SQ は投稿順に処理されるので、ホストにはデータが届いた後に応答が
+         * 届く。待つと完了 CQE の往復(実測 2.35us)がそのまま qd=1 の
+         * レイテンシに乗る。Linux の nvmet_rdma_queue_response() も
+         * rdma_rw_ctx_wrs(..., &rsp->send_wr) で 1 回の ib_post_send に
+         * 鎖でつないでいる(SPDK も同じ)。
+         * 代償は「RDMA_WRITE が失敗しても成功応答を先に投げてしまう」こと
+         * だが、Linux も SPDK も同じ露出を受け入れている(エラーは CQE で
+         * 検出して QP ごと畳む)。 */
+        if (nvmetr_pl_send_response(ctx, slot) != 0) return -2;
         return 0;
     }
     // WRITE: RDMA_READでram_diskへ引き込む -- RRA上限に達していれば保留
@@ -910,6 +922,13 @@ job_result_t nvmet_rdma_job_step(job_t *self)
                 }
                 if (ctx->pl.pending[slot].need_data_move) {
                     int dm_rc = nvmetr_pl_start_data_move(ctx, slot);
+                    if (dm_rc == -2) {
+                        /* RDMA_WRITE は SQ に載ったのに応答 SEND を積めなかった。
+                         * ここで応答を作り直すと二重に送ることになるので畳む。 */
+                        uart_printf("[!] nvmet-rdma pipeline: 応答capsule送信失敗(RDMA_WRITE後)\n");
+                        ctx->failed = 1;
+                        return JOB_DONE;
+                    }
                     if (dm_rc < 0) {
                         uart_printf("[!] nvmet-rdma pipeline: RDMA_WRITE/READ発行失敗\n");
                         ctx->pl.pending[slot].resp_status = NVMET_RDMA_SC_ERROR;
@@ -934,8 +953,12 @@ job_result_t nvmet_rdma_job_step(job_t *self)
                 nvmet_rdma_pl_sqop_t op = ctx->pl.sq_ops[ctx->pl.sq_head % (NVMET_RDMA_MAX_PENDING * 2u)];
                 ctx->pl.sq_head++;
                 if (!op.is_resp_send) {
-                    /* RDMA_WRITE/READ完了 -> 応答capsuleを送る。 */
-                    if (!ctx->pl.pending[op.slot].data_move_is_write) {
+                    /* RDMA_WRITE 完了 -> 応答は投稿済みなので何もしない。
+                     * RDMA_READ 完了 -> ここで応答capsuleを送る。 */
+                    if (ctx->pl.pending[op.slot].data_move_is_write) {
+                        continue;   /* RDMA_WRITE。応答は発行済み */
+                    }
+                    {
                         dcache_invalidate_range(
                             (const void *)(uintptr_t)&ctx->ctrl->ram_disk[
                                 ctx->pl.pending[op.slot].io_slba * NVMET_RDMA_LBA_SIZE],
