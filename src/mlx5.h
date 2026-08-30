@@ -61,6 +61,10 @@
 uint64_t mlx5_dma_addr(const volatile void *cpu_ptr);
 
 #define MLX5_OPCODE_SEND        0x0au
+/* この長さ以下の SEND は WQE へ埋め込む(1 WQEBB=64B に収める)。
+ * ctrl(16)+inline ヘッダ(4)= 20 バイト使うので 44 まで入るが、
+ * 応答 capsule の 16 バイトが収まればよいので余裕を持たせる。 */
+#define MLX5_SEND_INLINE_MAX   40u
 #define MLX5_OPCODE_SEND_INVAL 0x01u  /* SEND_WITH_INVALIDATE(include/linux/mlx5/device.h)*/
 #define MLX5_OPCODE_NOP         0x00u
 #define MLX5_OPCODE_LSO         0x0eu

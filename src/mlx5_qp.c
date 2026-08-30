@@ -77,7 +77,13 @@ int mlx5_qp_post_send_ex(mlx5_dev_t *dev, mlx5_qp_t *qp, const void *data0, uint
         wqe[i] = 0;
     }
 
-    const uint32_t ds_cnt = (data1 != 0) ? 3u : 2u; // ctrl_seg(1)+data_seg(1..2)、eth_seg無し(RC QPはHWがL2/L3/UDP/BTHを構成する)
+    /* **小さい送信は WQE へ埋め込む(inline data segment)。** ポインタで渡すと
+     * NIC が WQE とペイロードで PCIe の DMA 読みを 2 回する。埋め込めば WQE の
+     * 取得 1 回で済む。NVMe-oF の応答 capsule は 16 バイトなので必ず収まる。 */
+    const int use_inl = (data1 == 0 && len0 <= MLX5_SEND_INLINE_MAX);
+    /* inline: ctrl(1) + ceil((4+len)/16)。通常: ctrl(1)+data_seg(1..2) */
+    const uint32_t ds_cnt = use_inl ? (1u + ((4u + len0 + 15u) / 16u))
+                                    : ((data1 != 0) ? 3u : 2u);
     /* inval_rkey が非 0 なら SEND_WITH_INVALIDATE。相手の HCA にその rkey を
      * 無効化させる。**これを返さないと、ホストは 1 コマンドごとに自分で
      * LOCAL_INV を投げる**(Linux の nvme-rdma は register_always=Y が既定で、
@@ -104,6 +110,16 @@ int mlx5_qp_post_send_ex(mlx5_dev_t *dev, mlx5_qp_t *qp, const void *data0, uint
         wqe[15] = (uint8_t)inval_rkey;
     }
 
+    if (use_inl) { // inline_seg(wqe[16..19]=byte_count|MLX5_INLINE_SEG、以降にデータ)
+        uint32_t bc = 0x80000000u | len0;   // bit31 = inline
+        wqe[16] = (uint8_t)(bc >> 24);
+        wqe[17] = (uint8_t)(bc >> 16);
+        wqe[18] = (uint8_t)(bc >> 8);
+        wqe[19] = (uint8_t)bc;
+        const uint8_t *src = (const uint8_t *)data0;
+        for (uint32_t i = 0; i < len0; i++) wqe[20 + i] = src[i];
+        goto ring_db;
+    }
     // data_seg(wqe[16..31]): byte_count(4B BE)+lkey(4B BE)+addr(8B BE)。
     uint32_t byte_count = len;
     wqe[16] = (uint8_t)(byte_count >> 24);
@@ -134,6 +150,7 @@ int mlx5_qp_post_send_ex(mlx5_dev_t *dev, mlx5_qp_t *qp, const void *data0, uint
         }
     }
 
+ring_db:;
     volatile uint8_t *dbr = (volatile uint8_t *)(uintptr_t)mlx5_qp_dbr_addr(dev, qp);
     uint32_t new_pc = pc + 1u;
     dbr[4] = (uint8_t)(new_pc >> 24);
