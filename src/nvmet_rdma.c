@@ -1,4 +1,7 @@
 #include "nvmet_rdma.h"
+#if defined(__x86_64__)
+#include <emmintrin.h>   /* _mm_stream_si128(非一時ストア)*/
+#endif
 #include "mlx5.h"
 #include "net.h"
 #include "nvme_types.h"
@@ -40,6 +43,42 @@ static void nvmetr_zero_v64(volatile uint8_t *p, uint32_t len)
     volatile uint64_t *p64 = (volatile uint64_t *)p;
     uint32_t n64 = len / 8u;
     for (uint32_t i = 0; i < n64; i++) p64[i] = 0;
+}
+
+/*=================================================================
+ * in-capsule で届いた write データを RAM ディスクへ写す。
+ *
+ * **書き込み先(256MB の RAM ディスク)はキャッシュに載っていないので、
+ * 普通のストアだと 1 行ごとに read-for-ownership が入る。** 実測で 4KB の
+ * コピーに 725ns(5.6 GB/s)かかっていた。非一時ストアで RFO を避ける。
+ * 小さいコピーでは sfence のぶん損なので、閾値以上のときだけ使う。
+ *
+ * 引数:
+ *   dst / src - 書き込み先 / 読み出し元(どちらも 16 バイト整列)、len - バイト数
+ * コール元:
+ *   nvmet_rdma_job_step()
+ * ===============================================================*/
+#define NVMETR_NT_COPY_MIN 1024u
+
+static void nvmetr_copy_in_capsule(volatile uint8_t *dst, const volatile uint8_t *src,
+                                    uint32_t len)
+{
+#if defined(__x86_64__)
+    if (len >= NVMETR_NT_COPY_MIN &&
+        ((uintptr_t)dst % 16u) == 0u && ((uintptr_t)src % 16u) == 0u) {
+        __m128i *d = (__m128i *)(uintptr_t)dst;
+        const __m128i *sp = (const __m128i *)(uintptr_t)src;
+        uint32_t n = len / 16u;
+        for (uint32_t i = 0; i < n; i++) {
+            _mm_stream_si128(&d[i], _mm_loadu_si128(&sp[i]));
+        }
+        _mm_sfence();   /* 非一時ストアは順序が緩いので、応答を出す前に流し切る */
+        uint32_t done = n * 16u;
+        for (uint32_t i = done; i < len; i++) dst[i] = src[i];
+        return;
+    }
+#endif
+    volatile_fast_copy(dst, src, len);
 }
 
 static void nvmetr_copy_padded(volatile uint8_t *dst, const char *src, uint32_t field_len)
@@ -932,9 +971,9 @@ job_result_t nvmet_rdma_job_step(job_t *self)
                          * ポーリングループの中なので、4KB を 1 バイトずつ写すと
                          * 深さを上げたときに CQ を拾う手が止まる(実測で 4K
                          * qd=128 が 153k -> 16k IOPS まで落ちた)。 */
-                        volatile_fast_copy(&ctx->ctrl->ram_disk[ip->io_slba * NVMET_RDMA_LBA_SIZE],
-                                           &ctx->pl.recv_bufs[slot][64u + ip->inline_off],
-                                           ip->ksgl_len);
+                        nvmetr_copy_in_capsule(&ctx->ctrl->ram_disk[ip->io_slba * NVMET_RDMA_LBA_SIZE],
+                                               &ctx->pl.recv_bufs[slot][64u + ip->inline_off],
+                                               ip->ksgl_len);
                     }
                 }
                 if (ctx->pl.pending[slot].need_data_move) {
