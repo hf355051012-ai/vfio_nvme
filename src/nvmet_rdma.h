@@ -67,6 +67,7 @@ typedef struct {
     int      need_data_move;
     int      data_inline;        /* 1=データが受信 capsule に載っている(RDMA_READ 不要)*/
     uint32_t inline_off;        /* capsule 先頭の SQE(64B)からの相対オフセット */
+    uint32_t inval_rkey;        /* 非0なら応答を SEND_WITH_INVALIDATE で返す */
     int      data_move_is_write;
     uint32_t resp_dw0;
     uint32_t resp_dw1;

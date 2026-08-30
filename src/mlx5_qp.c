@@ -39,7 +39,12 @@ _Static_assert(MLX5_QP_CQ_NUM_ENTRIES == 1024u, "MLX5_CQ_BUF_SIZE/MLX5_QP_CQE_SI
  *   nvme_rdma_connect_job_step(), nvmer_post_send()
  * ===============================================================*/
 int mlx5_qp_post_send(mlx5_dev_t *dev, mlx5_qp_t *qp, const void *data, uint32_t len) {
-    return mlx5_qp_post_send2(dev, qp, data, len, 0, 0);
+    return mlx5_qp_post_send_ex(dev, qp, data, len, 0, 0, 0);
+}
+
+int mlx5_qp_post_send2(mlx5_dev_t *dev, mlx5_qp_t *qp, const void *data0, uint32_t len0,
+                       const void *data1, uint32_t len1) {
+    return mlx5_qp_post_send_ex(dev, qp, data0, len0, data1, len1, 0);
 }
 
 /*=================================================================
@@ -59,8 +64,8 @@ int mlx5_qp_post_send(mlx5_dev_t *dev, mlx5_qp_t *qp, const void *data, uint32_t
  * コール元:
  *   mlx5_qp_post_send(), nvme_rdma.c の in-capsule write
  * ===============================================================*/
-int mlx5_qp_post_send2(mlx5_dev_t *dev, mlx5_qp_t *qp, const void *data0, uint32_t len0,
-                       const void *data1, uint32_t len1) {
+int mlx5_qp_post_send_ex(mlx5_dev_t *dev, mlx5_qp_t *qp, const void *data0, uint32_t len0,
+                         const void *data1, uint32_t len1, uint32_t inval_rkey) {
     const void *data = data0;
     uint32_t len = len0;
     uint32_t pc = qp->sq_pc;
@@ -73,7 +78,13 @@ int mlx5_qp_post_send2(mlx5_dev_t *dev, mlx5_qp_t *qp, const void *data0, uint32
     }
 
     const uint32_t ds_cnt = (data1 != 0) ? 3u : 2u; // ctrl_seg(1)+data_seg(1..2)、eth_seg無し(RC QPはHWがL2/L3/UDP/BTHを構成する)
-    uint32_t opmod_idx_opcode = ((pc & 0xFFFFu) << 8) | MLX5_OPCODE_SEND;
+    /* inval_rkey が非 0 なら SEND_WITH_INVALIDATE。相手の HCA にその rkey を
+     * 無効化させる。**これを返さないと、ホストは 1 コマンドごとに自分で
+     * LOCAL_INV を投げる**(Linux の nvme-rdma は register_always=Y が既定で、
+     * コマンドごとに MR を登録して SGL の型に invalidate(0x4f)を立ててくる)。
+     * 実測で 4096B read qd=128 が 663 -> 825 MiB/s。 */
+    uint32_t op = (inval_rkey != 0u) ? MLX5_OPCODE_SEND_INVAL : MLX5_OPCODE_SEND;
+    uint32_t opmod_idx_opcode = ((pc & 0xFFFFu) << 8) | op;
     wqe[0] = (uint8_t)(opmod_idx_opcode >> 24);
     wqe[1] = (uint8_t)(opmod_idx_opcode >> 16);
     wqe[2] = (uint8_t)(opmod_idx_opcode >> 8);
@@ -86,6 +97,12 @@ int mlx5_qp_post_send2(mlx5_dev_t *dev, mlx5_qp_t *qp, const void *data0, uint32
     wqe[7] = (uint8_t)qpn_ds;
 
     wqe[11] = (uint8_t)MLX5_WQE_CTRL_CQ_UPDATE; // fm_ce_se -- 常にCQE要求(診断用途、常にsignaled)
+    if (inval_rkey != 0u) { // ctrl_seg の imm(byte12-15)へ無効化する rkey(BE)
+        wqe[12] = (uint8_t)(inval_rkey >> 24);
+        wqe[13] = (uint8_t)(inval_rkey >> 16);
+        wqe[14] = (uint8_t)(inval_rkey >> 8);
+        wqe[15] = (uint8_t)inval_rkey;
+    }
 
     // data_seg(wqe[16..31]): byte_count(4B BE)+lkey(4B BE)+addr(8B BE)。
     uint32_t byte_count = len;
@@ -143,7 +160,7 @@ int mlx5_qp_post_send2(mlx5_dev_t *dev, mlx5_qp_t *qp, const void *data0, uint32
 
     volatile ts_rdma_t ts_info = {0};
     ts_info.rdma_op = TS_RDMA_OP_SQ_SEND;
-    ts_info.wqe_cqe_opcode = (uint8_t)MLX5_OPCODE_SEND;
+    ts_info.wqe_cqe_opcode = (uint8_t)op;
     ts_info.ds_cnt = (uint8_t)ds_cnt;
     ts_info.qpn = qp->qpn;
     ts_info.counter = new_pc;

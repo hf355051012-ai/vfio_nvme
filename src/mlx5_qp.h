@@ -9,6 +9,10 @@ int mlx5_qp_post_send(mlx5_dev_t *dev, mlx5_qp_t *qp, const void *data, uint32_t
  * data1=NULL なら上と同じ。NVMe-oF の in-capsule write 用。 */
 int mlx5_qp_post_send2(mlx5_dev_t *dev, mlx5_qp_t *qp, const void *data0, uint32_t len0,
                        const void *data1, uint32_t len1);
+/* inval_rkey が非 0 なら SEND_WITH_INVALIDATE で送り、相手の HCA に
+ * その rkey を無効化させる(ホスト側の LOCAL_INV が要らなくなる)。 */
+int mlx5_qp_post_send_ex(mlx5_dev_t *dev, mlx5_qp_t *qp, const void *data0, uint32_t len0,
+                         const void *data1, uint32_t len1, uint32_t inval_rkey);
 
 int mlx5_qp_post_recv(mlx5_dev_t *dev, mlx5_qp_t *qp, void *buf, uint32_t buf_len);
 

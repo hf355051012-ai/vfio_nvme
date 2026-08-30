@@ -127,9 +127,20 @@ static void nvmetr_build_id_ns(nvmet_rdma_ctx_t *ctx)
  *   nvmetr_parse_command()
  * ===============================================================*/
 static void nvmetr_parse_ksgl_into(const volatile uint8_t *rb, uint64_t *out_addr,
-                                    uint32_t *out_len, uint32_t *out_key)
+                                    uint32_t *out_len, uint32_t *out_key,
+                                    uint32_t *out_inval_key)
 {
     const volatile uint8_t *dptr = &rb[24]; // nvme_sqe_t.dptrはSQE内offset24
+    /* 型の下位 4bit が 0xF(NVME_SGL_FMT_INVALIDATE)なら、ホストは
+     * 「この rkey を SEND_WITH_INVALIDATE で無効化して返せ」と要求している。
+     * **返さないとホストは自分で LOCAL_INV を投げる**ぶん遅くなる。
+     * Linux の nvmet_rdma_map_sgl_keyed(rsp, sgl, invalidate) と同じ判定。 */
+    if (out_inval_key) {
+        *out_inval_key = ((dptr[15] & 0x0Fu) == 0x0Fu)
+                       ? ((uint32_t)dptr[11] | ((uint32_t)dptr[12] << 8) |
+                          ((uint32_t)dptr[13] << 16) | ((uint32_t)dptr[14] << 24))
+                       : 0u;
+    }
     *out_addr = rd64le(&dptr[0]);
     *out_len  = (uint32_t)dptr[8] | ((uint32_t)dptr[9] << 8) | ((uint32_t)dptr[10] << 16);
     *out_key  = (uint32_t)dptr[11] | ((uint32_t)dptr[12] << 8) |
@@ -197,7 +208,8 @@ static void nvmetr_parse_command(nvmet_rdma_ctx_t *ctx, const volatile uint8_t *
     }
 
     if (p->opcode == NVME_ADM_CMD_IDENTIFY) {
-        nvmetr_parse_ksgl_into(rb, &p->ksgl_addr, &p->ksgl_len, &p->ksgl_key);
+        nvmetr_parse_ksgl_into(rb, &p->ksgl_addr, &p->ksgl_len, &p->ksgl_key,
+                               &p->inval_rkey);
         p->need_data_move = 1;
         p->data_move_is_write = 1; // ターゲット->ホストへRDMA_WRITEで押し込む
     } else if (p->opcode == NVME_ADM_CMD_SET_FEATURES) {
@@ -206,7 +218,8 @@ static void nvmetr_parse_command(nvmet_rdma_ctx_t *ctx, const volatile uint8_t *
     } else if (p->opcode == NVME_IO_CMD_FLUSH) {
         /* RAM ディスクなので揮発性キャッシュが無く、成功を返すだけでよい。 */
     } else if (p->opcode == NVME_IO_CMD_READ) {
-        nvmetr_parse_ksgl_into(rb, &p->ksgl_addr, &p->ksgl_len, &p->ksgl_key);
+        nvmetr_parse_ksgl_into(rb, &p->ksgl_addr, &p->ksgl_len, &p->ksgl_key,
+                               &p->inval_rkey);
         p->io_slba = (uint64_t)p->cdw10 | ((uint64_t)p->cdw11 << 32);
         uint32_t nlb = (p->cdw12 & 0xFFFFu) + 1u;
         uint64_t end_lba = p->io_slba + nlb;
@@ -229,7 +242,8 @@ static void nvmetr_parse_command(nvmet_rdma_ctx_t *ctx, const volatile uint8_t *
             p->inline_off  = (uint32_t)rd64le(&dptr[0]); /* ICDOFF 由来。こちらは 0 を広告 */
             p->ksgl_len    = rd32le(&dptr[8]);
         } else {
-            nvmetr_parse_ksgl_into(rb, &p->ksgl_addr, &p->ksgl_len, &p->ksgl_key);
+            nvmetr_parse_ksgl_into(rb, &p->ksgl_addr, &p->ksgl_len, &p->ksgl_key,
+                               &p->inval_rkey);
         }
         p->io_slba = (uint64_t)p->cdw10 | ((uint64_t)p->cdw11 << 32);
         uint32_t nlb = (p->cdw12 & 0xFFFFu) + 1u;
@@ -596,8 +610,11 @@ static int nvmetr_pl_send_response(nvmet_rdma_ctx_t *ctx, unsigned slot)
 {
     nvmet_rdma_pl_pending_t *p = &ctx->pl.pending[slot];
     nvmetr_build_resp_capsule_into(ctx->pl.resp_bufs[slot], p->resp_dw0, p->resp_dw1, p->cid, p->resp_status);
-    if (mlx5_qp_post_send(ctx->cm.dev, &ctx->cm.rc_qp, (const void *)(uintptr_t)ctx->pl.resp_bufs[slot],
-                          NVME_CQE_LEN) != 0) {
+    /* ホストが keyed SGL に invalidate を要求していれば、その rkey を載せて
+     * SEND_WITH_INVALIDATE で返す(ホスト側の LOCAL_INV が要らなくなる)。 */
+    if (mlx5_qp_post_send_ex(ctx->cm.dev, &ctx->cm.rc_qp,
+                             (const void *)(uintptr_t)ctx->pl.resp_bufs[slot],
+                             NVME_CQE_LEN, 0, 0, p->inval_rkey) != 0) {
         return -1;
     }
     ctx->pl.sq_ops[ctx->pl.sq_tail % (NVMET_RDMA_MAX_PENDING * 2u)].is_resp_send = 1;

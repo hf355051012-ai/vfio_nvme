@@ -61,6 +61,7 @@
 uint64_t mlx5_dma_addr(const volatile void *cpu_ptr);
 
 #define MLX5_OPCODE_SEND        0x0au
+#define MLX5_OPCODE_SEND_INVAL 0x01u  /* SEND_WITH_INVALIDATE(include/linux/mlx5/device.h)*/
 #define MLX5_OPCODE_NOP         0x00u
 #define MLX5_OPCODE_LSO         0x0eu
 #define MLX5_OPCODE_RDMA_WRITE      0x08u
