@@ -42,6 +42,20 @@ static void nvmetr_zero_v64(volatile uint8_t *p, uint32_t len)
     for (uint32_t i = 0; i < n64; i++) p64[i] = 0;
 }
 
+/*=================================================================
+ * in-capsule で届いた write データを RAM ディスクへ写す。受信バッファは
+ * volatile なので memcpy は使えない。
+ *
+ * 引数:
+ *   dst / src - 書き込み先 / 読み出し元、len - バイト数
+ * コール元:
+ *   nvmet_rdma_job_step()
+ * ===============================================================*/
+static void nvmetr_copy_v(volatile uint8_t *dst, const volatile uint8_t *src, uint32_t len)
+{
+    for (uint32_t i = 0; i < len; i++) dst[i] = src[i];
+}
+
 static void nvmetr_copy_padded(volatile uint8_t *dst, const char *src, uint32_t field_len)
 {
     uint32_t src_len = 0;
@@ -72,7 +86,11 @@ static void nvmetr_build_id_ctrl(nvmet_rdma_ctx_t *ctx)
     wr16le(&ctx->ctrl->id_ctrl[78], ctx->ctrl->ctrlr_id);       /* CNTLID */
     ctx->ctrl->id_ctrl[111] = 1;                          /* CNTRLTYPE = 1 (I/O controller) */
     wr16le(&ctx->ctrl->id_ctrl[320], 2);                  /* KAS(fabricsでは非0が必須) */
-    wr32le(&ctx->ctrl->id_ctrl[536], 1u | (1u << 2));     /* SGLS bit0(byte-aligned) | bit2(KSDBDS) */
+    /* SGLS bit0(byte-aligned) | bit2(KSDBDS) | bit20(SAOS = SGL のアドレス欄へ
+     * オフセットを書ける)。**SAOS を立てないと Linux は in-capsule write を
+     * 使わない**(nvme_rdma_setup_ctrl() が use_inline_data をこのビットだけで
+     * 決めている)。 */
+    wr32le(&ctx->ctrl->id_ctrl[536], 1u | (1u << 2) | (1u << 20));
     {
         const char *subnqn = NVMET_RDMA_SUBNQN;
         uint32_t len = 0;
@@ -83,7 +101,10 @@ static void nvmetr_build_id_ctrl(nvmet_rdma_ctx_t *ctx)
     ctx->ctrl->id_ctrl[512] = (6u << 4) | 6u;              /* SQES: 64バイト固定 */
     ctx->ctrl->id_ctrl[513] = (4u << 4) | 4u;              /* CQES: 16バイト固定 */
     wr16le(&ctx->ctrl->id_ctrl[514], (uint16_t)NVMET_RDMA_MAXCMD); /* MAXCMD */
-    wr32le(&ctx->ctrl->id_ctrl[1792], 64u / 16u);          /* IOCCSZ: SQE(64B)のみ、in-capsuleデータ無し */
+    /* IOCCSZ: SQE(64B) + in-capsule データ。**4(SQE のみ)にしていると 512B の
+     * write でもホストは keyed SGL を使い、ターゲットが RDMA_READ を 1 往復
+     * 追加する**(実測 3.2us)。 */
+    wr32le(&ctx->ctrl->id_ctrl[1792], (64u + NVMET_RDMA_INLINE_MAX) / 16u);
     wr32le(&ctx->ctrl->id_ctrl[1796], NVME_CQE_LEN / 16u); /* IORCSZ: CQE(16B)分のみ */
     ctx->ctrl->id_ctrl[1803] = 1;                          /* MSDBD = 1 */
     dcache_clean_range((const void *)(uintptr_t)ctx->ctrl->id_ctrl, sizeof(ctx->ctrl->id_ctrl));
@@ -212,13 +233,34 @@ static void nvmetr_parse_command(nvmet_rdma_ctx_t *ctx, const volatile uint8_t *
         p->need_data_move = 1;
         p->data_move_is_write = 1;
     } else if (p->opcode == NVME_IO_CMD_WRITE) {
-        nvmetr_parse_ksgl_into(rb, &p->ksgl_addr, &p->ksgl_len, &p->ksgl_key);
+        /* SGL descriptor の型は 16 バイト目(dptr[15])。上位 4bit が種別、
+         * 下位 4bit が sub-type で、0x01 = Data Block + Offset は
+         * 「データは capsule の中にある」の意味(in-capsule)。keyed SGL
+         * (0x4X)と長さ欄の位置が違う -- keyed は 3 バイト、こちらは 4 バイト。 */
+        const volatile uint8_t *dptr = &rb[24];
+        if (dptr[15] == 0x01u) {
+            p->data_inline = 1;
+            p->inline_off  = (uint32_t)rd64le(&dptr[0]); /* ICDOFF 由来。こちらは 0 を広告 */
+            p->ksgl_len    = rd32le(&dptr[8]);
+        } else {
+            nvmetr_parse_ksgl_into(rb, &p->ksgl_addr, &p->ksgl_len, &p->ksgl_key);
+        }
         p->io_slba = (uint64_t)p->cdw10 | ((uint64_t)p->cdw11 << 32);
         uint32_t nlb = (p->cdw12 & 0xFFFFu) + 1u;
         uint64_t end_lba = p->io_slba + nlb;
         if (end_lba > NVMET_RDMA_NS_LBA_COUNT ||
             (uint64_t)nlb * NVMET_RDMA_LBA_SIZE > NVMET_RDMA_RAMDISK_SLOT_SIZE) {
             p->resp_status = NVMET_RDMA_SC_ERROR;
+            return;
+        }
+        if (p->data_inline) {
+            if (p->ksgl_len > NVMET_RDMA_INLINE_MAX ||
+                p->ksgl_len > (uint64_t)nlb * NVMET_RDMA_LBA_SIZE) {
+                p->resp_status = NVMET_RDMA_SC_ERROR;
+                return;
+            }
+            /* データは既に受信バッファにある。RDMA_READ は要らない。 */
+            p->need_data_move = 0;
             return;
         }
         p->need_data_move = 1;
@@ -277,6 +319,7 @@ static void nvmetr_dispatch(nvmet_rdma_ctx_t *ctx)
     ctx->ksgl_key = p.ksgl_key;
     ctx->io_slba = p.io_slba;
     ctx->need_data_move = p.need_data_move;
+    ctx->data_inline = p.data_inline;
     ctx->data_move_is_write = p.data_move_is_write;
     ctx->resp_dw0 = p.resp_dw0;
     ctx->resp_dw1 = p.resp_dw1;
@@ -658,6 +701,13 @@ job_result_t nvmet_rdma_job_step(job_t *self)
         dcache_invalidate_range((const void *)(uintptr_t)ctx->recv_buf, recv_len);
         ctx->recv_len = recv_len;
         nvmetr_dispatch(ctx);
+        if (ctx->data_inline) {
+            /* in-capsule write はパイプライン側でしか処理していない。admin キューは
+             * IO コマンドを運ばないのでここへは来ないが、黙って成功を返すと
+             * 「書けたつもり」になるのでエラーにする。 */
+            uart_printf("[!] nvmet-rdma: in-capsule writeは非パイプライン経路では未対応\n");
+            ctx->resp_status = NVMET_RDMA_SC_ERROR;
+        }
         if (ctx->need_data_move) {
             self->state = NVMETR_ST_DATA_MOVE;
         } else {
@@ -788,6 +838,10 @@ job_result_t nvmet_rdma_job_step(job_t *self)
     }
 
     case NVMETR_ST_PIPELINE_LOOP: {
+        /* ポーリング周期の計測用(`ts mode` に TS_MODE_HOTPATH を含めたときだけ記録)。
+         * CQE を「消費した瞬間」しか記録しない既定の計装では、NIC が CQE を書いて
+         * からこのループが気付くまでの空白が見えない。 */
+        TS_HOT(TS_MK(TS_FILE_NVMET_RDMA, TS_FUNC_nvmet_rdma_job_step, 1u), 0u);
         if (nvmetr_check_gsi_disconnect(ctx, self)) {
             return ctx->failed ? JOB_DONE : JOB_WAITING;
         }
@@ -846,6 +900,23 @@ job_result_t nvmet_rdma_job_step(job_t *self)
                     ts_cmd.remote_addr = ctx->pl.pending[slot].cid;
                     ts_cmd.len = ctx->pl.pending[slot].ksgl_len;
                     ts_log_rdma(TS_MK(TS_FILE_NVMET_RDMA, TS_FUNC_nvmet_rdma_job_step, 0), &ts_cmd);
+                }
+                if (ctx->pl.pending[slot].data_inline &&
+                    ctx->pl.pending[slot].resp_status == 0) {
+                    /* データが capsule に載っている場合、RDMA_READ を挟まずに
+                     * ここで RAM ディスクへ写して即座に応答できる。**これが
+                     * 1 往復(実測 3.2us)の削減そのもの**。 */
+                    nvmet_rdma_pl_pending_t *ip = &ctx->pl.pending[slot];
+                    uint32_t need = 64u + ip->inline_off + ip->ksgl_len;
+                    if (need > recv_len) {
+                        uart_printf("[!] nvmet-rdma: in-capsuleデータが足りない(%u > %u)\n",
+                                    need, recv_len);
+                        ip->resp_status = NVMET_RDMA_SC_ERROR;
+                    } else {
+                        nvmetr_copy_v(&ctx->ctrl->ram_disk[ip->io_slba * NVMET_RDMA_LBA_SIZE],
+                                      &ctx->pl.recv_bufs[slot][64u + ip->inline_off],
+                                      ip->ksgl_len);
+                    }
                 }
                 if (ctx->pl.pending[slot].need_data_move) {
                     int dm_rc = nvmetr_pl_start_data_move(ctx, slot);

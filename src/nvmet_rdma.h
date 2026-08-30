@@ -9,7 +9,8 @@
 
 #define NVMET_RDMA_LBA_SIZE      512u
 #define NVMET_RDMA_NS_LBA_COUNT (NVMET_RDMA_RAMDISK_SLOT_SIZE / NVMET_RDMA_LBA_SIZE)
-#define NVMET_RDMA_MSG_MAX     2048u
+#define NVMET_RDMA_INLINE_MAX  4096u  /* in-capsule データの上限(Linux nvmet の既定と同じ)*/
+#define NVMET_RDMA_MSG_MAX     (64u + NVMET_RDMA_INLINE_MAX)
 #define NVMET_RDMA_ID_BUF_LEN  4096u
 #define NVMET_RDMA_SUBNQN "nqn.2014-08.org.nvmexpress:uuid:deadbeef-rdma-babe-dead-beefcafebabe"
 
@@ -64,6 +65,8 @@ typedef struct {
     uint32_t ksgl_key;
     uint64_t io_slba;
     int      need_data_move;
+    int      data_inline;        /* 1=データが受信 capsule に載っている(RDMA_READ 不要)*/
+    uint32_t inline_off;        /* capsule 先頭の SQE(64B)からの相対オフセット */
     int      data_move_is_write;
     uint32_t resp_dw0;
     uint32_t resp_dw1;
@@ -121,6 +124,7 @@ struct nvmet_rdma_ctx {
     uint32_t resp_dw1;
     uint16_t resp_status;
     int      need_data_move;      /* 1ならDATA_MOVEステートを経由する */
+    int      data_inline;         /* 1ならデータが受信capsuleに載っている */
     int      data_move_is_write;
     uint64_t io_slba;             /* Write時、RDMA_READ完了後にram_diskへコミットする位置 */
 
