@@ -121,6 +121,8 @@ _Static_assert(sizeof(nvme_keyed_sgl_desc_t) == 16, "must match nvme_sqe_t.dptr[
 #define NVME_FABRIC_FCTYPE_PROPERTY_SET  0x00u
 #define NVME_FABRIC_FCTYPE_CONNECT       0x01u
 #define NVME_FABRIC_FCTYPE_PROPERTY_GET  0x04u
+#define NVME_FABRIC_FCTYPE_AUTH_SEND     0x05u   /* DH-HMAC-CHAP(nvmet_auth.c)*/
+#define NVME_FABRIC_FCTYPE_AUTH_RECV     0x06u
 
 /* Get/Set Features の cdw10 下位バイト(FID: Feature Identifier)。値は Linux の
  * include/linux/nvme.h の enum { NVME_FEAT_* } と同じ。 */

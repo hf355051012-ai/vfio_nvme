@@ -5650,6 +5650,14 @@ static void shell_dispatch(char *line, int s0, int s1)
     } else if (strncmp(line, "ftprobe", 7) == 0) {
         mlx5_probe_flow_table_types(&s_dev0, "pf0");
         mlx5_probe_flow_table_types(&s_dev1, "pf1");
+    } else if (strncmp(line, "nvmetauth", 9) == 0) {
+        /* nvmetauth                                      -- 設定を表示
+         * nvmetauth <hostnqn> <DHHC-1:..:..:> [sha256|sha384|sha512]
+         * nvmetauth off
+         *
+         * NVMe/TCP ターゲットが DH-HMAC-CHAP でホストを確かめる(nvmet_auth.c)。
+         * 鍵は `nvme gen-dhchap-key` で作る。**効くのは次の Connect から。** */
+        nvmet_auth_shell(line + 9);
     } else if (strncmp(line, "nvmetqueues", 11) == 0) {
         /* nvmetqueues [N]
          *
@@ -6327,7 +6335,9 @@ static void shell_dispatch(char *line, int s0, int s1)
 }
 
 /* ---- 常駐シェルの行編集(64件履歴 + ↑↓ 呼び出し + backspace) ---- */
-#define SHELL_LINE_MAX 128
+/* 512: `nvmetauth <hostnqn> <DHHC-1:..>` が 1 行で 150 文字を超える(128 だと鍵が
+ * 黙って切り詰められ、「長さが合わない」で弾かれた)。 */
+#define SHELL_LINE_MAX 512
 #define SHELL_HIST_MAX 64
 
 static char     s_hist[SHELL_HIST_MAX][SHELL_LINE_MAX];

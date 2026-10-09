@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include "nvmet_tcp.h"
 #include "netif.h"
+#include "nvmet_auth.h"
 
 /* 統計をコアごとに持つときの本数(SMP_MAX_CORES と同じ。smp.h を引くと
  * ヘッダの依存が増えるので、ここで独立に定義して nvmet.c で検算する)。 */
@@ -192,6 +193,12 @@ typedef struct {
      * Discovery コントローラ。Identify Controller と Get Log Page の応答が
      * 通常のサブシステムと変わる。 */
     int      is_discovery;
+
+    /* in-band 認証(DH-HMAC-CHAP)の状態。**認証するのは admin キューだけ**
+     * (Linux と同じ)。required が立っている間は、認証が済むまで Connect と
+     * Authentication Send / Receive 以外を受けない。IO キューの Connect も
+     * 認証済みの admin が無ければ拒否する。 */
+    nvmet_auth_sess_t auth;
 
     /* Fabrics Connect の cdw12 で受け取った Keep Alive Timeout(ミリ秒)。
      * 0 = Keep Alive 無効(Discovery コントローラは通常 0 で繋いでくる)。

@@ -862,12 +862,45 @@ static int nvmet_admin_dispatch(nvmet_ctx_t *ctx, const nvme_sqe_t *sqe,
                ? ((rd32le(&sqe->nsid) & 0xFFu) << 8) | opcode
                : opcode);
 
+    /* **認証が済むまでは Connect と Authentication Send / Receive しか受けない。**
+     * Linux は Fabrics コマンド(Property Get / Set)を素通しするが、こちらは
+     * CC.EN を立てさせる前に認証を済ませる、より狭い側に倒してある
+     * (Linux のホストは Connect の直後に認証するので、どちらでも同じに動く)。 */
+    if (nvmet_auth_blocks(&ctx->auth)) {
+        const uint32_t fct = rd32le(&sqe->nsid) & 0xFFu;
+        const int allowed = (opcode == NVME_FABRIC_CMD) &&
+                            (fct == NVME_FABRIC_FCTYPE_CONNECT || fct == NVME_FABRIC_FCTYPE_AUTH_SEND ||
+                             fct == NVME_FABRIC_FCTYPE_AUTH_RECV);
+        if (!allowed) {
+            uart_printf("[auth] 認証前のコマンドを拒否 (opcode=0x%x%s)\n", opcode,
+                        opcode == NVME_FABRIC_CMD ? ", Fabrics" : "");
+            nvmet_build_cqe(ctx, &cqe, ctx->admin.last_cid, 0u, (uint16_t)NVMET_AUTH_SC_AUTH_REQUIRED);
+            nvmet_tcp_send_resp(&ctx->admin, &cqe);
+            return 0;
+        }
+    }
+
     if (opcode == NVME_FABRIC_CMD) {
         uint32_t fctype = rd32le(&sqe->nsid) & 0xFFu;
 
         if (fctype == NVME_FABRIC_FCTYPE_CONNECT) {
             uint32_t qid = rd32le(&sqe->cdw10) >> 16;
             if (qid == 0) {
+                /* 認証: 通常のサブシステムで鍵が設定されていれば、Connect の
+                 * 応答に ATR(認証が要る)を立てる。Connect データの offset 512 が
+                 * hostnqn。鍵を設定したホスト以外は Invalid Host で断る。 */
+                uint32_t atr = 0;
+                const int disc = (data != NULL && dlen >= 512u) ? nvmet_nqn_is_discovery(&data[256]) : 0;
+                if (!disc && data != NULL && dlen >= 768u) {
+                    const uint16_t ast = nvmet_auth_on_connect(&ctx->auth, &data[512], &atr);
+                    if (ast != 0) {
+                        nvmet_build_cqe(ctx, &cqe, ctx->admin.last_cid, 0u, ast);
+                        nvmet_tcp_send_resp(&ctx->admin, &cqe);
+                        return 0;
+                    }
+                } else {
+                    nvmet_auth_reset(&ctx->auth);   /* Discovery は認証しない(Linux も同じ)*/
+                }
                 ctx->ctrlr_id = 1;
                 /* Connect のデータは struct nvmf_connect_data(1024 バイト)で、
                  * offset 256 から subsysnqn[256]。ここが Discovery NQN なら
@@ -898,9 +931,10 @@ static int nvmet_admin_dispatch(nvmet_ctx_t *ctx, const nvme_sqe_t *sqe,
                      * accept の受け皿を用意できるようになる。 */
                     ctx->io_arm_owner = NVMET_ARM_FREE;
                 }
-                nvmet_build_cqe(ctx, &cqe, ctx->admin.last_cid, 1u, 0);
-                uart_printf("[nvmet:%s] Fabrics Connect (qid=0, admin) 受理 (ctrlr_id=1%s)\n",
-                            ctx->label, ctx->is_discovery ? ", Discovery コントローラ" : "");
+                nvmet_build_cqe(ctx, &cqe, ctx->admin.last_cid, 1u | atr, 0);
+                uart_printf("[nvmet:%s] Fabrics Connect (qid=0, admin) 受理 (ctrlr_id=1%s%s)\n",
+                            ctx->label, ctx->is_discovery ? ", Discovery コントローラ" : "",
+                            atr ? "、認証を要求" : "");
             } else {
                 uart_printf("[!] nvmet: adminキューで想定外のqid=%u\n", qid);
                 nvmet_build_cqe(ctx, &cqe, ctx->admin.last_cid, 0u, (uint16_t)NVMET_SC_GENERIC_ERROR);
@@ -945,6 +979,22 @@ static int nvmet_admin_dispatch(nvmet_ctx_t *ctx, const nvme_sqe_t *sqe,
                             (ctx->shutdown_complete ? NVME_CSTS_SHST_CMPLT : 0u);
                 }
                 nvmet_build_cqe(ctx, &cqe, ctx->admin.last_cid, value, 0);
+                nvmet_tcp_send_resp(&ctx->admin, &cqe);
+            }
+        } else if (fctype == NVME_FABRIC_FCTYPE_AUTH_SEND) {
+            const uint16_t st = nvmet_auth_send(&ctx->auth, rd32le(&sqe->cdw10), rd32le(&sqe->cdw11),
+                                                data, dlen, NVMET_SUBNQN);
+            nvmet_build_cqe(ctx, &cqe, ctx->admin.last_cid, 0u, st);
+            nvmet_tcp_send_resp(&ctx->admin, &cqe);
+        } else if (fctype == NVME_FABRIC_FCTYPE_AUTH_RECV) {
+            /* 応答は 1 コマンドずつ同期で返すので id_scratch を使い回してよい。 */
+            uint32_t olen = 0;
+            const uint16_t st = nvmet_auth_receive(&ctx->auth, rd32le(&sqe->cdw10), rd32le(&sqe->cdw11),
+                                                   ctx->id_scratch, sizeof(ctx->id_scratch), &olen);
+            nvmet_build_cqe(ctx, &cqe, ctx->admin.last_cid, 0u, st);
+            if (st == 0 && olen != 0) {
+                nvmet_tcp_send_c2h(&ctx->admin, ctx->admin.last_cid, &cqe, ctx->id_scratch, olen, 1);
+            } else {
                 nvmet_tcp_send_resp(&ctx->admin, &cqe);
             }
         } else {
@@ -1374,6 +1424,7 @@ static job_result_t nvmet_admin_session_finish(job_t *self, nvmet_admin_job_ctx_
     nvmet_tcp_close(&ctx->admin);
     ctx->is_discovery = 0;
     ctx->session_done = 0;
+    nvmet_auth_reset(&ctx->auth);
     /* **IO キューの受け皿を全部畳ませる。** ARM/ACCEPT_WAIT で待っている
      * ジョブはこれを見て arm 権を手放し、WAIT_ADMIN_READY へ戻る。 */
     ctx->io_armed          = 0;
@@ -1567,11 +1618,19 @@ static job_result_t nvmet_admin_job_step(job_t *self)
         int peer_gone = (ctx->admin.tcp.state == TCP_CLOSE_WAIT ||
                          ctx->admin.tcp.state == TCP_CLOSED ||
                          ctx->admin.tcp.state == TCP_TIME_WAIT);
-        if ((ctx->is_discovery || jc->linger_armed) && peer_gone) {
+        /* **IO キューが切断を知らせてこないセッションも admin が自分で畳む。**
+         * IO の受け皿を張っていない(Connect を断った / Connect の前に相手が
+         * 消えた)ときと、認証が済んでいないとき。段階 A で、設定外のホストの
+         * Connect を Invalid Host で断ったあと admin がここで固まり、**以後の SYN を
+         * 全部捨てる**ようになった(Discovery で踏んだのと同じ形)。 */
+        const int no_io_report = !ctx->io_armed || nvmet_auth_blocks(&ctx->auth);
+        if ((ctx->is_discovery || jc->linger_armed || no_io_report) && peer_gone) {
             return nvmet_admin_session_finish(self, jc, ctx,
                                               ctx->is_discovery
                                                   ? "Discovery セッション終了"
-                                                  : "セッション終了(adminキューも切断された)");
+                                                  : no_io_report && !jc->linger_armed
+                                                        ? "セッション終了(IO キュー無しで切断された)"
+                                                        : "セッション終了(adminキューも切断された)");
         }
         if (jc->linger_armed && timeout_ms(jc->linger_ticks, NVMET_ADMIN_LINGER_MS)) {
             return nvmet_admin_session_finish(self, jc, ctx,
@@ -2254,6 +2313,12 @@ static void nvmet_io_dispatch_cmd(nvmet_io_job_ctx_t *jc, const uint8_t *hdr_buf
                 uart_printf("[!] nvmet: IOキュー%u に qid=0(admin)のConnectが来た -- "
                             "admin用の接続を横取りしています\n", jc->qidx + 1u);
                 nvmet_build_cqe(ctx, &cqe, cid, 0u, (uint16_t)NVMET_SC_INVALID_FIELD);
+            } else if (nvmet_auth_blocks(&ctx->auth)) {
+                /* **認証が済んでいないコントローラに IO キューを張らせない。**
+                 * Linux はここを確かめていない(IO キューの Connect は cntlid と
+                 * hostnqn の照合だけ)が、こちらは塞いでおく。 */
+                uart_printf("[auth] 認証前の IO キュー Connect(qid=%u)を拒否\n", (unsigned)qid);
+                nvmet_build_cqe(ctx, &cqe, cid, 0u, (uint16_t)NVMET_AUTH_SC_AUTH_REQUIRED);
             } else {
                 nvmet_build_cqe(ctx, &cqe, cid, ctx->ctrlr_id, 0);
                 uart_printf("[nvmet:%s] Fabrics Connect (qid=%u, IO) 受理 [キュー%u/%u]\n",
