@@ -12,7 +12,7 @@
  * Linux と同じく**認証するのは admin キューだけ**(IO キューの Connect には
  * ATR を立てない。`nvmet_connect_result()` の "Do not authenticate I/O queues")。
  *
- * 段階 A の範囲: DH 群は NULL のみ、片方向(コントローラはホストを確かめるだけ)。
+ * 段階 A: DH 群 NULL・片方向。段階 B: ffdhe2048〜8192 と双方向(コントローラの鍵で R2 を返す)。
  */
 
 #include <stdint.h>
@@ -40,6 +40,16 @@ typedef struct {
     uint16_t tid;             /* トランザクション ID(T_ID)*/
     uint32_t s1;              /* Challenge に入れた通し番号 */
     uint8_t  c1[64];          /* Challenge に入れた乱数 */
+    /* 双方向(ホストもコントローラを確かめる)。Reply の S2 / C2 を控え、
+     * Success1 で R2 を返し、Success2 を受けて初めて認証済みにする。 */
+    uint8_t  bidir;
+    uint32_t s2;
+    uint8_t  c2[64];
+    /* DH 群(段階 B)。秘密の指数は共有秘密を作ったら消す。共有秘密は
+     * 素数の長さ(最大 1024 バイト)に 0 詰めしたまま持つ。 */
+    uint8_t  dh_priv[64];
+    uint8_t  skey[1024];
+    uint32_t skey_len;
     char     hostnqn[NVMET_AUTH_NQN_MAX + 1];
 } nvmet_auth_sess_t;
 
@@ -62,7 +72,7 @@ uint16_t nvmet_auth_send(nvmet_auth_sess_t *s, uint32_t cdw10, uint32_t cdw11,
 /* Authentication Receive。out に cdw11(AL)バイトぶんを作る(足りない部分は 0)。
  * *out_len に送るバイト数を返す。戻り値は CQE の status。 */
 uint16_t nvmet_auth_receive(nvmet_auth_sess_t *s, uint32_t cdw10, uint32_t cdw11,
-                            uint8_t *out, uint32_t cap, uint32_t *out_len);
+                            uint8_t *out, uint32_t cap, uint32_t *out_len, const char *subnqn);
 
 void nvmet_auth_reset(nvmet_auth_sess_t *s);
 

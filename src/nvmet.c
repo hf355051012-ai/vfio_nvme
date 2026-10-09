@@ -990,7 +990,8 @@ static int nvmet_admin_dispatch(nvmet_ctx_t *ctx, const nvme_sqe_t *sqe,
             /* 応答は 1 コマンドずつ同期で返すので id_scratch を使い回してよい。 */
             uint32_t olen = 0;
             const uint16_t st = nvmet_auth_receive(&ctx->auth, rd32le(&sqe->cdw10), rd32le(&sqe->cdw11),
-                                                   ctx->id_scratch, sizeof(ctx->id_scratch), &olen);
+                                                   ctx->id_scratch, sizeof(ctx->id_scratch), &olen,
+                                                   NVMET_SUBNQN);
             nvmet_build_cqe(ctx, &cqe, ctx->admin.last_cid, 0u, st);
             if (st == 0 && olen != 0) {
                 nvmet_tcp_send_c2h(&ctx->admin, ctx->admin.last_cid, &cqe, ctx->id_scratch, olen, 1);

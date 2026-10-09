@@ -6615,7 +6615,7 @@ int main(int argc, char **argv)
          * FIPS 180-4 / RFC 4231 / RFC 5869 / RFC 8448 の値。 */
         char err[64];
         const int crc = crypto_selftest(err, sizeof(err));
-        uart_printf("[selftest] crypto(SHA-256/384/512, HMAC, HKDF, Expand-Label, base64, CRC-32) -> %s%s%s\n",
+        uart_printf("[selftest] crypto(SHA-256/384/512, HMAC, HKDF, Expand-Label, base64, CRC-32, ffdhe) -> %s%s%s\n",
                     crc == 0 ? "OK" : "NG(", crc == 0 ? "" : err, crc == 0 ? "" : ")");
         rc |= crc;
     }

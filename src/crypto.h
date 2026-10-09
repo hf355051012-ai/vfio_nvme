@@ -91,6 +91,34 @@ int  crypto_equal(const void *a, const void *b, size_t n);
 /* 最適化で消されない消去(鍵の後始末)。 */
 void crypto_wipe(void *p, size_t n);
 
+/* ---- 有限体 Diffie-Hellman(crypto_dh.c、RFC 7919 の ffdhe 群、生成元 2)----
+ * 群の番号は NVMe の DH-HMAC-CHAP の DH group ID と同じ(1=2048 ... 5=8192)。
+ * 公開値・共有秘密は**素数の長さ(256〜1024 バイト)に 0 詰めしたビッグエンディアン**
+ * (Linux の dh_compute_value() と同じ。共有秘密はこの長さのままハッシュされる)。 */
+enum {
+    CRYPTO_FFDHE2048 = 1,
+    CRYPTO_FFDHE3072 = 2,
+    CRYPTO_FFDHE4096 = 3,
+    CRYPTO_FFDHE6144 = 4,
+    CRYPTO_FFDHE8192 = 5,
+};
+#define CRYPTO_FFDHE_PRIV_LEN  64u     /* 秘密の指数は 512 ビット */
+#define CRYPTO_FFDHE_MAX_LEN   1024u   /* ffdhe8192 の長さ */
+
+size_t crypto_ffdhe_len(unsigned gid);   /* 0 なら未知の群 */
+/* 秘密の指数を乱数で作り、公開値 2^x mod p を pub(crypto_ffdhe_len バイト)へ。 */
+int crypto_ffdhe_keygen(unsigned gid, uint8_t priv[CRYPTO_FFDHE_PRIV_LEN], uint8_t *pub);
+/* 与えた指数での公開値(自己検査用)。 */
+int crypto_ffdhe_public(unsigned gid, const uint8_t priv[CRYPTO_FFDHE_PRIV_LEN], uint8_t *pub);
+/* 共有秘密 peer^x mod p。peer は 1 < y < p-1 かつ素数位数の部分群に居ること
+ * (y^((p-1)/2) = 1)を確かめ、だめなら負を返す。 */
+int crypto_ffdhe_shared(unsigned gid, const uint8_t priv[CRYPTO_FFDHE_PRIV_LEN],
+                        const uint8_t *peer, size_t peerlen, uint8_t *out);
+/* 汎用の冪剰余 base^exp mod mod(mod は奇数、1024 バイトまで、base < mod)。
+ * out は mlen バイト。検算用(tools/crypto_check.c が OpenSSL の BN_mod_exp と比べる)。 */
+int crypto_modexp(const uint8_t *base, size_t blen, const uint8_t *exp, size_t elen,
+                  const uint8_t *mod, size_t mlen, uint8_t *out);
+
 /* 既知の値との照合。0=全部一致。err に最初に食い違った項目名を入れる。 */
 int crypto_selftest(char *err, size_t errlen);
 

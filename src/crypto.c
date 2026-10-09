@@ -555,6 +555,43 @@ int crypto_selftest(char *err, size_t errlen) {
     }
     if (crypto_base64_decode("Zm9v!A==", 8, out, sizeof(out)) != -1) return fail(err, errlen, "base64 不正文字");
 
+    /* ffdhe: 指数 x1 = 01 02 .. 40、x2 = 41 42 .. 80(各 64 バイト)で
+     * 2^x1 と (2^x2)^x1 を計算し、SHA-256 を比べる。期待値は Python の
+     * 組み込みの整数(pow)で計算したもの。共有秘密は部分群の検査を含むので
+     * 起動を遅くしない 2048 / 3072 だけ。 */
+    static const char *const want_dh[5][2] = {
+        { "1908b0773912e53f8b481d76c9723f551e22e7edcee9e562bf0cc763a9ce3958",
+          "17947c482b7dbb4197a9e9319cba6a569535dbc12000e94f4231ce7c2baf3efd" },
+        { "e9f81f609bb558fd1ea247cff217d7681f14a9b132cb0c93203a873ad800ca24",
+          "7d2ba81f1cfac146cf48854b3b798d8a6e75aa089cc1e857af17ffef471bc03d" },
+        { "a53688d3a4d42b2c60ebff8551c83d059a0415eea23c365d1e190ebaff879f1c", NULL },
+        { "21ff5bd61a7d69b1817b7ae910dc291ab6c5f4d60aa562b30c987dda2f0f9157", NULL },
+        { "b2f1e92b44e0a45ee7b23938bfd9be352a84ab3878fa0afae756e3c4f6999e9e", NULL },
+    };
+    {
+        static uint8_t y1[CRYPTO_FFDHE_MAX_LEN], y2[CRYPTO_FFDHE_MAX_LEN], z[CRYPTO_FFDHE_MAX_LEN];
+        uint8_t x1[CRYPTO_FFDHE_PRIV_LEN], x2[CRYPTO_FFDHE_PRIV_LEN], d[32];
+        for (unsigned i = 0; i < CRYPTO_FFDHE_PRIV_LEN; i++) {
+            x1[i] = (uint8_t)(1u + i);
+            x2[i] = (uint8_t)(65u + i);
+        }
+        for (unsigned g = 1; g <= 5; g++) {
+            const size_t n = crypto_ffdhe_len(g);
+            crypto_ffdhe_public(g, x1, y1);
+            crypto_hash(CRYPTO_SHA256, y1, n, d);
+            if (!hexeq(d, want_dh[g - 1][0], 32)) return fail(err, errlen, "ffdhe 公開値");
+            if (want_dh[g - 1][1] == NULL) continue;
+            crypto_ffdhe_public(g, x2, y2);
+            if (crypto_ffdhe_shared(g, x1, y2, n, z) != 0) return fail(err, errlen, "ffdhe 公開値の検査");
+            crypto_hash(CRYPTO_SHA256, z, n, d);
+            if (!hexeq(d, want_dh[g - 1][1], 32)) return fail(err, errlen, "ffdhe 共有秘密");
+            /* 陰性対照: 1 と p-1 は弾く(部分群の検査より先に範囲で落ちる)。 */
+            memset(y2, 0, n);
+            y2[n - 1] = 1;
+            if (crypto_ffdhe_shared(g, x1, y2, n, z) == 0) return fail(err, errlen, "ffdhe y=1 を受け付けた");
+        }
+    }
+
     /* 比較(陰性対照つき)と乱数(全部 0 は返さない、2 回で違う値)*/
     if (!crypto_equal("abcd", "abcd", 4) || crypto_equal("abcd", "abce", 4)) return fail(err, errlen, "crypto_equal");
     uint8_t r1[32], r2[32];
