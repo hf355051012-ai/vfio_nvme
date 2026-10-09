@@ -224,6 +224,31 @@ int tls13_nvme_psk(tls13_psk_t out[2], const char *keystr, const char *hostnqn,
     return 2;
 }
 
+int tls13_nvme_generated_psk(tls13_psk_t *out, const uint8_t *psk, size_t len,
+                             const char *hostnqn, const char *subnqn) {
+    if (len != HL) return -1;
+    /* digest = base64(HMAC(PSK, host " " sub " NVMe-over-Fabrics"))(設定鍵の版 1 と同じ式で、
+     * retained PSK の代わりに生成した PSK を使う)*/
+    crypto_hmac_ctx_t m;
+    uint8_t dig[HL], prk[HL];
+    crypto_hmac_init(&m, CRYPTO_SHA256, psk, HL);
+    crypto_hmac_update(&m, hostnqn, strlen(hostnqn));
+    crypto_hmac_update(&m, " ", 1);
+    crypto_hmac_update(&m, subnqn, strlen(subnqn));
+    crypto_hmac_update(&m, " NVMe-over-Fabrics", 18);
+    crypto_hmac_final(&m, dig);
+    char b64[64], ctx[80];
+    crypto_base64_encode(dig, HL, b64);
+    const int w = snprintf(out->identity, sizeof(out->identity), "NVMe1G01 %s %s %s", hostnqn, subnqn, b64);
+    if (w <= 0 || (size_t)w >= sizeof(out->identity)) return -1;
+    out->identity_len = (uint16_t)w;
+    const int cl = snprintf(ctx, sizeof(ctx), "01 %s", b64);
+    crypto_hkdf_extract(CRYPTO_SHA256, NULL, 0, psk, HL, prk);
+    expand_label(prk, "nvme-tls-psk", ctx, (size_t)cl, out->psk, HL);
+    crypto_wipe(prk, sizeof(prk));
+    return 0;
+}
+
 void tls13_server_init(tls13_t *t, const tls13_psk_t *psks, unsigned npsk) {
     memset(t, 0, sizeof(*t));
     t->psks = psks;

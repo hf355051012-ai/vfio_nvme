@@ -117,6 +117,12 @@ typedef struct {
 int tls13_nvme_psk(tls13_psk_t out[2], const char *keystr, const char *hostnqn,
                    const char *subnqn, const char **why);
 
+/* secure channel concatenation(段階 H)で DH-HMAC-CHAP が生成した PSK から、
+ * 身元 "NVMe1G01 host sub digest" と TLS PSK を作る(Linux の nvme_auth_generate_digest() +
+ * nvme_auth_derive_tls_psk())。PSK は SHA-256 の 32 バイトだけ(TLS_AES_128_GCM_SHA256)。 */
+int tls13_nvme_generated_psk(tls13_psk_t *out, const uint8_t *psk, size_t len,
+                             const char *hostnqn, const char *subnqn);
+
 void tls13_server_init(tls13_t *t, const tls13_psk_t *psks, unsigned npsk);
 
 /* クライアント(段階 F)。psk は 1 本(身元とその TLS PSK)。

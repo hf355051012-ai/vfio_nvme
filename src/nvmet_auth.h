@@ -39,6 +39,9 @@ typedef struct {
     uint8_t  hashid;          /* 合意したハッシュ(1/2/3)*/
     uint8_t  dhgid;           /* 合意した DH 群(段階 A は 0 = NULL のみ)*/
     uint8_t  sc_c;            /* Negotiate の SC_C(secure channel concatenation)*/
+    uint8_t  concat_ok;       /* このトランスポートで concatenation できる(TCP = 1、RDMA = 0)*/
+    uint8_t  queue_tls;       /* このキューは TLS で繋がっている */
+    uint8_t  concat;          /* このセッションは concatenation(認証が済んだら PSK を生成する)*/
     uint16_t tid;             /* トランザクション ID(T_ID)*/
     uint32_t s1;              /* Challenge に入れた通し番号 */
     uint8_t  c1[64];          /* Challenge に入れた乱数 */
@@ -62,6 +65,11 @@ int nvmet_auth_enabled(void);
  * offset 512 の 256 バイト。戻り値は 0 = 受理(応答 dw0 に *atr を OR する)、
  * それ以外 = Connect に返す status(設定外のホスト)。 */
 uint16_t nvmet_auth_on_connect(nvmet_auth_sess_t *s, const uint8_t *hostnqn256, uint32_t *atr);
+
+/* NVMe/TCP の admin の Connect(段階 H)。concatenation を受けられ、**TLS で繋がった
+ * キューには認証を求めない**(Linux の nvmet_has_auth() = 鍵があり、かつ TLS でないとき)。 */
+uint16_t nvmet_auth_on_connect_tcp(nvmet_auth_sess_t *s, const uint8_t *hostnqn256, uint32_t *atr,
+                                   int queue_tls);
 
 /* 認証が済むまで受けてはいけないコマンドか。1 = 拒否する。 */
 int nvmet_auth_blocks(const nvmet_auth_sess_t *s);

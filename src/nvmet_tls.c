@@ -16,7 +16,19 @@ static FILE       *s_keylog;
 
 volatile uint32_t g_nvmet_tls_corrupt;
 
+/* concatenation で生成した PSK(段階 H)。握手の候補は「設定した 2 本 + 生成した 1 本」。 */
+static tls13_psk_t s_gen;
+static int         s_gen_valid;
+static tls13_psk_t s_list[3];
+
 int nvmet_tls_enabled(void) { return s_npsk != 0; }
+int nvmet_tls_possible(void) { return s_npsk != 0 || s_gen_valid; }
+
+void nvmet_tls_set_generated(const tls13_psk_t *p) {
+    s_gen = *p;
+    s_gen_valid = 1;
+    uart_printf("[nvmet-tls] secure channel concatenation: 生成した PSK を登録(身元 %.70s...)\n", s_gen.identity);
+}
 
 /* SSLKEYLOGFILE 形式で追記する。Precision の tshark に `-o tls.keylog_file:<path>` で
  * 渡すと、こちらが出した暗号文を相手側の道具で復号して読める。
@@ -77,7 +89,10 @@ void nvmet_tls_shell(const char *args) {
 }
 
 void nvmet_tls_start(nvmet_tls_conn_t *s) {
-    tls13_server_init(&s->t, s_psk, s_npsk);
+    unsigned n = 0;
+    for (unsigned i = 0; i < s_npsk; i++) s_list[n++] = s_psk[i];
+    if (s_gen_valid) s_list[n++] = s_gen;
+    tls13_server_init(&s->t, s_list, n);
     s->t.keylog = keylog_write;
     s->pendlen = 0;
     s->applen = s->apphead = 0;
@@ -169,6 +184,16 @@ int nvmet_tls_poll(nvmet_tls_conn_t *s, tcp_conn_t *tcp) {
     if (before != TLS13_ST_OPEN && s->t.state == TLS13_ST_OPEN) {
         uart_printf("[%s] 握手が済んだ(TLS 1.3、TLS_AES_128_GCM_SHA256、x25519、身元の版 %d)\n",
                     s->t.is_client ? "nvme-tls" : "nvmet-tls", s->t.psk_index == 0 ? 1 : 0);
+    }
+    return s->t.state == TLS13_ST_OPEN ? 1 : 0;
+}
+
+int nvmet_tls_preload(nvmet_tls_conn_t *s, tcp_conn_t *tcp, const uint8_t *buf, size_t n) {
+    const int rc = feed_raw(s, buf, n);
+    if (flush_pend(s, tcp, 1) != 0) return -1;
+    if (rc != 0) {
+        log_failure(s);
+        return -1;
     }
     return s->t.state == TLS13_ST_OPEN ? 1 : 0;
 }

@@ -41,7 +41,15 @@ typedef struct nvmet_tls_conn {
     tls13_psk_t cpsk;               /* クライアント: この接続の PSK(身元は host / sub で決まる)*/
 } nvmet_tls_conn_t;
 
-int  nvmet_tls_enabled(void);
+int  nvmet_tls_enabled(void);   /* TLS を必須にしている(`nvmettls` で鍵を設定した)*/
+/* TLS を受けられる(設定した鍵か、concatenation で生成した鍵がある)。必須でなければ
+ * 最初のバイトで TLS(0x16)か平文の ICReq(0x00)かを見分ける(段階 H)。 */
+int  nvmet_tls_possible(void);
+/* concatenation で生成した PSK を登録する(以後の TLS の握手で使える)。 */
+void nvmet_tls_set_generated(const tls13_psk_t *p);
+/* 握手を始める前に TCP から読んでしまったバイト(ICReq のつもりで読んだ ClientHello の頭)を
+ * 食わせる。戻り値は nvmet_tls_poll() と同じ。 */
+int  nvmet_tls_preload(nvmet_tls_conn_t *s, tcp_conn_t *tcp, const uint8_t *buf, size_t n);
 /* nvmettls [<hostnqn> <NVMeTLSkey-1:..> [keylog <path>] | off | corrupt <N>] */
 void nvmet_tls_shell(const char *args);
 

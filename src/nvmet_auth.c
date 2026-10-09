@@ -1,4 +1,5 @@
 #include "nvmet_auth.h"
+#include "nvmet_tls.h"
 #include "nvme_auth.h"
 #include "crypto.h"
 #include "timer.h"
@@ -21,6 +22,10 @@
 #define MSG_DONE                0xFFu   /* 自前の印: やりとりが終わった */
 #define AUTH_ID_DHCHAP          0x01u   /* protocol descriptor の authid */
 #define FAIL_REASON_FAILED      0x01u
+/* Negotiate の SC_C(include/linux/nvme.h の NVME_AUTH_SECP_*)*/
+#define SECP_NOSC               0x00u
+#define SECP_NEWTLSPSK          0x02u
+#define SECP_REPLACETLSPSK      0x03u
 #define FAIL_FAILED             0x01u
 #define FAIL_NOT_USABLE         0x02u
 #define FAIL_CONCAT_MISMATCH    0x03u
@@ -83,6 +88,20 @@ uint16_t nvmet_auth_on_connect(nvmet_auth_sess_t *s, const uint8_t *hostnqn256, 
     return 0;
 }
 
+uint16_t nvmet_auth_on_connect_tcp(nvmet_auth_sess_t *s, const uint8_t *hostnqn256, uint32_t *atr,
+                                   int queue_tls) {
+    const uint16_t st = nvmet_auth_on_connect(s, hostnqn256, atr);
+    s->concat_ok = 1;
+    s->queue_tls = (uint8_t)(queue_tls != 0);
+    if (st == 0 && queue_tls && s->required) {
+        /* TLS(PSK)で既に相手を確かめてある。Linux も TLS のキューには ATR を立てない。 */
+        s->required = 0;
+        *atr = 0;
+        uart_printf("[auth] TLS で繋がった admin なので認証は求めない\n");
+    }
+    return st;
+}
+
 int nvmet_auth_blocks(const nvmet_auth_sess_t *s) {
     return s->required && (!s->authenticated || s->failed);
 }
@@ -96,14 +115,46 @@ static void fail(nvmet_auth_sess_t *s, uint8_t reason, const char *why) {
     uart_printf("[auth] 失敗: %s(理由 0x%02x)\n", why, reason);
 }
 
+/* secure channel concatenation の PSK を作って TLS へ渡す(Linux の nvmet_auth_insert_psk())。
+ * PSK = HMAC(共有秘密, C1 || C2)(強める前の素のチャレンジ)。 */
+static void concat_generate(nvmet_auth_sess_t *s, const char *subnqn) {
+    const size_t hl = crypto_hash_len((crypto_hash_id_t)s->hashid);
+    if (s->hashid != CRYPTO_SHA256) {
+        uart_printf("[auth] concatenation: SHA-%u の PSK は TLS_AES_256_GCM_SHA384 が要るので使えない\n",
+                    hash_bits(s->hashid));
+        return;
+    }
+    uint8_t psk[CRYPTO_HASH_MAX];
+    crypto_hmac_ctx_t m;
+    crypto_hmac_init(&m, (crypto_hash_id_t)s->hashid, s->skey, s->skey_len);
+    crypto_hmac_update(&m, s->c1, hl);
+    crypto_hmac_update(&m, s->c2, hl);
+    crypto_hmac_final(&m, psk);
+    tls13_psk_t p;
+    if (tls13_nvme_generated_psk(&p, psk, hl, s->hostnqn, subnqn) == 0) nvmet_tls_set_generated(&p);
+    crypto_wipe(psk, sizeof(psk));
+    crypto_wipe(&p, sizeof(p));
+}
+
 /* AUTH_Negotiate(Linux の nvmet_auth_negotiate())。 */
 static void on_negotiate(nvmet_auth_sess_t *s, const uint8_t *d, uint32_t len) {
     s->tid = rd16le(d + 4);
     s->sc_c = d[6];
     const uint8_t napd = d[7];
-    if (s->sc_c != 0) {   /* secure channel concatenation は TLS が要る(段階 H)*/
-        fail(s, FAIL_CONCAT_MISMATCH, "SC_C(secure channel concatenation)は未対応");
-        return;
+    /* secure channel concatenation(段階 H、Linux の nvmet_auth_negotiate())。
+     * NEWTLSPSK = 平文のキューで新しい PSK を作る、REPLACETLSPSK = TLS のキューで作り直す。 */
+    s->concat = 0;
+    if (s->sc_c != SECP_NOSC) {
+        if (!s->concat_ok) {
+            fail(s, FAIL_CONCAT_MISMATCH, "このトランスポートでは secure channel concatenation できない");
+            return;
+        }
+        if ((s->sc_c == SECP_NEWTLSPSK && s->queue_tls) || (s->sc_c == SECP_REPLACETLSPSK && !s->queue_tls) ||
+            (s->sc_c != SECP_NEWTLSPSK && s->sc_c != SECP_REPLACETLSPSK)) {
+            fail(s, FAIL_CONCAT_MISMATCH, "SC_C とキューの TLS の有無が合わない");
+            return;
+        }
+        s->concat = 1;
     }
     if (napd != 1 || len < 8u + 64u) {
         fail(s, FAIL_HASH_UNUSABLE, "protocol descriptor が 1 個でない");
@@ -136,6 +187,11 @@ static void on_negotiate(nvmet_auth_sess_t *s, const uint8_t *d, uint32_t len) {
     }
     if (!ok) {
         fail(s, FAIL_DHGROUP_UNUSABLE, "設定した DH 群がホストの候補に無い");
+        return;
+    }
+    if (s->concat && s_cfg.dhgid == 0) {
+        /* 共有秘密が無いと PSK を作れない(Linux も断る)*/
+        fail(s, FAIL_CONCAT_MISMATCH, "secure channel concatenation に DH 群 NULL は使えない");
         return;
     }
     s->hashid = pick;
@@ -186,6 +242,11 @@ static void on_reply(nvmet_auth_sess_t *s, const uint8_t *d, uint32_t len, const
         fail(s, FAIL_FAILED, "ホストの応答が一致しない(鍵が違う)");
         return;
     }
+    if (s->concat && !cvalid) {
+        fail(s, FAIL_FAILED, "concatenation なのに C2 が無い");
+        return;
+    }
+    if (cvalid) memcpy(s->c2, d + 16u + hl, hl);
     if (cvalid && s2 != 0) {
         /* 双方向: ホストもこちらを確かめたがっている。コントローラの鍵が要る。 */
         if (s_cfg.ctrl.len == 0) {
@@ -203,6 +264,7 @@ static void on_reply(nvmet_auth_sess_t *s, const uint8_t *d, uint32_t len, const
     s->authenticated = 1;
     s->step = MSG_SUCCESS1;
     uart_printf("[auth] ホスト %s を認証しました\n", s->hostnqn);
+    if (s->concat) concat_generate(s, subnqn);
 }
 
 uint16_t nvmet_auth_send(nvmet_auth_sess_t *s, uint32_t cdw10, uint32_t cdw11,
@@ -245,6 +307,7 @@ uint16_t nvmet_auth_send(nvmet_auth_sess_t *s, uint32_t cdw10, uint32_t cdw11,
             s->authenticated = 1;
             s->step = MSG_DONE;
             uart_printf("[auth] 双方向の認証が終わった(ホストがこちらを認めた)\n");
+            if (s->concat) concat_generate(s, subnqn);
         }
     }
     return 0;

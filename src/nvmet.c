@@ -899,7 +899,8 @@ static int nvmet_admin_dispatch(nvmet_ctx_t *ctx, const nvme_sqe_t *sqe,
                 uint32_t atr = 0;
                 const int disc = (data != NULL && dlen >= 512u) ? nvmet_nqn_is_discovery(&data[256]) : 0;
                 if (!disc && data != NULL && dlen >= 768u) {
-                    const uint16_t ast = nvmet_auth_on_connect(&ctx->auth, &data[512], &atr);
+                    const uint16_t ast = nvmet_auth_on_connect_tcp(&ctx->auth, &data[512], &atr,
+                                                                   ctx->admin.tls != NULL);
                     if (ast != 0) {
                         nvmet_build_cqe(ctx, &cqe, ctx->admin.last_cid, 0u, ast);
                         nvmet_tcp_send_resp(&ctx->admin, &cqe);
@@ -932,12 +933,12 @@ static int nvmet_admin_dispatch(nvmet_ctx_t *ctx, const nvme_sqe_t *sqe,
                 /* 前のセッションの KATO 切れの旗が残っていたら捨てる
                  * (IO キューが 1 本も繋がらないまま切れた場合に残りうる)。 */
                 ctx->kato_expired = 0;
-                if (!ctx->is_discovery) {
-                    ctx->io_armed = 1;
-                    /* **arm 権を admin から手放す。** これで IO ジョブの 1 本が
-                     * accept の受け皿を用意できるようになる。 */
-                    ctx->io_arm_owner = NVMET_ARM_FREE;
-                }
+                /* **IO キューの受け皿はここでは立てない。ホストが CC.EN を立てたとき
+                 * に立てる**(段階 H)。secure channel concatenation の Linux ホストは、
+                 * 平文の admin で認証して PSK を作ると、**CC.EN を立てずに admin を閉じて
+                 * TLS で張り直す**。ここで立てると、admin がその切断で畳まず、張り直しの
+                 * SYN を IO 側の受け皿が受け取ってしまう。通常のホストは必ず CC.EN を
+                 * 立ててから IO キューを張る。 */
                 nvmet_build_cqe(ctx, &cqe, ctx->admin.last_cid, 1u | atr, 0);
                 uart_printf("[nvmet:%s] Fabrics Connect (qid=0, admin) 受理 (ctrlr_id=1%s%s)\n",
                             ctx->label, ctx->is_discovery ? ", Discovery コントローラ" : "",
@@ -952,6 +953,12 @@ static int nvmet_admin_dispatch(nvmet_ctx_t *ctx, const nvme_sqe_t *sqe,
             if (offset == NVME_REG_CC) {
                 ctx->cc    = rd32le(&sqe->cdw12);
                 ctx->cc_en = (ctx->cc & NVME_CC_EN) ? 1 : 0;
+                if (ctx->cc_en && !ctx->io_armed && !ctx->is_discovery) {
+                    ctx->io_armed = 1;
+                    /* **arm 権を admin から手放す。** これで IO ジョブの 1 本が
+                     * accept の受け皿を用意できるようになる。 */
+                    ctx->io_arm_owner = NVMET_ARM_FREE;
+                }
                 /* **CC.SHN を受けたらシャットダウン完了を報告する。** ホストは CC を
                  * 書いたあと CSTS.SHST が 10b になるまで待つ(Linux は 5 秒)。
                  * 実装しないと切断のたびに
@@ -1611,6 +1618,20 @@ static job_result_t nvmet_admin_job_step(job_t *self)
 
     case NADM_ST_ICREQ_RECV: {
         int r = nvmet_tcp_recv_poll(&ctx->admin, &jc->xfer);
+        /* **TLS が必須でなくても受けられるとき(concatenation で鍵を生成した後)は、
+         * 最初のバイトで見分ける**: 0x16 = TLS の握手、0x00 = 平文の ICReq。 */
+        if (r >= 0 && !ctx->admin.tls && jc->xfer.got > 0 && jc->icreq_buf[0] == 0x16 &&
+            nvmet_tls_possible()) {
+            nvmet_tls_start(&s_admin_tls);
+            const int t = nvmet_tls_preload(&s_admin_tls, &ctx->admin.tcp, jc->icreq_buf, jc->xfer.got);
+            if (t < 0) {
+                crypto_wipe(&s_admin_tls.t, sizeof(s_admin_tls.t));
+                return nvmet_admin_job_setup_fail(self, ctx);
+            }
+            nvmet_tcp_xfer_reset(&jc->xfer, jc->icreq_buf, NVME_TCP_ICREQ_LEN);
+            self->state = NADM_ST_TLS_HS;
+            return JOB_WAITING;
+        }
         if (r < 0) return nvmet_admin_job_setup_fail(self, ctx);
         if (r == 0) {
             if (timeout_ms(jc->wait_started_ticks, NVMET_ACCEPT_TIMEOUT_MS)) {
@@ -3054,6 +3075,14 @@ static job_result_t nvmet_io_job_step_impl(job_t *self)
 
     case NIO_ST_ICREQ_RECV: {
         int r = nvmet_tcp_recv_poll(&jc->io, &jc->xfer);
+        if (r >= 0 && !jc->io.tls && jc->xfer.got > 0 && jc->icreq_buf[0] == 0x16 && nvmet_tls_possible()) {
+            nvmet_tls_start(&s_io_tls[jc->qidx]);
+            if (nvmet_tls_preload(&s_io_tls[jc->qidx], &jc->io.tcp, jc->icreq_buf, jc->xfer.got) < 0)
+                return nvmet_io_job_end(self, jc, 1, "IO の TLS 握手に失敗");
+            nvmet_tcp_xfer_reset(&jc->xfer, jc->icreq_buf, NVME_TCP_ICREQ_LEN);
+            self->state = NIO_ST_TLS_HS;
+            return JOB_WAITING;
+        }
         if (r < 0) return nvmet_io_job_end(self, jc, 1, "IO ICReq受信失敗");
         if (r == 0) {
             if (timeout_ms(jc->wait_started_ticks, NVMET_ACCEPT_TIMEOUT_MS)) {
