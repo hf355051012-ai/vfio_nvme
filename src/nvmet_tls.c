@@ -244,18 +244,38 @@ int nvmet_tls_send(nvmet_tls_conn_t *s, tcp_conn_t *tcp, const void *p1, uint32_
     uint32_t chunk = seg_cap(tcp) - (5u + 1u + 16u);
     if (chunk > TLS13_PLAIN_MAX) chunk = TLS13_PLAIN_MAX;
     while (left) {
-        /* 平文をレコードの中へ直接組み立て、その場で暗号化する */
         const uint32_t take = left < chunk ? left : chunk;
-        uint8_t *dst = s->rec + 5;
+        /* このレコードに入る平文の断片(最大 2 個)*/
+        const uint8_t *q[2] = { NULL, NULL };
+        uint32_t ql[2] = { 0, 0 };
+        unsigned nq = 0;
         for (uint32_t got = 0; got < take;) {
             while (fo == fl[fi]) { fi++; fo = 0; }
             uint32_t c = fl[fi] - fo;
             if (c > take - got) c = take - got;
-            memcpy(dst + got, f[fi] + fo, c);
+            q[nq] = f[fi] + fo;
+            ql[nq] = c;
+            nq++;
             fo += c;
             got += c;
         }
-        const size_t rl = tls13_seal(&s->t, dst, take, s->rec);
+        /* **暗号化の出力を TCP の再送スロットへ直接書く**(段階 G)。平文をレコード用
+         * バッファへ写す 1 回と、レコードをスロットへ写す 1 回が無くなる。 */
+        const uint16_t rl_want = (uint16_t)(5u + take + 1u + 16u);
+        uint8_t *slot = g_nvmet_tls_corrupt ? NULL : tcp_send_async_reserve(tcp, rl_want);
+        if (slot) {
+            const size_t rl = tls13_seal2(&s->t, q[0], ql[0], q[1], ql[1], slot);
+            if (rl != rl_want || tcp_send_async_commit(tcp, (uint16_t)rl) < 0) {
+                s->failed = 1;
+                return -1;
+            }
+            s->tx_records++;
+            s->tx_bytes += take;
+            left -= take;
+            continue;
+        }
+        /* 予約できない(検証用に壊す / 大きすぎる)ときは従来どおりレコード用バッファで */
+        const size_t rl = tls13_seal2(&s->t, q[0], ql[0], q[1], ql[1], s->rec);
         if (g_nvmet_tls_corrupt) {   /* 検証用: 暗号文を 1 ビット壊す(相手が bad_record_mac で切るか)*/
             g_nvmet_tls_corrupt--;
             s->rec[rl - 1] ^= 0x01;

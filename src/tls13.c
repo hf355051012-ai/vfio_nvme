@@ -681,8 +681,14 @@ static int on_record(tls13_t *t, uint8_t *rec, size_t rlen, obuf_t *o,
         if (n < 17) return fail(t, o, TLS13_ALERT_DECODE_ERROR, "暗号文が短い");
         uint8_t iv[12];
         nonce(&t->rx, iv);
-        if (crypto_aes128gcm_open(&t->rx.aead, iv, rec, 5, d, n - 16u, d, d + n - 16u) != 0)
+        /* **平文の受け取り先へ直接復号する**(段階 G。その場で復号してから写すと
+         * 64KB の IO で 1 回余計にコピーする)。入り切らないとき(握手中に小さい
+         * 受け取り先を渡された場合など)だけその場で復号する。application_data で
+         * なかったら(握手 / alert)そこを作業域として使うだけで、applen は進めない。 */
+        uint8_t *dst = (*applen + (n - 16u) <= appcap) ? app + *applen : d;
+        if (crypto_aes128gcm_open(&t->rx.aead, iv, rec, 5, d, n - 16u, dst, d + n - 16u) != 0)
             return fail(t, o, TLS13_ALERT_BAD_RECORD_MAC, "復号できない(タグが合わない)");
+        d = dst;
         t->rx.seq++;
         n -= 16u;
         while (n && d[n - 1] == 0) n--;   /* 詰め物 */
@@ -700,6 +706,10 @@ static int on_record(tls13_t *t, uint8_t *rec, size_t rlen, obuf_t *o,
         return d[1] == TLS13_ALERT_CLOSE_NOTIFY ? 0 : -1;
     case CT_APPDATA:
         if (t->state != TLS13_ST_OPEN) return fail(t, o, TLS13_ALERT_UNEXPECTED_MESSAGE, "握手の前の application_data");
+        if (d == app + *applen) {   /* 直接復号した */
+            *applen += n;
+            return 0;
+        }
         if (*applen + n > appcap) return fail(t, o, TLS13_ALERT_INTERNAL_ERROR, "平文の受け取り先が足りない");
         memcpy(app + *applen, d, n);
         *applen += n;
@@ -715,6 +725,19 @@ int tls13_input(tls13_t *t, const uint8_t *in, size_t n,
     obuf_t o = { out, cap, *outlen, 0 };
     int rc = 0;
     while (n && rc == 0 && t->state != TLS13_ST_CLOSED && t->state != TLS13_ST_FAILED) {
+        /* **近道(段階 G): 入力の中に暗号化レコードが丸ごと揃っていれば、組み立て用の
+         * バッファへ写さずにその場から直接復号する。** 自作の送り手は 1 レコード =
+         * 1 セグメントで送るのでほぼ毎回ここを通る。入力は書き換えない(復号は平文の
+         * 受け取り先へ。入り切らないなら近道を使わない)。 */
+        if (t->rlen == 0 && n >= 5 && t->rx.on && in[0] == CT_APPDATA && in[1] == 3) {
+            const size_t rl = 5u + rd16(in + 3);
+            if (rl <= n && rl <= sizeof(t->rbuf) && rl >= 5u + 17u && *applen + (rl - 5u - 16u) <= appcap) {
+                rc = on_record(t, (uint8_t *)(uintptr_t)in, rl, &o, app, appcap, applen);
+                in += rl;
+                n -= rl;
+                continue;
+            }
+        }
         /* ヘッダ 5 バイトを揃えてから本体 */
         size_t want = 5;
         if (t->rlen >= 5) want = 5u + rd16(t->rbuf + 3);
@@ -753,6 +776,21 @@ int tls13_input(tls13_t *t, const uint8_t *in, size_t n,
 size_t tls13_seal(tls13_t *t, const void *in, size_t n, uint8_t *out) {
     if (t->state != TLS13_ST_OPEN || n > TLS13_PLAIN_MAX) return 0;
     return seal_record(&t->tx, CT_APPDATA, (const uint8_t *)in, n, out);
+}
+
+size_t tls13_seal2(tls13_t *t, const void *p1, size_t l1, const void *p2, size_t l2, uint8_t *out) {
+    if (t->state != TLS13_ST_OPEN || l1 + l2 > TLS13_PLAIN_MAX) return 0;
+    const size_t n = l1 + l2;
+    const size_t clen = n + 1u + 16u;
+    out[0] = CT_APPDATA; out[1] = 3; out[2] = 3;
+    wr16(out + 3, (unsigned)clen);
+    static const uint8_t type = CT_APPDATA;   /* TLSInnerPlaintext の末尾の種別 */
+    const crypto_iov_t v[3] = { { p1, l1 }, { p2, l2 }, { &type, 1 } };
+    uint8_t iv[12];
+    nonce(&t->tx, iv);
+    crypto_aes128gcm_seal_iov(&t->tx.aead, iv, out, 5, v, 3, out + 5, out + 5 + n + 1u);
+    t->tx.seq++;
+    return 5u + clen;
 }
 
 size_t tls13_close(tls13_t *t, uint8_t *out) {

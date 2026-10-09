@@ -123,7 +123,8 @@ int crypto_modexp(const uint8_t *base, size_t blen, const uint8_t *exp, size_t e
  * TLS 1.3 の TLS_AES_128_GCM_SHA256 用。IV は 12 バイト、タグは 16 バイト固定。 */
 typedef struct {
     uint8_t rk[11 * 16];         /* 展開した鍵 */
-    uint8_t h[16];               /* GHASH の鍵 H = E(K, 0)(バイト順を反転した表現)*/
+    uint8_t hpow[8][16];         /* GHASH の鍵 H = E(K, 0) の 1〜8 乗(バイト順を反転した表現)。
+                                  * 8 ブロックをまとめて畳むために先に計算しておく */
 } crypto_aes128gcm_t;
 
 void crypto_aes128_encrypt_block(const uint8_t key[16], const uint8_t in[16], uint8_t out[16]);
@@ -132,7 +133,13 @@ void crypto_aes128gcm_init(crypto_aes128gcm_t *c, const uint8_t key[16]);
 void crypto_aes128gcm_seal(const crypto_aes128gcm_t *c, const uint8_t iv[12],
                            const void *aad, size_t alen, const void *in, size_t n,
                            void *out, uint8_t tag[16]);
-/* タグが合わなければ -1(out には何も書かない)。 */
+/* 断片(最大 4 個)を続けた平文を暗号化する(段階 G)。平文をいったん連続した
+ * バッファへ写さずに済む。out と断片は重ならないこと。 */
+typedef struct { const void *p; size_t n; } crypto_iov_t;
+void crypto_aes128gcm_seal_iov(const crypto_aes128gcm_t *c, const uint8_t iv[12],
+                               const void *aad, size_t alen, const crypto_iov_t *v, int nv,
+                               void *out, uint8_t tag[16]);
+/* タグが合わなければ -1(書いた平文は消してから返す)。 */
 int  crypto_aes128gcm_open(const crypto_aes128gcm_t *c, const uint8_t iv[12],
                            const void *aad, size_t alen, const void *in, size_t n,
                            void *out, const uint8_t tag[16]);

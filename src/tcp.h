@@ -208,6 +208,10 @@ int  tcp_send_async_ref(tcp_conn_t *conn, const void *buf, uint16_t len);
  * 合計が収まらなければ自動で 2 回に分けて従来動作へ落ちる。 */
 int  tcp_send_async2(tcp_conn_t *conn, const void *buf1, uint16_t len1,
                      const void *buf2, uint16_t len2);
+/* 短経路のスロットを予約して書き込み先を返し(NULL=失敗)、書いたら commit で送る。
+ * 間に同じコネクションへの別の送信を挟まないこと(TLS の送信用、段階 G)。 */
+uint8_t *tcp_send_async_reserve(tcp_conn_t *conn, uint16_t len);
+int      tcp_send_async_commit(tcp_conn_t *conn, uint16_t len);
 
 /* まだ ACK されていない送信済みバイト数(Nagle 的な溜め込みの判定用)。 */
 uint32_t tcp_unacked_bytes(const tcp_conn_t *conn);

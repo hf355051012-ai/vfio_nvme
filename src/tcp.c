@@ -3603,9 +3603,9 @@ static int tcp_send_async_enqueue(tcp_conn_t *conn, tcp_priv_t *priv,
  * コール元:
  *   tcp_send_async_ex()
  * ===============================================================*/
-static int tcp_send_async_short2(tcp_conn_t *conn, tcp_priv_t *priv,
-                                 const void *buf, uint16_t len,
-                                 const void *buf2, uint16_t len2)
+/* 短経路のスロットが空き、送信ウィンドウに余地ができるまで待つ。0=空いた、-1=中断。
+ * tcp_send_async_short2() と tcp_send_async_reserve() が共有する。 */
+static int tcp_short_wait(tcp_conn_t *conn, tcp_priv_t *priv)
 {
     while (priv->async_short_count >= g_tcp_async_short_cap) {
         g_tcp_async_short_stalls++;
@@ -3637,6 +3637,15 @@ static int tcp_send_async_short2(tcp_conn_t *conn, tcp_priv_t *priv,
         if (priv->cwnd < usable_window) usable_window = priv->cwnd;
         if (usable_window == 0) usable_window = 1u;
     }
+
+    return 0;
+}
+
+static int tcp_send_async_short2(tcp_conn_t *conn, tcp_priv_t *priv,
+                                 const void *buf, uint16_t len,
+                                 const void *buf2, uint16_t len2)
+{
+    if (tcp_short_wait(conn, priv) != 0) return -1;
 
     uint32_t seq = conn->snd_seq;
     uint16_t total = (uint16_t)(len + len2);
@@ -3844,6 +3853,56 @@ int tcp_send_async2(tcp_conn_t *conn, const void *buf1, uint16_t len1,
         return -1;
     }
     return tcp_send_async_short2(conn, priv, buf1, len1, buf2, len2);
+}
+
+/*=================================================================
+ * 短経路のスロットを予約して、その書き込み先を返す(段階 G)。呼び出し側は
+ * len バイトを書いてから tcp_send_async_commit() で送る。**間に同じ
+ * コネクションへの別の送信を挟まないこと**(スロットの順番がずれる)。
+ *
+ * TLS の送信で使う: 暗号化の出力を再送スロットへ直接書けば、平文を
+ * レコード用のバッファへ写す 1 回と、レコードをスロットへ写す 1 回が要らない
+ * (再送は同じ暗号文を送り直すだけなので、暗号化は 1 回でよい)。
+ *
+ * 引数:
+ *   conn - 対象コネクション
+ *   len  - 書くバイト数(1 セグメント・TCP_ASYNC_SHORT_SLOT_BYTES 以下)
+ * 戻り値:
+ *   書き込み先(NULL=送れない状態 / 大きすぎる / 中断)
+ * コール元:
+ *   nvmet_tls_send()
+ * ===============================================================*/
+uint8_t *tcp_send_async_reserve(tcp_conn_t *conn, uint16_t len)
+{
+    if (conn->state != TCP_ESTABLISHED && conn->state != TCP_CLOSE_WAIT) return NULL;
+    if (len == 0 || len > TCP_ASYNC_SHORT_SLOT_BYTES) return NULL;
+    tcp_priv_t *priv = tcp_priv_for(conn);
+    if (!priv) return NULL;
+    if (tcp_short_wait(conn, priv) != 0) return NULL;
+    const unsigned slot_idx = (priv->async_short_head + priv->async_short_count) % g_tcp_async_short_cap;
+    return (uint8_t *)priv->async_short_slots[slot_idx].buf;
+}
+
+/*=================================================================
+ * tcp_send_async_reserve() で予約したスロットの中身(len バイト)を送る。
+ * 戻り値: len、-1=失敗
+ * ===============================================================*/
+int tcp_send_async_commit(tcp_conn_t *conn, uint16_t len)
+{
+    tcp_priv_t *priv = tcp_priv_for(conn);
+    if (!priv) return -1;
+    const unsigned slot_idx = (priv->async_short_head + priv->async_short_count) % g_tcp_async_short_cap;
+    tcp_async_short_slot_t *slot = &priv->async_short_slots[slot_idx];
+    const uint32_t seq = conn->snd_seq;
+    if (tcp_send_segment(conn, priv, TCP_FLAG_PSH | TCP_FLAG_ACK, slot->buf, len) != 0) return -1;
+    slot->seq     = seq;
+    slot->len     = len;
+    slot->sent_at = timer_now();
+    slot->rto_ms  = priv->rto_ms;
+    slot->retries = 0;
+    priv->async_short_count++;
+    conn->snd_seq = seq + len;
+    return (int)len;
 }
 
 /*=================================================================

@@ -136,6 +136,10 @@ int tls13_input(tls13_t *t, const uint8_t *in, size_t n,
  * 戻り値はレコードの長さ(5 + n + 1 + 16)。OPEN でなければ 0。 */
 size_t tls13_seal(tls13_t *t, const void *in, size_t n, uint8_t *out);
 
+/* 2 断片を続けた application_data を 1 レコードに暗号化して out へ書く(段階 G)。
+ * 平文を写さずに済む(out は TCP の再送スロットでよい)。戻り値は長さ、OPEN でなければ 0。 */
+size_t tls13_seal2(tls13_t *t, const void *p1, size_t l1, const void *p2, size_t l2, uint8_t *out);
+
 /* close_notify のレコードを作る。戻り値は長さ。 */
 size_t tls13_close(tls13_t *t, uint8_t *out);
 
