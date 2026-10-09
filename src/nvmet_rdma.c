@@ -31,6 +31,7 @@ static nvmet_rdma_ctx_t s_standalone_io_ctx[NVMET_RDMA_IO_QUEUES];
 static int         s_standalone_io_spawned;   /* 立てた acceptor の本数 */
 static void nvmetr_spawn_io_queue(nvmet_rdma_ctx_t *admin_ctx, unsigned idx);
 static void nvmetr_on_io_established(nvmet_rdma_ctx_t *self);
+static void nvmetr_after_auth(nvmet_rdma_ctx_t *ctx);
 static const char *s_standalone_self_label;
 static uint8_t     s_standalone_peer_mac[6];
 
@@ -236,9 +237,57 @@ static void nvmetr_parse_command(nvmet_rdma_ctx_t *ctx, const volatile uint8_t *
 
     if (p->opcode == NVME_FABRIC_CMD) {
         p->fctype = (uint8_t)(nsid_field & 0xFFu);
+    }
+    /* **認証が済むまでは Connect と Authentication Send / Receive しか受けない**
+     * (TCP 側の nvmet.c と同じ)。IO キューの Connect も admin の認証が済むまで断る。 */
+    if (nvmet_auth_blocks(&ctx->ctrl->auth)) {
+        const int fab_ok = (p->opcode == NVME_FABRIC_CMD) &&
+                           ((p->fctype == NVME_FABRIC_FCTYPE_CONNECT && ctx->queue_id == 0) ||
+                            p->fctype == NVME_FABRIC_FCTYPE_AUTH_SEND ||
+                            p->fctype == NVME_FABRIC_FCTYPE_AUTH_RECV);
+        if (!fab_ok) {
+            uart_printf("[auth] nvmet-rdma: 認証前のコマンドを拒否 (queue %u opcode=0x%x)\n",
+                        ctx->queue_id, p->opcode);
+            p->resp_status = (uint16_t)NVMET_AUTH_SC_AUTH_REQUIRED;
+            return;
+        }
+    }
+    if (p->opcode == NVME_FABRIC_CMD) {
         if (p->fctype == NVME_FABRIC_FCTYPE_CONNECT) {
             p->resp_dw0 = ctx->ctrl->ctrlr_id;
             uart_printf("[nvmet-rdma] Fabrics Connect受理 (cntlid=%u)\n", ctx->ctrl->ctrlr_id);
+            if (ctx->queue_id == 0) {
+                /* **admin の Connect はデータ(1024 バイト、hostnqn を含む)を読む。**
+                 * 以前は読まずに受理していた。認証では hostnqn が要る。 */
+                nvmetr_parse_ksgl_into(rb, &p->ksgl_addr, &p->ksgl_len, &p->ksgl_key, &p->inval_rkey);
+                if (p->ksgl_len >= 768u && p->ksgl_len <= NVME_AUTH_RECV_BYTES) {
+                    p->need_data_move = 1;
+                    p->data_move_is_write = 0;
+                    p->fab_data = 1;
+                }
+            }
+        } else if (ctx->queue_id == 0 && p->fctype == NVME_FABRIC_FCTYPE_AUTH_SEND) {
+            nvmetr_parse_ksgl_into(rb, &p->ksgl_addr, &p->ksgl_len, &p->ksgl_key, &p->inval_rkey);
+            if (p->ksgl_len == 0 || p->ksgl_len > NVME_AUTH_RECV_BYTES) {
+                p->resp_status = (uint16_t)NVMET_AUTH_SC_INVALID_FIELD;
+            } else {
+                p->need_data_move = 1;
+                p->data_move_is_write = 0;
+                p->fab_data = 1;
+            }
+        } else if (ctx->queue_id == 0 && p->fctype == NVME_FABRIC_FCTYPE_AUTH_RECV) {
+            nvmetr_parse_ksgl_into(rb, &p->ksgl_addr, &p->ksgl_len, &p->ksgl_key, &p->inval_rkey);
+            uint32_t olen = 0;
+            p->resp_status = nvmet_auth_receive(&ctx->ctrl->auth, p->cdw10, p->cdw11,
+                                                (uint8_t *)(uintptr_t)ctx->ctrl->fab_buf,
+                                                NVME_AUTH_RECV_BYTES, &olen, NVMET_RDMA_SUBNQN);
+            if (p->resp_status == 0 && olen != 0) {
+                if (olen > p->ksgl_len) olen = p->ksgl_len;
+                p->ksgl_len = olen;
+                p->need_data_move = 1;
+                p->data_move_is_write = 1;
+                p->fab_data = 1;
+            }
         } else if (p->fctype == NVME_FABRIC_FCTYPE_PROPERTY_SET) {
             uint32_t offset = p->cdw11;
             uint64_t value = (uint64_t)p->cdw12 | ((uint64_t)rd32le(&rb[52]) << 32);
@@ -397,6 +446,7 @@ static void nvmetr_dispatch(nvmet_rdma_ctx_t *ctx)
     ctx->need_data_move = p.need_data_move;
     ctx->data_inline = p.data_inline;
     ctx->data_move_is_write = p.data_move_is_write;
+    ctx->fab_data = p.fab_data;
     ctx->resp_dw0 = p.resp_dw0;
     ctx->resp_dw1 = p.resp_dw1;
     ctx->resp_status = p.resp_status;
@@ -491,6 +541,7 @@ static void nvmetr_reset_admin_for_reconnect(nvmet_rdma_ctx_t *ctx, job_t *self)
     ctx->ctrl->ctrlr_id = 1;
     ctx->ctrl->cc = 0;
     ctx->ctrl->cc_en = 0;
+    nvmet_auth_reset(&ctx->ctrl->auth);
     nvmetr_build_id_ctrl(ctx);
     nvmetr_build_id_ns(ctx);
 
@@ -603,7 +654,8 @@ static int nvmetr_pl_post_recv_slot(nvmet_rdma_ctx_t *ctx, unsigned slot)
 static int nvmetr_pl_issue_rdma_read(nvmet_rdma_ctx_t *ctx, unsigned slot)
 {
     nvmet_rdma_pl_pending_t *p = &ctx->pl.pending[slot];
-    volatile uint8_t *dst = &ctx->ctrl->ram_disk[p->io_slba * NVMET_RDMA_LBA_SIZE];
+    volatile uint8_t *dst = p->fab_data ? ctx->ctrl->fab_buf
+                                        : &ctx->ctrl->ram_disk[p->io_slba * NVMET_RDMA_LBA_SIZE];
     if (mlx5_qp_post_rdma_read(ctx->cm.dev, &ctx->cm.rc_qp, (void *)(uintptr_t)dst,
                                 p->ksgl_len, p->ksgl_addr, p->ksgl_key) != 0) {
         return -1;
@@ -636,7 +688,9 @@ static int nvmetr_pl_start_data_move(nvmet_rdma_ctx_t *ctx, unsigned slot)
     if (p->data_move_is_write) { // RDMA_WRITE(READ/Identify) -- RRA対象外、常に即時発行
         const volatile uint8_t *src;
         uint32_t len = p->ksgl_len;
-        if (p->opcode == NVME_ADM_CMD_IDENTIFY) {
+        if (p->fab_data) {   /* Authentication Receive の応答(長さは解析時に決めてある)*/
+            src = ctx->ctrl->fab_buf;
+        } else if (p->opcode == NVME_ADM_CMD_IDENTIFY) {
             uint8_t cns = (uint8_t)(p->cdw10 & 0xFFu);
             src = (cns == NVME_IDENTIFY_CNS_CONTROLLER) ? ctx->ctrl->id_ctrl : ctx->ctrl->id_ns;
             if (len > NVMET_RDMA_ID_BUF_LEN) len = NVMET_RDMA_ID_BUF_LEN;
@@ -735,6 +789,7 @@ job_result_t nvmet_rdma_job_step(job_t *self)
             ctx->ctrl->ctrlr_id = 1;
             ctx->ctrl->cc = 0;
             ctx->ctrl->cc_en = 0;
+            nvmet_auth_reset(&ctx->ctrl->auth);
             nvmetr_build_id_ctrl(ctx);
             nvmetr_build_id_ns(ctx);
             nvmetr_zero_v64(ctx->ctrl->ram_disk, NVMET_RDMA_RAMDISK_SLOT_SIZE);
@@ -813,7 +868,17 @@ job_result_t nvmet_rdma_job_step(job_t *self)
 
     case NVMETR_ST_DATA_MOVE: {
         int rc;
-        if (ctx->data_move_is_write) {
+        if (ctx->fab_data) {
+            if (ctx->data_move_is_write) {
+                rc = mlx5_qp_post_rdma_write(ctx->cm.dev, &ctx->cm.rc_qp,
+                                             (const void *)(uintptr_t)ctx->ctrl->fab_buf, ctx->ksgl_len,
+                                             ctx->ksgl_addr, ctx->ksgl_key);
+            } else {
+                rc = mlx5_qp_post_rdma_read(ctx->cm.dev, &ctx->cm.rc_qp,
+                                            (void *)(uintptr_t)ctx->ctrl->fab_buf, ctx->ksgl_len,
+                                            ctx->ksgl_addr, ctx->ksgl_key);
+            }
+        } else if (ctx->data_move_is_write) {
             const volatile uint8_t *src;
             uint32_t len = ctx->ksgl_len;
             if (ctx->opcode == NVME_ADM_CMD_IDENTIFY) {
@@ -846,7 +911,24 @@ job_result_t nvmet_rdma_job_step(job_t *self)
         uint8_t synd = 0;
         int rc = mlx5_qp_poll_cqe(ctx->cm.dev, &ctx->cm.rc_qp, &is_send, NULL, &synd);
         if (rc == 1 && is_send) {
-            if (!ctx->data_move_is_write) {
+            if (ctx->fab_data && !ctx->data_move_is_write) {
+                /* admin の Connect / Authentication Send のデータが届いた。 */
+                const uint8_t *d = (const uint8_t *)(uintptr_t)ctx->ctrl->fab_buf;
+                if (ctx->fctype == NVME_FABRIC_FCTYPE_CONNECT) {
+                    uint32_t atr = 0;
+                    const uint16_t st = nvmet_auth_on_connect(&ctx->ctrl->auth, d + 512, &atr);
+                    if (st != 0) {
+                        ctx->resp_status = st;
+                        ctx->resp_dw0 = 0;
+                    } else {
+                        ctx->resp_dw0 |= atr;
+                        if (atr) uart_printf("[nvmet-rdma] 認証を要求 (ホスト %s)\n", ctx->ctrl->auth.hostnqn);
+                    }
+                } else {
+                    ctx->resp_status = nvmet_auth_send(&ctx->ctrl->auth, ctx->cdw10, ctx->cdw11, d,
+                                                       ctx->ksgl_len, NVMET_RDMA_SUBNQN);
+                }
+            } else if (!ctx->data_move_is_write) {
                 dcache_invalidate_range(
                     (const void *)(uintptr_t)&ctx->ctrl->ram_disk[ctx->io_slba * NVMET_RDMA_LBA_SIZE],
                     ctx->ksgl_len);
@@ -1061,6 +1143,30 @@ job_result_t nvmet_rdma_job_step(job_t *self)
                     if (ctx->pl.pending[op.slot].data_move_is_write) {
                         continue;   /* RDMA_WRITE。応答は発行済み */
                     }
+                    if (ctx->pl.pending[op.slot].fab_data) {
+                        /* admin の Connect / Authentication Send のデータが届いた。
+                         * 処理して応答の中身を決めてから、下で応答を送る。 */
+                        nvmet_rdma_pl_pending_t *fp = &ctx->pl.pending[op.slot];
+                        const uint8_t *d = (const uint8_t *)(uintptr_t)ctx->ctrl->fab_buf;
+                        if (fp->fctype == NVME_FABRIC_FCTYPE_CONNECT) {
+                            uint32_t atr = 0;
+                            const uint16_t st = nvmet_auth_on_connect(&ctx->ctrl->auth, d + 512, &atr);
+                            if (st != 0) {
+                                fp->resp_status = st;
+                                fp->resp_dw0 = 0;
+                            } else {
+                                fp->resp_dw0 |= atr;
+                                if (atr) {
+                                    uart_printf("[nvmet-rdma] 認証を要求 (ホスト %s)\n",
+                                                ctx->ctrl->auth.hostnqn);
+                                }
+                            }
+                        } else {
+                            fp->resp_status = nvmet_auth_send(&ctx->ctrl->auth, fp->cdw10, fp->cdw11, d,
+                                                              fp->ksgl_len, NVMET_RDMA_SUBNQN);
+                            nvmetr_after_auth(ctx);
+                        }
+                    }
                     {
                         dcache_invalidate_range(
                             (const void *)(uintptr_t)&ctx->ctrl->ram_disk[
@@ -1233,7 +1339,23 @@ static void nvmetr_on_admin_established(nvmet_rdma_ctx_t *admin_ctx)
 {
     if (!admin_ctx->enable_io_queue || s_standalone_io_spawned > 0) return;
     s_standalone_admin_ctx_for_io = admin_ctx;
-    nvmetr_spawn_io_queue(admin_ctx, 0);}
+    /* **認証を求めるなら、IO キューの受け皿は認証が済んでから立てる。**
+     * 先に立てると、認証に失敗したホストが繋ぎ直してきたときの admin 用の REQ を
+     * IO 側の受け皿が受け取り、Connect(qid=0)が「認証前」として拒否される
+     * (段階 C で踏んだ。TCP で admin が畳まれずに SYN を捨てたのと同じ系統)。 */
+    if (nvmet_auth_enabled()) return;
+    nvmetr_spawn_io_queue(admin_ctx, 0);
+}
+
+/* 認証が済んだら IO キューの受け皿を立てる(nvmetr_on_admin_established() の続き)。 */
+static void nvmetr_after_auth(nvmet_rdma_ctx_t *ctx)
+{
+    if (ctx->queue_id != 0 || !ctx->enable_io_queue || s_standalone_io_spawned > 0) return;
+    const nvmet_auth_sess_t *a = &ctx->ctrl->auth;
+    if (!a->required || !a->authenticated || a->failed) return;
+    s_standalone_admin_ctx_for_io = ctx;
+    nvmetr_spawn_io_queue(ctx, 0);
+}
 
 /*=================================================================
  * admin キューの切断を検出したときに 1 度だけ呼ばれる。NVMe-oF の意味論上、

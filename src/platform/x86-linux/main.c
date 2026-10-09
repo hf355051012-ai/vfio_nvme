@@ -3,6 +3,7 @@
 #include "smp.h"
 #include "crc32c.h"
 #include "crypto.h"
+#include "nvme_auth.h"
 #include "vfio.h"
 #include "mlx5.h"
 #include "nvme_rdma.h"
@@ -5650,6 +5651,20 @@ static void shell_dispatch(char *line, int s0, int s1)
     } else if (strncmp(line, "ftprobe", 7) == 0) {
         mlx5_probe_flow_table_types(&s_dev0, "pf0");
         mlx5_probe_flow_table_types(&s_dev1, "pf1");
+    } else if (strncmp(line, "nvmeauth", 8) == 0) {
+        /* nvmeauth [<DHHC-1:..> [ctrl=<DHHC-1:..>] | off]
+         *
+         * 内蔵イニシエータ(tcpbench など)が、相手のターゲットに認証を求められた
+         * ときに使う鍵(nvme_auth.c)。ctrl= を付けると双方向を求める。 */
+        nvme_auth_host_shell(line + 8);
+        /* 認証は接続のときに 1 回だけ行うので、鍵を変えたら張り直させる
+         * (張ったままだと、次の tcpbench / bench は古い鍵で認証済みの接続を使い続ける)。 */
+        const char *a = line + 8;
+        while (*a == ' ') a++;
+        if (*a != '\0') {
+            shell_tcp_session_close("鍵を変えたのでセッションを張り直します");
+            nvme_rdma_force_reconnect();
+        }
     } else if (strncmp(line, "nvmetauth", 9) == 0) {
         /* nvmetauth                                      -- 設定を表示
          * nvmetauth <hostnqn> <DHHC-1:..:..:> [sha256|sha384|sha512]

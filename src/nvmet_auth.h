@@ -26,6 +26,8 @@
 #define NVMET_AUTH_CONNECT_ATR       (1u << 17)
 
 #define NVMET_AUTH_NQN_MAX           256u
+/* Authentication Receive の最大長(Linux のホストは 4096 を入れてくる)。 */
+#define NVME_AUTH_RECV_BYTES         4096u
 
 /* admin キュー 1 本ぶん(= 1 セッション)の認証の状態。 */
 typedef struct {

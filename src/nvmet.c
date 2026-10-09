@@ -337,7 +337,13 @@ static void nvmet_build_disc_log(nvmet_ctx_t *ctx, const netaddr_t *addr)
     e[NVMET_DISC_ENT_OFF_TRTYPE]  = 3u;   /* NVMF_TRTYPE_TCP */
     e[NVMET_DISC_ENT_OFF_ADRFAM]  = (addr && addr->family == NETADDR_V6) ? 2u : 1u; /* IP6 : IP4 */
     e[NVMET_DISC_ENT_OFF_SUBTYPE] = 2u;   /* NVME_NQN_NVME (NVMe subsystem) */
-    e[NVMET_DISC_ENT_OFF_TREQ]    = 0u;   /* NVMF_TREQ_NOT_SPECIFIED */
+    /* TREQ の bit1:0 は secure channel(TLS)を求めるかどうか。TLS はまだ無いので
+     * 「求めない」(NVMF_TREQ_NOT_REQUIRED = 2)。0(指定なし)だと、ホストは TLS 付きで
+     * 繋ぐべきか判断できない。**DH-HMAC-CHAP はここには載らない**(TREQ に認証の
+     * ビットは無い。認証を求めることは Connect の応答の ATR で伝える)。
+     * bit2(SQ flow control を無効にできる)は対応していないので立てない。
+     * Linux nvmet も configfs の addr_treq の bit1:0 をそのまま入れる。 */
+    e[NVMET_DISC_ENT_OFF_TREQ]    = 2u;   /* NVMF_TREQ_NOT_REQUIRED */
     wr16le(&e[NVMET_DISC_ENT_OFF_PORTID], 1u);
     wr16le(&e[NVMET_DISC_ENT_OFF_CNTLID], 0xFFFFu); /* dynamic controller */
     wr16le(&e[NVMET_DISC_ENT_OFF_ASQSZ],  32u);     /* 32 以上でなければならない */

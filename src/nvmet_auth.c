@@ -1,4 +1,5 @@
 #include "nvmet_auth.h"
+#include "nvme_auth.h"
 #include "crypto.h"
 #include "timer.h"
 #include "uart.h"
@@ -33,17 +34,11 @@
 /* ------------------------------------------------------------------ */
 /* 設定(シェルの nvmetauth が書く。admin ジョブは読むだけ)。           */
 /* ------------------------------------------------------------------ */
-typedef struct {
-    uint8_t  key[64];
-    uint32_t len;
-    uint8_t  hash;        /* DHHC-1:<hh>: の hh。0 なら鍵をそのまま使う */
-} auth_key_t;
-
 static struct {
     int        enabled;
     char       hostnqn[NVMET_AUTH_NQN_MAX + 1];
-    auth_key_t host;      /* ホストの鍵(ホストが知っているはずの鍵)*/
-    auth_key_t ctrl;      /* コントローラの鍵(双方向のときホストに示す鍵)。len=0 なら無し */
+    nvme_auth_key_t host;      /* ホストの鍵(ホストが知っているはずの鍵)*/
+    nvme_auth_key_t ctrl;      /* コントローラの鍵(双方向のときホストに示す鍵)。len=0 なら無し */
     uint8_t    hash_pref; /* 優先するハッシュ(Linux の dhchap_hash、既定 SHA-256)*/
     uint8_t    dhgid;     /* 使う DH 群(Linux の dhchap_dhgroup、既定 NULL)*/
 } s_cfg = { .hash_pref = CRYPTO_SHA256 };
@@ -57,7 +52,6 @@ static inline void wr32le_b(uint8_t *p, uint32_t v) {
     p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); p[2] = (uint8_t)(v >> 16); p[3] = (uint8_t)(v >> 24);
 }
 
-static const char *const s_dh_name[6] = { "null", "ffdhe2048", "ffdhe3072", "ffdhe4096", "ffdhe6144", "ffdhe8192" };
 
 static unsigned hash_bits(uint8_t id) { return id == 1 ? 256u : id == 2 ? 384u : 512u; }
 
@@ -66,122 +60,6 @@ int nvmet_auth_enabled(void) { return s_cfg.enabled; }
 void nvmet_auth_reset(nvmet_auth_sess_t *s) {
     crypto_wipe(s, sizeof(*s));
     s->step = MSG_NEGOTIATE;
-}
-
-/*=================================================================
- * DHHC-1:<hh>:<base64>: を解く(Linux の nvme_auth_extract_key())。
- * base64 を解いた末尾 4 バイトが鍵本体の CRC-32(リトルエンディアン)。
- * 鍵本体は 32 / 48 / 64 バイト。
- * ===============================================================*/
-static int parse_secret(const char *sec, auth_key_t *k) {
-    if (strncmp(sec, "DHHC-1:", 7) != 0) return -1;
-    if (sec[7] < '0' || sec[7] > '9' || sec[8] < '0' || sec[8] > '9' || sec[9] != ':') return -1;
-    const unsigned hh = (unsigned)((sec[7] - '0') * 10 + (sec[8] - '0'));
-    if (hh > 3u) return -1;
-    const char *b = sec + 10;
-    const char *e = strchr(b, ':');
-    const size_t blen = e ? (size_t)(e - b) : strlen(b);
-    uint8_t raw[72];
-    const int n = crypto_base64_decode(b, blen, raw, sizeof(raw));
-    if (n != 36 && n != 52 && n != 68) return -2;
-    const uint32_t len = (uint32_t)n - 4u;
-    if (crypto_crc32(raw, len) != rd32le_b(raw + len)) return -3;
-    memcpy(k->key, raw, len);
-    crypto_wipe(raw, sizeof(raw));
-    k->len = len;
-    k->hash = (uint8_t)hh;
-    return 0;
-}
-
-/* 鍵の変換(Linux の nvme_auth_transform_key())。hash が 0 ならそのまま。
- * ホストの鍵は hostnqn、コントローラの鍵は subnqn で変換する。 */
-static uint32_t transform_key(const auth_key_t *k, const char *nqn, uint8_t *out) {
-    if (k->hash == 0) {
-        memcpy(out, k->key, k->len);
-        return k->len;
-    }
-    crypto_hmac_ctx_t t;
-    crypto_hmac_init(&t, (crypto_hash_id_t)k->hash, k->key, k->len);
-    crypto_hmac_update(&t, nqn, strlen(nqn));
-    crypto_hmac_update(&t, "NVMe-over-Fabrics", 17);
-    crypto_hmac_final(&t, out);
-    return (uint32_t)crypto_hash_len((crypto_hash_id_t)k->hash);
-}
-
-/* DH 群を使うときの「強めた」チャレンジ(Linux の nvme_auth_augmented_challenge())。
- *   Ca = HMAC(hash, H(共有秘密), C)
- * H は合意したハッシュそのもの。共有秘密は素数の長さに 0 詰めしたまま渡す。 */
-static void challenge_for(const nvmet_auth_sess_t *s, const uint8_t *c, uint8_t *out) {
-    const crypto_hash_id_t id = (crypto_hash_id_t)s->hashid;
-    const size_t hl = crypto_hash_len(id);
-    if (s->dhgid == 0) {
-        memcpy(out, c, hl);
-        return;
-    }
-    uint8_t hk[CRYPTO_HASH_MAX];
-    crypto_hash(id, s->skey, s->skey_len, hk);
-    crypto_hmac(id, hk, hl, c, hl, out);
-    crypto_wipe(hk, sizeof(hk));
-}
-
-/*=================================================================
- * ホストの応答 R1(Linux の nvmet_auth_host_hash())。
- *   R1 = HMAC(hash, 鍵, Ca1 ‖ S1(LE32) ‖ T_ID(LE16) ‖ SC_C ‖ "HostHost" ‖
- *             hostnqn ‖ 0x00 ‖ subnqn)
- * ===============================================================*/
-static void host_response(const nvmet_auth_sess_t *s, const char *subnqn, uint8_t *out) {
-    uint8_t tkey[CRYPTO_HASH_MAX], ca[CRYPTO_HASH_MAX], b4[4];
-    const uint32_t tlen = transform_key(&s_cfg.host, s->hostnqn, tkey);
-    const crypto_hash_id_t id = (crypto_hash_id_t)s->hashid;
-    const size_t hl = crypto_hash_len(id);
-    challenge_for(s, s->c1, ca);
-    crypto_hmac_ctx_t h;
-    crypto_hmac_init(&h, id, tkey, tlen);
-    crypto_hmac_update(&h, ca, hl);
-    wr32le_b(b4, s->s1);
-    crypto_hmac_update(&h, b4, 4);
-    wr16le(b4, s->tid);
-    crypto_hmac_update(&h, b4, 2);
-    crypto_hmac_update(&h, &s->sc_c, 1);
-    crypto_hmac_update(&h, "HostHost", 8);
-    crypto_hmac_update(&h, s->hostnqn, strlen(s->hostnqn));
-    b4[0] = 0;
-    crypto_hmac_update(&h, b4, 1);
-    crypto_hmac_update(&h, subnqn, strlen(subnqn));
-    crypto_hmac_final(&h, out);
-    crypto_wipe(tkey, sizeof(tkey));
-    crypto_wipe(ca, sizeof(ca));
-}
-
-/*=================================================================
- * コントローラの応答 R2(双方向のとき。Linux の nvmet_auth_ctrl_hash())。
- *   R2 = HMAC(hash, 鍵, Ca2 ‖ S2(LE32) ‖ T_ID(LE16) ‖ 0x00 ‖ "Controller" ‖
- *             subnqn ‖ 0x00 ‖ hostnqn)
- * 鍵はコントローラの鍵を subnqn で変換したもの。**NQN の並びと区切りが
- * ホスト側と逆**(subnqn が先)なので取り違えないこと。
- * ===============================================================*/
-static void ctrl_response(const nvmet_auth_sess_t *s, const char *subnqn, uint8_t *out) {
-    uint8_t tkey[CRYPTO_HASH_MAX], ca[CRYPTO_HASH_MAX], b4[4];
-    const uint32_t tlen = transform_key(&s_cfg.ctrl, subnqn, tkey);
-    const crypto_hash_id_t id = (crypto_hash_id_t)s->hashid;
-    const size_t hl = crypto_hash_len(id);
-    challenge_for(s, s->c2, ca);
-    crypto_hmac_ctx_t h;
-    crypto_hmac_init(&h, id, tkey, tlen);
-    crypto_hmac_update(&h, ca, hl);
-    wr32le_b(b4, s->s2);
-    crypto_hmac_update(&h, b4, 4);
-    wr16le(b4, s->tid);
-    crypto_hmac_update(&h, b4, 2);
-    b4[0] = 0;
-    crypto_hmac_update(&h, b4, 1);
-    crypto_hmac_update(&h, "Controller", 10);
-    crypto_hmac_update(&h, subnqn, strlen(subnqn));
-    crypto_hmac_update(&h, b4, 1);
-    crypto_hmac_update(&h, s->hostnqn, strlen(s->hostnqn));
-    crypto_hmac_final(&h, out);
-    crypto_wipe(tkey, sizeof(tkey));
-    crypto_wipe(ca, sizeof(ca));
 }
 
 /* ------------------------------------------------------------------ */
@@ -264,7 +142,7 @@ static void on_negotiate(nvmet_auth_sess_t *s, const uint8_t *d, uint32_t len) {
     s->dhgid = s_cfg.dhgid;
     s->step = MSG_CHALLENGE;
     uart_printf("[auth] Negotiate: T_ID=%u ハッシュ=SHA-%u DH=%s\n", s->tid, hash_bits(pick),
-                s_dh_name[s->dhgid]);
+                nvme_auth_dh_name(s->dhgid));
 }
 
 /* DH-HMAC-CHAP_Reply(Linux の nvmet_auth_reply())。
@@ -295,11 +173,13 @@ static void on_reply(nvmet_auth_sess_t *s, const uint8_t *d, uint32_t len, const
         }
         s->skey_len = (uint32_t)plen;
         crypto_wipe(s->dh_priv, sizeof(s->dh_priv));
-        uart_printf("[auth] 共有秘密を計算(%s、%u us)\n", s_dh_name[s->dhgid],
+        uart_printf("[auth] 共有秘密を計算(%s、%u us)\n", nvme_auth_dh_name(s->dhgid),
                     (unsigned)get_us_from(t0));
     }
-    uint8_t expect[CRYPTO_HASH_MAX];
-    host_response(s, subnqn, expect);
+    uint8_t expect[CRYPTO_HASH_MAX], ca1[CRYPTO_HASH_MAX];
+    nvme_auth_augment(s->hashid, s->dhgid, s->skey, s->skey_len, s->c1, ca1);
+    nvme_auth_host_response(&s_cfg.host, s->hashid, ca1, s->s1, s->tid, s->sc_c, s->hostnqn, subnqn, expect);
+    crypto_wipe(ca1, sizeof(ca1));
     const int ok = crypto_equal(expect, d + 16, hl);
     crypto_wipe(expect, sizeof(expect));
     if (!ok) {
@@ -407,7 +287,7 @@ uint16_t nvmet_auth_receive(nvmet_auth_sess_t *s, uint32_t cdw10, uint32_t cdw11
             if (crypto_ffdhe_keygen(s->dhgid, s->dh_priv, out + 16 + hl) != 0) {
                 return NVMET_AUTH_SC_INVALID_FIELD;
             }
-            uart_printf("[auth] DH 公開値を作った(%s、%u バイト、%u us)\n", s_dh_name[s->dhgid],
+            uart_printf("[auth] DH 公開値を作った(%s、%u バイト、%u us)\n", nvme_auth_dh_name(s->dhgid),
                         (unsigned)dhlen, (unsigned)get_us_from(t0));
         }
         s->step = MSG_REPLY;
@@ -423,7 +303,10 @@ uint16_t nvmet_auth_receive(nvmet_auth_sess_t *s, uint32_t cdw10, uint32_t cdw11
         wr16le(out + 4, s->tid);
         out[6] = hl;
         if (s->bidir) {
-            ctrl_response(s, subnqn, out + 16);
+            uint8_t ca2[CRYPTO_HASH_MAX];
+            nvme_auth_augment(s->hashid, s->dhgid, s->skey, s->skey_len, s->c2, ca2);
+            nvme_auth_ctrl_response(&s_cfg.ctrl, s->hashid, ca2, s->s2, s->tid, s->hostnqn, subnqn, out + 16);
+            crypto_wipe(ca2, sizeof(ca2));
             out[8] = 1;   /* rvalid */
             s->step = MSG_SUCCESS2;
         } else {
@@ -472,18 +355,18 @@ void nvmet_auth_shell(const char *args) {
         return;
     }
     if (nt >= 2) {
-        auth_key_t host, ctrl;
+        nvme_auth_key_t host, ctrl;
         memset(&ctrl, 0, sizeof(ctrl));
-        int r = parse_secret(tok[1], &host);
+        int r = nvme_auth_parse_secret(tok[1], &host);
         uint8_t pref = CRYPTO_SHA256, dh = 0;
         for (unsigned i = 2; i < nt && r == 0; i++) {
             if (!strcmp(tok[i], "sha256")) pref = CRYPTO_SHA256;
             else if (!strcmp(tok[i], "sha384")) pref = CRYPTO_SHA384;
             else if (!strcmp(tok[i], "sha512")) pref = CRYPTO_SHA512;
-            else if (!strncmp(tok[i], "ctrl=", 5)) r = parse_secret(tok[i] + 5, &ctrl);
+            else if (!strncmp(tok[i], "ctrl=", 5)) r = nvme_auth_parse_secret(tok[i] + 5, &ctrl);
             else {
                 unsigned g;
-                for (g = 0; g < 6u && strcmp(tok[i], s_dh_name[g]) != 0; g++) {
+                for (g = 0; g < 6u && strcmp(tok[i], nvme_auth_dh_name((uint8_t)g)) != 0; g++) {
                 }
                 if (g == 6u) {
                     uart_printf("nvmetauth: 分からない指定 %s\n%s", tok[i], usage);
@@ -494,8 +377,7 @@ void nvmet_auth_shell(const char *args) {
         }
         if (r != 0) {
             uart_printf("nvmetauth: 鍵の形式が正しくない(%s)。DHHC-1:<00-03>:<base64>: の形\n",
-                        r == -3 ? "末尾の CRC-32 が合わない" : r == -2 ? "長さが 32/48/64 バイトでない"
-                                                              : "書式");
+                        nvme_auth_parse_error(r));
             crypto_wipe(&host, sizeof(host));
             crypto_wipe(&ctrl, sizeof(ctrl));
             return;
@@ -521,6 +403,6 @@ void nvmet_auth_shell(const char *args) {
                     "コントローラの鍵 %s、優先ハッシュ SHA-%u、DH 群 %s)。次の Connect から\n",
                     s_cfg.hostnqn, s_cfg.host.len, s_cfg.host.hash,
                     s_cfg.ctrl.len ? "あり(双方向に応じる)" : "なし(片方向のみ)",
-                    hash_bits(s_cfg.hash_pref), s_dh_name[s_cfg.dhgid]);
+                    hash_bits(s_cfg.hash_pref), nvme_auth_dh_name(s_cfg.dhgid));
     }
 }

@@ -1,3 +1,4 @@
+#include "nvme_auth.h"
 #include <stddef.h>
 #include "nvme.h"
 #include "net.h"
@@ -601,6 +602,14 @@ typedef enum {
     NCONN_ST_TCP_ADMIN_WAIT,
     NCONN_ST_ICRESP_ADMIN_RECV,
     NCONN_ST_EXEC_FABRIC_CONNECT_ADMIN,
+    /* in-band 認証(DH-HMAC-CHAP、相手が Connect の応答で ATR を立てたとき)。
+     * 列挙の位置は admin の確立より後・IO の確立より前に置く(キャンセル時に
+     * `state > NCONN_ST_TCP_IO_WAIT` で IO を閉じるかを決めているため)。 */
+    NCONN_ST_AUTH_NEGOTIATE,
+    NCONN_ST_AUTH_CHALLENGE,
+    NCONN_ST_AUTH_REPLY,
+    NCONN_ST_AUTH_RESULT,
+    NCONN_ST_AUTH_SUCCESS2,
     NCONN_ST_EXEC_PROPSET_CC,
     NCONN_ST_CSTS_POLL_WAIT,
     NCONN_ST_CSTS_POLL_EXEC,
@@ -629,6 +638,10 @@ typedef struct {
     nvme_exec_ctx_t       exec;
     uint32_t              csts_poll_count;
     uint8_t               id_buf[4096] __attribute__((aligned(64)));
+    /* in-band 認証。受信(Challenge / Success1)は id_buf を使い回す。 */
+    nvme_auth_host_t      auth;
+    uint8_t               auth_tx[16 + 2 * 64 + CRYPTO_FFDHE_MAX_LEN] __attribute__((aligned(64)));
+    int                   auth_failed;
 
 } nvme_connect_job_ctx_t;
 
@@ -670,6 +683,47 @@ static job_result_t nvme_connect_job_finish_discovery(nvme_connect_job_ctx_t *jc
     jc->ctx->busy = 0;
     uart_printf("[nvme] Discovery 完了 (IOキューは作らない)\n");
     return JOB_DONE;
+}
+
+/*=================================================================
+ * Authentication Send(fctype 0x05、データは in-capsule)/ Receive(0x06)の
+ * SQE。cdw10 = SECP 0xE9 / SPSP0 = SPSP1 = 1、cdw11 = 長さ(TL / AL)。
+ * ===============================================================*/
+static void nvme_build_auth_sqe(nvme_sqe_t *sqe, int send, uint32_t len)
+{
+    nvme_zero(sqe, sizeof(*sqe));
+    wr32le(&sqe->cdw0, NVME_FABRIC_CMD | ((uint32_t)NVME_PSDT_SGL_MPTR_CONTIGUOUS << 8));
+    wr32le(&sqe->nsid, send ? NVME_FABRIC_FCTYPE_AUTH_SEND : NVME_FABRIC_FCTYPE_AUTH_RECV);
+    if (send) {
+        nvme_set_sgl_inline(sqe, len);
+    } else {
+        nvme_set_sgl(sqe, len);
+    }
+    wr32le(&sqe->cdw10, NVME_AUTH_CDW10);
+    wr32le(&sqe->cdw11, len);
+}
+
+static void nvme_auth_exec_send(nvme_connect_job_ctx_t *jc, uint32_t len)
+{
+    nvme_build_auth_sqe(&jc->sqe, 1, len);
+    nvme_exec_begin(&jc->exec, &jc->ctx->admin, &jc->sqe, jc->auth_tx, len, NULL, 0);
+}
+
+static void nvme_auth_exec_recv(nvme_connect_job_ctx_t *jc)
+{
+    nvme_build_auth_sqe(&jc->sqe, 0, NVME_AUTH_RECV_LEN);
+    nvme_exec_begin(&jc->exec, &jc->ctx->admin, &jc->sqe, NULL, 0, jc->id_buf, NVME_AUTH_RECV_LEN);
+}
+
+/* admin の確立(と認証)が済んだので CC.EN を立てに行く。 */
+static job_result_t nvme_connect_start_enable(job_t *self, nvme_connect_job_ctx_t *jc)
+{
+    uint32_t cc = NVME_CC_EN | NVME_CC_CSS_NVM | NVME_CC_AMS_RR | NVME_CC_SHN_NONE |
+                  NVME_CC_IOSQES | NVME_CC_IOCQES;
+    nvme_build_property_set_sqe(&jc->sqe, NVME_REG_CC, cc);
+    nvme_exec_begin(&jc->exec, &jc->ctx->admin, &jc->sqe, NULL, 0, NULL, 0);
+    self->state = NCONN_ST_EXEC_PROPSET_CC;
+    return JOB_WAITING;
 }
 
 /*=================================================================
@@ -756,16 +810,88 @@ static job_result_t nvme_connect_job_step(job_t *self)
     case NCONN_ST_EXEC_FABRIC_CONNECT_ADMIN: {
         if (!nvme_exec_step(&jc->exec)) return JOB_WAITING;
         if (jc->exec.result != 0) return nvme_connect_job_fail(jc, 1, 0, "admin Fabrics Connect失敗");
-        ctx->ctrlr_id = (uint16_t)(rd32le(&jc->exec.cqe_out.dw0) & 0xFFFFu);
-        uart_printf("[nvme] admin queue接続完了 (controller id=%u)\n", ctx->ctrlr_id);
+        const uint32_t cdw0 = rd32le(&jc->exec.cqe_out.dw0);
+        ctx->ctrlr_id = (uint16_t)(cdw0 & 0xFFFFu);
+        uart_printf("[nvme] admin queue接続完了 (controller id=%u%s)\n", ctx->ctrlr_id,
+                    (cdw0 & NVME_AUTH_CONNECT_ATR) ? "、相手が認証を求めている" : "");
+        if (cdw0 & NVME_AUTH_CONNECT_ATR) {
+            /* **相手(コントローラ)が DH-HMAC-CHAP を求めている。** 鍵は `nvmeauth`。 */
+            const nvme_auth_key_t *hk = nvme_auth_host_key();
+            if (hk->len == 0) {
+                return nvme_connect_job_fail(jc, 1, 0, "相手が認証を求めたがイニシエータの鍵が無い(nvmeauth)");
+            }
+            nvme_zero(&jc->auth, sizeof(jc->auth));
+            jc->auth.host = *hk;
+            jc->auth.ctrl = *nvme_auth_ctrl_key();
+            jc->auth.hostnqn = NVME_HOST_NQN;
+            jc->auth.subnqn = ctx->subnqn;
+            jc->auth_failed = 0;
+            nvme_auth_exec_send(jc, nvme_auth_host_negotiate(&jc->auth, jc->auth_tx));
+            self->state = NCONN_ST_AUTH_NEGOTIATE;
+            return JOB_WAITING;
+        }
+        return nvme_connect_start_enable(self, jc);
+    }
 
-        uint32_t cc = NVME_CC_EN | NVME_CC_CSS_NVM | NVME_CC_AMS_RR | NVME_CC_SHN_NONE |
-                      NVME_CC_IOSQES | NVME_CC_IOCQES;
-        nvme_build_property_set_sqe(&jc->sqe, NVME_REG_CC, cc);
-        nvme_exec_begin(&jc->exec, &ctx->admin, &jc->sqe, NULL, 0, NULL, 0);
-        self->state = NCONN_ST_EXEC_PROPSET_CC;
+    case NCONN_ST_AUTH_NEGOTIATE:
+        if (!nvme_exec_step(&jc->exec)) return JOB_WAITING;
+        if (jc->exec.result != 0) return nvme_connect_job_fail(jc, 1, 0, "認証: Negotiate が拒否された");
+        nvme_auth_exec_recv(jc);
+        self->state = NCONN_ST_AUTH_CHALLENGE;
+        return JOB_WAITING;
+
+    case NCONN_ST_AUTH_CHALLENGE: {
+        if (!nvme_exec_step(&jc->exec)) return JOB_WAITING;
+        if (jc->exec.result != 0) return nvme_connect_job_fail(jc, 1, 0, "認証: Challenge を受け取れない");
+        const char *why = "";
+        const uint32_t n = nvme_auth_host_reply(&jc->auth, jc->id_buf, NVME_AUTH_RECV_LEN,
+                                                jc->auth_tx, sizeof(jc->auth_tx), &why);
+        if (n == 0) {
+            nvme_auth_host_wipe(&jc->auth);
+            uart_printf("[nvme] 認証: %s\n", why);
+            return nvme_connect_job_fail(jc, 1, 0, "認証: Challenge が受け入れられない");
+        }
+        uart_printf("[nvme] 認証: Challenge(ハッシュ %u、DH %s)に Reply を返す%s\n", jc->auth.hashid,
+                    nvme_auth_dh_name(jc->auth.dhgid), jc->auth.bidir ? "(双方向)" : "");
+        nvme_auth_exec_send(jc, n);
+        self->state = NCONN_ST_AUTH_REPLY;
         return JOB_WAITING;
     }
+
+    case NCONN_ST_AUTH_REPLY:
+        if (!nvme_exec_step(&jc->exec)) return JOB_WAITING;
+        if (jc->exec.result != 0) return nvme_connect_job_fail(jc, 1, 0, "認証: Reply が拒否された");
+        nvme_auth_exec_recv(jc);
+        self->state = NCONN_ST_AUTH_RESULT;
+        return JOB_WAITING;
+
+    case NCONN_ST_AUTH_RESULT: {
+        if (!nvme_exec_step(&jc->exec)) return JOB_WAITING;
+        if (jc->exec.result != 0) return nvme_connect_job_fail(jc, 1, 0, "認証: 結果を受け取れない");
+        const char *why = "";
+        uint32_t olen = 0;
+        const int ok = nvme_auth_host_result(&jc->auth, jc->id_buf, NVME_AUTH_RECV_LEN,
+                                             jc->auth_tx, &olen, &why);
+        nvme_auth_host_wipe(&jc->auth);
+        if (!ok) uart_printf("[nvme] 認証: %s\n", why);
+        if (olen != 0) {
+            /* 双方向の Success2、またはコントローラを認めない Failure2 を送る。 */
+            jc->auth_failed = !ok;
+            nvme_auth_exec_send(jc, olen);
+            self->state = NCONN_ST_AUTH_SUCCESS2;
+            return JOB_WAITING;
+        }
+        if (!ok) return nvme_connect_job_fail(jc, 1, 0, "認証に失敗");
+        uart_printf("[nvme] 認証: 済んだ(片方向)\n");
+        return nvme_connect_start_enable(self, jc);
+    }
+
+    case NCONN_ST_AUTH_SUCCESS2:
+        if (!nvme_exec_step(&jc->exec)) return JOB_WAITING;
+        if (jc->auth_failed) return nvme_connect_job_fail(jc, 1, 0, "認証: コントローラを認めなかった");
+        if (jc->exec.result != 0) return nvme_connect_job_fail(jc, 1, 0, "認証: Success2 が拒否された");
+        uart_printf("[nvme] 認証: 済んだ(双方向)\n");
+        return nvme_connect_start_enable(self, jc);
 
     case NCONN_ST_EXEC_PROPSET_CC: {
         if (!nvme_exec_step(&jc->exec)) return JOB_WAITING;

@@ -6,6 +6,7 @@
 #include "rdma_cm.h"
 #include "job.h"
 #include "nvme_types.h"
+#include "nvme_auth.h"
 
 #define NVME_RDMA_MSG_MAX    2048u
 #define NVME_RDMA_ID_BUF_LEN 4096u  /* Identify Controller/Namespace応答長 */
@@ -39,6 +40,8 @@ typedef enum {
     NVMER_ST_PIPELINE_LOOP,
     NVMER_ST_DONE_OK,
     NVMER_ST_DONE_FAIL,
+    NVMER_ST_AUTH_SEND,   /* in-band 認証のメッセージを 1 個出す(auth_phase で中身が決まる)*/
+    NVMER_ST_AUTH_WAIT,
 } nvme_rdma_state_t;
 
 /* RDMA パイプラインの同時 outstanding 数の上限。RQ 256 / SQ 64 WQEBB /
@@ -105,6 +108,13 @@ typedef struct {
 
     int      reusable;
     uint32_t established_generation;
+
+    /* in-band 認証(相手が Connect の応答で ATR を立てたとき)。送るデータは
+     * send_buf[64..]、受け取るデータは id_ns(Identify Namespace の前なので空いている)。 */
+    nvme_auth_host_t auth;
+    uint8_t  auth_phase;
+    uint32_t auth_len;
+    int      auth_failed;
 } nvme_rdma_ctx_t;
 
 job_result_t nvme_rdma_connect_job_step(job_t *self);

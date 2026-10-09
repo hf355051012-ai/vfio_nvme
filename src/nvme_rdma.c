@@ -223,6 +223,31 @@ static uint32_t nvmer_build_connect(nvme_rdma_ctx_t *ctx, uint16_t qid, const ch
 }
 
 /*=================================================================
+ * Authentication Send(fctype 0x05)/ Receive(0x06)の capsule。
+ * admin キューは in-capsule を使えない(相手の RECV が 64 バイト)ので、
+ * 送るデータは send_buf[64..] を keyed SGL で相手に RDMA_READ させ、
+ * 受け取るデータは id_ns へ RDMA_WRITE してもらう。
+ * ===============================================================*/
+enum { NVMER_AUTH_NEG = 0, NVMER_AUTH_CHAL, NVMER_AUTH_REPLY, NVMER_AUTH_RESULT, NVMER_AUTH_S2 };
+
+static uint32_t nvmer_build_auth(nvme_rdma_ctx_t *ctx, int send, uint32_t len)
+{
+    volatile uint8_t *b = ctx->send_buf;
+    nvmer_zero_v(b, 64u);
+    wr32le(&b[0], NVME_FABRIC_CMD | ((uint32_t)NVME_PSDT_SGL_MPTR_CONTIGUOUS << 8));
+    wr16le(&b[2], ctx->cur_cid);
+    wr32le(&b[4], send ? NVME_FABRIC_FCTYPE_AUTH_SEND : NVME_FABRIC_FCTYPE_AUTH_RECV);
+    if (send) {
+        nvmer_set_ksgl(&b[24], mlx5_dma_addr((const void *)(uintptr_t)&b[64]), len, nvmer_qp(ctx)->mkey);
+    } else {
+        nvmer_set_ksgl(&b[24], mlx5_dma_addr((const void *)(uintptr_t)ctx->id_ns), len, nvmer_qp(ctx)->mkey);
+    }
+    wr32le(&b[40], NVME_AUTH_CDW10);
+    wr32le(&b[44], len);
+    return 64u;
+}
+
+/*=================================================================
  * Fabrics Property Set capsule を組み立てる(CC レジスタ書き込み用)。
  *
  * 引数:
@@ -587,10 +612,94 @@ job_result_t nvme_rdma_connect_job_step(job_t *self)
         if (rc < 0) return nvmer_fail(ctx, "Fabrics Connect失敗");
         uint16_t status = rd16le(&ctx->recv_buf[14]);
         if (nvme_cqe_status_code(status) != 0) return nvmer_fail(ctx, "Fabrics Connect: 応答エラー");
-        ctx->cntlid = (uint16_t)(rd32le(&ctx->recv_buf[0]) & 0xFFFFu);
-        uart_printf("[nvme-rdma] Fabrics Connect完了 (cntlid=%u)\n", ctx->cntlid);
+        const uint32_t cdw0 = rd32le(&ctx->recv_buf[0]);
+        ctx->cntlid = (uint16_t)(cdw0 & 0xFFFFu);
+        uart_printf("[nvme-rdma] Fabrics Connect完了 (cntlid=%u%s)\n", ctx->cntlid,
+                    (cdw0 & NVME_AUTH_CONNECT_ATR) ? "、相手が認証を求めている" : "");
         ctx->cur_cid++;
+        if (cdw0 & NVME_AUTH_CONNECT_ATR) {
+            const nvme_auth_key_t *hk = nvme_auth_host_key();
+            if (hk->len == 0) return nvmer_fail(ctx, "相手が認証を求めたがイニシエータの鍵が無い(nvmeauth)");
+            nvmer_zero_v((volatile uint8_t *)&ctx->auth, (uint32_t)sizeof(ctx->auth));
+            ctx->auth.host = *hk;
+            ctx->auth.ctrl = *nvme_auth_ctrl_key();
+            ctx->auth.hostnqn = NVME_RDMA_HOST_NQN;
+            ctx->auth.subnqn = (s_remote.enabled && s_remote.subnqn[0]) ? s_remote.subnqn : NVMET_RDMA_SUBNQN;
+            ctx->auth_failed = 0;
+            ctx->auth_phase = NVMER_AUTH_NEG;
+            ctx->auth_len = nvme_auth_host_negotiate(&ctx->auth, (uint8_t *)(uintptr_t)&ctx->send_buf[64]);
+            self->state = NVMER_ST_AUTH_SEND;
+            return JOB_WAITING;
+        }
         self->state = NVMER_ST_SEND_PROP_SET_CC;
+        return JOB_WAITING;
+    }
+
+    case NVMER_ST_AUTH_SEND: {
+        if (nvmer_post_recv(ctx) != 0) return nvmer_fail(ctx, "post_recv(認証)失敗");
+        const int send = (ctx->auth_phase == NVMER_AUTH_NEG || ctx->auth_phase == NVMER_AUTH_REPLY ||
+                          ctx->auth_phase == NVMER_AUTH_S2);
+        nvmer_post_send(ctx, nvmer_build_auth(ctx, send, send ? ctx->auth_len : NVME_AUTH_RECV_LEN));
+        self->state = NVMER_ST_AUTH_WAIT;
+        return JOB_WAITING;
+    }
+
+    case NVMER_ST_AUTH_WAIT: {
+        int rc = nvmer_wait_exec(ctx);
+        if (rc == 0) return JOB_WAITING;
+        if (rc < 0) return nvmer_fail(ctx, "認証: 応答が無い");
+        const uint16_t st = rd16le(&ctx->recv_buf[14]);
+        ctx->cur_cid++;
+        if (nvme_cqe_status_code(st) != 0 && ctx->auth_phase != NVMER_AUTH_S2) {
+            return nvmer_fail(ctx, "認証: コマンドが拒否された");
+        }
+        const uint8_t *in = (const uint8_t *)(uintptr_t)ctx->id_ns;
+        uint8_t *out = (uint8_t *)(uintptr_t)&ctx->send_buf[64];
+        const char *why = "";
+        switch (ctx->auth_phase) {
+        case NVMER_AUTH_NEG:
+            ctx->auth_phase = NVMER_AUTH_CHAL;
+            break;
+        case NVMER_AUTH_CHAL:
+            ctx->auth_len = nvme_auth_host_reply(&ctx->auth, in, NVME_AUTH_RECV_LEN, out,
+                                                 NVME_RDMA_MSG_MAX - 64u, &why);
+            if (ctx->auth_len == 0) {
+                nvme_auth_host_wipe(&ctx->auth);
+                uart_printf("[nvme-rdma] 認証: %s\n", why);
+                return nvmer_fail(ctx, "認証: Challenge が受け入れられない");
+            }
+            uart_printf("[nvme-rdma] 認証: Challenge(ハッシュ %u、DH %s)に Reply を返す%s\n",
+                        ctx->auth.hashid, nvme_auth_dh_name(ctx->auth.dhgid),
+                        ctx->auth.bidir ? "(双方向)" : "");
+            ctx->auth_phase = NVMER_AUTH_REPLY;
+            break;
+        case NVMER_AUTH_REPLY:
+            ctx->auth_phase = NVMER_AUTH_RESULT;
+            break;
+        case NVMER_AUTH_RESULT: {
+            uint32_t olen = 0;
+            const int ok = nvme_auth_host_result(&ctx->auth, in, NVME_AUTH_RECV_LEN, out, &olen, &why);
+            nvme_auth_host_wipe(&ctx->auth);
+            if (!ok) uart_printf("[nvme-rdma] 認証: %s\n", why);
+            if (olen != 0) {   /* Success2 か Failure2 を送る */
+                ctx->auth_failed = !ok;
+                ctx->auth_len = olen;
+                ctx->auth_phase = NVMER_AUTH_S2;
+                break;
+            }
+            if (!ok) return nvmer_fail(ctx, "認証に失敗");
+            uart_printf("[nvme-rdma] 認証: 済んだ(片方向)\n");
+            self->state = NVMER_ST_SEND_PROP_SET_CC;
+            return JOB_WAITING;
+        }
+        default:   /* NVMER_AUTH_S2 */
+            if (ctx->auth_failed) return nvmer_fail(ctx, "認証: コントローラを認めなかった");
+            if (nvme_cqe_status_code(st) != 0) return nvmer_fail(ctx, "認証: Success2 が拒否された");
+            uart_printf("[nvme-rdma] 認証: 済んだ(双方向)\n");
+            self->state = NVMER_ST_SEND_PROP_SET_CC;
+            return JOB_WAITING;
+        }
+        self->state = NVMER_ST_AUTH_SEND;
         return JOB_WAITING;
     }
 

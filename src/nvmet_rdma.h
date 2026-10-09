@@ -6,6 +6,7 @@
 #include "rdma_cm.h"
 #include "job.h"
 #include "nvme_types.h"
+#include "nvmet_auth.h"
 
 #define NVMET_RDMA_LBA_SIZE      512u
 #define NVMET_RDMA_NS_LBA_COUNT (NVMET_RDMA_RAMDISK_SLOT_SIZE / NVMET_RDMA_LBA_SIZE)
@@ -79,6 +80,15 @@ typedef struct {
     volatile uint8_t id_ns[NVMET_RDMA_ID_BUF_LEN] __attribute__((aligned(64)));
 
     volatile uint8_t *ram_disk;
+
+    /* in-band 認証(DH-HMAC-CHAP、nvmet_auth.c)。admin と IO の全キューで共有
+     * (認証するのは admin キューだけ。IO キューの Connect は、admin の認証が
+     * 済むまで拒否する)。 */
+    nvmet_auth_sess_t auth;
+    /* admin キューの Fabrics コマンドのデータ置き場(Connect 1024 バイト、
+     * Authentication Send / Receive)。**Linux のホストは admin キューで
+     * in-capsule を使わない**ので、keyed SGL で RDMA_READ / RDMA_WRITE する。 */
+    volatile uint8_t fab_buf[NVME_AUTH_RECV_BYTES] __attribute__((aligned(64)));
 } nvmet_rdma_ctrl_t;
 
 /* 1インスタンス分の RAM ディスク容量(dma_alloc で確保する、nvmet_rdma.c)。 */
@@ -99,6 +109,7 @@ typedef struct {
     uint32_t inline_off;        /* capsule 先頭の SQE(64B)からの相対オフセット */
     uint32_t inval_rkey;        /* 非0なら応答を SEND_WITH_INVALIDATE で返す */
     int      data_move_is_write;
+    int      fab_data;          /* 1=データの相手は ctrl->fab_buf(admin の Fabrics コマンド)*/
     uint32_t resp_dw0;
     uint32_t resp_dw1;
     uint16_t resp_status;
@@ -157,6 +168,7 @@ struct nvmet_rdma_ctx {
     int      need_data_move;      /* 1ならDATA_MOVEステートを経由する */
     int      data_inline;         /* 1ならデータが受信capsuleに載っている */
     int      data_move_is_write;
+    int      fab_data;            /* 1ならデータの相手は ctrl->fab_buf */
     uint64_t io_slba;             /* Write時、RDMA_READ完了後にram_diskへコミットする位置 */
 
     uint64_t deadline;
