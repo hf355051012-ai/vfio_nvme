@@ -35,7 +35,7 @@ static const char *const s_op_name[] = { "write", "read", "cas", "faa", "nop", "
 /* bw / lat で拡張 atomic を当てる場所(相手の hash の対象外。32B 境界 x 16 か所)。 */
 #define RS_XAREA_OFF  6144u
 
-static struct {
+typedef struct {
     rdma_cm_ctx_t cm;
     mlx5_dev_t *dev;
     int connected;
@@ -62,7 +62,16 @@ static struct {
     const volatile uint8_t *last_scat; /* 直前の CQE がデータを抱えていればその CQE */
     uint8_t cs_req;              /* この接続の qpc.cs_req(0 / 0x11)*/
     uint32_t bf_off;             /* 2 面ある BF レジスタのどちらを使うか(0 / RS_BF_BUF_SIZE)*/
-} s_rs;
+} rs_conn_t;
+
+/* **接続はポートごとに 1 本**(添字 = PF 番号)。2 ポートを同時に使うときは
+ * 両方を張り、bw2 が交互に投稿する。lat / verify などの単独の操作は
+ * s_cur(`rshort use pf0|pf1`、または最後に張ったほう)に対して行う。
+ * ホットパスの関数は s_rs を通して見るので、bw2 は s_cur を差し替えるだけで
+ * 同じ組み立て・ドアベル・回収の関数をそのまま使う。 */
+static rs_conn_t  s_rsv[2];
+static rs_conn_t *s_cur = &s_rsv[1];
+#define s_rs (*s_cur)
 
 /* 受け皿(read の着地点 / atomic の元値)と、inline を使わない write の送り元。
  * プロセスの rw 領域は起動時に VFIO へまるごとマップされているので .bss でよい。 */
@@ -762,6 +771,177 @@ static int rs_bw(rs_op_t op, uint32_t len, uint32_t qd, uint32_t ms, int quiet,
 }
 
 /*=================================================================
+ * **2 ポート同時のスループット。** ポートごとの接続(s_rsv[])を 1 本の
+ * ループで交互に回す。補充と回収の中身は rs_bw() と同じで、ポートごとの
+ * 状態(signaled の待ち行列・投稿数・回収済みの位置)を lane に分けただけ。
+ * mask は使うポート(bit0=PF0 / bit1=PF1)。片方だけにすると同じループで
+ * 1 ポートぶんを測れるので、1 本と 2 本を同じ測り方で比べられる。
+ * ===============================================================*/
+typedef struct {
+    rs_conn_t *c;
+    uint32_t f_start[RS_FIFO];
+    uint32_t f_end[RS_FIFO];
+    uint64_t f_ops[RS_FIFO];
+    uint32_t fh, ft;
+    uint64_t posted, done;
+    uint32_t sq_free_pc;
+    uint32_t since_sig;
+    uint64_t t_last;
+    uint64_t mismatch;
+} rs_lane_t;
+
+static rs_lane_t s_lanes[2];
+
+static int rs_bw_multi(rs_op_t op, uint32_t len, uint32_t qd, uint32_t ms, uint32_t mask) {
+    rs_conn_t *const keep = s_cur;
+    unsigned nl = 0;
+    rs_lane_t *ln[2];
+    for (int pf = 0; pf < 2; pf++) {
+        if (!(mask & (1u << pf))) continue;
+        if (!s_rsv[pf].connected) {
+            uart_printf("rshort: bw2: PF%d が未接続\n", pf);
+            return -1;
+        }
+        rs_lane_t *L = &s_lanes[nl];
+        memset(L, 0, sizeof(*L));
+        L->c = &s_rsv[pf];
+        L->sq_free_pc = L->c->sq_pc;
+        ln[nl++] = L;
+    }
+    if (qd == 0) qd = 1;
+    if (qd > RS_QD_MAX) qd = RS_QD_MAX;
+    uint32_t sig = s_opt_sig ? s_opt_sig : ((qd / 2u) ? ((qd / 2u > 32u) ? 32u : qd / 2u) : 1u);
+    if (op != RS_OP_WRITE) sig = 1u;   /* rs_bw() と同じ理由(scatter to CQE と同時数の上限)*/
+    if (sig > qd) sig = qd;
+    const int inl = (op == RS_OP_WRITE) &&
+                    (s_opt_inline == 1 || (s_opt_inline == 2 && len <= RS_INLINE_1BB_MAX));
+    uint8_t src[RSHORT_MAX_LEN];
+    for (unsigned j = 0; j < len && j < RSHORT_MAX_LEN; j++) src[j] = (uint8_t)(0xC3u ^ j);
+    if (op == RS_OP_WRITE && !inl) {
+        for (unsigned s = 0; s < RS_SLOTS; s++) memcpy(&s_wbuf[s * 64u], src, len);
+    }
+
+    const uint64_t khz = s_tsc_khz;
+    const uint64_t t_start = __rdtsc();
+    const uint64_t t_end = t_start + (uint64_t)ms * khz;
+    int stopping = 0;
+    uint32_t idle_spins = 0;
+    int rc_all = 0;
+
+    for (;;) {
+        if (!stopping && __rdtsc() >= t_end) stopping = 1;
+        int all_done = 1;
+        int progressed = 0;
+        for (unsigned l = 0; l < nl; l++) {
+            rs_lane_t *const L = ln[l];
+            s_cur = L->c;
+            /* ---- 補充 ---- */
+            uint64_t w0 = 0;
+            int any = 0;
+            const uint32_t first_pc = s_rs.sq_pc;
+            if (!stopping) {
+                while (L->posted - L->done < qd && (s_rs.sq_pc - L->sq_free_pc) + 2u <= RS_SQ_WQEBB &&
+                       L->ft - L->fh < RS_FIFO) {
+                    const uint32_t i = (uint32_t)L->posted;
+                    const int sgn = (++L->since_sig >= sig) || (L->posted + 1u - L->done >= qd);
+                    const unsigned slot = i & (RS_SLOTS - 1u);
+                    const uint64_t laddr = (op == RS_OP_WRITE) ? (s_rs.wbuf_iova + slot * 64u)
+                                         : (len > 64u) ? s_rs.big_iova : (s_rs.lbuf_iova + slot * 64u);
+                    const uint32_t start_pc = s_rs.sq_pc;
+                    uint32_t bbs;
+                    w0 = rs_build(op, len, s_rs.raddr + rs_target_off(op, i), src, laddr, 1u, 0u, sgn,
+                                  inl, &bbs);
+                    s_rs.sq_pc += bbs;
+                    L->posted++;
+                    any++;
+                    if (sgn) {
+                        L->since_sig = 0;
+                        const uint32_t e = L->ft & (RS_FIFO - 1u);
+                        L->f_start[e] = start_pc;
+                        L->f_end[e] = s_rs.sq_pc;
+                        L->f_ops[e] = L->posted;
+                        L->ft++;
+                    }
+                }
+            } else if (L->posted != L->done && L->fh == L->ft) {
+                /* 最後が unsignaled のまま止めた。signaled な NOP で締める。 */
+                const uint32_t start_pc = s_rs.sq_pc;
+                uint32_t bbs;
+                w0 = rs_build(RS_OP_NOP, 0, 0, 0, 0, 0, 0, 1, 0, &bbs);
+                s_rs.sq_pc += bbs;
+                const uint32_t e = L->ft & (RS_FIFO - 1u);
+                L->f_start[e] = start_pc;
+                L->f_end[e] = s_rs.sq_pc;
+                L->f_ops[e] = L->posted;
+                L->ft++;
+                any = 1;
+            }
+            if (any) rs_ring(w0, first_pc, (any == 1) ? (s_rs.sq_pc - first_pc) : 0u);
+
+            /* ---- 回収 ---- */
+            uint16_t cnt;
+            uint8_t synd = 0, vsynd = 0;
+            int rc;
+            while ((rc = rs_poll(&cnt, &synd, &vsynd)) != 0) {
+                if (rc < 0) {
+                    rs_report_cqe_err(s_op_name[op], synd, vsynd);
+                    rc_all = -1;
+                    goto out;
+                }
+                if (L->fh == L->ft) { L->mismatch++; continue; }
+                const uint32_t e = L->fh & (RS_FIFO - 1u);
+                if ((uint16_t)L->f_start[e] != cnt) L->mismatch++;
+                L->done = L->f_ops[e];
+                L->sq_free_pc = L->f_end[e];
+                L->fh++;
+                L->t_last = __rdtsc();
+                progressed = 1;
+            }
+            if (!(stopping && L->posted == L->done)) all_done = 0;
+        }
+        if (stopping && all_done) break;
+        if (progressed) {
+            idle_spins = 0;
+        } else if (++idle_spins > 50000000u) {
+            uart_printf("rshort: bw2: 完了が返らない\n");
+            for (unsigned l = 0; l < nl; l++) ln[l]->c->connected = 0;
+            rc_all = -1;
+            goto out;
+        }
+    }
+
+    {
+        uint64_t sum_ops = 0, ns_max = 0;
+        for (unsigned l = 0; l < nl; l++) {
+            rs_lane_t *const L = ln[l];
+            s_cur = L->c;
+            rs_sync_back();
+            const uint64_t ns = rs_cyc2ns(L->t_last - t_start);
+            const uint64_t kops = ns ? L->posted * 1000000ull / ns : 0;
+            const uint64_t mbps_x10 = ns ? L->posted * len * 10000ull / ns : 0;
+            uart_printf("rshort bw2 %s %uB qd=%u PF%d: %llu ops / %llu us -> %llu.%03llu Mops/s  "
+                        "%llu.%llu MB/s%s\n",
+                        s_op_name[op], len, qd, (int)(L->c - s_rsv), (unsigned long long)L->posted,
+                        (unsigned long long)(ns / 1000u), (unsigned long long)(kops / 1000u),
+                        (unsigned long long)(kops % 1000u), (unsigned long long)(mbps_x10 / 10u),
+                        (unsigned long long)(mbps_x10 % 10u),
+                        L->mismatch ? "  (!! CQE の wqe_counter が控えと食い違った)" : "");
+            sum_ops += L->posted;
+            if (ns > ns_max) ns_max = ns;
+        }
+        const uint64_t kops = ns_max ? sum_ops * 1000000ull / ns_max : 0;
+        const uint64_t mbps_x10 = ns_max ? sum_ops * len * 10000ull / ns_max : 0;
+        uart_printf("rshort bw2 %s %uB qd=%u 合計(%u ポート): %llu.%03llu Mops/s  %llu.%llu MB/s\n",
+                    s_op_name[op], len, qd, nl, (unsigned long long)(kops / 1000u),
+                    (unsigned long long)(kops % 1000u), (unsigned long long)(mbps_x10 / 10u),
+                    (unsigned long long)(mbps_x10 % 10u));
+    }
+out:
+    s_cur = keep;
+    return rc_all;
+}
+
+/*=================================================================
  * BlueFlame が本当に使われているかを確かめる。**ホストメモリ上の WQE と
  * BF レジスタへ書く WQE で inline データだけを変えて** 8B の write を 1 個出し、
  * 相手に届いた値を読み戻す。BF の値が届けば NIC は BF の WQE を実行した
@@ -1423,7 +1603,10 @@ static void rs_help(void) {
         "  rshort xprobe                                拡張 atomic の形式を実機で確かめる\n"
         "  rshort sweep [回数]                          lat を全種類・代表長で\n"
         "  rshort opt [inline|mfence|spread|bf|scqe on|off] [sig N]   scqe は次の connect から\n"
-        "  rshort bfprobe                               BlueFlame が NIC に使われているか\n",
+        "  rshort bfprobe                               BlueFlame が NIC に使われているか\n"
+        "  rshort use pf0|pf1                           単独の操作をどちらの接続に向けるか\n"
+        "  rshort bw2 <op> <len> <qd> [ms] [pf0|pf1|both]   2 ポートへ交互に投稿(qd はポートごと)\n"
+        "    op: w | r | cas | faa。使うポートを両方 connect しておく\n",
         RSHORT_DEFAULT_PORT);
 }
 
@@ -1470,12 +1653,52 @@ void rdma_short_shell(const char *args, mlx5_dev_t *dev0, mlx5_dev_t *dev1) {
             else if (!strcmp(tok[i], "pf1")) pf = 1;
             else port = (uint16_t)atoi(tok[i]);
         }
+        s_cur = &s_rsv[pf];
         if (s_rs.cm.rc_qp.in_use) rs_disconnect();
         rs_connect(pf ? dev1 : dev0, pf, ip, mac, port);
         return;
     }
     if (!strcmp(cmd, "disconnect")) {
-        rs_disconnect();
+        /* 引数無しなら張ってあるほう全部。 */
+        rs_conn_t *const keep = s_cur;
+        for (int pf = 0; pf < 2; pf++) {
+            if (nt >= 2 && strcmp(tok[1], pf ? "pf1" : "pf0") != 0) continue;
+            s_cur = &s_rsv[pf];
+            if (nt >= 2 || s_rs.cm.rc_qp.in_use || s_rs.connected) rs_disconnect();
+        }
+        s_cur = keep;
+        return;
+    }
+    if (!strcmp(cmd, "use")) {
+        if (nt >= 2) s_cur = &s_rsv[!strcmp(tok[1], "pf0") ? 0 : 1];
+        uart_printf("rshort: 単独の操作は PF%d の接続に対して行う(%s)\n",
+                    (int)(s_cur - s_rsv), s_rs.connected ? "接続中" : "未接続");
+        return;
+    }
+    if (!strcmp(cmd, "bw2")) {
+        rs_op_t op;
+        if (nt < 4 || rs_parse_op(tok[1], &op) != 0 ||
+            (op != RS_OP_WRITE && op != RS_OP_READ && op != RS_OP_CAS && op != RS_OP_FAA)) {
+            rs_help();
+            return;
+        }
+        uint32_t len = (uint32_t)atoi(tok[2]);
+        {
+            const char *q = tok[2];
+            while (*q >= '0' && *q <= '9') q++;
+            if (*q == 'k' || *q == 'K') len *= 1024u;
+        }
+        if (op == RS_OP_CAS || op == RS_OP_FAA) len = 8;
+        const uint32_t maxlen = (op == RS_OP_READ) ? RS_READ_MAX : RSHORT_MAX_LEN;
+        if (len < 1u || len > maxlen) {
+            uart_printf("rshort: 長さは 1〜%u\n", maxlen);
+            return;
+        }
+        const uint32_t qd = (uint32_t)atoi(tok[3]);
+        const uint32_t ms = (nt >= 5) ? (uint32_t)atoi(tok[4]) : 3000u;
+        uint32_t mask = 3u;
+        if (nt >= 6) mask = !strcmp(tok[5], "pf0") ? 1u : !strcmp(tok[5], "pf1") ? 2u : 3u;
+        rs_bw_multi(op, len, qd, ms, mask);
         return;
     }
     if (!strcmp(cmd, "caps")) {
