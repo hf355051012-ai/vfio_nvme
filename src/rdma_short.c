@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <x86intrin.h>
+#include "platform.h"
 
 /* RC QP の資源スロット(mlx5_dev_t.rcqp[])。NVMe-oF は admin=0、IO=1.. を使うので
  * 一番後ろを借りる。**NVMe-oF RDMA と同じ PF で同時に使わないこと**(GSI は
@@ -22,6 +23,7 @@
 #define RS_LAT_MAX    200000u
 #define RS_FIFO       256u     /* signaled な WQE の待ち行列(2 の冪)*/
 #define RS_SPIN_LIMIT_MS 2000u
+#define RS_READ_MAX   65536u   /* read の上限(64B を超える分は big バッファへ着地させる)*/
 /* BF レジスタ 1 面の大きさ。UAR の 0x800 から 2 面(log_bf_reg_size=9 の半分ずつ)。
  * rdma-core の mlx5 も bf->buf_size = bf_reg_size / 2 で交互に使う。 */
 #define RS_BF_BUF_SIZE 256u
@@ -55,6 +57,7 @@ static struct {
     uint32_t cq_cc;
     uint64_t lbuf_iova;
     uint64_t wbuf_iova;
+    uint64_t big_iova;           /* 64B を超える read の着地点(RS_READ_MAX、全操作で共有)*/
     volatile uint8_t *bf_page;   /* この QP の UAR ページを WC でマップしたもの(BlueFlame 用)*/
     const volatile uint8_t *last_scat; /* 直前の CQE がデータを抱えていればその CQE */
     uint8_t cs_req;              /* この接続の qpc.cs_req(0 / 0x11)*/
@@ -307,7 +310,7 @@ static uint64_t rs_one(rs_op_t op, uint32_t len, uint64_t roff, const uint8_t *s
                        unsigned slot, uint64_t swap_add, uint64_t cmp) {
     uint32_t bbs;
     const uint64_t laddr = (op == RS_OP_WRITE) ? (s_rs.wbuf_iova + slot * 64u)
-                                               : (s_rs.lbuf_iova + slot * 64u);
+                         : (len > 64u) ? s_rs.big_iova : (s_rs.lbuf_iova + slot * 64u);
     /* qd=1 は 32B まで inline(2 WQEBB でもデータの DMA 読みを省くほうが速い)。 */
     const int inl = (op == RS_OP_WRITE) && (s_opt_inline != 0);
     if (op == RS_OP_WRITE && !inl) memcpy(&s_wbuf[slot * 64u], src, len);
@@ -474,6 +477,11 @@ static int rs_connect(mlx5_dev_t *dev, int pf, uint32_t peer_ip, const uint8_t p
     s_rs.cq_cc = qp->cq_cc;
     s_rs.lbuf_iova = mlx5_dma_addr(s_lbuf);
     s_rs.wbuf_iova = mlx5_dma_addr(s_wbuf);
+    if (s_rs.big_iova == 0) {
+        /* 長い read の着地点。DMA プールから取るので IOVA が連続している。 */
+        dma_region_t big = dma_alloc(RS_READ_MAX, 4096u, DMA_COHERENT);
+        if (big.cpu != 0) s_rs.big_iova = mlx5_dma_addr(big.cpu);
+    }
     s_rs.bf_off = 0;
     s_rs.bf_page = (volatile uint8_t *)hal_bar0_map_wc(dev, (uint64_t)qp->uarn * 4096u, 4096u);
     if (s_rs.bf_page == 0) {
@@ -529,7 +537,7 @@ static int rs_lat(rs_op_t op, uint32_t len, uint32_t iters, int quiet, uint32_t 
     if (iters > RS_LAT_MAX) iters = RS_LAT_MAX;
     if (op == RS_OP_MCAS || op == RS_OP_MFAA) return rs_lat_masked(op, len, iters, quiet, out_p50, out_avg);
     uint8_t src[RSHORT_MAX_LEN];
-    for (unsigned j = 0; j < len; j++) src[j] = (uint8_t)(0x5Au ^ j);
+    for (unsigned j = 0; j < len && j < RSHORT_MAX_LEN; j++) src[j] = (uint8_t)(0x5Au ^ j);
     const uint32_t warm = iters / 10u + 100u;
     uint64_t cas_cur = 0;
     if (op == RS_OP_CAS) { // 現在値を知る(FAA +0)
@@ -606,7 +614,7 @@ static int rs_bw(rs_op_t op, uint32_t len, uint32_t qd, uint32_t ms, int quiet,
     const int inl = (op == RS_OP_WRITE) &&
                     (s_opt_inline == 1 || (s_opt_inline == 2 && len <= RS_INLINE_1BB_MAX));
     uint8_t src[RSHORT_MAX_LEN];
-    for (unsigned j = 0; j < len; j++) src[j] = (uint8_t)(0xC3u ^ j);
+    for (unsigned j = 0; j < len && j < RSHORT_MAX_LEN; j++) src[j] = (uint8_t)(0xC3u ^ j);
     /* 拡張 atomic: 欄は塊の先頭(o=0)。CAS は外れる比較値でもよい(操作の速さを測る)。 */
     uint8_t ma[32], mb[32], mc[32], md[32];
     uint32_t mS = 0;
@@ -670,7 +678,7 @@ static int rs_bw(rs_op_t op, uint32_t len, uint32_t qd, uint32_t ms, int quiet,
                 const int sgn = (++since_sig >= sig) || (posted + 1u - done >= qd);
                 const unsigned slot = i & (RS_SLOTS - 1u);
                 const uint64_t laddr = (op == RS_OP_WRITE) ? (s_rs.wbuf_iova + slot * 64u)
-                                                           : (s_rs.lbuf_iova + slot * 64u);
+                                     : (len > 64u) ? s_rs.big_iova : (s_rs.lbuf_iova + slot * 64u);
                 const uint32_t start_pc = s_rs.sq_pc;
                 uint32_t bbs;
                 if (mS != 0u) {
@@ -1526,9 +1534,16 @@ void rdma_short_shell(const char *args, mlx5_dev_t *dev0, mlx5_dev_t *dev1) {
         rs_op_t op;
         if (nt < 3 || rs_parse_op(tok[1], &op) != 0) { rs_help(); return; }
         uint32_t len = (uint32_t)atoi(tok[2]);
+        {   /* 1k / 64k のような k 付きも受ける */
+            const char *q = tok[2];
+            while (*q >= '0' && *q <= '9') q++;
+            if (*q == 'k' || *q == 'K') len *= 1024u;
+        }
         if (op == RS_OP_CAS || op == RS_OP_FAA) len = 8;
-        if (len < 1u || len > RSHORT_MAX_LEN) {
-            uart_printf("rshort: 長さは 1〜%u\n", RSHORT_MAX_LEN);
+        /* read だけは 64KB まで(BlueFlame / scatter to CQE の効き方を長さで比べるため)。 */
+        const uint32_t maxlen = (op == RS_OP_READ && s_rs.big_iova) ? RS_READ_MAX : RSHORT_MAX_LEN;
+        if (len < 1u || len > maxlen || (op == RS_OP_READ && len + 4096u > s_rs.rlen)) {
+            uart_printf("rshort: 長さは 1〜%u(read は %u まで)\n", RSHORT_MAX_LEN, maxlen);
             return;
         }
         if (op == RS_OP_MFAA && len > 8u && len != 16u && len != 32u) {
