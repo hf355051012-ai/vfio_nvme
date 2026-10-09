@@ -803,7 +803,7 @@ void rdma_cm_fill_addr(rdma_cm_ctx_t *ctx, mlx5_dev_t *dev, const char *self_lab
  * 戻り値:
  *   0=DREP を受けた、-1=送信失敗、1=待ち切れ
  * コール元:
- *   rdma_short_disconnect()
+ *   rdma_short_disconnect()、nvme_rdma.c の nvmer_send_dreq()
  * ===============================================================*/
 int rdma_cm_disconnect(rdma_cm_ctx_t *ctx, uint32_t wait_ms) {
     if (mlx5_qp_post_recv_gsi(ctx->dev, ctx->gsi_qp, (void *)(uintptr_t)ctx->recv_buf,

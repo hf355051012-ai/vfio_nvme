@@ -6374,6 +6374,7 @@ static void shell_dispatch(char *line, int s0, int s1)
                     "  nvmet [port] | jobs | help | quit    (↑↓で履歴呼び出し)\n"
                     "  例: bench 8,64,256 rw 8 / tcpbench 64,256 w digest / ts core 1 num 40\n");
     } else if (strncmp(line, "quit", 4) == 0 || strncmp(line, "exit", 4) == 0) {
+        nvme_rdma_shutdown();   /* 相手に接続を残さない(CM の DREQ)*/
         uart_printf("bye\n");
         exit(0);
     } else {

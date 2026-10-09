@@ -1238,6 +1238,27 @@ static void nvmer_destroy_qp_if_valid(mlx5_dev_t *dev, mlx5_qp_t *qp)
 }
 
 /*=================================================================
+ * 確立済みの接続に CM の DREQ を送り、DREP を待つ(rdma_cm_disconnect())。
+ *
+ * **送らずに QP を壊すと、相手(Linux の ib_cm)に前の接続が残る。** 次の
+ * REQ は同じ (CA GUID, QPN) になりやすく、REJ reason=10(stale connection)で
+ * 弾かれる。Linux も IO キュー -> admin の順に畳むので同じ順で呼ぶ。
+ * CM のジョブを止めた後(GSI を直接回すので)、QP を壊す前に呼ぶこと。
+ *
+ * 引数:
+ *   cm - 畳む接続の CM コンテキスト(確立していなければ何もしない)
+ * コール元:
+ *   nvme_rdma_run_bench()、nvme_rdma_shutdown()
+ * ===============================================================*/
+static void nvmer_send_dreq(rdma_cm_ctx_t *cm)
+{
+    if (cm->dev != 0 && cm->gsi_qp != 0 && cm->established) {
+        rdma_cm_disconnect(cm, 1000u);
+        cm->established = 0;
+    }
+}
+
+/*=================================================================
  * ctx を作り直す前に、それを参照しているジョブを止めて完全に抜けるまで待つ。
  *
  * **待たずにゼロクリアすると落ちる。** CM が失敗しても passive 側の CM ジョブ
@@ -1309,6 +1330,22 @@ static void nvmer_pin_target_to_core1(job_t *target_job)
 void nvme_rdma_force_reconnect(void)
 {
     s_init_ctx.reusable = 0;
+}
+
+/*=================================================================
+ * プロセスを終える前に、イニシエータの接続を CM の DREQ で畳む。
+ * 送らずに終えると相手に前の接続が残り、次に起動して繋ぐと
+ * REJ reason=10 で弾かれる(nvmer_send_dreq() の説明と同じ)。
+ *
+ * コール元:
+ *   shell_dispatch() の quit
+ * ===============================================================*/
+void nvme_rdma_shutdown(void)
+{
+    nvmer_quiesce_jobs(&s_init_ctx, &s_init_ctx.cm, 2000u);
+    nvmer_quiesce_jobs(&s_init_ctx, &s_init_ctx.io_cm, 2000u);
+    nvmer_send_dreq(&s_init_ctx.io_cm);
+    nvmer_send_dreq(&s_init_ctx.cm);
 }
 
 void nvme_rdma_run_bench(mlx5_dev_t *dev0, mlx5_dev_t *dev1, uint32_t duration_ms,
@@ -1388,6 +1425,8 @@ void nvme_rdma_run_bench(mlx5_dev_t *dev0, mlx5_dev_t *dev1, uint32_t duration_m
          * **残すと ctx をゼロクリアした後も回り続けて事故になる**
          * (RDMA CM で踏んだ segfault と同じ形)。 */
         nvmer_quiesce_jobs(&s_init_ctx, &s_init_ctx.io_cm, 2000u);
+        nvmer_send_dreq(&s_init_ctx.io_cm);
+        nvmer_send_dreq(&s_init_ctx.cm);
         nvmer_destroy_qp_if_valid(s_init_ctx.io_cm.dev, &s_init_ctx.io_cm.rc_qp);
         nvmer_destroy_qp_if_valid(s_init_ctx.cm.dev, &s_init_ctx.cm.rc_qp);
         nvmer_destroy_qp_if_valid(s_init_ctx.cm.dev, s_init_ctx.cm.gsi_qp);
