@@ -32,6 +32,7 @@
 /* admin キュー 1 本ぶん(= 1 セッション)の認証の状態。 */
 typedef struct {
     uint8_t  required;        /* このセッションは認証が済むまで他のコマンドを受けない */
+    uint8_t  allowed;         /* 鍵を設定したホスト。ホストから(再)認証を始めてよい */
     uint8_t  authenticated;
     uint8_t  failed;          /* Failure を返した / 受けた。以後は何も受けない */
     uint8_t  step;            /* 次に期待するメッセージ(NVME_AUTH_DHCHAP_MESSAGE_*)*/

@@ -7,8 +7,13 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* PSK は身元の版 1 / 版 0 の 2 本(tls13_nvme_psk())。 */
-static tls13_psk_t s_psk[2];
+/* PSK は身元の版 1 / 版 0 の 2 本(tls13_nvme_psk())を、subnqn と Discovery の NQN の
+ * 2 つぶん持つ。**TLS を必須にすると Discovery も TLS でしか繋げず**(TREQ も
+ * required を広告する)、ホストは身元に Discovery の NQN を入れた PSK を探す
+ * (Linux は `failed to add controller, error pre-shared TLS key is missing` で断る)。
+ * 同じ設定鍵から導出するので、ホストは `nvme gen-tls-key --subsysnqn=<Discovery NQN>`
+ * を同じ秘密で 1 本足せばよい。 */
+static tls13_psk_t s_psk[4];
 static unsigned    s_npsk;
 static char        s_hostnqn[256];
 static char        s_keylog_path[256];
@@ -16,18 +21,23 @@ static FILE       *s_keylog;
 
 volatile uint32_t g_nvmet_tls_corrupt;
 
-/* concatenation で生成した PSK(段階 H)。握手の候補は「設定した 2 本 + 生成した 1 本」。 */
+/* concatenation で生成した PSK(段階 H)。握手の候補は「設定した 4 本 + 生成した 1 本」。 */
 static tls13_psk_t s_gen;
 static int         s_gen_valid;
-static tls13_psk_t s_list[3];
+static tls13_psk_t s_list[5];
 
 int nvmet_tls_enabled(void) { return s_npsk != 0; }
 int nvmet_tls_possible(void) { return s_npsk != 0 || s_gen_valid; }
 
 void nvmet_tls_set_generated(const tls13_psk_t *p) {
+    /* 再認証(REPLACETLSPSK)では古い PSK を捨てて置き換える(Linux のターゲットも
+     * ctrl->tls_key を差し替える)。張ってある TLS の接続は鍵を握ったまま続く。 */
+    const int replaced = s_gen_valid;
     s_gen = *p;
     s_gen_valid = 1;
-    uart_printf("[nvmet-tls] secure channel concatenation: 生成した PSK を登録(身元 %.70s...)\n", s_gen.identity);
+    uart_printf("[nvmet-tls] secure channel concatenation: 生成した PSK を%s(身元 %.70s... 要約 %.12s)\n",
+                replaced ? "置き換え" : "登録", s_gen.identity,
+                s_gen.identity + (s_gen.identity_len > 44u ? s_gen.identity_len - 44u : 0u));
 }
 
 /* SSLKEYLOGFILE 形式で追記する。Precision の tshark に `-o tls.keylog_file:<path>` で
@@ -61,8 +71,10 @@ void nvmet_tls_shell(const char *args) {
         s_npsk = 0;
     } else if (nt >= 2) {
         const char *why = "";
-        tls13_psk_t p[2];
-        if (tls13_nvme_psk(p, tok[1], tok[0], NVMET_SUBNQN, &why) < 0) {
+        tls13_psk_t p[4];
+        if (tls13_nvme_psk(&p[0], tok[1], tok[0], NVMET_SUBNQN, &why) < 0 ||
+            tls13_nvme_psk(&p[2], tok[1], tok[0], NVMET_DISCOVERY_NQN, &why) < 0) {
+            crypto_wipe(p, sizeof(p));
             uart_printf("nvmettls: 鍵が使えない(%s)\n"
                         "使い方: nvmettls <hostnqn> <NVMeTLSkey-1:01:..:> [keylog <path>] / nvmettls off / "
                         "nvmettls corrupt <N>\n", why);
@@ -70,7 +82,7 @@ void nvmet_tls_shell(const char *args) {
         }
         memcpy(s_psk, p, sizeof(p));
         crypto_wipe(p, sizeof(p));
-        s_npsk = 2;
+        s_npsk = 4;
         strncpy(s_hostnqn, tok[0], sizeof(s_hostnqn) - 1u);
         s_keylog_path[0] = 0;
         if (s_keylog) {

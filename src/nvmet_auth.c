@@ -84,6 +84,7 @@ uint16_t nvmet_auth_on_connect(nvmet_auth_sess_t *s, const uint8_t *hostnqn256, 
         return NVMET_AUTH_SC_INVALID_HOST;
     }
     s->required = 1;
+    s->allowed = 1;
     *atr = NVMET_AUTH_CONNECT_ATR;
     return 0;
 }
@@ -95,9 +96,12 @@ uint16_t nvmet_auth_on_connect_tcp(nvmet_auth_sess_t *s, const uint8_t *hostnqn2
     s->queue_tls = (uint8_t)(queue_tls != 0);
     if (st == 0 && queue_tls && s->required) {
         /* TLS(PSK)で既に相手を確かめてある。Linux も TLS のキューには ATR を立てない。 */
+        /* ただし allowed は残す: ホストは後から REPLACETLSPSK で再認証して
+         * PSK を作り直せる(`dhchap_secret` への書き込み = Linux の
+         * nvme_ctrl_dhchap_secret_store())。その間もコマンドは止めない。 */
         s->required = 0;
         *atr = 0;
-        uart_printf("[auth] TLS で繋がった admin なので認証は求めない\n");
+        uart_printf("[auth] TLS で繋がった admin なので認証は求めない(再認証は受ける)\n");
     }
     return st;
 }
@@ -276,13 +280,15 @@ uint16_t nvmet_auth_send(nvmet_auth_sess_t *s, uint32_t cdw10, uint32_t cdw11,
     }
     const uint32_t tl = cdw11;
     if (tl == 0 || tl > dlen || data == NULL || tl < 8u) return NVMET_AUTH_SC_INVALID_FIELD;
-    if (!s->required) {
+    if (!s->required && !s->allowed) {
         uart_printf("[auth] 認証を求めていないセッションに Authentication Send\n");
         return NVMET_AUTH_SC_INVALID_FIELD;
     }
     const uint8_t type = data[0], id = data[1];
     if (type == AUTH_TYPE_COMMON && id == MSG_NEGOTIATE) {
         /* いつでも最初からやり直せる(Linux も同じ)。 */
+        if (s->authenticated || !s->required)
+            uart_printf("[auth] 再認証を始める(%s)\n", s->queue_tls ? "TLS のキュー" : "平文のキュー");
         s->authenticated = 0;
         s->failed = 0;
         s->bidir = 0;
