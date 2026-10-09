@@ -24,6 +24,46 @@
 _Static_assert(MLX5_QP_CQ_NUM_ENTRIES == 1024u, "MLX5_CQ_BUF_SIZE/MLX5_QP_CQE_SIZE assumption changed");
 
 /*=================================================================
+ * SQ の doorbell を鳴らす。WQE を書き終えた後に呼ぶ。
+ * ① doorbell record の送信カウンタ(dbr[4..7])に new_pc を書く
+ * → ② バリア → ③ UAR の BlueFlame 位置へ WQE の先頭 8 バイトを書く、の順。
+ * 最後に qp->sq_pc を new_pc へ進める。
+ *
+ * 引数:
+ *   dev    - この QP を持つ HCA
+ *   qp     - 対象 QP(uarn と sq_pc を使う)
+ *   dbr    - doorbell record(RC は mlx5_qp_dbr_addr()、GSI は dev->gsi_dbr_cpu)
+ *   new_pc - 投稿後の送信カウンタ(WQEBB 単位)
+ *   wqe    - 書き終えた WQE の先頭
+ * コール元:
+ *   mlx5_qp_post_send_ex(), mlx5_qp_post_send_ud(), mlx5_qp_post_rdma_common()
+ * ===============================================================*/
+static inline void mlx5_qp_ring_sq(mlx5_dev_t *dev, mlx5_qp_t *qp, volatile uint8_t *dbr,
+                                   uint32_t new_pc, const volatile uint8_t *wqe) {
+    dbr[4] = (uint8_t)(new_pc >> 24);
+    dbr[5] = (uint8_t)(new_pc >> 16);
+    dbr[6] = (uint8_t)(new_pc >> 8);
+    dbr[7] = (uint8_t)new_pc;
+
+    dma_wmb();
+
+    uint32_t raw0 = (uint32_t)wqe[0] | ((uint32_t)wqe[1] << 8) |
+                    ((uint32_t)wqe[2] << 16) | ((uint32_t)wqe[3] << 24);
+    uint32_t raw1 = (uint32_t)wqe[4] | ((uint32_t)wqe[5] << 8) |
+                    ((uint32_t)wqe[6] << 16) | ((uint32_t)wqe[7] << 24);
+    uint64_t uar_addr = dev->bar0_base + (uint64_t)qp->uarn * 4096u;
+    /* BlueFlame の 8 バイトは 1 命令でアトミックに書く。32bit x 2 に分けると
+     * PCIe 上で分割されうる(Linux の mlx5_write64() が「32bit システムでは
+     * ロックが必要」と注記しているのと同じ理由)。同時 RDMA_READ を 1 本から
+     * 16 本へ緩めてドアベル発行頻度が上がった途端、LOCAL_QP_OP_ERR
+     * (syndrome=0x02)として実機で顕在化した。 */
+    uint64_t raw64 = (uint64_t)raw0 | ((uint64_t)raw1 << 32);
+    mmio_write64(uar_addr + MLX5_BF_OFFSET, raw64);
+
+    qp->sq_pc = new_pc;
+}
+
+/*=================================================================
  * RC QP の SQ へ SEND WQE を 1 個投稿し、BlueFlame ドアベルを鳴らす。
  * 送信完了は待たない(mlx5_qp_poll_cqe() で確認する)。
  *
@@ -151,29 +191,8 @@ int mlx5_qp_post_send_ex(mlx5_dev_t *dev, mlx5_qp_t *qp, const void *data0, uint
     }
 
 ring_db:;
-    volatile uint8_t *dbr = (volatile uint8_t *)(uintptr_t)mlx5_qp_dbr_addr(dev, qp);
     uint32_t new_pc = pc + 1u;
-    dbr[4] = (uint8_t)(new_pc >> 24);
-    dbr[5] = (uint8_t)(new_pc >> 16);
-    dbr[6] = (uint8_t)(new_pc >> 8);
-    dbr[7] = (uint8_t)new_pc;
-
-    dma_wmb();
-
-    uint32_t raw0 = (uint32_t)wqe[0] | ((uint32_t)wqe[1] << 8) |
-                    ((uint32_t)wqe[2] << 16) | ((uint32_t)wqe[3] << 24);
-    uint32_t raw1 = (uint32_t)wqe[4] | ((uint32_t)wqe[5] << 8) |
-                    ((uint32_t)wqe[6] << 16) | ((uint32_t)wqe[7] << 24);
-    uint64_t uar_addr = dev->bar0_base + (uint64_t)qp->uarn * 4096u;
-    /* BlueFlame の 8 バイトは 1 命令でアトミックに書く。32bit x 2 に分けると
-     * PCIe 上で分割されうる(Linux の mlx5_write64() が「32bit システムでは
-     * ロックが必要」と注記しているのと同じ理由)。同時 RDMA_READ を 1 本から
-     * 16 本へ緩めてドアベル発行頻度が上がった途端、LOCAL_QP_OP_ERR
-     * (syndrome=0x02)として実機で顕在化した。 */
-    uint64_t raw64 = (uint64_t)raw0 | ((uint64_t)raw1 << 32);
-    mmio_write64(uar_addr + MLX5_BF_OFFSET, raw64);
-
-    qp->sq_pc = new_pc;
+    mlx5_qp_ring_sq(dev, qp, (volatile uint8_t *)(uintptr_t)mlx5_qp_dbr_addr(dev, qp), new_pc, wqe);
 
     volatile ts_rdma_t ts_info = {0};
     ts_info.rdma_op = TS_RDMA_OP_SQ_SEND;
@@ -275,29 +294,8 @@ int mlx5_qp_post_send_ud(mlx5_dev_t *dev, mlx5_qp_t *qp, const void *data, uint3
         wqe1[8 + b] = (uint8_t)(data_pa >> (56 - 8 * b));
     }
 
-    volatile uint8_t *dbr = (volatile uint8_t *)(uintptr_t)(uint64_t)dev->gsi_dbr_cpu;
     uint32_t new_pc = pc + 2u; // このWQEはWQEBB 2個分を消費した
-    dbr[4] = (uint8_t)(new_pc >> 24);
-    dbr[5] = (uint8_t)(new_pc >> 16);
-    dbr[6] = (uint8_t)(new_pc >> 8);
-    dbr[7] = (uint8_t)new_pc;
-
-    dma_wmb();
-
-    uint32_t raw0 = (uint32_t)wqe0[0] | ((uint32_t)wqe0[1] << 8) |
-                    ((uint32_t)wqe0[2] << 16) | ((uint32_t)wqe0[3] << 24);
-    uint32_t raw1 = (uint32_t)wqe0[4] | ((uint32_t)wqe0[5] << 8) |
-                    ((uint32_t)wqe0[6] << 16) | ((uint32_t)wqe0[7] << 24);
-    uint64_t uar_addr = dev->bar0_base + (uint64_t)qp->uarn * 4096u;
-    /* BlueFlame の 8 バイトは 1 命令でアトミックに書く。32bit x 2 に分けると
-     * PCIe 上で分割されうる(Linux の mlx5_write64() が「32bit システムでは
-     * ロックが必要」と注記しているのと同じ理由)。同時 RDMA_READ を 1 本から
-     * 16 本へ緩めてドアベル発行頻度が上がった途端、LOCAL_QP_OP_ERR
-     * (syndrome=0x02)として実機で顕在化した。 */
-    uint64_t raw64 = (uint64_t)raw0 | ((uint64_t)raw1 << 32);
-    mmio_write64(uar_addr + MLX5_BF_OFFSET, raw64);
-
-    qp->sq_pc = new_pc;
+    mlx5_qp_ring_sq(dev, qp, (volatile uint8_t *)(uintptr_t)(uint64_t)dev->gsi_dbr_cpu, new_pc, wqe0);
 
     volatile ts_rdma_t ts_info = {0};
     ts_info.rdma_op = TS_RDMA_OP_SQ_SEND;
@@ -376,29 +374,8 @@ static int mlx5_qp_post_rdma_common(mlx5_dev_t *dev, mlx5_qp_t *qp, uint32_t opc
         wqe[40 + b] = (uint8_t)(data_pa >> (56 - 8 * b));
     }
 
-    volatile uint8_t *dbr = (volatile uint8_t *)(uintptr_t)mlx5_qp_dbr_addr(dev, qp);
     uint32_t new_pc = pc + 1u;
-    dbr[4] = (uint8_t)(new_pc >> 24);
-    dbr[5] = (uint8_t)(new_pc >> 16);
-    dbr[6] = (uint8_t)(new_pc >> 8);
-    dbr[7] = (uint8_t)new_pc;
-
-    dma_wmb();
-
-    uint32_t raw0 = (uint32_t)wqe[0] | ((uint32_t)wqe[1] << 8) |
-                    ((uint32_t)wqe[2] << 16) | ((uint32_t)wqe[3] << 24);
-    uint32_t raw1 = (uint32_t)wqe[4] | ((uint32_t)wqe[5] << 8) |
-                    ((uint32_t)wqe[6] << 16) | ((uint32_t)wqe[7] << 24);
-    uint64_t uar_addr = dev->bar0_base + (uint64_t)qp->uarn * 4096u;
-    /* BlueFlame の 8 バイトは 1 命令でアトミックに書く。32bit x 2 に分けると
-     * PCIe 上で分割されうる(Linux の mlx5_write64() が「32bit システムでは
-     * ロックが必要」と注記しているのと同じ理由)。同時 RDMA_READ を 1 本から
-     * 16 本へ緩めてドアベル発行頻度が上がった途端、LOCAL_QP_OP_ERR
-     * (syndrome=0x02)として実機で顕在化した。 */
-    uint64_t raw64 = (uint64_t)raw0 | ((uint64_t)raw1 << 32);
-    mmio_write64(uar_addr + MLX5_BF_OFFSET, raw64);
-
-    qp->sq_pc = new_pc;
+    mlx5_qp_ring_sq(dev, qp, (volatile uint8_t *)(uintptr_t)mlx5_qp_dbr_addr(dev, qp), new_pc, wqe);
 
     volatile ts_rdma_t ts_info = {0};
     ts_info.rdma_op = (opcode == MLX5_OPCODE_RDMA_READ) ? TS_RDMA_OP_SQ_RDMA_READ
