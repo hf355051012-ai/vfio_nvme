@@ -7,6 +7,7 @@
 #include "job.h"
 #include "tcp.h"
 #include "crc32c.h"
+#include "nvmet_tls.h"
 
 int g_nvmet_force_pull = 0;
 
@@ -1365,7 +1366,12 @@ typedef enum {
     /* 相手から H2C TermReq が来たときに FES を読むためだけの終端状態。
      * ヘッダ 8 バイトの先に FES があるので、あと 16 バイト読んでから畳む。 */
     NADM_ST_RECV_TERM,
+    /* TLS 1.3 の握手(`nvmettls` を設定したときだけ。ACCEPT_WAIT と ICREQ_RECV の間)。 */
+    NADM_ST_TLS_HS,
 } nvmet_admin_state_t;
+
+/* admin キューの TLS(段階 D は admin だけ。接続は同時に 1 本なので 1 個で足りる)。 */
+static nvmet_tls_conn_t s_admin_tls;
 
 #define NADM_STATE_NAME_COUNT (sizeof(NADM_STATE_NAMES) / sizeof(NADM_STATE_NAMES[0]))
 
@@ -1561,6 +1567,12 @@ static job_result_t nvmet_admin_job_step(job_t *self)
             uart_printf("[nvmet:%s] adminキュー接続完了\n", ctx->label);
             nvmet_tcp_xfer_reset(&jc->xfer, jc->icreq_buf, NVME_TCP_ICREQ_LEN);
             jc->wait_started_ticks = timer_now();
+            if (nvmet_tls_enabled()) {
+                /* **ICReq より前に TLS の握手**(NVMe/TCP の決まり)。 */
+                nvmet_tls_start(&s_admin_tls);
+                self->state = NADM_ST_TLS_HS;
+                return JOB_WAITING;
+            }
             self->state = NADM_ST_ICREQ_RECV;
             return JOB_WAITING;
         }
@@ -1573,6 +1585,31 @@ static job_result_t nvmet_admin_job_step(job_t *self)
             return JOB_DONE;
         }
         return JOB_WAITING;
+
+    case NADM_ST_TLS_HS: {
+        const int r = nvmet_tls_poll(&s_admin_tls, &ctx->admin.tcp);
+        if (r < 0) {
+            crypto_wipe(&s_admin_tls.t, sizeof(s_admin_tls.t));
+            return nvmet_admin_job_setup_fail(self, ctx);
+        }
+        if (r == 0 || s_admin_tls.applen < NVME_TCP_ICREQ_LEN) {
+            if (timeout_ms(jc->wait_started_ticks, NVMET_ACCEPT_TIMEOUT_MS)) {
+                uart_printf("[!] nvmet-tls: 握手 / ICReq の待ちがタイムアウト\n");
+                crypto_wipe(&s_admin_tls.t, sizeof(s_admin_tls.t));
+                return nvmet_admin_job_setup_fail(self, ctx);
+            }
+            return JOB_WAITING;
+        }
+        /* **段階 D: 握手の後の最初の暗号文を復号して、ICReq であることを確かめる。**
+         * PDU を暗号化して流すのは段階 E(レコード層)なので、ここで閉じる。 */
+        const uint8_t *ic = s_admin_tls.app;
+        uart_printf("[nvmet-tls] 暗号文から ICReq を復号した(type=0x%x hlen=%u plen=%u pfv=%u "
+                    "hpda=%u digest=0x%x maxr2t=%u)\n",
+                    ic[0], ic[2], rd32le(&ic[4]), (unsigned)rd16le(&ic[8]), ic[10], ic[11], rd32le(&ic[12]));
+        uart_printf("[nvmet-tls] 段階 D はここまで(PDU を暗号化して流すのは段階 E)。close_notify を送って閉じる\n");
+        nvmet_tls_close(&s_admin_tls, &ctx->admin.tcp);
+        return nvmet_admin_job_setup_fail(self, ctx);
+    }
 
     case NADM_ST_ICREQ_RECV: {
         int r = nvmet_tcp_recv_poll(&ctx->admin, &jc->xfer);

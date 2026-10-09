@@ -119,6 +119,29 @@ int crypto_ffdhe_shared(unsigned gid, const uint8_t priv[CRYPTO_FFDHE_PRIV_LEN],
 int crypto_modexp(const uint8_t *base, size_t blen, const uint8_t *exp, size_t elen,
                   const uint8_t *mod, size_t mlen, uint8_t *out);
 
+/* ---- AES-128 と GCM(crypto_aes.c、AES-NI + PCLMULQDQ)----
+ * TLS 1.3 の TLS_AES_128_GCM_SHA256 用。IV は 12 バイト、タグは 16 バイト固定。 */
+typedef struct {
+    uint8_t rk[11 * 16];         /* 展開した鍵 */
+    uint8_t h[16];               /* GHASH の鍵 H = E(K, 0)(バイト順を反転した表現)*/
+} crypto_aes128gcm_t;
+
+void crypto_aes128_encrypt_block(const uint8_t key[16], const uint8_t in[16], uint8_t out[16]);
+void crypto_aes128gcm_init(crypto_aes128gcm_t *c, const uint8_t key[16]);
+/* in と out は同じでもよい。 */
+void crypto_aes128gcm_seal(const crypto_aes128gcm_t *c, const uint8_t iv[12],
+                           const void *aad, size_t alen, const void *in, size_t n,
+                           void *out, uint8_t tag[16]);
+/* タグが合わなければ -1(out には何も書かない)。 */
+int  crypto_aes128gcm_open(const crypto_aes128gcm_t *c, const uint8_t iv[12],
+                           const void *aad, size_t alen, const void *in, size_t n,
+                           void *out, const uint8_t tag[16]);
+
+/* ---- X25519(crypto_x25519.c、RFC 7748)----
+ * 結果が全 0(相手が小位数の点を送ってきた)なら -1。 */
+int crypto_x25519(uint8_t out[32], const uint8_t scalar[32], const uint8_t point[32]);
+int crypto_x25519_keygen(uint8_t priv[32], uint8_t pub[32]);
+
 /* 既知の値との照合。0=全部一致。err に最初に食い違った項目名を入れる。 */
 int crypto_selftest(char *err, size_t errlen);
 

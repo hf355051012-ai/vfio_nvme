@@ -420,6 +420,17 @@ static int hexeq(const uint8_t *got, const char *hex, size_t n) {
     return hex[2 * n] == 0;   /* 期待値の長さも一致すること */
 }
 
+static void unhex(const char *hex, uint8_t *out, size_t n) {
+    for (size_t i = 0; i < n; i++) {
+        unsigned v = 0;
+        for (int j = 0; j < 2; j++) {
+            const char ch = hex[2 * i + (size_t)j];
+            v = v * 16u + (unsigned)(ch <= '9' ? ch - '0' : (ch | 0x20) - 'a' + 10);
+        }
+        out[i] = (uint8_t)v;
+    }
+}
+
 static int fail(char *err, size_t errlen, const char *what) {
     if (err && errlen) {
         strncpy(err, what, errlen - 1u);
@@ -590,6 +601,63 @@ int crypto_selftest(char *err, size_t errlen) {
             y2[n - 1] = 1;
             if (crypto_ffdhe_shared(g, x1, y2, n, z) == 0) return fail(err, errlen, "ffdhe y=1 を受け付けた");
         }
+    }
+
+    /* AES-128(FIPS-197 付録 C.1)と GCM(McGrew & Viega の Test Case 4:
+     * 60 バイトの平文 = 端数ブロックあり、20 バイトの AAD)。 */
+    {
+        static const uint8_t k0[16] = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 };
+        static const uint8_t p0[16] = { 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
+                                        0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF };
+        crypto_aes128_encrypt_block(k0, p0, out);
+        if (!hexeq(out, "69c4e0d86a7b0430d8cdb78070b4c55a", 16)) return fail(err, errlen, "AES-128");
+
+        uint8_t key[16], iv[12], aad[20], pt[60], ct[60], tag[16], back[60];
+        unhex("feffe9928665731c6d6a8f9467308308", key, 16);
+        unhex("cafebabefacedbaddecaf888", iv, 12);
+        unhex("feedfacedeadbeeffeedfacedeadbeefabaddad2", aad, 20);
+        unhex("d9313225f88406e5a55909c5aff5269a86a7a9531534f7da2e4c303d8a318a72"
+              "1c3c0c95956809532fcf0e2449a6b525b16aedf5aa0de657ba637b39", pt, 60);
+        crypto_aes128gcm_t g;
+        crypto_aes128gcm_init(&g, key);
+        crypto_aes128gcm_seal(&g, iv, aad, 20, pt, 60, ct, tag);
+        if (!hexeq(ct, "42831ec2217774244b7221b784d0d49ce3aa212f2c02a4e035c17e2329aca12e"
+                       "21d514b25466931c7d8f6a5aac84aa051ba30b396a0aac973d58e091", 60))
+            return fail(err, errlen, "AES-GCM 暗号文");
+        if (!hexeq(tag, "5bc94fbc3221a5db94fae95ae7121a47", 16)) return fail(err, errlen, "AES-GCM タグ");
+        if (crypto_aes128gcm_open(&g, iv, aad, 20, ct, 60, back, tag) != 0 || memcmp(back, pt, 60) != 0)
+            return fail(err, errlen, "AES-GCM 復号");
+        /* 陰性対照: 暗号文・AAD・タグのどれを 1 ビット変えても開かない */
+        ct[59] ^= 1;
+        if (crypto_aes128gcm_open(&g, iv, aad, 20, ct, 60, back, tag) == 0) return fail(err, errlen, "AES-GCM 改ざん(暗号文)");
+        ct[59] ^= 1; aad[0] ^= 1;
+        if (crypto_aes128gcm_open(&g, iv, aad, 20, ct, 60, back, tag) == 0) return fail(err, errlen, "AES-GCM 改ざん(AAD)");
+        aad[0] ^= 1; tag[15] ^= 0x80;
+        if (crypto_aes128gcm_open(&g, iv, aad, 20, ct, 60, back, tag) == 0) return fail(err, errlen, "AES-GCM 改ざん(タグ)");
+    }
+
+    /* X25519(RFC 7748 5.2 の 1 本目と 6.1 の鍵交換)*/
+    {
+        uint8_t s[32], u[32], r[32], a[32], b[32], pa[32], pb[32];
+        static const uint8_t base[32] = { 9 };
+        unhex("a546e36bf0527c9d3b16154b82465edd62144c0ac1fc5a18506a2244ba449ac4", s, 32);
+        unhex("e6db6867583030db3594c1a424b15f7c726624ec26b3353b10a903a6d0ab1c4c", u, 32);
+        crypto_x25519(r, s, u);
+        if (!hexeq(r, "c3da55379de9c6908e94ea4df28d084f32eccf03491c71f754b4075577a28552", 32))
+            return fail(err, errlen, "X25519 5.2");
+        unhex("77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a", a, 32);
+        unhex("5dab087e624a8a4b79e17f8b83800ee66f3bb1292618b6fd1c2f8b27ff88e0eb", b, 32);
+        crypto_x25519(pa, a, base);
+        crypto_x25519(pb, b, base);
+        if (!hexeq(pa, "8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a", 32) ||
+            !hexeq(pb, "de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f", 32))
+            return fail(err, errlen, "X25519 公開値");
+        crypto_x25519(r, a, pb);
+        if (!hexeq(r, "4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742", 32))
+            return fail(err, errlen, "X25519 共有秘密");
+        /* 陰性対照: 位数 1 の点(u=0)は全 0 になるので拒否する */
+        memset(u, 0, 32);
+        if (crypto_x25519(r, a, u) == 0) return fail(err, errlen, "X25519 小位数の点を受け付けた");
     }
 
     /* 比較(陰性対照つき)と乱数(全部 0 は返さない、2 回で違う値)*/

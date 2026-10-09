@@ -4,6 +4,7 @@
 #include "crc32c.h"
 #include "crypto.h"
 #include "nvme_auth.h"
+#include "nvmet_tls.h"
 #include "vfio.h"
 #include "mlx5.h"
 #include "nvme_rdma.h"
@@ -5665,6 +5666,13 @@ static void shell_dispatch(char *line, int s0, int s1)
             shell_tcp_session_close("鍵を変えたのでセッションを張り直します");
             nvme_rdma_force_reconnect();
         }
+    } else if (strncmp(line, "nvmettls", 8) == 0) {
+        /* nvmettls [<hostnqn> <NVMeTLSkey-1:..> [keylog <path>] | off]
+         *
+         * NVMe/TCP ターゲットが ICReq の前に TLS 1.3 の握手を求める(nvmet_tls.c)。
+         * 鍵は Linux の `nvme gen-tls-key` で作ったもの。段階 D は握手と最初の
+         * 暗号文(ICReq)の復号まで。 */
+        nvmet_tls_shell(line + 8);
     } else if (strncmp(line, "nvmetauth", 9) == 0) {
         /* nvmetauth                                      -- 設定を表示
          * nvmetauth <hostnqn> <DHHC-1:..:..:> [sha256|sha384|sha512]
@@ -6630,9 +6638,13 @@ int main(int argc, char **argv)
          * FIPS 180-4 / RFC 4231 / RFC 5869 / RFC 8448 の値。 */
         char err[64];
         const int crc = crypto_selftest(err, sizeof(err));
-        uart_printf("[selftest] crypto(SHA-256/384/512, HMAC, HKDF, Expand-Label, base64, CRC-32, ffdhe) -> %s%s%s\n",
+        uart_printf("[selftest] crypto(SHA-256/384/512, HMAC, HKDF, Expand-Label, base64, CRC-32, ffdhe, AES-GCM, X25519) -> %s%s%s\n",
                     crc == 0 ? "OK" : "NG(", crc == 0 ? "" : err, crc == 0 ? "" : ")");
         rc |= crc;
+        const int trc = tls13_selftest(err, sizeof(err));
+        uart_printf("[selftest] TLS 1.3(RFC 8448 4 章の ServerHello と暗号化レコードを全バイト再現)-> %s%s%s\n",
+                    trc == 0 ? "OK" : "NG(", trc == 0 ? "" : err, trc == 0 ? "" : ")");
+        rc |= trc;
     }
     timer_selftest();
     spinlock_selftest();
