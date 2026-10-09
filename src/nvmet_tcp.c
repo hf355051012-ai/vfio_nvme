@@ -6,6 +6,7 @@
 #include "timer.h"
 #include "timestamp.h"
 #include "crc32c.h"
+#include "nvmet_tls.h"
 
 #define NVMET_TCP_C2H_CHUNK_MAX 262144u
 
@@ -98,6 +99,7 @@ static int nvmet_tcp_tx_put(nvmet_tcp_conn_t *c, const void *p1, uint32_t l1,
                              const void *p2, uint32_t l2)
 {
     uint32_t need = l1 + l2;
+    if (c->tls) return nvmet_tls_send(c->tls, &c->tcp, p1, l1, p2, l2);   /* TLS は束ねない */
     if (!c->tx_batching || need > NVMET_TCP_TX_BATCH_MAX) {
         /* **溜まっているものを先に出してから**送る(順序を崩さない)。 */
         if (nvmet_tcp_tx_flush(c) != 0) return -1;
@@ -202,6 +204,16 @@ int nvmet_tcp_recv_poll(nvmet_tcp_conn_t *c, nvmet_tcp_xfer_t *x)
     }
 
     uint32_t remain = x->want - x->got;
+    if (c->tls) {
+        /* TLS: 復号済みの平文(タグを検証したもの)から読む */
+        int t = nvmet_tls_recv(c->tls, &c->tcp, x->buf + x->got, remain);
+        if (t < 0) {
+            uart_printf("[!] NVMe/TCP target: 受信中に相手が閉じた / TLS のレコードが壊れていた\n");
+            return -1;
+        }
+        x->got += (uint32_t)t;
+        return (x->got >= x->want) ? 1 : 0;
+    }
     int n = tcp_recv_no_ack(&c->tcp, x->buf + x->got, remain, 0u);
     if (n == 0) {
         uart_printf("[!] NVMe/TCP target: 受信中に相手がFINでクローズ\n");
@@ -381,6 +393,7 @@ int nvmet_tcp_send_term(nvmet_tcp_conn_t *c, uint16_t fes, uint32_t fei,
     uart_printf("[NVMe/TCP target] C2H TermReq 送信 (fes=0x%02x fei=0x%x len=%u)\n",
                 (unsigned)fes, (unsigned)fei, (unsigned)total);
     if (c->tcp.state != TCP_ESTABLISHED) return -1;
+    if (c->tls) return nvmet_tls_send(c->tls, &c->tcp, s_term_buf, total, NULL, 0);
     if (tcp_send(&c->tcp, s_term_buf, (uint16_t)total) != (int)total) {
         uart_printf("[!] NVMe/TCP target: C2H TermReq 送信失敗\n");
         return -1;
@@ -427,6 +440,13 @@ int nvmet_tcp_send_icresp(nvmet_tcp_conn_t *c, const uint8_t icreq_buf[NVME_TCP_
         info.pdo      = 0;
         info.plen     = NVME_TCP_ICRESP_LEN;
         ts_log_nvme_tcp_pdu(TS_MK(TS_FILE_NVMET_TCP, TS_FUNC_nvmet_tcp_send_icresp, 0), &info);
+    }
+    if (c->tls) {
+        if (nvmet_tls_send(c->tls, &c->tcp, s_icresp_buf, NVME_TCP_ICRESP_LEN, NULL, 0) != 0) {
+            uart_printf("[!] NVMe/TCP target: ICResp送信失敗(TLS)\n");
+            return -1;
+        }
+        return 0;
     }
     if (tcp_send(&c->tcp, s_icresp_buf, (uint16_t)NVME_TCP_ICRESP_LEN) != (int)NVME_TCP_ICRESP_LEN) {
         uart_printf("[!] NVMe/TCP target: ICResp送信失敗\n");
@@ -596,7 +616,8 @@ int nvmet_tcp_send_c2h(nvmet_tcp_conn_t *c, uint16_t cid, const nvme_cqe_t *cqe,
             ts_log_nvme_tcp_pdu(TS_MK(TS_FILE_NVMET_TCP, TS_FUNC_nvmet_tcp_send_c2h, 0), &info);
         }
 
-        if (tcp_send(&c->tcp, s_c2h_buf, total) != (int)total) {
+        if (c->tls ? nvmet_tls_send(c->tls, &c->tcp, s_c2h_buf, total, NULL, 0) != 0
+                   : tcp_send(&c->tcp, s_c2h_buf, total) != (int)total) {
             uart_printf("[!] NVMe/TCP target: C2HData送信失敗 (offset=%u len=%u)\n", sent, chunk);
             return -1;
         }
@@ -653,6 +674,21 @@ int nvmet_tcp_send_c2h_async(nvmet_tcp_conn_t *c, uint16_t cid,
     nvmet_tcp_append_hdgst(c, hdr, NVME_TCP_DATA_PDU_LEN);
 
     const uint8_t *src = (const uint8_t *)data;
+
+    if (c->tls) {
+        /* TLS: 暗号化先が要るのでゼロコピーは使わない。ヘッダと本体を
+         * 同じレコードへ詰め、データダイジェストがあれば続けて送る。 */
+        if (nvmet_tls_send(c->tls, &c->tcp, hdr, (uint32_t)NVME_TCP_DATA_PDU_LEN + hd, src, dlen) != 0) {
+            uart_printf("[!] NVMe/TCP target: C2HData送信失敗(TLS、cid=%u)\n", cid);
+            return -1;
+        }
+        if (dd) {
+            uint8_t d[4];
+            wr32le(d, ~crc32c(0xFFFFFFFFu, src, dlen));
+            if (nvmet_tls_send(c->tls, &c->tcp, d, 4u, NULL, 0) != 0) return -1;
+        }
+        goto sent;
+    }
 
     /* **ヘッダと本体を 1 つの TCP セグメントにまとめる。** 別々に送ると
      * **read 応答 1 個が 2 パケットになり、相手のパケット処理を 2 倍消費する**
@@ -727,5 +763,9 @@ sent:
  * ===============================================================*/
 void nvmet_tcp_close(nvmet_tcp_conn_t *c)
 {
+    if (c->tls) {
+        nvmet_tls_close(c->tls, &c->tcp);   /* 溜めた alert と close_notify を送る */
+        c->tls = NULL;
+    }
     tcp_close(&c->tcp);
 }

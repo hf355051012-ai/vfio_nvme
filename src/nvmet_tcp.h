@@ -11,8 +11,13 @@
  * まとめたものを長経路(LSO)へ流すと壊れる(CLAUDE.md)。 */
 #define NVMET_TCP_TX_BATCH_MAX 9216u
 
+struct nvmet_tls_conn;   /* nvmet_tls.h */
+
 typedef struct {
     tcp_conn_t tcp;
+    /* TLS 1.3(段階 E)。NULL なら平文。NULL でなければ送受信が全部
+     * nvmet_tls.c のレコード層を通る(握手が済んでから入れる)。 */
+    struct nvmet_tls_conn *tls;
     uint16_t   maxdata;
     uint16_t   last_cid;
     uint8_t    hdgst;

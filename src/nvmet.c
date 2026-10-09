@@ -1370,8 +1370,10 @@ typedef enum {
     NADM_ST_TLS_HS,
 } nvmet_admin_state_t;
 
-/* admin キューの TLS(段階 D は admin だけ。接続は同時に 1 本なので 1 個で足りる)。 */
+/* TLS の接続状態。admin は同時に 1 本、IO はキューの番号ごと。
+ * **Linux のホストは admin と IO キューの全部の接続で握手してくる。** */
 static nvmet_tls_conn_t s_admin_tls;
+static nvmet_tls_conn_t s_io_tls[NVMET_IO_QUEUES];
 
 #define NADM_STATE_NAME_COUNT (sizeof(NADM_STATE_NAMES) / sizeof(NADM_STATE_NAMES[0]))
 
@@ -1592,23 +1594,19 @@ static job_result_t nvmet_admin_job_step(job_t *self)
             crypto_wipe(&s_admin_tls.t, sizeof(s_admin_tls.t));
             return nvmet_admin_job_setup_fail(self, ctx);
         }
-        if (r == 0 || s_admin_tls.applen < NVME_TCP_ICREQ_LEN) {
+        if (r == 0) {
             if (timeout_ms(jc->wait_started_ticks, NVMET_ACCEPT_TIMEOUT_MS)) {
-                uart_printf("[!] nvmet-tls: 握手 / ICReq の待ちがタイムアウト\n");
+                uart_printf("[!] nvmet-tls: 握手の待ちがタイムアウト\n");
                 crypto_wipe(&s_admin_tls.t, sizeof(s_admin_tls.t));
                 return nvmet_admin_job_setup_fail(self, ctx);
             }
             return JOB_WAITING;
         }
-        /* **段階 D: 握手の後の最初の暗号文を復号して、ICReq であることを確かめる。**
-         * PDU を暗号化して流すのは段階 E(レコード層)なので、ここで閉じる。 */
-        const uint8_t *ic = s_admin_tls.app;
-        uart_printf("[nvmet-tls] 暗号文から ICReq を復号した(type=0x%x hlen=%u plen=%u pfv=%u "
-                    "hpda=%u digest=0x%x maxr2t=%u)\n",
-                    ic[0], ic[2], rd32le(&ic[4]), (unsigned)rd16le(&ic[8]), ic[10], ic[11], rd32le(&ic[12]));
-        uart_printf("[nvmet-tls] 段階 D はここまで(PDU を暗号化して流すのは段階 E)。close_notify を送って閉じる\n");
-        nvmet_tls_close(&s_admin_tls, &ctx->admin.tcp);
-        return nvmet_admin_job_setup_fail(self, ctx);
+        /* **握手が済んだら、以後の送受信は全部レコード層を通る**(段階 E)。
+         * ICReq はもう平文の待ち行列に入っているかもしれない。 */
+        ctx->admin.tls = &s_admin_tls;
+        self->state = NADM_ST_ICREQ_RECV;
+        return JOB_WAITING;
     }
 
     case NADM_ST_ICREQ_RECV: {
@@ -1959,6 +1957,8 @@ typedef enum {
     NIO_ST_RECV_H2C_DDGST,
     NIO_ST_DISPATCH_H2C,
     NIO_ST_PUSH_RUN,
+    /* TLS 1.3 の握手(`nvmettls` のときだけ。ACCEPT_WAIT と ICREQ_RECV の間)。 */
+    NIO_ST_TLS_HS,
 } nvmet_io_state_t;
 
 #define NIO_STATE_NAME_COUNT (sizeof(NIO_STATE_NAMES) / sizeof(NIO_STATE_NAMES[0]))
@@ -2857,6 +2857,20 @@ static void nvmet_io_rx_upcall(void *arg, const volatile uint8_t *data, uint16_t
 }
 
 /*=================================================================
+ * TLS(段階 E)の push 型受信。届いた暗号文をレコード層へ食わせ、
+ * **タグの検証が通った平文だけ**を元のパーサ(nvmet_io_rx_upcall)へ渡す。
+ * レコードが壊れていた / 相手が alert を送ってきたら、パーサの失敗と同じ
+ * 旗を立てて上位に畳ませる。
+ * ===============================================================*/
+static void nvmet_io_rx_upcall_tls(void *arg, const volatile uint8_t *data, uint16_t len)
+{
+    nvmet_io_job_ctx_t *jc = (nvmet_io_job_ctx_t *)arg;
+    if (!jc->io.tls || nvmet_tls_feed(jc->io.tls, data, len, nvmet_io_rx_upcall, jc) != 0) {
+        jc->prx_error = 1;
+    }
+}
+
+/*=================================================================
  * IO キューのステートマシン本体 1 tick。admin の準備完了を待って accept ->
  * ICReq/ICResp -> 以後はコマンド受信とディスパッチ。非 digest 接続では
  * push 型受信を登録し、ready-ring に積まれたコマンドをここで dispatch する
@@ -2999,6 +3013,11 @@ static job_result_t nvmet_io_job_step_impl(job_t *self)
              * ままだと、ホストが繋いでくるまで長く待った 2 本目以降で
              * 残り時間がほとんど無くなる。 */
             jc->wait_started_ticks = timer_now();
+            if (nvmet_tls_enabled()) {
+                nvmet_tls_start(&s_io_tls[jc->qidx]);
+                self->state = NIO_ST_TLS_HS;
+                return JOB_WAITING;
+            }
             self->state = NIO_ST_ICREQ_RECV;
             return JOB_WAITING;
         }
@@ -3017,6 +3036,21 @@ static job_result_t nvmet_io_job_step_impl(job_t *self)
             return nvmet_io_job_end(self, jc, 0, "IOキュー接続待ちタイムアウト");
         }
         return JOB_WAITING;
+
+    case NIO_ST_TLS_HS: {
+        const int r = nvmet_tls_poll(&s_io_tls[jc->qidx], &jc->io.tcp);
+        if (r < 0) return nvmet_io_job_end(self, jc, 1, "IO の TLS 握手に失敗");
+        if (r == 0) {
+            if (timeout_ms(jc->wait_started_ticks, NVMET_ACCEPT_TIMEOUT_MS)) {
+                uart_printf("[!] nvmet-tls: IO キューの握手の待ちがタイムアウト\n");
+                return nvmet_io_job_end(self, jc, 1, "IO の TLS 握手タイムアウト");
+            }
+            return JOB_WAITING;
+        }
+        jc->io.tls = &s_io_tls[jc->qidx];
+        self->state = NIO_ST_ICREQ_RECV;
+        return JOB_WAITING;
+    }
 
     case NIO_ST_ICREQ_RECV: {
         int r = nvmet_tcp_recv_poll(&jc->io, &jc->xfer);
@@ -3055,7 +3089,14 @@ static job_result_t nvmet_io_job_step_impl(job_t *self)
             jc->prx_error   = 0;
             jc->ready_head  = 0;
             jc->ready_tail  = 0;
-            tcp_set_recv_upcall(&jc->io.tcp, nvmet_io_rx_upcall, jc);
+            if (jc->io.tls) {
+                /* TLS: upcall の前に復号を挟む。握手と ICReq の間に復号済みの
+                 * 平文が残っていれば、先にパーサへ渡す。 */
+                tcp_set_recv_upcall(&jc->io.tcp, nvmet_io_rx_upcall_tls, jc);
+                nvmet_tls_drain(jc->io.tls, nvmet_io_rx_upcall, jc);
+            } else {
+                tcp_set_recv_upcall(&jc->io.tcp, nvmet_io_rx_upcall, jc);
+            }
             self->state = NIO_ST_PUSH_RUN;
             uart_printf("[nvmet:%s] IOキュー%u push型(inline upcall)受信を有効化 (hdgst=%u ddgst=%u)\n",
                         ctx->label, jc->qidx + 1u, jc->io.hdgst, jc->io.ddgst);
