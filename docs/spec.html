@@ -1699,6 +1699,49 @@ traddr:  192.168.101.11</code></pre></div>
 <p>CPU が触れるのは最初と最後だけで、<strong>残りはハードウェアとワイヤの時間</strong>です。 縮められるのは主に「NIC が WQE を取りに行く往復」と「応答の書き込み」でした。</p>
 <h5>工夫 1: WQE を呼び鈴と一緒に渡す(BlueFlame)— 320 ナノ秒</h5>
 <p>通常、呼び鈴(8 バイト)を鳴らすと、NIC は<strong>メモリまで WQE を読みに来ます</strong>。 mlx5 には <strong>BlueFlame</strong> という仕組みがあり、呼び鈴の代わりに <strong>WQE の 64 バイト そのものを呼び鈴の窓へ書く</strong>と、NIC は読みに来ずにそれを使います。</p>
+<p><strong>ラダーチャートで比べる(8 バイトの write、データは WQE に埋め込み)。</strong></p>
+<p>縦線が登場人物、横の矢印が時間の順に起きることです。上から下へ読みます。 「PCIe」はこちらの CPU と NIC を結ぶ線で、<strong>NIC がメモリを読むときは、 要求を送って中身が返ってくるまでの 1 往復</strong>になります。</p>
+<p><strong>BlueFlame を使わない場合:</strong></p>
+<figure class="diagram"><pre class="mermaid">sequenceDiagram
+  participant CPU as CPU&lt;br&gt;(rshort)
+  participant MEM as ホストの&lt;br&gt;メモリ
+  participant NIC as 自分の&lt;br&gt;NIC
+  participant PNIC as 相手の&lt;br&gt;NIC
+  participant PMEM as 相手の&lt;br&gt;メモリ
+  CPU-&gt;&gt;MEM: ① WQE 64 バイトを&lt;br&gt;SQ に書く
+  CPU-&gt;&gt;MEM: ② doorbell record&lt;br&gt;を進める
+  CPU-&gt;&gt;NIC: ③ 呼び鈴 8 バイト&lt;br&gt;(MMIO 書き込み)
+  rect rgba(128, 128, 128, 0.18)
+    NIC-&gt;&gt;MEM: ④ WQE を読みに行く&lt;br&gt;(PCIe の読み要求)
+    MEM--&gt;&gt;NIC: ⑤ WQE 64 バイト&lt;br&gt;が返る
+    Note over MEM,NIC: この 1 往復が&lt;br&gt;約 320 ns
+  end
+  NIC-&gt;&gt;PNIC: ⑥ RDMA WRITE&lt;br&gt;(8 バイト入り)
+  PNIC-&gt;&gt;PMEM: ⑦ 書く&lt;br&gt;(DMA)
+  PNIC--&gt;&gt;NIC: ⑧ ACK
+  NIC-&gt;&gt;MEM: ⑨ 完了(CQE)を書く
+  CPU-&gt;&gt;MEM: ⑩ CQE を見つける&lt;br&gt;(ポーリング)</pre></figure>
+<p><strong>BlueFlame を使う場合:</strong></p>
+<figure class="diagram"><pre class="mermaid">sequenceDiagram
+  participant CPU as CPU&lt;br&gt;(rshort)
+  participant MEM as ホストの&lt;br&gt;メモリ
+  participant NIC as 自分の&lt;br&gt;NIC
+  participant PNIC as 相手の&lt;br&gt;NIC
+  participant PMEM as 相手の&lt;br&gt;メモリ
+  CPU-&gt;&gt;MEM: ① WQE 64 バイトを&lt;br&gt;SQ に書く(控え)
+  CPU-&gt;&gt;MEM: ② doorbell record&lt;br&gt;を進める
+  rect rgba(128, 128, 128, 0.18)
+    CPU-&gt;&gt;NIC: ③ WQE 64 バイトそのものを&lt;br&gt;BlueFlame の窓へ書く&lt;br&gt;(WC で 1 回の書き込み&lt;br&gt;+ sfence)
+    Note over CPU,NIC: NIC はこの時点で&lt;br&gt;WQE を持っている&lt;br&gt;→ ④⑤ の往復が無い
+  end
+  NIC-&gt;&gt;PNIC: ⑥ RDMA WRITE&lt;br&gt;(8 バイト入り)
+  PNIC-&gt;&gt;PMEM: ⑦ 書く&lt;br&gt;(DMA)
+  PNIC--&gt;&gt;NIC: ⑧ ACK
+  NIC-&gt;&gt;MEM: ⑨ 完了(CQE)を書く
+  CPU-&gt;&gt;MEM: ⑩ CQE を見つける&lt;br&gt;(ポーリング)</pre></figure>
+<p>違いは灰色の部分だけです。</p>
+<ul><li><strong>使わない場合</strong>、③ の呼び鈴は「SQ のここまで積んだ」という<strong>合図</strong>でしかなく、 NIC は ④⑤ で<strong>中身を取りに行く</strong>必要があります。PCIe の読みは要求と応答の 往復なので、書き込みだけで済む ③ よりずっと時間がかかります。</li><li><strong>使う場合</strong>、③ で <strong>WQE の中身ごと</strong>渡すので ④⑤ が消えます。① で SQ にも 同じ WQE を書くのは控えのためで、BlueFlame の書き込みが使われなかったときは NIC がこちらを読みに来ます(使わない場合と同じ道に戻るだけで、壊れはしません)。</li><li>⑥ 以降は両者まったく同じです。<strong>縮むのは ④⑤ の 1 往復ぶん(約 320 ns)だけ</strong>で、 1 往復全体(約 1.3 マイクロ秒)の 4 分の 1 弱にあたります。</li><li>データを WQE に埋め込まない write(29 バイト以上、または積み上げるとき)や read の着地点は別の話で、NIC は<strong>データ</strong>を取りにメモリへ行きます。 BlueFlame が省くのは <strong>WQE の取得だけ</strong>です。</li></ul>
+<p><strong>積み上げる(qd が大きい)ときは差が消えます</strong>(実測は下の「BlueFlame の 効き方」)。何個もの WQE を積んでから呼び鈴を 1 回だけ鳴らすので、NIC は ④⑤ で <strong>まとめて</strong>読みに来ます。1 往復の費用が多くの WQE で割られるうえ、NIC は 読みに行っている間も前の WQE の送信を進めるので、往復が隠れます。 <code>rshort</code> も BlueFlame を使うのは<strong>1 回の呼び鈴で 1 個だけ出すとき</strong>に限っています (Linux の libmlx5 と同じ)。</p>
 <p>ただし 64 バイトを<strong>1 回の書き込み</strong>として NIC へ届ける必要があり、それには その窓を <strong>write-combining(WC)</strong> という、書き込みをまとめて送る種類の メモリとして貼る必要があります。ここで 2 つ壁がありました。</p>
 <ul><li><strong>VFIO が貼る窓は「キャッシュしない(UC)」型で、型を変える手段が無い。</strong> Linux の sysfs にある <code>resource0_wc</code> を使うと WC で貼れます。</li><li><strong>ところが x86 は、同じ物理ページに 2 種類の型を許しません。</strong> VFIO が 窓全体を UC で登録していたので、WC で貼ったつもりが<strong>黙って UC に 格下げされていました。</strong> NIC は「64 バイトが 1 回で来ない」BlueFlame を 捨てて、メモリへ読みに行きます。</li></ul>
 <p><strong>これを見抜く道具</strong>として <code>rshort bfprobe</code> を作りました。<strong>メモリ上の WQE と 窓へ書く WQE で、書き込むデータだけを変えて</strong>送り、相手に届いた値を見ます。 窓の方の値が届けば BlueFlame が使われた、メモリの方なら捨てられた、と 一発で分かります。</p>
@@ -2598,7 +2641,8 @@ function setup(){
     },
     flowchart: { htmlLabels: true, curve: 'basis', useMaxWidth: true,
                  nodeSpacing: 32, rankSpacing: 40, padding: 10 },
-    sequence: { useMaxWidth: true, mirrorActors: false },
+    sequence: { useMaxWidth: true, mirrorActors: false, width: 110, actorMargin: 30,
+                boxMargin: 8, noteMargin: 8 },
     state: { useMaxWidth: true },
     packet: { bitWidth: 18, rowHeight: 36 }   // 32 ビットで約 600px(本文の幅に収める)
   });
