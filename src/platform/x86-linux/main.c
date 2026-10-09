@@ -295,15 +295,16 @@ static void shell_tcpdisconnect(void)
     }
 }
 
-static int shell_ensure_tcp_session(uint8_t want_hdgst, uint8_t want_ddgst, uint8_t want_ipv6)
+static int shell_ensure_tcp_session(uint8_t want_hdgst, uint8_t want_ddgst, uint8_t want_ipv6,
+                                    uint8_t want_tls)
 {
     /* ダイジェストは ICReq/ICResp でコネクション確立時に一度だけ合意する。
      * IPv4/IPv6 もコネクション単位で決まる。いずれも要求が変わったら既存
      * セッションは使い回せないので張り直す。 */
     if (s_shell_tcp_connected &&
         (s_nvme_ctx.req_hdgst != want_hdgst || s_nvme_ctx.req_ddgst != want_ddgst ||
-         s_shell_tcp_ipv6 != want_ipv6)) {
-        shell_tcp_session_close("digest/IP版の設定が変わったのでセッションを張り直します");
+         s_shell_tcp_ipv6 != want_ipv6 || s_nvme_ctx.req_tls != want_tls)) {
+        shell_tcp_session_close("digest/IP版/TLS の設定が変わったのでセッションを張り直します");
     }
     /* 接続先が変わったときも張り直す(digest/IP 版と同じ理由)。 */
     if (s_shell_tcp_connected &&
@@ -316,6 +317,11 @@ static int shell_ensure_tcp_session(uint8_t want_hdgst, uint8_t want_ddgst, uint
     if (s_shell_tcp_connected) return 0;
     s_nvme_ctx.req_hdgst = want_hdgst;
     s_nvme_ctx.req_ddgst = want_ddgst;
+    if (want_tls && !nvme_tls_client_enabled()) {
+        uart_printf("tcpbench: tls には先に `nvmetls <NVMeTLSkey-1:..>` で鍵を入れること\n");
+        return -1;
+    }
+    s_nvme_ctx.req_tls = want_tls;
     netif_t *ctx0 = netif_find("mlx5-pf0");
     netif_t *ctx1 = netif_find("mlx5-pf1");
     if (!ctx0) { uart_printf("netif 未登録\n"); return -1; }
@@ -368,13 +374,18 @@ wait_connect:;
         if (timeout_ms(t, 15000u)) { uart_printf("tcpbench: connect タイムアウト\n"); return -1; }
     }
     if (s_nvme_ctx.lba_size == 0u) { uart_printf("tcpbench: lba_size=0\n"); return -1; }
+    /* **lba_size だけでは成否が分からない**(前のセッションの値が残る)。接続ジョブが
+     * 失敗すると io_connected が 0 のまま返る(TLS の握手失敗で「接続完了」と
+     * 表示していた)。 */
+    if (!s_nvme_ctx.io_connected) { uart_printf("tcpbench: 接続に失敗した\n"); return -1; }
     s_shell_tcp_connected  = 1;
     s_shell_tcp_ipv6       = want_ipv6;
     s_shell_tcp_was_remote = s_tcp_remote.enabled ? 1 : 0;
     s_shell_tcp_sess_ip    = s_tcp_remote.ip;
     s_shell_tcp_sess_port  = s_tcp_remote.port;
-    uart_printf("tcpbench: initiator 接続完了 (lba_size=%u, %s%s)\n",
+    uart_printf("tcpbench: initiator 接続完了 (lba_size=%u, %s%s%s)\n",
                 s_nvme_ctx.lba_size, want_ipv6 ? "IPv6" : "IPv4",
+                want_tls ? ", TLS 1.3" : "",
                 s_tcp_remote.enabled ? ", 外部ターゲット" : "");
     return 0;
 }
@@ -1523,7 +1534,7 @@ static void shell_termtest(void)
 
     /* ---- [3] 陰性対照を先に取る(壊さずに 1 往復)---- */
     uint32_t t_sent0 = g_nvmet_tcp_term_sent, i_recv0 = g_nvme_tcp_term_recv;
-    if (shell_ensure_tcp_session(1u, 0u, 0u) != 0) {
+    if (shell_ensure_tcp_session(1u, 0u, 0u, 0u) != 0) {
         uart_printf("termtest: NG -- hdgst 有効のセッションを張れませんでした\n");
         return;
     }
@@ -4697,6 +4708,7 @@ typedef struct {
     uint32_t qd;
     uint8_t  hdgst, ddgst;  /* NVMe/TCP のみ。RDMA には digest の概念が無い */
     uint8_t  ipv6;          /* NVMe/TCP のみ。1=対向のリンクローカルへ IPv6 で繋ぐ */
+    uint8_t  tls;           /* NVMe/TCP のみ。1=TLS 1.3 で繋ぐ(鍵は `nvmetls`)*/
     uint32_t runtime_ms;    /* 1 条件あたりの測定時間。`t<秒>` で上書きできる */
 } bench_plan_t;
 
@@ -4717,7 +4729,7 @@ static void bench_plan_parse(char *args, bench_plan_t *pl)
     char *tok[6];
     unsigned nt = shell_tokenize(args, tok, 6);
     pl->qd = 8u; pl->do_r = 1; pl->do_w = 1;
-    pl->hdgst = 0; pl->ddgst = 0; pl->ipv6 = 0;
+    pl->hdgst = 0; pl->ddgst = 0; pl->ipv6 = 0; pl->tls = 0;
     pl->runtime_ms = 3000u;
 
     /* 先に digest キーワードを抜き取り、残りを従来通り位置引数として扱う。 */
@@ -4728,6 +4740,7 @@ static void bench_plan_parse(char *args, bench_plan_t *pl)
         if (strcmp(tok[i], "digest") == 0) { pl->hdgst = 1; pl->ddgst = 1; continue; }
         if (strcmp(tok[i], "ipv6") == 0)   { pl->ipv6 = 1; continue; }
         if (strcmp(tok[i], "ipv4") == 0)   { pl->ipv6 = 0; continue; }
+        if (strcmp(tok[i], "tls") == 0)    { pl->tls = 1; continue; }
         /* `t<秒>` -- 1 条件あたりの測定時間。**Linux 側(fio / spdk_nvme_perf)と
          * 同じ秒数で測るために要る**。位置引数と紛れないようキーワードにする。 */
         if (tok[i][0] == 't' && tok[i][1] >= '0' && tok[i][1] <= '9') {
@@ -4941,7 +4954,7 @@ static void shell_tcpbench(char *args)
     /* **同時 outstanding 数は接続とは無関係**(コマンドの出し方だけの話)なので、
      * セッションを張り直さずに変えられる。 */
     nvme_set_io_qdepth(pl.qd);
-    if (shell_ensure_tcp_session(pl.hdgst, pl.ddgst, pl.ipv6) != 0) return;
+    if (shell_ensure_tcp_session(pl.hdgst, pl.ddgst, pl.ipv6, pl.tls) != 0) return;
     if (pl.hdgst != s_nvme_ctx.io.hdgst || pl.ddgst != s_nvme_ctx.io.ddgst) {
         uart_printf("[!] tcpbench: digestの合意結果が要求と異なります "
                     "(要求 hdgst=%u ddgst=%u / 合意 hdgst=%u ddgst=%u)\n",
@@ -5666,6 +5679,17 @@ static void shell_dispatch(char *line, int s0, int s1)
             shell_tcp_session_close("鍵を変えたのでセッションを張り直します");
             nvme_rdma_force_reconnect();
         }
+    } else if (strncmp(line, "nvmetls", 7) == 0) {
+        /* nvmetls [<NVMeTLSkey-1:..> [keylog <path>] | off]
+         *
+         * 内蔵イニシエータの TLS 1.3 の鍵(段階 F)。`tcpbench ... tls` で使う。
+         * 身元は自分の hostnqn と接続先の subnqn で決まる。 */
+        nvme_tls_client_shell(line + 7);
+        /* 握手は接続のときだけなので、鍵を変えたら張り直させる(nvmeauth と同じ。
+         * 張ったままだと次の tcpbench は古い鍵で確立した接続を使い続け、陰性が素通りする)。 */
+        const char *a = line + 7;
+        while (*a == ' ') a++;
+        if (*a != '\0') shell_tcp_session_close("TLS の鍵を変えたのでセッションを張り直します");
     } else if (strncmp(line, "nvmettls", 8) == 0) {
         /* nvmettls [<hostnqn> <NVMeTLSkey-1:..> [keylog <path>] | off]
          *

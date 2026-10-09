@@ -1,7 +1,8 @@
 #ifndef TLS13_H
 #define TLS13_H
 
-/* TLS 1.3 のサーバ側(PLAN_auth_tls.md 段階 D)。NVMe/TCP の secure channel 用。
+/* TLS 1.3 のサーバ側(PLAN_auth_tls.md 段階 D)とクライアント側(段階 F)。
+ * NVMe/TCP の secure channel 用。
  *
  * **できることを絞ってある**(相手は Linux の tlshd = GnuTLS):
  *   - 暗号スイートは TLS_AES_128_GCM_SHA256 だけ。
@@ -36,6 +37,10 @@ typedef enum {
     TLS13_ST_OPEN,          /* 握手が済んだ。application_data が流せる */
     TLS13_ST_CLOSED,        /* close_notify を受けた */
     TLS13_ST_FAILED,        /* alert を送った / 受けた */
+    /* クライアント側(段階 F)*/
+    TLS13_ST_WAIT_SH,       /* ClientHello を送った。ServerHello 待ち */
+    TLS13_ST_WAIT_EE,       /* EncryptedExtensions 待ち */
+    TLS13_ST_WAIT_SFIN,     /* サーバの Finished 待ち */
 } tls13_state_t;
 
 /* alert の description(RFC 8446 6)*/
@@ -61,6 +66,7 @@ typedef struct {
     uint64_t seq;
     uint8_t  secret[32];   /* KeyUpdate で次の鍵を作る元 */
     int      on;
+    uint32_t epoch;        /* 鍵を入れ替えた回数(握手メッセージが鍵の境目をまたいでいないかの判定)*/
 } tls13_dir_t;
 
 typedef void (*tls13_keylog_fn)(void *arg, const char *line);
@@ -86,6 +92,11 @@ typedef struct {
     size_t   test_ee_len;
     int      test_resumption;     /* binder の label を "res binder" にし、身元を問わず先頭を選ぶ */
 
+    int      is_client;
+    uint8_t  sid[32];             /* クライアント: 互換モードのセッション ID */
+    uint8_t  early[32];           /* クライアント: early secret(ServerHello まで持つ)*/
+    uint8_t  cpriv[32];           /* クライアント: x25519 の秘密鍵(ServerHello まで持つ)*/
+
     crypto_hash_ctx_t th;         /* 握手の transcript */
     uint8_t  crandom[32];
     uint8_t  c_hs[32], s_hs[32], master[32];
@@ -107,6 +118,12 @@ int tls13_nvme_psk(tls13_psk_t out[2], const char *keystr, const char *hostnqn,
                    const char *subnqn, const char **why);
 
 void tls13_server_init(tls13_t *t, const tls13_psk_t *psks, unsigned npsk);
+
+/* クライアント(段階 F)。psk は 1 本(身元とその TLS PSK)。
+ * tls13_client_hello() が ClientHello のレコードを out へ書き、長さを返す(0 なら失敗)。
+ * 以後は tls13_input() に相手の応答を食わせる(こちらの Finished は out に出る)。 */
+void   tls13_client_init(tls13_t *t, const tls13_psk_t *psk);
+size_t tls13_client_hello(tls13_t *t, uint8_t *out, size_t cap);
 
 /* 受け取ったバイト列を食わせる。送るべきバイト列を out へ(*outlen)、復号した
  * application_data を app へ(*applen、appcap を超えたら失敗)追記する。

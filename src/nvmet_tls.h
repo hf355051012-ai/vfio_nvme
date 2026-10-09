@@ -38,6 +38,7 @@ typedef struct nvmet_tls_conn {
     uint8_t  rec[TLS13_REC_MAX];   /* 送信レコードの組み立て */
     int      failed;
     uint64_t rx_records, tx_records, rx_bytes, tx_bytes;
+    tls13_psk_t cpsk;               /* クライアント: この接続の PSK(身元は host / sub で決まる)*/
 } nvmet_tls_conn_t;
 
 int  nvmet_tls_enabled(void);
@@ -65,6 +66,13 @@ int  nvmet_tls_feed(nvmet_tls_conn_t *s, const volatile uint8_t *data, uint16_t 
 void nvmet_tls_drain(nvmet_tls_conn_t *s, nvmet_tls_deliver_fn deliver, void *arg);
 /* 溜めた送信を吐き、close_notify を送り、状態を消す。 */
 void nvmet_tls_close(nvmet_tls_conn_t *s, tcp_conn_t *tcp);
+
+/* ---- 段階 F: イニシエータ側(内蔵イニシエータの `tcpbench ... tls`)---- */
+int  nvme_tls_client_enabled(void);
+/* nvmetls [<NVMeTLSkey-1:..> [keylog <path>] | off] */
+void nvme_tls_client_shell(const char *args);
+/* ClientHello を送って握手を始める(以後は nvmet_tls_poll() で進める)。0=送った、-1=失敗。 */
+int  nvme_tls_client_start(nvmet_tls_conn_t *s, tcp_conn_t *tcp, const char *hostnqn, const char *subnqn);
 
 /* 検証用: 次に送る N 個のレコードの暗号文を 1 ビット壊す(`nvmettls corrupt N`)。 */
 extern volatile uint32_t g_nvmet_tls_corrupt;

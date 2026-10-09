@@ -70,6 +70,7 @@ static void dir_install(tls13_dir_t *d, const uint8_t secret[HL]) {
     crypto_wipe(key, sizeof(key));
     d->seq = 0;
     d->on = 1;
+    d->epoch++;
 }
 
 static void nonce(const tls13_dir_t *d, uint8_t n[12]) {
@@ -446,6 +447,158 @@ static int on_client_hello(tls13_t *t, const uint8_t *msg, size_t mlen, obuf_t *
 #undef NEED
 }
 
+/* ---- クライアント(段階 F)---- */
+void tls13_client_init(tls13_t *t, const tls13_psk_t *psk) {
+    tls13_server_init(t, psk, 1);
+    t->is_client = 1;
+    t->psk_index = 0;
+}
+
+size_t tls13_client_hello(tls13_t *t, uint8_t *out, size_t cap) {
+    obuf_t o = { out, cap, 0, 0 };
+    const tls13_psk_t *psk = &t->psks[0];
+    static const uint8_t base[32] = { 9 };
+    uint8_t pub[32];
+    if (t->test_priv) memcpy(t->cpriv, t->test_priv, 32);
+    else if (crypto_random(t->cpriv, 32) != 0) return 0;
+    crypto_x25519(pub, t->cpriv, base);
+    if (t->test_random) memcpy(t->crandom, t->test_random, 32);
+    else if (crypto_random(t->crandom, 32) != 0) return 0;
+    if (crypto_random(t->sid, 32) != 0) return 0;   /* 互換モード(tlshd と同じ)*/
+
+    uint8_t ch[TLS13_HS_MAX];
+    size_t n = 0;
+    ch[n++] = HS_CLIENT_HELLO;
+    n += 3;
+    ch[n++] = 3; ch[n++] = 3;
+    memcpy(ch + n, t->crandom, 32); n += 32;
+    ch[n++] = 32;
+    memcpy(ch + n, t->sid, 32); n += 32;
+    wr16(ch + n, 2); wr16(ch + n + 2, SUITE_AES128_GCM_SHA256); n += 4;
+    ch[n++] = 1; ch[n++] = 0;
+    const size_t extpos = n;
+    n += 2;
+    /* supported_versions: TLS 1.3 だけ */
+    wr16(ch + n, EXT_SUPPORTED_VERSIONS); wr16(ch + n + 2, 3); ch[n + 4] = 2; wr16(ch + n + 5, 0x0304); n += 7;
+    /* supported_groups: x25519 だけ */
+    wr16(ch + n, EXT_SUPPORTED_GROUPS); wr16(ch + n + 2, 4); wr16(ch + n + 4, 2); wr16(ch + n + 6, GROUP_X25519); n += 8;
+    /* key_share: x25519 */
+    wr16(ch + n, EXT_KEY_SHARE); wr16(ch + n + 2, 38); wr16(ch + n + 4, 36);
+    wr16(ch + n + 6, GROUP_X25519); wr16(ch + n + 8, 32); memcpy(ch + n + 10, pub, 32); n += 42;
+    /* psk_key_exchange_modes: psk_dhe_ke だけ */
+    wr16(ch + n, EXT_PSK_KEX_MODES); wr16(ch + n + 2, 2); ch[n + 4] = 1; ch[n + 5] = 1; n += 6;
+    /* pre_shared_key(**最後の拡張**): 身元 1 本 + binder 1 本 */
+    const unsigned il = psk->identity_len;
+    if (n + 4 + 2 + 2 + il + 4 + 2 + 1 + HL > sizeof(ch)) return 0;
+    wr16(ch + n, EXT_PRE_SHARED_KEY); wr16(ch + n + 2, 2 + 2 + il + 4 + 2 + 1 + HL); n += 4;
+    wr16(ch + n, 2 + il + 4); wr16(ch + n + 2, il); memcpy(ch + n + 4, psk->identity, il);
+    memset(ch + n + 4 + il, 0, 4);   /* 外部 PSK なので obfuscated_ticket_age は 0 */
+    n += 2 + 2 + il + 4;
+    const size_t binders = n;
+    wr16(ch + n, 1 + HL); ch[n + 2] = HL; n += 3 + HL;
+    wr16(ch + extpos, (unsigned)(n - extpos - 2));
+    wr24(ch + 1, (unsigned)(n - 4));
+
+    /* binder = HMAC(finished_key(binder_key), H(binder のリストより前))*/
+    uint8_t bkey[HL], fkey[HL], h[HL], eh[HL];
+    crypto_hkdf_extract(CRYPTO_SHA256, NULL, 0, psk->psk, HL, t->early);
+    empty_hash(eh);
+    derive_secret(t->early, t->test_resumption ? "res binder" : "ext binder", eh, bkey);
+    expand_label(bkey, "finished", NULL, 0, fkey, HL);
+    crypto_hash(CRYPTO_SHA256, ch, binders, h);
+    crypto_hmac(CRYPTO_SHA256, fkey, HL, h, HL, ch + binders + 3);
+    crypto_hash_update(&t->th, ch, n);
+    put_plain(&o, CT_HANDSHAKE, ch, n);
+    t->state = TLS13_ST_WAIT_SH;
+    return o.over ? 0 : o.len;
+}
+
+static int on_server_hello(tls13_t *t, const uint8_t *msg, size_t mlen, obuf_t *o) {
+    static const uint8_t hrr[32] = {   /* SHA-256("HelloRetryRequest")(RFC 8446 4.1.3)*/
+        0xCF, 0x21, 0xAD, 0x74, 0xE5, 0x9A, 0x61, 0x11, 0xBE, 0x1D, 0x8C, 0x02, 0x1E, 0x65, 0xB8, 0x91,
+        0xC2, 0xA2, 0x11, 0x16, 0x7A, 0xBB, 0x8C, 0x5E, 0x07, 0x9E, 0x09, 0xE2, 0xC8, 0xA8, 0x33, 0x9C,
+    };
+    const uint8_t *p = msg + 4, *end = msg + mlen;
+    if (end - p < 2 + 32 + 1 + 32 + 2 + 1 + 2) return fail(t, o, TLS13_ALERT_DECODE_ERROR, "ServerHello が短い");
+    p += 2;
+    if (memcmp(p, hrr, 32) == 0) return fail(t, o, TLS13_ALERT_HANDSHAKE_FAILURE, "HelloRetryRequest は未対応");
+    p += 32;
+    if (*p != 32 || memcmp(p + 1, t->sid, 32) != 0) return fail(t, o, TLS13_ALERT_ILLEGAL_PARAMETER, "セッション ID が返ってこない");
+    p += 33;
+    if (rd16(p) != SUITE_AES128_GCM_SHA256 || p[2] != 0) return fail(t, o, TLS13_ALERT_ILLEGAL_PARAMETER, "出していない暗号スイート");
+    p += 3;
+    const uint16_t extlen = rd16(p);
+    p += 2;
+    if ((size_t)(end - p) != extlen) return fail(t, o, TLS13_ALERT_DECODE_ERROR, "拡張の長さが合わない");
+    int v13 = 0, psk_ok = 0;
+    const uint8_t *share = NULL;
+    while (p + 4 <= end) {
+        const uint16_t et = rd16(p), el = rd16(p + 2);
+        const uint8_t *e = p + 4;
+        if (e + el > end) return fail(t, o, TLS13_ALERT_DECODE_ERROR, "拡張の長さが合わない");
+        if (et == EXT_SUPPORTED_VERSIONS && el == 2) v13 = (rd16(e) == 0x0304);
+        else if (et == EXT_KEY_SHARE && el == 36 && rd16(e) == GROUP_X25519 && rd16(e + 2) == 32) share = e + 4;
+        else if (et == EXT_PRE_SHARED_KEY && el == 2) psk_ok = (rd16(e) == 0);
+        p = e + el;
+    }
+    if (!v13) return fail(t, o, TLS13_ALERT_PROTOCOL_VERSION, "TLS 1.3 でない");
+    if (!psk_ok) return fail(t, o, TLS13_ALERT_HANDSHAKE_FAILURE, "サーバが PSK を選ばなかった(証明書は使えない)");
+    if (!share) return fail(t, o, TLS13_ALERT_HANDSHAKE_FAILURE, "サーバの x25519 の公開値が無い");
+    uint8_t shared[32];
+    if (crypto_x25519(shared, t->cpriv, share) != 0) return fail(t, o, TLS13_ALERT_ILLEGAL_PARAMETER, "x25519 の公開値が小位数の点");
+    crypto_hash_update(&t->th, msg, mlen);
+
+    uint8_t eh[HL], derived[HL], hs[HL], th[HL];
+    static const uint8_t zero[HL];
+    empty_hash(eh);
+    derive_secret(t->early, "derived", eh, derived);
+    crypto_hkdf_extract(CRYPTO_SHA256, derived, HL, shared, 32, hs);
+    transcript(t, th);
+    derive_secret(hs, "c hs traffic", th, t->c_hs);
+    derive_secret(hs, "s hs traffic", th, t->s_hs);
+    derive_secret(hs, "derived", eh, derived);
+    crypto_hkdf_extract(CRYPTO_SHA256, derived, HL, zero, HL, t->master);
+    keylog(t, "CLIENT_HANDSHAKE_TRAFFIC_SECRET", t->c_hs);
+    keylog(t, "SERVER_HANDSHAKE_TRAFFIC_SECRET", t->s_hs);
+    dir_install(&t->rx, t->s_hs);
+    crypto_wipe(t->early, sizeof(t->early)); crypto_wipe(t->cpriv, sizeof(t->cpriv));
+    crypto_wipe(shared, sizeof(shared)); crypto_wipe(hs, sizeof(hs));
+    t->state = TLS13_ST_WAIT_EE;
+    return 0;
+}
+
+static int on_server_finished(tls13_t *t, const uint8_t *msg, size_t mlen, obuf_t *o) {
+    uint8_t th[HL], fk[HL], want[HL];
+    transcript(t, th);   /* CH..EE */
+    expand_label(t->s_hs, "finished", NULL, 0, fk, HL);
+    crypto_hmac(CRYPTO_SHA256, fk, HL, th, HL, want);
+    if (!crypto_equal(want, msg + 4, HL)) return fail(t, o, TLS13_ALERT_DECRYPT_ERROR, "サーバの Finished が合わない");
+    crypto_hash_update(&t->th, msg, mlen);
+
+    uint8_t c_ap[HL], s_ap[HL], fin[4 + HL];
+    transcript(t, th);   /* CH..サーバ Finished */
+    derive_secret(t->master, "c ap traffic", th, c_ap);
+    derive_secret(t->master, "s ap traffic", th, s_ap);
+    keylog(t, "CLIENT_TRAFFIC_SECRET_0", c_ap);
+    keylog(t, "SERVER_TRAFFIC_SECRET_0", s_ap);
+    expand_label(t->c_hs, "finished", NULL, 0, fk, HL);
+    fin[0] = HS_FINISHED;
+    wr24(fin + 1, HL);
+    crypto_hmac(CRYPTO_SHA256, fk, HL, th, HL, fin + 4);
+    crypto_hash_update(&t->th, fin, sizeof(fin));
+    /* 互換モードではこちらも最初の暗号化レコードの前に CCS を 1 個送る(RFC 8446 D.4)*/
+    static const uint8_t one = 1;
+    put_plain(o, CT_CCS, &one, 1);
+    dir_install(&t->tx, t->c_hs);
+    put_enc(o, &t->tx, CT_HANDSHAKE, fin, sizeof(fin));
+    dir_install(&t->tx, c_ap);
+    dir_install(&t->rx, s_ap);
+    crypto_wipe(t->master, sizeof(t->master));
+    crypto_wipe(c_ap, sizeof(c_ap)); crypto_wipe(s_ap, sizeof(s_ap));
+    t->state = TLS13_ST_OPEN;
+    return o->over ? fail(t, o, TLS13_ALERT_INTERNAL_ERROR, "送信バッファが足りない") : 0;
+}
+
 /* 握手メッセージ 1 個 */
 static int on_handshake(tls13_t *t, const uint8_t *msg, size_t mlen, obuf_t *o) {
     switch (t->state) {
@@ -459,6 +612,17 @@ static int on_handshake(tls13_t *t, const uint8_t *msg, size_t mlen, obuf_t *o) 
         crypto_wipe(t->master, sizeof(t->master));
         t->state = TLS13_ST_OPEN;
         return 0;
+    case TLS13_ST_WAIT_SH:
+        if (msg[0] != HS_SERVER_HELLO) return fail(t, o, TLS13_ALERT_UNEXPECTED_MESSAGE, "ServerHello でない");
+        return on_server_hello(t, msg, mlen, o);
+    case TLS13_ST_WAIT_EE:
+        if (msg[0] != HS_ENCRYPTED_EXTENSIONS) return fail(t, o, TLS13_ALERT_UNEXPECTED_MESSAGE, "EncryptedExtensions でない");
+        crypto_hash_update(&t->th, msg, mlen);   /* 中身(record_size_limit など)は使わない */
+        t->state = TLS13_ST_WAIT_SFIN;
+        return 0;
+    case TLS13_ST_WAIT_SFIN:
+        if (msg[0] != HS_FINISHED || mlen != 4 + HL) return fail(t, o, TLS13_ALERT_UNEXPECTED_MESSAGE, "サーバの Finished でない");
+        return on_server_finished(t, msg, mlen, o);
     case TLS13_ST_OPEN:
         if (msg[0] == HS_KEY_UPDATE && mlen == 5) {
             /* 相手の鍵を進める。求められたらこちらも進めて KeyUpdate を返す(RFC 8446 4.6.3)*/
@@ -490,12 +654,14 @@ static int on_handshake_bytes(tls13_t *t, const uint8_t *d, size_t n, obuf_t *o)
         const size_t ml = 4u + rd24(t->hbuf + 1);
         if (ml > sizeof(t->hbuf)) return fail(t, o, TLS13_ALERT_RECORD_OVERFLOW, "握手メッセージが大きすぎる");
         if (t->hlen < ml) break;
-        const tls13_state_t before = t->state;
+        const uint32_t before = t->rx.epoch;
         if (on_handshake(t, t->hbuf, ml, o) != 0) return -1;
         memmove(t->hbuf, t->hbuf + ml, t->hlen - ml);
         t->hlen -= ml;
-        /* 鍵が切り替わる境目にメッセージが残っていてはいけない(RFC 8446 5.1)*/
-        if (t->state != before && t->hlen) return fail(t, o, TLS13_ALERT_UNEXPECTED_MESSAGE, "鍵の切り替わりをまたぐ握手メッセージ");
+        /* 受信の鍵が切り替わる境目にメッセージが残っていてはいけない(RFC 8446 5.1)。
+         * **状態の変化ではなく鍵の世代で見る** -- クライアントは EE と Finished を
+         * 同じレコードで受け取る(状態は変わるが鍵は同じ)。 */
+        if (t->rx.epoch != before && t->hlen) return fail(t, o, TLS13_ALERT_UNEXPECTED_MESSAGE, "鍵の切り替わりをまたぐ握手メッセージ");
     }
     return 0;
 }
@@ -548,7 +714,7 @@ int tls13_input(tls13_t *t, const uint8_t *in, size_t n,
                 uint8_t *app, size_t appcap, size_t *applen) {
     obuf_t o = { out, cap, *outlen, 0 };
     int rc = 0;
-    while (n && rc == 0 && (t->state == TLS13_ST_WAIT_CH || t->state == TLS13_ST_WAIT_CFIN || t->state == TLS13_ST_OPEN)) {
+    while (n && rc == 0 && t->state != TLS13_ST_CLOSED && t->state != TLS13_ST_FAILED) {
         /* ヘッダ 5 バイトを揃えてから本体 */
         size_t want = 5;
         if (t->rlen >= 5) want = 5u + rd16(t->rbuf + 3);
@@ -675,6 +841,49 @@ int tls13_selftest(char *err, size_t errlen) {
     if (tls13_input(&t, RFC8448_CH_RECORD, sizeof(RFC8448_CH_RECORD), out, sizeof(out), &ol, app, sizeof(app), &al) == 0 ||
         t.alert_sent != TLS13_ALERT_UNKNOWN_PSK_IDENTITY)
         return tfail(err, errlen, "TLS 1.3 知らない身元を受け付けた");
+    /* 自作のクライアント <-> 自作のサーバ(段階 F)。往復と、違う PSK の陰性。
+     * **自作どうしなので両側が同じ間違い方をしうる** -- 独立の確認は
+     * tools/tls13_check.c(OpenSSL のサーバと握手)と Linux の tlshd が受け持つ。 */
+    {
+        static tls13_t c;
+        static tls13_psk_t cp;
+        memset(&cp, 0, sizeof(cp));
+        memcpy(cp.identity, "NVMe1R01 selftest", 17);
+        cp.identity_len = 17;
+        for (int i = 0; i < 32; i++) cp.psk[i] = (uint8_t)(i * 3 + 1);
+        for (int neg = 0; neg < 2; neg++) {
+            static tls13_psk_t sp;
+            sp = cp;
+            if (neg) sp.psk[5] ^= 1;
+            tls13_server_init(&t, &sp, 1);
+            tls13_client_init(&c, &cp);
+            static uint8_t a[2048], b[2048];
+            size_t an = tls13_client_hello(&c, a, sizeof(a)), bn = 0, cn = 0;
+            const int rs = tls13_input(&t, a, an, b, sizeof(b), &bn, app, sizeof(app), &al);
+            if (neg) {
+                if (rs == 0 || t.alert_sent != TLS13_ALERT_DECRYPT_ERROR)
+                    return tfail(err, errlen, "TLS 1.3 自作どうし: 違う PSK を受け付けた");
+                break;
+            }
+            if (rs != 0 || tls13_input(&c, b, bn, a, sizeof(a), &cn, app, sizeof(app), &al) != 0 ||
+                c.state != TLS13_ST_OPEN)
+                return tfail(err, errlen, c.why ? c.why : "TLS 1.3 自作どうし: クライアントの握手");
+            bn = 0;
+            if (tls13_input(&t, a, cn, b, sizeof(b), &bn, app, sizeof(app), &al) != 0 || t.state != TLS13_ST_OPEN)
+                return tfail(err, errlen, t.why ? t.why : "TLS 1.3 自作どうし: サーバの握手");
+            /* 両方向に 1 レコードずつ */
+            al = 0;
+            size_t rl = tls13_seal(&c, "ping", 4, a);
+            if (tls13_input(&t, a, rl, b, sizeof(b), &bn, app, sizeof(app), &al) != 0 || al != 4 || memcmp(app, "ping", 4))
+                return tfail(err, errlen, "TLS 1.3 自作どうし: クライアント -> サーバ");
+            al = 0;
+            rl = tls13_seal(&t, "pong", 4, a);
+            cn = 0;
+            if (tls13_input(&c, a, rl, b, sizeof(b), &cn, app, sizeof(app), &al) != 0 || al != 4 || memcmp(app, "pong", 4))
+                return tfail(err, errlen, "TLS 1.3 自作どうし: サーバ -> クライアント");
+        }
+        crypto_wipe(&c, sizeof(c));
+    }
     crypto_wipe(&t, sizeof(t));
     return 0;
 }

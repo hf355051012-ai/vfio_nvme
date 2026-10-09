@@ -110,8 +110,19 @@ static int send_raw(tcp_conn_t *tcp, const uint8_t *p, size_t n) {
 }
 
 /* 溜めた送信(握手の応答 / KeyUpdate / alert)を吐く。 */
-static int flush_pend(nvmet_tls_conn_t *s, tcp_conn_t *tcp) {
+static int flush_pend(nvmet_tls_conn_t *s, tcp_conn_t *tcp, int handshake) {
     if (!s->pendlen) return 0;
+    /* **握手中は同期送信(ACK まで待ち、自分で再送する)。** 非同期送信は
+     * 「誰かがポーリングして再送を回す」前提で、握手中のイニシエータの
+     * 接続ジョブはそれを回さない。実機で ClientHello が最初の 1 回でワイヤに
+     * 出ず、相手が 10 秒で諦めて FIN を送ってくるまで再送されなかった
+     * (ICReq が同期送信なのと同じ理由。冷たい経路なので費用は問題にならない)。 */
+    if (handshake) {
+        const int r = tcp_send(tcp, s->pend, (uint32_t)s->pendlen);
+        const int ok = (r == (int)s->pendlen);
+        s->pendlen = 0;
+        return ok ? 0 : -1;
+    }
     const int r = send_raw(tcp, s->pend, s->pendlen);
     s->pendlen = 0;
     return r;
@@ -147,7 +158,7 @@ int nvmet_tls_poll(nvmet_tls_conn_t *s, tcp_conn_t *tcp) {
     }
     if (n < 0) return s->t.state == TLS13_ST_OPEN ? 1 : 0;
     const int rc = feed_raw(s, s->in, (size_t)n);
-    if (flush_pend(s, tcp) != 0) return -1;
+    if (flush_pend(s, tcp, 1) != 0) return -1;
     if (rc != 0) {
         log_failure(s);
         return -1;
@@ -156,8 +167,8 @@ int nvmet_tls_poll(nvmet_tls_conn_t *s, tcp_conn_t *tcp) {
         uart_printf("[nvmet-tls] ClientHello を受理(身元 %.60s...)\n", s->t.psks[s->t.psk_index].identity);
     }
     if (before != TLS13_ST_OPEN && s->t.state == TLS13_ST_OPEN) {
-        uart_printf("[nvmet-tls] 握手が済んだ(TLS 1.3、TLS_AES_128_GCM_SHA256、x25519、身元の版 %d)\n",
-                    s->t.psk_index == 0 ? 1 : 0);
+        uart_printf("[%s] 握手が済んだ(TLS 1.3、TLS_AES_128_GCM_SHA256、x25519、身元の版 %d)\n",
+                    s->t.is_client ? "nvme-tls" : "nvmet-tls", s->t.psk_index == 0 ? 1 : 0);
     }
     return s->t.state == TLS13_ST_OPEN ? 1 : 0;
 }
@@ -170,7 +181,7 @@ int nvmet_tls_recv(nvmet_tls_conn_t *s, tcp_conn_t *tcp, uint8_t *dst, uint32_t 
         if (n == 0) return -1;
         if (n < 0) return 0;
         const int rc = feed_raw(s, s->in, (size_t)n);
-        flush_pend(s, tcp);
+        flush_pend(s, tcp, 0);
         if (rc != 0) {
             log_failure(s);
             return -1;
@@ -224,7 +235,7 @@ void nvmet_tls_drain(nvmet_tls_conn_t *s, nvmet_tls_deliver_fn deliver, void *ar
 int nvmet_tls_send(nvmet_tls_conn_t *s, tcp_conn_t *tcp, const void *p1, uint32_t l1,
                    const void *p2, uint32_t l2) {
     if (s->failed || s->t.state != TLS13_ST_OPEN) return -1;
-    if (flush_pend(s, tcp) != 0) return -1;   /* **受信中に生まれた送信を先に**(順序を崩さない)*/
+    if (flush_pend(s, tcp, 0) != 0) return -1;   /* **受信中に生まれた送信を先に**(順序を崩さない)*/
     const uint8_t *f[2] = { (const uint8_t *)p1, (const uint8_t *)p2 };
     uint32_t fl[2] = { l1, l2 };
     unsigned fi = 0;
@@ -261,9 +272,78 @@ int nvmet_tls_send(nvmet_tls_conn_t *s, tcp_conn_t *tcp, const void *p1, uint32_
     return 0;
 }
 
+/* ---- 段階 F: イニシエータ側 ---- */
+static char  s_cli_key[256];
+static char  s_cli_keylog_path[256];
+static FILE *s_cli_keylog;
+
+static void cli_keylog_write(void *arg, const char *line) {
+    (void)arg;
+    if (!s_cli_keylog && s_cli_keylog_path[0]) s_cli_keylog = fopen(s_cli_keylog_path, "a");
+    if (!s_cli_keylog) return;
+    fprintf(s_cli_keylog, "%s\n", line);
+    fflush(s_cli_keylog);
+}
+
+int nvme_tls_client_enabled(void) { return s_cli_key[0] != 0; }
+
+void nvme_tls_client_shell(const char *args) {
+    char buf[512];
+    strncpy(buf, args, sizeof(buf) - 1u);
+    buf[sizeof(buf) - 1u] = 0;
+    char *tok[3];
+    unsigned nt = 0;
+    char *save = 0;
+    for (char *p = strtok_r(buf, " \t\r\n", &save); p && nt < 3u; p = strtok_r(0, " \t\r\n", &save)) tok[nt++] = p;
+    if (nt == 1 && !strcmp(tok[0], "off")) {
+        crypto_wipe(s_cli_key, sizeof(s_cli_key));
+    } else if (nt >= 1) {
+        /* 形式だけ先に確かめる(身元は接続先の subnqn で決まるので、ここでは仮の NQN)*/
+        tls13_psk_t p[2];
+        const char *why = "";
+        if (tls13_nvme_psk(p, tok[0], "nqn.check", "nqn.check", &why) < 0) {
+            uart_printf("nvmetls: 鍵が使えない(%s)\n使い方: nvmetls <NVMeTLSkey-1:01:..:> [keylog <path>] / nvmetls off\n", why);
+            return;
+        }
+        crypto_wipe(p, sizeof(p));
+        strncpy(s_cli_key, tok[0], sizeof(s_cli_key) - 1u);
+        s_cli_keylog_path[0] = 0;
+        if (s_cli_keylog) {
+            fclose(s_cli_keylog);
+            s_cli_keylog = NULL;
+        }
+        if (nt >= 3 && !strcmp(tok[1], "keylog")) strncpy(s_cli_keylog_path, tok[2], sizeof(s_cli_keylog_path) - 1u);
+    }
+    uart_printf(s_cli_key[0] ? "nvmetls: 内蔵イニシエータは `tcpbench ... tls` で TLS 1.3 を使う(鍵の書き出し: %s)\n"
+                             : "nvmetls: イニシエータの TLS の鍵なし%s\n",
+                s_cli_key[0] ? (s_cli_keylog_path[0] ? s_cli_keylog_path : "しない") : "");
+}
+
+int nvme_tls_client_start(nvmet_tls_conn_t *s, tcp_conn_t *tcp, const char *hostnqn, const char *subnqn) {
+    tls13_psk_t p[2];
+    const char *why = "";
+    if (!s_cli_key[0] || tls13_nvme_psk(p, s_cli_key, hostnqn, subnqn, &why) < 0) {
+        uart_printf("[!] nvme-tls: 鍵が無い / 使えない(%s)\n", why);
+        return -1;
+    }
+    s->cpsk = p[0];   /* 身元の版 1(nvme gen-tls-key --identity=1 と同じ)*/
+    crypto_wipe(p, sizeof(p));
+    tls13_client_init(&s->t, &s->cpsk);
+    s->t.keylog = cli_keylog_write;
+    s->pendlen = 0;
+    s->applen = s->apphead = 0;
+    s->failed = 0;
+    s->rx_records = s->tx_records = s->rx_bytes = s->tx_bytes = 0;
+    const size_t n = tls13_client_hello(&s->t, s->pend, sizeof(s->pend));
+    if (!n) return -1;
+    s->pendlen = n;
+    uart_printf("[nvme-tls] ClientHello を送る(身元 %.60s...)\n", s->cpsk.identity);
+    return flush_pend(s, tcp, 1);
+}
+
 void nvmet_tls_close(nvmet_tls_conn_t *s, tcp_conn_t *tcp) {
     if (tcp->state == TCP_ESTABLISHED || tcp->state == TCP_CLOSE_WAIT) {
-        flush_pend(s, tcp);
+        flush_pend(s, tcp, 0);
         if (!s->failed && s->t.state == TLS13_ST_OPEN) {
             const size_t n = tls13_close(&s->t, s->rec);
             if (n) send_raw(tcp, s->rec, n);

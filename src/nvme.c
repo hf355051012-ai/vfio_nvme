@@ -30,6 +30,10 @@ static const uint8_t NVME_HOST_ID[16] = {
 };
 #define NVME_HOST_NQN "nqn.2014-08.org.nvmexpress:uuid:a0a1a2a3-a4a5-a6a7-a8a9-aaabacadaeaf"
 
+/* 内蔵イニシエータの TLS(段階 F)。admin と IO キュー(1 本)で 1 個ずつ。 */
+#include "nvmet_tls.h"
+static nvmet_tls_conn_t s_cli_tls[2];
+
 #define NVME_CNTLID_DYNAMIC 0xFFFFu  /* Fabrics Connect(admin queue): controller ID割り当てをtargetに任せる */
 
 typedef struct __attribute__((packed)) {
@@ -600,6 +604,7 @@ static void nvme_build_set_features_num_queues_sqe(nvme_sqe_t *sqe)
 typedef enum {
     NCONN_ST_TCP_ADMIN_BEGIN = 0,
     NCONN_ST_TCP_ADMIN_WAIT,
+    NCONN_ST_TLS_ADMIN,       /* TLS 1.3 の握手(req_tls のとき。ICReq より前)*/
     NCONN_ST_ICRESP_ADMIN_RECV,
     NCONN_ST_EXEC_FABRIC_CONNECT_ADMIN,
     /* in-band 認証(DH-HMAC-CHAP、相手が Connect の応答で ATR を立てたとき)。
@@ -619,6 +624,7 @@ typedef enum {
     NCONN_ST_EXEC_IDENTIFY_NS,
     NCONN_ST_EXEC_SET_FEATURES,
     NCONN_ST_TCP_IO_WAIT,
+    NCONN_ST_TLS_IO,
     NCONN_ST_ICRESP_IO_RECV,
     NCONN_ST_EXEC_FABRIC_CONNECT_IO,
 } nvme_connect_state_t;
@@ -761,6 +767,30 @@ static job_result_t nvme_connect_job_step(job_t *self)
         int r = tcp_connect_poll(&ctx->admin.tcp);
         if (r < 0) return nvme_connect_job_fail(jc, 0, 0, "admin TCP接続失敗");
         if (r == 0) return JOB_WAITING;
+        if (ctx->req_tls) {
+            /* **ICReq より前に TLS の握手**(NVMe/TCP の決まり)。 */
+            if (nvme_tls_client_start(&s_cli_tls[0], &ctx->admin.tcp, NVME_HOST_NQN,
+                                      ctx->subnqn) != 0)
+                return nvme_connect_job_fail(jc, 1, 0, "admin の TLS 握手を始められない");
+            jc->wait_started_ticks = timer_now();
+            self->state = NCONN_ST_TLS_ADMIN;
+            return JOB_WAITING;
+        }
+        goto admin_icreq;
+    }
+
+    case NCONN_ST_TLS_ADMIN: {
+        const int r = nvmet_tls_poll(&s_cli_tls[0], &ctx->admin.tcp);
+        if (r < 0) return nvme_connect_job_fail(jc, 1, 0, "admin の TLS 握手に失敗");
+        if (r == 0) {
+            if (timeout_ms(jc->wait_started_ticks, NVME_CONNECT_ICRESP_TIMEOUT_MS))
+                return nvme_connect_job_fail(jc, 1, 0, "admin の TLS 握手がタイムアウト");
+            return JOB_WAITING;
+        }
+        ctx->admin.tls = &s_cli_tls[0];
+    }
+    /* fallthrough */
+    admin_icreq: {
         if (nvme_tcp_send_icreq(&ctx->admin) != 0) {
             return nvme_connect_job_fail(jc, 1, 0, "admin ICReq送信失敗");
         }
@@ -1055,6 +1085,28 @@ static job_result_t nvme_connect_job_step(job_t *self)
         int r = tcp_connect_poll(&ctx->io.tcp);
         if (r < 0) return nvme_connect_job_fail(jc, 1, 0, "IO TCP接続失敗");
         if (r == 0) return JOB_WAITING;
+        if (ctx->req_tls) {
+            if (nvme_tls_client_start(&s_cli_tls[1], &ctx->io.tcp, NVME_HOST_NQN, ctx->subnqn) != 0)
+                return nvme_connect_job_fail(jc, 1, 1, "IO の TLS 握手を始められない");
+            jc->wait_started_ticks = timer_now();
+            self->state = NCONN_ST_TLS_IO;
+            return JOB_WAITING;
+        }
+        goto io_icreq;
+    }
+
+    case NCONN_ST_TLS_IO: {
+        const int r = nvmet_tls_poll(&s_cli_tls[1], &ctx->io.tcp);
+        if (r < 0) return nvme_connect_job_fail(jc, 1, 1, "IO の TLS 握手に失敗");
+        if (r == 0) {
+            if (timeout_ms(jc->wait_started_ticks, NVME_CONNECT_ICRESP_TIMEOUT_MS))
+                return nvme_connect_job_fail(jc, 1, 1, "IO の TLS 握手がタイムアウト");
+            return JOB_WAITING;
+        }
+        ctx->io.tls = &s_cli_tls[1];
+    }
+    /* fallthrough */
+    io_icreq: {
         if (nvme_tcp_send_icreq(&ctx->io) != 0) {
             return nvme_connect_job_fail(jc, 1, 1, "IO ICReq送信失敗");
         }
@@ -1621,6 +1673,24 @@ static void nvme_pipeline_h2c_pump(nvme_ctx_t *ctx)
         wr32le(&hdr[16], s_h2c_cursor.r2tl);
         wr32le(&hdr[20], 0);  /* reserved */
         nvme_tcp_append_hdgst(&ctx->io, hdr, NVME_TCP_DATA_PDU_LEN);
+        if (ctx->io.tls) {
+            /* TLS: ヘッダとデータを同じレコード列へ一度に(ゼロコピーは使わない)*/
+            const uint8_t *s0 = (const uint8_t *)s_pl_slots[s_h2c_cursor.slot].data + s_h2c_cursor.r2to;
+            int bad = nvmet_tls_send(ctx->io.tls, &ctx->io.tcp, hdr, NVME_TCP_DATA_PDU_LEN + hd,
+                                     s0, s_h2c_cursor.r2tl) != 0;
+            if (!bad && dd) {
+                uint8_t d[NVME_TCP_DGST_LEN];
+                wr32le(d, ~crc32c(0xFFFFFFFFu, s0, s_h2c_cursor.r2tl));
+                bad = nvmet_tls_send(ctx->io.tls, &ctx->io.tcp, d, NVME_TCP_DGST_LEN, NULL, 0) != 0;
+            }
+            if (bad) {
+                uart_printf("[!] nvme pipeline: H2CData送信失敗(TLS、cid=%u)\n", s_h2c_cursor.cid);
+                s_pl_slots[s_h2c_cursor.slot].done   = 1;
+                s_pl_slots[s_h2c_cursor.slot].result = -1;
+            }
+            s_h2c_cursor.active = 0;
+            return;
+        }
         {
             volatile ts_nvme_pdu_t info = {0};
             info.pdu_type    = hdr[0];
@@ -2072,6 +2142,17 @@ static void nvme_read_prx_dispatch(nvme_ctx_t *ctx, nvme_rd_state_t *rd)
     (void)ctx;
 }
 
+static void nvme_read_rx_upcall(void *arg, const volatile uint8_t *data, uint16_t len);
+
+/* TLS(段階 F)の push 型受信。復号して、タグの検証が通った平文だけを元の upcall へ。 */
+static void nvme_read_rx_upcall_tls(void *arg, const volatile uint8_t *data, uint16_t len)
+{
+    nvme_ctx_t *ctx = (nvme_ctx_t *)arg;
+    if (!ctx->io.tls || nvmet_tls_feed(ctx->io.tls, data, len, nvme_read_rx_upcall, ctx) != 0) {
+        s_rd[smp_core_index()].nrx_error = 1;
+    }
+}
+
 static void nvme_read_rx_upcall(void *arg, const volatile uint8_t *data, uint16_t len)
 {
     nvme_ctx_t *ctx = (nvme_ctx_t *)arg;
@@ -2361,7 +2442,13 @@ int nvme_read_pipelined_run(nvme_ctx_t *ctx, uint32_t nsid, uint64_t lba,
     rd->cur_slot = -1;
 
     rd->nrx_phase = NRX_HDR; rd->nrx_hdr_off = 0; rd->nrx_error = 0; rd->nrx_slot = -1;
-    tcp_set_recv_upcall(&ctx->io.tcp, nvme_read_rx_upcall, ctx);
+    if (ctx->io.tls) {
+        /* TLS: upcall の前に復号を挟む。待ち行列に残った平文は先に渡す */
+        tcp_set_recv_upcall(&ctx->io.tcp, nvme_read_rx_upcall_tls, ctx);
+        nvmet_tls_drain(ctx->io.tls, nvme_read_rx_upcall, ctx);
+    } else {
+        tcp_set_recv_upcall(&ctx->io.tcp, nvme_read_rx_upcall, ctx);
+    }
 
     uint64_t cur_lba = lba;  /* fio 同様、コマンドごとに進める(nvme_bench_next_lba) */
     uint32_t count = 0;

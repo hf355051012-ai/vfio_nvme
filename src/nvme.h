@@ -40,6 +40,8 @@ typedef struct {
      * ICReq 要求値へ配る。 */
     uint8_t  req_hdgst;
     uint8_t  req_ddgst;
+    /* 1 = TLS 1.3 で繋ぐ(段階 F。鍵はシェルの `nvmetls`)。admin / IO の両方で握手する。 */
+    uint8_t  req_tls;
 
     /* 接続前に 1 にすると Discovery コントローラとして接続する。Identify
      * Controller の後で Discovery Log Page を 2 回(ヘッダだけ → 全体)読み、

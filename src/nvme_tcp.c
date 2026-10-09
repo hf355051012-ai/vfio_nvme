@@ -7,6 +7,14 @@
 #include "job.h"
 #include "timestamp.h"
 #include "crc32c.h"
+#include "nvmet_tls.h"
+
+/* TLS の送信(段階 F)。失敗なら 1(呼び出し側の「送信失敗」の判定にそのまま使う)。 */
+static int nvme_tls_send_or_fail(nvme_tcp_conn_t *c, const void *p1, uint32_t l1,
+                                 const void *p2, uint32_t l2)
+{
+    return nvmet_tls_send(c->tls, &c->tcp, p1, l1, p2, l2) != 0;
+}
 
 #define NVME_TCP_ICRESP_TIMEOUT_MS 3000u
 #define NVME_TCP_RESP_TIMEOUT_MS   10000u
@@ -253,7 +261,8 @@ int nvme_tcp_send_cmd(nvme_tcp_conn_t *c, const nvme_sqe_t *sqe,
     c->pending_data = data;   /* use_r2t時: R2Tが来るまでdlen全体をここに保留 */
     c->pending_len  = dlen;
 
-    if (tcp_send(&c->tcp, s_cmd_buf, total_len) != (int)total_len) {
+    if (c->tls ? nvme_tls_send_or_fail(c, s_cmd_buf, total_len, NULL, 0)
+               : tcp_send(&c->tcp, s_cmd_buf, total_len) != (int)total_len) {
         uart_printf("[!] NVMe/TCP: CapsuleCmd送信失敗 (cid=%u)\n", cid);
         return -1;
     }
@@ -364,7 +373,8 @@ int nvme_tcp_tx_flush(nvme_tcp_conn_t *c)
     /* **tcp_send_async2() で送る(短経路 = 1 セグメント)。**
      * tcp_send_async() だと 640 バイト超が長経路(LSO)へ回り、そこへ
      * まとめた PDU 列を流すと相手が応答を返さなくなる。 */
-    if (tcp_send_async2(&c->tcp, s_tx_batch, (uint16_t)n, NULL, 0) < 0) {
+    if (c->tls ? nvme_tls_send_or_fail(c, s_tx_batch, n, NULL, 0)
+               : tcp_send_async2(&c->tcp, s_tx_batch, (uint16_t)n, NULL, 0) < 0) {
         uart_printf("[!] NVMe/TCP: 送信バッチのフラッシュ失敗 (%u バイト)\n", n);
         return -1;
     }
@@ -433,6 +443,11 @@ static int nvme_tcp_tx_put(nvme_tcp_conn_t *c, const void *p1, uint32_t l1,
                             const void *p2, uint32_t l2)
 {
     uint32_t need = l1 + l2;
+    if (c->tls) {
+        /* TLS: 溜めずに暗号化して送る(溜まっていれば先に出す)*/
+        if (nvme_tcp_tx_flush(c) != 0) return -1;
+        return nvme_tls_send_or_fail(c, p1, l1, p2, l2) ? -1 : 0;
+    }
     if (!s_tx_batching) {
         return tcp_send_async2(&c->tcp, p1, (uint16_t)l1, p2, (uint16_t)l2) < 0 ? -1 : 0;
     }
@@ -498,6 +513,17 @@ int nvme_tcp_send_cmd_inline_async(nvme_tcp_conn_t *c, const nvme_sqe_t *sqe,
      * なくスロットの実容量にしてあるので、**4K の in-capsule write(72+4096)も
      * 1 パケットで出る**。収まらなければ tcp_send_async2() が自動で 2 回に
      * 分けるが、そこへ来ないよう先に条件で切っておく。 */
+    if (c->tls) {
+        /* TLS: ヘッダとデータを同じレコード列へ。ダイジェストがあれば続けて */
+        if (nvme_tcp_tx_put(c, s_icd_hdr, hdr_len, src, dlen) != 0) return -1;
+        if (dd) {
+            uint8_t d[NVME_TCP_DGST_LEN];
+            wr32le(d, ~crc32c(0xFFFFFFFFu, src, dlen));
+            if (nvme_tls_send_or_fail(c, d, NVME_TCP_DGST_LEN, NULL, 0)) return -1;
+        }
+        if (out_cid) *out_cid = cid;
+        return 0;
+    }
     if (g_nvme_tcp_coalesce && dd == 0 &&
         (uint32_t)hdr_len + dlen <= TCP_ASYNC_SHORT_SLOT_BYTES) {
         if (nvme_tcp_tx_put(c, s_icd_hdr, hdr_len, src, dlen) != 0) {
@@ -596,7 +622,8 @@ int nvme_tcp_send_h2c_data_ex(nvme_tcp_conn_t *c, uint16_t cid, uint16_t ttag,
         nvme_tcp_append_ddgst(c, s_h2c_buf, data_off, chunk);
 
         uint32_t total = data_off + chunk + dd;
-        if (tcp_send(&c->tcp, s_h2c_buf, total) != (int)total) {
+        if (c->tls ? nvme_tls_send_or_fail(c, s_h2c_buf, total, NULL, 0)
+                   : tcp_send(&c->tcp, s_h2c_buf, total) != (int)total) {
             uart_printf("[!] NVMe/TCP: H2CData送信失敗 (offset=%u len=%u)\n", r2to + sent, chunk);
             return -1;
         }
@@ -638,7 +665,18 @@ int nvme_tcp_recv_poll(nvme_tcp_conn_t *c, nvme_tcp_xfer_t *x)
 
     uint32_t remain = x->want - x->got;
     uint32_t got_before = x->got;
-    int n = tcp_recv(&c->tcp, x->buf + x->got, remain, 0u);
+    int n;
+    if (c->tls) {
+        /* TLS: 復号済みの平文(タグを検証したもの)から読む */
+        n = nvmet_tls_recv(c->tls, &c->tcp, x->buf + x->got, remain);
+        if (n < 0) {
+            uart_printf("[!] NVMe/TCP: 受信中に相手が閉じた / TLS のレコードが壊れていた\n");
+            return -1;
+        }
+        if (n == 0) return 0;
+    } else {
+        n = tcp_recv(&c->tcp, x->buf + x->got, remain, 0u);
+    }
     if (n == 0) {
         uart_printf("[!] NVMe/TCP: 受信中に相手がFINでクローズ\n");
         return -1;
@@ -696,7 +734,8 @@ int nvme_tcp_send_term(nvme_tcp_conn_t *c, uint16_t fes, uint32_t fei,
     uart_printf("[NVMe/TCP] H2C TermReq 送信 (fes=0x%02x fei=0x%x len=%u)\n",
                 (unsigned)fes, (unsigned)fei, (unsigned)total);
     if (c->tcp.state != TCP_ESTABLISHED) return -1;
-    if (tcp_send(&c->tcp, s_term_buf, (uint16_t)total) != (int)total) {
+    if (c->tls ? nvme_tls_send_or_fail(c, s_term_buf, total, NULL, 0)
+               : tcp_send(&c->tcp, s_term_buf, (uint16_t)total) != (int)total) {
         uart_printf("[!] NVMe/TCP: H2C TermReq 送信失敗\n");
         return -1;
     }
@@ -732,7 +771,8 @@ int nvme_tcp_send_icreq(nvme_tcp_conn_t *c)
 
     uart_printf("[NVMe/TCP] ICReq送信 (hdgst要求=%u ddgst要求=%u)\n",
                 c->req_hdgst, c->req_ddgst);
-    if (tcp_send(&c->tcp, s_icreq_buf, (uint16_t)NVME_TCP_ICREQ_LEN) != (int)NVME_TCP_ICREQ_LEN) {
+    if (c->tls ? nvme_tls_send_or_fail(c, s_icreq_buf, NVME_TCP_ICREQ_LEN, NULL, 0)
+               : tcp_send(&c->tcp, s_icreq_buf, (uint16_t)NVME_TCP_ICREQ_LEN) != (int)NVME_TCP_ICREQ_LEN) {
         uart_printf("[!] NVMe/TCP: ICReq送信失敗\n");
         return -1;
     }
@@ -787,5 +827,9 @@ int nvme_tcp_verify_icresp(nvme_tcp_conn_t *c, const uint8_t icresp_buf[NVME_TCP
  * ===============================================================*/
 void nvme_tcp_close(nvme_tcp_conn_t *c)
 {
+    if (c->tls) {
+        nvmet_tls_close(c->tls, &c->tcp);   /* close_notify を送ってから閉じる */
+        c->tls = NULL;
+    }
     tcp_close(&c->tcp);
 }

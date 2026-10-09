@@ -9,8 +9,12 @@
 /* CRC32C ダイジェストは常に 4 バイト。 */
 #define NVME_TCP_DGST_LEN 4u
 
+struct nvmet_tls_conn;   /* nvmet_tls.h */
+
 typedef struct {
     tcp_conn_t tcp;
+    /* TLS 1.3(段階 F)。NULL なら平文。握手が済んでから入れる。 */
+    struct nvmet_tls_conn *tls;
     uint32_t   maxdata;    /* ICRespのMAXH2CDATA -- 1回のH2CDataで送れる最大バイト数 */
     uint16_t   next_cid;   /* コマンドID採番カウンタ(nvme_tcp_send_cmd()が使用) */
 
