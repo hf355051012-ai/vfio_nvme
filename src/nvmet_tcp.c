@@ -30,6 +30,107 @@ uint32_t nvmet_tcp_max_h2c_data(const nvmet_tcp_conn_t *c)
         : NVMET_TCP_MAXH2CDATA_UNSCALED;
 }
 
+/* **既定は 0 = 束ねない。** 実装して測ったが、パケットは 20% 減るのに
+ * スループットは 9% 落ちた(相手の cpu0 は 85%->84% で変わらない)。
+ * **相手を律速しているのはパケット数ではなかった。** 応答を溜めるぶん
+ * レイテンシが増えるだけ損になる。仕組みは陰性の記録として残す
+ * (`tcpnagle` と同じ扱い)。 */
+volatile uint32_t g_nvmet_tcp_batch = 0u;
+
+/*=================================================================
+ * 溜め込んだ応答 PDU を 1 つの TCP セグメントとして吐き出す。
+ *
+ * **短経路(tcp_send_async2)で送り切ること。** 長経路(LSO)へ流すと
+ * 壊れる(CLAUDE.md「まとめた送信を長経路へ流してはいけない」)。
+ *
+ * 引数:
+ *   c - 対象コネクション
+ * 戻り値:
+ *   0=送信した/溜まっていない、-1=失敗
+ * コール元:
+ *   nvmet_tcp_tx_put(), nvmet_tcp_tx_batch_end()
+ * ===============================================================*/
+int nvmet_tcp_tx_flush(nvmet_tcp_conn_t *c)
+{
+    if (c->tx_batch_len == 0u) return 0;
+    uint32_t n = c->tx_batch_len;
+    c->tx_batch_len = 0u;
+    if (tcp_send_async2(&c->tcp, c->tx_batch, (uint16_t)n, NULL, 0) < 0) {
+        uart_printf("[!] NVMe/TCP target: まとめ送信に失敗 (%u バイト)\n", n);
+        return -1;
+    }
+    return 0;
+}
+
+/*=================================================================
+ * バッチ区間を開始する。以後 nvmet_tcp_tx_put() は溜め込む。
+ * コール元: nvmet_io_job_step_impl() の ready-ring 排出ループ
+ * ===============================================================*/
+void nvmet_tcp_tx_batch_begin(nvmet_tcp_conn_t *c)
+{
+    if (g_nvmet_tcp_batch) c->tx_batching = 1u;
+}
+
+/*=================================================================
+ * バッチ区間を終える。**溜まっているものは必ずここで吐き出す**
+ * (残したまま park すると応答が止まる)。
+ * コール元: nvmet_io_job_step_impl() の ready-ring 排出ループ
+ * ===============================================================*/
+int nvmet_tcp_tx_batch_end(nvmet_tcp_conn_t *c)
+{
+    c->tx_batching = 0u;
+    return nvmet_tcp_tx_flush(c);
+}
+
+/*=================================================================
+ * 1〜2 断片の PDU を送る。バッチ区間の中なら溜め込み、外なら即送信する。
+ *
+ * 引数:
+ *   c        - 対象コネクション
+ *   p1 / l1  - 1 断片目(PDU ヘッダ)
+ *   p2 / l2  - 2 断片目(本体。無ければ NULL/0)
+ * 戻り値:
+ *   0=成功、-1=失敗
+ * コール元:
+ *   nvmet_tcp_send_r2t(), nvmet_tcp_send_resp(), nvmet_tcp_send_c2h_async()
+ * ===============================================================*/
+static int nvmet_tcp_tx_put(nvmet_tcp_conn_t *c, const void *p1, uint32_t l1,
+                             const void *p2, uint32_t l2)
+{
+    uint32_t need = l1 + l2;
+    if (!c->tx_batching || need > NVMET_TCP_TX_BATCH_MAX) {
+        /* **溜まっているものを先に出してから**送る(順序を崩さない)。 */
+        if (nvmet_tcp_tx_flush(c) != 0) return -1;
+        return tcp_send_async2(&c->tcp, p1, (uint16_t)l1,
+                               p2, (uint16_t)l2) < 0 ? -1 : 0;
+    }
+    if (c->tx_batch_len + need > NVMET_TCP_TX_BATCH_MAX) {
+        if (nvmet_tcp_tx_flush(c) != 0) return -1;
+    }
+    volatile_fast_copy((volatile uint8_t *)&c->tx_batch[c->tx_batch_len],
+                        (const volatile uint8_t *)p1, l1);
+    c->tx_batch_len += l1;
+    if (l2 != 0u) {
+        volatile_fast_copy((volatile uint8_t *)&c->tx_batch[c->tx_batch_len],
+                            (const volatile uint8_t *)p2, l2);
+        c->tx_batch_len += l2;
+    }
+    return 0;
+}
+
+/* 既定で有効。**`tcpcoalesce off` が陰性対照**(まとめる前の挙動)。 */
+volatile uint32_t g_nvmet_tcp_coalesce = 1u;
+
+/* 検証用: 次に送る N 個のヘッダダイジェストをわざと壊す(シェルの
+ * `hdgstcorrupt`)。**相手が誤りを検出して TermReq を返してくるかを
+ * 確かめる唯一の手段**で、Linux 相手にも効く。 */
+volatile uint32_t g_nvmet_tcp_hdgst_corrupt;
+/* 検証側をわざと失敗させる(シェルの `hdgstcorrupt v`)。 */
+volatile uint32_t g_nvmet_tcp_hdgst_verify_fail;
+/* 送った / 受け取った TermReq の数。 */
+volatile uint32_t g_nvmet_tcp_term_sent;
+volatile uint32_t g_nvmet_tcp_term_recv;
+
 /*=================================================================
  * ヘッダダイジェストが有効なら buf[0..hlen) の CRC32C を buf[hlen..+4) へ
  * 書く。**呼び出し元は先に flags/plen/pdo など hlen 範囲の全フィールドを
@@ -45,16 +146,6 @@ uint32_t nvmet_tcp_max_h2c_data(const nvmet_tcp_conn_t *c)
  * コール元:
  *   nvmet_tcp_send_r2t(), nvmet_tcp_send_resp(), nvmet_tcp_send_c2h()
  * ===============================================================*/
-/* 検証用: 次に送る N 個のヘッダダイジェストをわざと壊す(シェルの
- * `hdgstcorrupt`)。**相手が誤りを検出して TermReq を返してくるかを
- * 確かめる唯一の手段**で、Linux 相手にも効く。 */
-volatile uint32_t g_nvmet_tcp_hdgst_corrupt;
-/* 検証側をわざと失敗させる(シェルの `hdgstcorrupt v`)。 */
-volatile uint32_t g_nvmet_tcp_hdgst_verify_fail;
-/* 送った / 受け取った TermReq の数。 */
-volatile uint32_t g_nvmet_tcp_term_sent;
-volatile uint32_t g_nvmet_tcp_term_recv;
-
 static uint32_t nvmet_tcp_append_hdgst(nvmet_tcp_conn_t *c, uint8_t *buf, uint32_t hlen)
 {
     if (!c->hdgst) return 0;
@@ -391,7 +482,7 @@ int nvmet_tcp_send_r2t(nvmet_tcp_conn_t *c, uint16_t cid,
     }
     ts_log(TS_MK(TS_FILE_NVMET_TCP, TS_FUNC_nvmet_tcp_send_r2t, 1), c->tcp.snd_seq);
 
-    if (tcp_send_async(&c->tcp, s_r2t_buf, (uint16_t)total) != (int)total) {
+    if (nvmet_tcp_tx_put(c, s_r2t_buf, total, NULL, 0) != 0) {
         uart_printf("[!] NVMe/TCP target: R2T送信失敗 (cid=%u offset=%u len=%u)\n", cid, r2to, r2tl);
         return -1;
     }
@@ -426,7 +517,7 @@ int nvmet_tcp_send_resp(nvmet_tcp_conn_t *c, const nvme_cqe_t *cqe)
         ts_log_nvme_tcp_pdu(TS_MK(TS_FILE_NVMET_TCP, TS_FUNC_nvmet_tcp_send_resp, 0), &info);
     }
 
-    if (tcp_send_async(&c->tcp, s_resp_buf, (uint16_t)total) != (int)total) {
+    if (nvmet_tcp_tx_put(c, s_resp_buf, total, NULL, 0) != 0) {
         uart_printf("[!] NVMe/TCP target: Response Capsule送信失敗 (cid=%u)\n", cqe->cid);
         return -1;
     }
@@ -561,12 +652,33 @@ int nvmet_tcp_send_c2h_async(nvmet_tcp_conn_t *c, uint16_t cid,
     wr32le(&hdr[20], 0);       /* reserved */
     nvmet_tcp_append_hdgst(c, hdr, NVME_TCP_DATA_PDU_LEN);
 
+    const uint8_t *src = (const uint8_t *)data;
+
+    /* **ヘッダと本体を 1 つの TCP セグメントにまとめる。** 別々に送ると
+     * **read 応答 1 個が 2 パケットになり、相手のパケット処理を 2 倍消費する**
+     * (実測で相手の受信パケット/コマンドが 2.4)。write は 24 バイトの応答
+     * 1 個で済むので、**これが「read だけ遅い」という非対称の正体**だった。
+     * イニシエータ側の in-capsule write でまったく同じ形を直してある
+     * (CLAUDE.md「1 コマンドを 2 パケットで送っていた」)。
+     *
+     * ゼロコピー(`tcp_send_async_ref`)は捨てて再送スロットへ写すことになるが、
+     * **どのみち再送用に控える必要がある**ので増える費用はコピー 1 回だけ。
+     * データダイジェストがあるときは 3 断片目が付くのでまとめない。 */
+    if (g_nvmet_tcp_coalesce && dd == 0u &&
+        (uint32_t)NVME_TCP_DATA_PDU_LEN + hd + dlen <= TCP_ASYNC_SHORT_SLOT_BYTES) {
+        if (nvmet_tcp_tx_put(c, hdr, (uint32_t)NVME_TCP_DATA_PDU_LEN + hd,
+                             src, dlen) != 0) {
+            uart_printf("[!] NVMe/TCP target: C2HData非同期送信失敗 (cid=%u)\n", cid);
+            return -1;
+        }
+        goto sent;
+    }
+
     if (tcp_send_async(&c->tcp, hdr, (uint16_t)(NVME_TCP_DATA_PDU_LEN + hd)) < 0) {
         uart_printf("[!] NVMe/TCP target: C2HDataヘッダ非同期送信失敗 (cid=%u)\n", cid);
         return -1;
     }
 
-    const uint8_t *src = (const uint8_t *)data;
     uint32_t queued = 0;
     while (queued < dlen) {
         uint32_t remaining = dlen - queued;
@@ -589,6 +701,7 @@ int nvmet_tcp_send_c2h_async(nvmet_tcp_conn_t *c, uint16_t cid,
         }
     }
 
+sent:
     /* NSND(旧NC2H)。 */
     {
         volatile ts_nvme_pdu_t info = {0};

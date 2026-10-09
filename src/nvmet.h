@@ -5,6 +5,29 @@
 #include "nvmet_tcp.h"
 #include "netif.h"
 
+/* 統計をコアごとに持つときの本数(SMP_MAX_CORES と同じ。smp.h を引くと
+ * ヘッダの依存が増えるので、ここで独立に定義して nvmet.c で検算する)。 */
+#define NVMET_STAT_CORES 4u
+
+/* **1 コアぶんでちょうど 1 キャッシュライン。** 隣のコアの更新で自分の行が
+ * 無効化されると、分けた意味が無くなる(false sharing)。 */
+typedef struct {
+    uint64_t read_bytes;
+    uint64_t write_bytes;
+    uint64_t read_cmds;
+    uint64_t write_cmds;
+    /* **エラー記録の文脈も毎コマンド書く**ので、同じ行に置いてコア間で
+     * 共有しない(値そのものは「直前に処理したコマンド」の意味で、
+     * エラーを起こしたコアの値を読めばよい)。 */
+    uint64_t err_lba;
+    uint32_t write_incapsule;   /* write の内訳: in-capsule で届いた数 */
+    uint32_t write_h2c;         /* write の内訳: R2T -> H2CData で届いた数 */
+    uint32_t err_nsid;
+    uint16_t err_sqid;
+    uint8_t  pad[10];
+} __attribute__((aligned(64))) nvmet_core_stat_t;
+_Static_assert(sizeof(nvmet_core_stat_t) == 64, "nvmet_core_stat_t は 1 キャッシュライン");
+
 #define NVMET_LBA_SIZE       512u
 
 /* 名前空間は 2 つ。**2 個目を小さくしてあるのは .bss の都合**(1 個目と同じ
@@ -61,6 +84,30 @@
 
 #define NVMET_MAX_INSTANCES 1u
 
+/* 1 つのコントローラが同時に持てる IO キュー(= TCP コネクション)の本数の
+ * **上限**。実際に何本広告するかは実行時に `g_nvmet_io_queues` で決める
+ * (シェルの `nvmetqueues`)。**1 にすると従来どおりの 1 本だけ**になるので
+ * 陰性対照として使える。
+ *
+ * **上限は `TCP_MAX_CONNS`(32/コア)と `JOB_MAX`(32)で決まる。** 1 セッションで
+ * admin 1 + IO N 本を握り、listen backlog(最大 4)と内蔵イニシエータ
+ * (admin+IO の 2 本)が同時に生きうる。**増やすときは両方を一緒に見ること。**
+ *
+ * **1 キューあたり約 1.1MB**(`dsm_stage[256][4096]` が支配的)なので、
+ * 16 本で約 18MB を .bss に置く。
+ *
+ * **この機材では 4 本より多くは実測できない** -- Linux のホストは
+ * `min(要求, オンライン CPU 数)` に丸め、Pi5 は 4 コアだから。16 にして
+ * あるのは「本数を決めるのは利用者であってこちらではない」ため。 */
+#define NVMET_IO_QUEUES 16u
+
+/* **この本数以上の IO キューを合意したときだけ ACK の相乗りを使う。**
+ * 実測(方向B、512B read qd=128): 4 本では 98.0k -> 106.8k(+9%、kernel
+ * 108.3k / SPDK 107.6k と並ぶ)。1 本では 245k -> 207k、3 本では
+ * 332k -> 281k と**損**になる(相手の cpu0 が 85〜90% で飽和しており、
+ * ACK が送信のペーシングに効いているため)。 */
+#define NVMET_ACKPIGGY_MIN_QUEUES 4u
+
 #define NVMET_MAX_PENDING_WRITES 8u
 
 /* push 型受信の ready-ring の段数(`nvmet.c` が使う)。**Dataset Management の
@@ -82,6 +129,10 @@
 #define NVMET_DSM_MAX_RANGE_LBAS  65536u
 #define NVMET_DSM_MAX_TOTAL_LBAS  65536u
 
+/* `io_arm_owner` の番人。0 以上は IO キュー番号。 */
+#define NVMET_ARM_FREE  (-1)
+#define NVMET_ARM_ADMIN (-2)
+
 typedef struct {
     int      in_use;
     uint16_t cid;
@@ -102,14 +153,31 @@ typedef struct {
 
 typedef struct {
     nvmet_tcp_conn_t admin;
-    nvmet_tcp_conn_t io;
-    int      io_connected;
     uint16_t ctrlr_id;   /* 固定値1 */
     uint32_t cc;         /* CCレジスタ(Property Setで書き込まれる) */
     int      cc_en;      /* cc & NVME_CC_ENが立ったら1 */
     int      shutdown_complete; /* CC.SHNを受けた=CSTS.SHSTに完了(10b)を返す */
 
+    /* admin が Fabrics Connect(qid=0)を受理したら 1。IO ジョブはこれが
+     * 立つまで accept しない。**Discovery コントローラでは立てない**
+     * (IO キューを作らないので、arm すると次の接続の admin 用 SYN を
+     * IO 側の accept が食べてしまう)。 */
     volatile int io_armed;
+
+    /* ---- 複数 IO キュー(= 複数コネクション)------------------------------
+     * **listener の受け皿(`accept_conn`)は 1 本しか無い**ので、admin と N 本の
+     * IO ジョブが同時に arm することはできない。この「arm 権」を持てるのは
+     * 常に 1 ジョブだけで、`tcp_accept_ready_poll()` を呼んでよいのも
+     * 権利を持っているジョブだけ。**持っていないジョブが poll すると、
+     * armed なジョブ宛に確立したコネクションを横取りする。** */
+    volatile int io_arm_owner;       /* NVMET_ARM_FREE / _ADMIN / IO キュー番号 */
+    /* いま確立している IO キューの本数。0 になった時点でセッション終了。 */
+    volatile int io_open;
+    /* Set Features(Number of Queues)でホストと合意した IO キュー本数。
+     * **ホストの要求とこちらの上限の小さいほう。** これ以上は arm しない
+     * (arm したまま残すと、その受け皿が次の admin 接続を食べてしまう)。 */
+    volatile uint32_t io_queues_granted;
+
     volatile int admin_failed;
     volatile int session_done;
     volatile int session_active;
@@ -173,35 +241,36 @@ typedef struct {
     /* Discovery Log Page(ヘッダ + エントリ)。 */
     uint8_t  disc_log[NVMET_DISC_LOG_LEN] __attribute__((aligned(64)));
 
-    /* Dataset Management の範囲リスト。**ready-ring のスロットと 1 対 1** で
-     * 割り当てるので、DSM が続けて届いても互いを踏まない。ring 側に持たせると
-     * スロットの間隔が 4KB 開いて **hot path(通常の read/write)の TLB を
-     * 荒らす**ので、こちらへ置いてある。 */
-    uint8_t  dsm_stage[NVMET_READY_RING][NVMET_DSM_STAGE_BYTES] __attribute__((aligned(64)));
-
     /* SMART / Error Information ログの実体。**セッションをまたいで持ち越す**
      * (実コントローラの通電中の統計はホストが繋ぎ直しても 0 に戻らない)。
      * リセットするのは nvmet_job_start() = プロセス起動時だけ。 */
     uint64_t start_tick;         /* power_on_hours の起点 */
-    uint64_t stat_read_bytes;
-    uint64_t stat_write_bytes;
-    uint64_t stat_read_cmds;
-    uint64_t stat_write_cmds;
+    /* **IO ホットパスで進むカウンタはコアごとに持つ**(合計は冷たい経路で取る)。
+     * 複数コアで IO キューを回すようになったので、1 本の共有カウンタだと
+     * **1 コマンドごとに同じキャッシュラインをコア間で往復させる**ことになる。
+     * 実測で、2 コアへ分散した途端に 512B read が 266k -> 211k、
+     * 4K read が 182k -> 147k まで落ちた(分散した効果を自分で食い潰していた)。
+     * 読むのは SMART / Keep Alive / 表示だけなので、そこで足し合わせればよい。 */
+    nvmet_core_stat_t stat[NVMET_STAT_CORES];
     uint64_t error_count;        /* 発生したエラーの累計(SMART の num_err_log_entries)*/
     /* 直近 1 件のエラー(ELPE=0 = 1 エントリを広告している)。 */
     uint8_t  error_slot[NVME_ERROR_SLOT_LEN];
-    /* エラー記録に使う「いま処理中のコマンド」の文脈。dispatch の入口で
-     * 設定し、LBA を持つコマンドだけがエラー直前に err_lba を入れる。 */
-    uint16_t err_sqid;
-    uint32_t err_nsid;
-    uint64_t err_lba;
-
-    uint32_t write_incapsule_count;
-    uint32_t write_h2c_count;
-    nvmet_pending_write_t pending_writes[NVMET_MAX_PENDING_WRITES];
 } nvmet_ctx_t;
 
+/* 全コアぶんを足した統計を取り出す(NULL のポインタは無視する)。 */
+void nvmet_stat_totals(const nvmet_ctx_t *ctx, uint64_t *read_bytes, uint64_t *write_bytes,
+                       uint64_t *read_cmds, uint64_t *write_cmds,
+                       uint32_t *write_incapsule, uint32_t *write_h2c);
+void nvmet_stat_clear(nvmet_ctx_t *ctx);
+
 int nvmet_job_start(nvmet_ctx_t *ctx, uint16_t port, netif_t *bound_ctx, const char *label);
+
+/* 広告する IO キュー(= 同時に受け付ける IO コネクション)の本数。
+ * 1..NVMET_IO_QUEUES。**1 が従来の挙動(陰性対照)。** `txdrop` などと同じ
+ * 恒久デバッグ機能で、**変更は次のセッションから効く**(Set Features で
+ * ホストと合意する値なので、確立済みのセッションには反映できない)。 */
+extern volatile uint32_t g_nvmet_io_queues;
+void nvmet_io_queues_show(const nvmet_ctx_t *ctx);
 
 /* 名前空間の追加/削除(シェルの `nvmens` から呼ぶ)。**D6 の AER は
  * これで発火させる** -- 稼働中に名前空間が増減したことをホストへ通知し、

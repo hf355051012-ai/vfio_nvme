@@ -26,6 +26,8 @@ uint8_t rdma_cm_responder_resources_override(void) { return s_rr_override; }
 
 #define CM_REP_ATTR_ID 0x0013u
 #define CM_RTU_ATTR_ID 0x0014u
+#define CM_DREQ_ATTR_ID 0x0015u
+#define CM_DREP_ATTR_ID 0x0016u
 #define IB_CM_CLASS_VERSION 2u // drivers/infiniband/core/cm_msgs.hで確認済み
 
 /* Linux の rdma_cm はサービス ID を (port_space << 16) + port で作り、
@@ -277,6 +279,9 @@ static void rdma_cm_parse_rep(rdma_cm_ctx_t *ctx, const volatile uint8_t *recv_b
     ctx->remote_comm_id = rd32be_ib(&p[0]);
     ctx->peer_rc_qpn = ((uint32_t)p[12] << 16) | ((uint32_t)p[13] << 8) | p[14];
     ctx->peer_starting_psn = ((uint32_t)p[20] << 16) | ((uint32_t)p[21] << 8) | p[22];
+    for (unsigned i = 0; i < sizeof(ctx->rep_priv); i++) {
+        ctx->rep_priv[i] = p[36 + i]; // PRIVATE_DATA(p[36..231])
+    }
 }
 
 /*=================================================================
@@ -366,7 +371,7 @@ static int rdma_cm_setup_gsi_reused(rdma_cm_ctx_t *ctx) {
  *   rdma_cm_job_step()
  * ===============================================================*/
 static int rdma_cm_setup_rc(rdma_cm_ctx_t *ctx) {
-    if (mlx5_qp_create_rc(ctx->dev, &ctx->rc_qp, ctx->rc_qp_index) != 0) {
+    if (mlx5_qp_create_rc_ex(ctx->dev, &ctx->rc_qp, ctx->rc_qp_index, ctx->rc_cs_req) != 0) {
         uart_printf("rdma_cm: FAILED (RC CREATE_QP)\n");
         return -1;
     }
@@ -780,4 +785,74 @@ void rdma_cm_fill_addr(rdma_cm_ctx_t *ctx, mlx5_dev_t *dev, const char *self_lab
     ctx->hrqsize      = RDMA_CM_DEFAULT_HRQSIZE;
     ctx->hsqsize      = RDMA_CM_DEFAULT_HSQSIZE;
     ctx->cntlid       = 0xFFFFu;
+}
+
+/*=================================================================
+ * 確立済みの接続を CM の DREQ(IBTA Vol1 Table 114)で畳み、DREP を待つ。
+ *
+ * **これを送らないと相手(Linux の ib_cm)に接続が残る。** 次に同じ
+ * (CA GUID, QPN) で REQ を出すと REJ reason=10(stale connection)で
+ * 弾かれる。こちらは QP を作り直すと同じ QPN が再利用されるので当たりやすい。
+ *
+ * DREQ の REMOTE_QPN は**相手の QPN**(Linux の cm_dreq_handler() は
+ * 自分の local_qpn と照合して、違えば黙って捨てる)。
+ *
+ * 引数:
+ *   ctx        - 確立済みの CM コンテキスト(GSI と comm_id を使う)
+ *   wait_ms    - DREP を待つ上限
+ * 戻り値:
+ *   0=DREP を受けた、-1=送信失敗、1=待ち切れ
+ * コール元:
+ *   rdma_short_disconnect()
+ * ===============================================================*/
+int rdma_cm_disconnect(rdma_cm_ctx_t *ctx, uint32_t wait_ms) {
+    if (mlx5_qp_post_recv_gsi(ctx->dev, ctx->gsi_qp, (void *)(uintptr_t)ctx->recv_buf,
+                              sizeof(ctx->recv_buf)) != 0) {
+        return -1;
+    }
+    volatile uint8_t *buf = ctx->send_buf;
+    for (unsigned i = 0; i < RDMA_CM_MAD_SIZE; i++) {
+        buf[i] = 0;
+    }
+    ctx->tid = timer_now() ^ 0x5566778899AABBCCull;
+    ib_mad_hdr_build(buf, IB_MGMT_CLASS_CM, IB_CM_CLASS_VERSION, IB_MGMT_METHOD_SEND,
+                     ctx->tid, CM_DREQ_ATTR_ID, 0);
+    volatile uint8_t *p = &buf[IB_MAD_HDR_LEN];
+    wr32be_ib(&p[0], ctx->local_comm_id);
+    wr32be_ib(&p[4], ctx->remote_comm_id);
+    p[8]  = (uint8_t)(ctx->peer_rc_qpn >> 16);
+    p[9]  = (uint8_t)(ctx->peer_rc_qpn >> 8);
+    p[10] = (uint8_t)ctx->peer_rc_qpn; // REMOTE_QPN(24bit)
+    dcache_clean_range((const void *)(uintptr_t)ctx->send_buf, sizeof(ctx->send_buf));
+    if (mlx5_qp_post_send_ud(ctx->dev, ctx->gsi_qp, (const void *)(uintptr_t)ctx->send_buf,
+                              RDMA_CM_MAD_SIZE, 1u, IB_QP1_QKEY, ctx->peer_gid, ctx->peer_mac) != 0) {
+        return -1;
+    }
+    uart_printf("rdma_cm: DREQ sent (local_comm_id=0x%08x remote_comm_id=0x%08x)\n",
+                ctx->local_comm_id, ctx->remote_comm_id);
+
+    uint64_t start = timer_now();
+    while (!timeout_ms(start, wait_ms)) {
+        int is_send = 0;
+        uint32_t recv_len = 0;
+        uint8_t synd = 0;
+        int rc = mlx5_qp_poll_cqe_gsi(ctx->dev, ctx->gsi_qp, &is_send, &recv_len, &synd);
+        if (rc < 0) {
+            uart_printf("rdma_cm: DREQ: GSI CQE error syndrome=0x%02x\n", synd);
+            return -1;
+        }
+        if (rc == 1 && !is_send) {
+            dcache_invalidate_range((const void *)(uintptr_t)ctx->recv_buf, sizeof(ctx->recv_buf));
+            uint16_t attr = rdma_cm_recv_attr_id(ctx->recv_buf);
+            if (attr == CM_DREP_ATTR_ID) {
+                uart_printf("rdma_cm: DREP received -- 切断完了\n");
+                return 0;
+            }
+            uart_printf("rdma_cm: DREQ 待ち中に想定外 MAD attr_id=0x%04x\n", attr);
+            mlx5_qp_post_recv_gsi(ctx->dev, ctx->gsi_qp, (void *)(uintptr_t)ctx->recv_buf,
+                                  sizeof(ctx->recv_buf));
+        }
+    }
+    uart_printf("rdma_cm: DREP を待ち切れませんでした(%ums)\n", wait_ms);
+    return 1;
 }

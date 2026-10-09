@@ -79,9 +79,21 @@ void tcp_copy_stats_get(uint64_t *c2_ns, uint64_t *c2_by,
 #define TCP_MSS_LOCAL           10182u
 #define TCP_MSS_DEFAULT_RFC879   536u  /* 相手がMSSオプションを付けなかった場合の既定値 */
 
-#define TCP_MAX_CONNS 12u
+/* コアごとのコネクション数の上限。1 セッションで admin 1 + IO
+ * NVMET_IO_QUEUES(16)本を握り、さらに listen backlog(4)と内蔵
+ * イニシエータ(admin+IO の 2 本)が同時に生きうるので 23 本。余裕を見て 32。
+ * **`tcp_priv_t` が rx_buf を抱えているのでここは .bss へ直結する** --
+ * 増やす前に TCP_RX_BUF_SIZE の見積もりを確認すること。 */
+#define TCP_MAX_CONNS 32u
 
-#define TCP_RX_BUF_SIZE (16u * 1024u * 1024u)
+/* **順番どおり届いたデータの置き場(コネクションごと)。**
+ * **広告ウィンドウはここではなく `ooo[]` の容量(64 x MSS = 約 589KB)で
+ * 頭打ちになる**(tcp_wire_window())ので、16MB は 27 倍の過剰だった。
+ * `s_priv[SMP_MAX_CORES][TCP_MAX_CONNS]` に埋まっているため、16MB のままだと
+ * **4 コア x 12 本で約 800MB**を .bss に置くことになり、IO キューを
+ * 増やすとそれだけで破綻する。ウィンドウの上限(589KB)の 3.5 倍あれば
+ * 「アプリが読み出すのが遅れたぶんの余裕」として十分。 */
+#define TCP_RX_BUF_SIZE (2u * 1024u * 1024u)
 
 #define TCP_RECV_NOACK_ACK_THRESHOLD_MSS 2u
 
@@ -106,8 +118,36 @@ void tcp_copy_stats_get(uint64_t *c2_ns, uint64_t *c2_by,
 #define TCP_ASYNC_SLOTS_MLX5_EXTRA    16u
 #define TCP_ASYNC_MLX5_OVERFLOW_CONNS 8u
 
-#define TCP_ASYNC_SHORT_MAX_LEN 512u
-#define TCP_ASYNC_SHORT_SLOTS   16u
+/* 短い非同期送信の再送スロット数(配列の大きさ)。**実際に使う本数は
+ * `g_tcp_async_short_cap`(既定 16 = 従来値)** で、`tcpasync` から変えられる。
+ *
+ * **ここがイニシエータのスループット上限を決めている。** 満杯になると
+ * tcp_send_async_short() が ACK を待って**その場でブロックする**ので、
+ * 「NVMe の深さをいくら上げても、ACK されていないセグメントは
+ * この本数まで」になる。512B の in-capsule write は**ヘッダとデータで
+ * 2 本使う**ので、16 本 = 同時 8 コマンドぶんしかパイプに入らない。 */
+#define TCP_ASYNC_SHORT_SLOTS   64u
+
+/* 実効本数(1..TCP_ASYNC_SHORT_SLOTS)。**ベンチの合間に変えること** --
+ * リングに要素が残っている状態で変えると添字がずれて再送内容が壊れる。 */
+/* **既定は 64。** 16(元の値)だと、受信をまとめて進めたときに 1 周で
+ * 多数のコマンドが送信され、スロットを使い切って ACK 待ちでブロックする
+ * (4K write で実測 91k、64 本なら 118k)。配列は最初から
+ * TCP_ASYNC_SHORT_SLOTS 本あるので、増やしてもメモリは増えない。 */
+volatile unsigned g_tcp_async_short_cap = 64u;
+
+/* 満杯で待たされた回数(`tcpasync` で表示)。**送信側が詰まっているかを
+ * 見る唯一の手段。** */
+volatile uint64_t g_tcp_async_short_stalls;
+
+/* 送信ウィンドウ(相手の広告窓 or 自分の cwnd)が空くのを待った回数と、
+ * 最後に待たされたときの値。**write だけが遅い**ときにここを見る --
+ * read はコマンド 72B しか送らないので窓を使い切らない。 */
+volatile uint64_t g_tcp_async_short_winwait;
+volatile uint32_t g_tcp_win_last_usable;
+volatile uint32_t g_tcp_win_last_outstanding;
+volatile uint32_t g_tcp_win_last_cwnd;
+volatile uint32_t g_tcp_win_last_sndwin;
 
 volatile uint32_t g_tcp_retransmit_count[SMP_MAX_CORES];
 
@@ -121,7 +161,29 @@ volatile uint32_t g_tcp_fast_retransmit_count[SMP_MAX_CORES];
  * 効きすぎていないか(1 回のロスに対し何回入り直しているか)が分かる。 */
 volatile uint32_t g_tcp_dup_ack_count[SMP_MAX_CORES];
 
-volatile uint32_t g_tcp_ack_threshold = 4u;
+/* **既定 1(= 受信セグメントごとに ACK)。** 4 にすると相手の ACK 処理は
+ * 減るが、**得か損かは相手が飽和しているかで逆になる**:
+ *
+ * | | 相手の状態 | ackthresh 4 の効果 |
+ * |---|---|---|
+ * | 方向A(自製=イニシエータ、相手 nvmet)| **cpu0 が 100%** | **+12〜38%** |
+ * | 方向B(自製=ターゲット、相手 nvme-tcp)| 余裕あり(25〜32%)| **-7〜10%** |
+ *
+ * **相手に余裕があるときは、ACK を間引くと送信の駆動(ACK clocking)が
+ * 粗くなって損をする。** 既定は 1 にして退行させず、**相手が飽和して
+ * いると分かっている条件でだけ `ackthresh 4` を使う。** */
+volatile uint32_t g_tcp_ack_threshold = 1u;
+
+/* ACK を間引く対象とする受信セグメントの最小長(0 = MSS/8 を使う)。
+ * **小さいセグメント(write の応答 PDU など)を待たせないため。** */
+volatile uint32_t g_tcp_ack_min_seg = 0u;
+
+/* **ACK を応答セグメントへ相乗りさせるとき、何周まで借りておくか**
+ * (`ackpiggy N`)。**0 が相乗り前の挙動 = 陰性対照。**
+ * 1 = ポーリング 1 周だけ待つ。大きくすると応答が出るまで待つ確率が上がり
+ * パケットは減るが、応答が出ない条件では ACK が遅れる。
+ * upcall を持つコネクション(nvmet の IO キュー)でだけ効く。 */
+volatile uint32_t g_tcp_ack_piggyback = 2u;
 
 /* 人為的な送信破棄(高速再送の検証用)。0=無効、N なら「データを持つセグメント」
  * N 個に 1 個を、送ったことにして捨てる。DAC 直結ループバックではパケットロスが
@@ -307,7 +369,7 @@ typedef struct {
 typedef struct {
     uint32_t seq;
     uint16_t len;
-    uint8_t  buf[TCP_ASYNC_SHORT_MAX_LEN];
+    uint8_t  buf[TCP_ASYNC_SHORT_SLOT_BYTES];
     uint64_t sent_at;
     uint32_t rto_ms;
     int      retries;
@@ -400,6 +462,15 @@ typedef struct {
     uint32_t          ka_probes;       /* 応答が無いまま送った probe の数 */
 
     uint32_t          unacked_full_segments;
+
+    /* **ACK の相乗り(piggyback)。** 受信のたびに裸の ACK を別セグメントで
+     * 返すと、応答 PDU と合わせて 1 コマンド 2 パケットになる。応答は
+     * 同じ tick のうちに出るので、**裸の ACK を出さずに応答へ載せれば
+     * 遅延を増やさずにパケットを半減できる**(kernel nvmet は 1 コマンド
+     * あたり 0.27〜0.37 パケットなのに対し自製は 1.18〜2.00 だった)。
+     * upcall を持つコネクション(= 応答が必ず出る)だけで使う。 */
+    uint8_t           ack_deferred;   /* 残り何周まで借りておけるか(0=借り無し)*/
+    uint8_t           ack_piggy_ok;   /* このコネクションで相乗りしてよいか */
 
     uint32_t          unacked_consumed_bytes;
 
@@ -806,6 +877,96 @@ static void tcp_deliver_data(tcp_priv_t *priv, const volatile uint8_t *data, uin
  * コール元:
  *   nvme_read_pipelined_run(), nvmet_io_job_step_impl()
  * ===============================================================*/
+static int tcp_send_segment(tcp_conn_t *conn, tcp_priv_t *priv, uint8_t flags,
+                             const void *data, uint16_t data_len);
+
+/* このコアで ACK を借りているコネクションがあるか。**0 のときは走査を
+ * まるごと飛ばす**ので、nvmet を動かしていない経路には費用がかからない。 */
+static uint8_t s_ack_deferred_any[SMP_MAX_CORES];
+
+/*=================================================================
+ * 借りたままの ACK をまとめて返す。**ポーリングの先頭で呼ぶ**ことで、
+ * 「前回の巡回で応答が出なかったぶん」だけをここで返す形になり、
+ * **遅延はポーリング 1 周に収まる**(ジョブの巡回待ちにしない)。
+ *
+ * ジョブ側の `tcp_ack_flush()` だけに任せると、1 コアで 3〜4 本の IO キューを
+ * 回すときに自分の番が来るまで待つことになり、**512B の高速な条件で
+ * 12〜15% 落ちた**。
+ *
+ * コール元:
+ *   net_poll_all_and_dispatch()
+ * ===============================================================*/
+void tcp_ack_flush_deferred(void)
+{
+    unsigned core = smp_core_index();
+    if (!s_ack_deferred_any[core]) return;
+    uint8_t still = 0;
+    for (unsigned i = 0; i < TCP_MAX_CONNS; i++) {
+        tcp_conn_t *c = s_conns[core][i];
+        if (c == NULL) continue;
+        tcp_priv_t *priv = &s_priv[core][i];
+        if (!priv->ack_deferred) continue;
+        if (--priv->ack_deferred != 0u) { still = 1; continue; }
+        tcp_send_segment(c, priv, TCP_FLAG_ACK, NULL, 0);
+    }
+    s_ack_deferred_any[core] = still;
+}
+
+/*=================================================================
+ * 借りている ACK があれば裸の ACK で返す。**応答を出し終えた直後に
+ * 必ず呼ぶこと** -- 応答が出ていれば相乗り済みで何もしないが、
+ * 出なかった(PDU が途中までしか届いていない等)ときはここで返さないと
+ * 相手が RTO まで待つ。
+ *
+ * 引数:
+ *   conn - 対象コネクション
+ * 戻り値:
+ *   1=裸の ACK を送った、0=借りが無い
+ * コール元:
+ *   nvmet_io_job_step_impl() の ready-ring 排出ループ
+ * ===============================================================*/
+/*=================================================================
+ * このコネクションで ACK の相乗りを使うかどうかを設定する。
+ *
+ * **既定は無効。** 相乗りが得かどうかは相手の状態で逆転する --
+ * 相手に余裕があるとき(IO キュー 4 本)は +9% だが、相手が飽和している
+ * とき(1〜3 本、相手の cpu0 が 85〜90%)は **ACK が送信のペーシングに
+ * 効いている**ので 4〜16% 損をする。**そのため呼び出し側(nvmet)が
+ * キュー数を見て決める。**
+ *
+ * 引数:
+ *   conn - 対象コネクション
+ *   on   - 1=相乗りする
+ * コール元:
+ *   nvmet_io_job_step_impl()(IO キュー確立時)
+ * ===============================================================*/
+void tcp_set_ack_piggyback(tcp_conn_t *conn, int on)
+{
+    tcp_priv_t *priv = tcp_priv_for(conn);
+    if (!priv) return;
+    priv->ack_piggy_ok = on ? 1u : 0u;
+    if (!on) priv->ack_deferred = 0u;
+}
+
+int tcp_ack_flush(tcp_conn_t *conn)
+{
+    tcp_priv_t *priv = tcp_priv_for(conn);
+    if (!priv || !priv->ack_deferred) return 0;
+    priv->ack_deferred = 0;
+    tcp_send_segment(conn, priv, TCP_FLAG_ACK, NULL, 0);
+    return 1;
+}
+
+/*=================================================================
+ * ACK を借りたままかどうか(ジョブが眠ってよいかの判定に使う)。
+ * コール元: nvmet_io_job_step_impl()
+ * ===============================================================*/
+int tcp_ack_owed(const tcp_conn_t *conn)
+{
+    tcp_priv_t *priv = tcp_priv_for((tcp_conn_t *)conn);
+    return (priv && priv->ack_deferred) ? 1 : 0;
+}
+
 void tcp_set_recv_upcall(tcp_conn_t *conn, tcp_recv_upcall_fn fn, void *ctx)
 {
     tcp_priv_t *priv = tcp_priv_for(conn);
@@ -1485,6 +1646,10 @@ static int tcp_send_segment(tcp_conn_t *conn, tcp_priv_t *priv, uint8_t flags,
 {
     unsigned core = smp_core_index();
 
+    /* **確立後のセグメントは必ず ACK ビットを立てて現在の rcv_seq を運ぶ**
+     * ので、借りていた ACK はこれで返せる(相乗り)。 */
+    priv->ack_deferred = 0;
+
     if (g_tcp_tx_drop_every != 0u && tcp_tx_should_drop(data_len)) {
         return 0;  /* 送ったことにして捨てる(ロス注入、txdrop) */
     }
@@ -2101,7 +2266,7 @@ static void tcp_async_short_poll(tcp_conn_t *conn, tcp_priv_t *priv)
         tcp_async_short_slot_t *s = &priv->async_short_slots[priv->async_short_head];
         uint32_t end_seq = s->seq + s->len;
         if (!tcp_seq_lt(priv->snd_una, end_seq)) {
-            priv->async_short_head = (priv->async_short_head + 1u) % TCP_ASYNC_SHORT_SLOTS;
+            priv->async_short_head = (priv->async_short_head + 1u) % g_tcp_async_short_cap;
             priv->async_short_count--;
             if(ts_log_mode()&0x1) ts_log(TS_MK(TS_FILE_TCP, TS_FUNC_tcp_async_short_poll, 0), tcp_conn_arg(conn, s->len));
             continue;
@@ -2118,7 +2283,7 @@ static void tcp_async_short_poll(tcp_conn_t *conn, tcp_priv_t *priv)
             uint32_t fr_sack_high = tcp_sack_high(priv);
             for (unsigned k = 0; k < priv->async_short_count; k++) {
                 tcp_async_short_slot_t *rs =
-                    &priv->async_short_slots[(priv->async_short_head + k) % TCP_ASYNC_SHORT_SLOTS];
+                    &priv->async_short_slots[(priv->async_short_head + k) % g_tcp_async_short_cap];
                 if (fr_sack_high != 0u && !tcp_seq_lt(rs->seq, fr_sack_high)) {
                     g_tcp_sack_skipped_count++;
                     break;
@@ -3438,9 +3603,12 @@ static int tcp_send_async_enqueue(tcp_conn_t *conn, tcp_priv_t *priv,
  * コール元:
  *   tcp_send_async_ex()
  * ===============================================================*/
-static int tcp_send_async_short(tcp_conn_t *conn, tcp_priv_t *priv, const void *buf, uint16_t len)
+static int tcp_send_async_short2(tcp_conn_t *conn, tcp_priv_t *priv,
+                                 const void *buf, uint16_t len,
+                                 const void *buf2, uint16_t len2)
 {
-    while (priv->async_short_count >= TCP_ASYNC_SHORT_SLOTS) {
+    while (priv->async_short_count >= g_tcp_async_short_cap) {
+        g_tcp_async_short_stalls++;
         tcp_poll_once();
         if (tcp_abort_requested()) {
             priv->async_short_head  = 0;
@@ -3454,6 +3622,11 @@ static int tcp_send_async_short(tcp_conn_t *conn, tcp_priv_t *priv, const void *
     if (priv->cwnd < usable_window) usable_window = priv->cwnd;
     if (usable_window == 0) usable_window = 1u;
     while (usable_window <= outstanding) {
+        g_tcp_async_short_winwait++;
+        g_tcp_win_last_usable      = usable_window;
+        g_tcp_win_last_outstanding = outstanding;
+        g_tcp_win_last_cwnd        = priv->cwnd;
+        g_tcp_win_last_sndwin      = conn->snd_win;
         tcp_poll_once();
         if (tcp_abort_requested() ||
             (conn->state != TCP_ESTABLISHED && conn->state != TCP_CLOSE_WAIT)) {
@@ -3466,24 +3639,34 @@ static int tcp_send_async_short(tcp_conn_t *conn, tcp_priv_t *priv, const void *
     }
 
     uint32_t seq = conn->snd_seq;
-    if(ts_log_mode()&0x1) ts_log(TS_MK(TS_FILE_TCP, TS_FUNC_tcp_send_async_short, 0), tcp_conn_arg(conn, len));
+    uint16_t total = (uint16_t)(len + len2);
+    if(ts_log_mode()&0x1) ts_log(TS_MK(TS_FILE_TCP, TS_FUNC_tcp_send_async_short, 0), tcp_conn_arg(conn, total));
 
-    if (tcp_send_segment(conn, priv, TCP_FLAG_PSH | TCP_FLAG_ACK, buf, len) != 0) {
+    /* **先に再送スロットへ連結してから、そこから送る。** こうすると 2 つの
+     * 断片が **1 つの TCP セグメント**として出る。以前は断片ごとに
+     * tcp_send_segment() を呼んでいたので、in-capsule write が
+     * 「ヘッダ 72B」と「データ 512B」の 2 パケットに分かれ、**相手の
+     * パケット処理能力を 1 コマンドで 2 個消費していた**(実測で 1 コマンド
+     * あたり 2.13 パケット)。コピー回数は増えていない -- どのみち再送用に
+     * スロットへ写す必要がある。 */
+    unsigned slot_idx = (priv->async_short_head + priv->async_short_count) % g_tcp_async_short_cap;
+    tcp_async_short_slot_t *slot = &priv->async_short_slots[slot_idx];
+    volatile_fast_copy(slot->buf, buf, len);
+    if (len2 > 0) volatile_fast_copy(slot->buf + len, buf2, len2);
+
+    if (tcp_send_segment(conn, priv, TCP_FLAG_PSH | TCP_FLAG_ACK, slot->buf, total) != 0) {
         return -1;
     }
 
-    unsigned slot_idx = (priv->async_short_head + priv->async_short_count) % TCP_ASYNC_SHORT_SLOTS;
-    tcp_async_short_slot_t *slot = &priv->async_short_slots[slot_idx];
-    volatile_fast_copy(slot->buf, buf, len);
     slot->seq     = seq;
-    slot->len     = len;
+    slot->len     = total;
     slot->sent_at = timer_now();
     slot->rto_ms  = priv->rto_ms;
     slot->retries = 0;
     priv->async_short_count++;
 
-    conn->snd_seq = seq + len;
-    return (int)len;
+    conn->snd_seq = seq + total;
+    return (int)total;
 }
 
 /*=================================================================
@@ -3516,7 +3699,7 @@ static int tcp_send_async_ex(tcp_conn_t *conn, const void *buf, uint16_t len, in
     }
 
     if (!is_ref && len <= TCP_ASYNC_SHORT_MAX_LEN) {
-        return tcp_send_async_short(conn, priv, buf, len);
+        return tcp_send_async_short2(conn, priv, buf, len, NULL, 0);
     }
 
     if (len > TCP_ASYNC_MAX_LEN) {
@@ -3594,6 +3777,73 @@ static int tcp_send_async_ex(tcp_conn_t *conn, const void *buf, uint16_t len, in
 int tcp_send_async(tcp_conn_t *conn, const void *buf, uint16_t len)
 {
     return tcp_send_async_ex(conn, buf, len, 0);
+}
+
+/*=================================================================
+ * 2 つの断片を **1 つの TCP セグメント**として非同期に送る。
+ *
+ * **PDU のヘッダと本体を別々に送ると、相手はそれを 2 パケットとして
+ * 処理する。** NVMe/TCP の in-capsule write(ヘッダ 72B + データ 512B)で
+ * これが効き、実測で 1 コマンドあたり 2.13 パケットを相手へ届けていた。
+ * 弱いホスト(Pi5)ではパケット処理率が先に飽和するので、まとめるだけで
+ * 上限が倍になる。
+ *
+ * 合計が TCP_ASYNC_SHORT_MAX_LEN を超えるときは**まとめずに 2 回に分けて**
+ * 従来どおり送る(呼び出し側は成否だけ見ればよい)。
+ *
+ * 引数:
+ *   conn        - 対象コネクション
+ *   buf1 / len1 - 前半(PDU ヘッダなど)
+ *   buf2 / len2 - 後半(データ本体)。len2=0 なら 1 断片と同じ
+ * 戻り値:
+ *   キューイングした合計バイト数、-1=失敗
+ * コール元:
+ *   nvme_tcp_send_cmd_inline_async()
+ * ===============================================================*/
+/*=================================================================
+ * まだ ACK されていない送信済みバイト数。**Nagle 的な溜め込みの判定に使う**
+ * -- 「相手からの ACK を待っている間は小さいセグメントを出さずに溜める」の
+ * 「待っている間」がこれ。0 なら溜めずにすぐ出してよい(だから qd=1 の
+ * レイテンシは悪化しない)。
+ *
+ * 引数:
+ *   conn - 対象コネクション
+ * 戻り値:
+ *   未 ACK のバイト数(未登録なら 0)
+ * コール元:
+ *   nvme_tcp_tx_batch_end()
+ * ===============================================================*/
+uint32_t tcp_unacked_bytes(const tcp_conn_t *conn)
+{
+    tcp_priv_t *priv = tcp_priv_for((tcp_conn_t *)conn);
+    if (!priv) return 0u;
+    return conn->snd_seq - priv->snd_una;
+}
+
+int tcp_send_async2(tcp_conn_t *conn, const void *buf1, uint16_t len1,
+                    const void *buf2, uint16_t len2)
+{
+    uint32_t seg_cap = conn->snd_mss ? (uint32_t)conn->snd_mss : 1400u;
+    if (seg_cap > TCP_ASYNC_SHORT_SLOT_BYTES) seg_cap = TCP_ASYNC_SHORT_SLOT_BYTES;
+    if ((uint32_t)len1 + (uint32_t)len2 > seg_cap) {
+        int r1 = tcp_send_async(conn, buf1, len1);
+        if (r1 < 0) return -1;
+        if (len2 == 0) return r1;
+        int r2 = tcp_send_async(conn, buf2, len2);
+        if (r2 < 0) return -1;
+        return r1 + r2;
+    }
+    if (conn->state != TCP_ESTABLISHED && conn->state != TCP_CLOSE_WAIT) {
+        uart_printf("[!] tcp_send_async2: ESTABLISHED/CLOSE_WAITでない (state=%d)\n", (int)conn->state);
+        return -1;
+    }
+    if (len1 + len2 == 0) return 0;
+    tcp_priv_t *priv = tcp_priv_for(conn);
+    if (!priv) {
+        uart_printf("[!] tcp_send_async2: 未登録のconn\n");
+        return -1;
+    }
+    return tcp_send_async_short2(conn, priv, buf1, len1, buf2, len2);
 }
 
 /*=================================================================
@@ -3888,9 +4138,9 @@ void tcp_debug_dump_rx(const tcp_conn_t *conn)
                     i, s->seq, (unsigned)s->len, s->retries);
     }
     uart_printf("[DEBUG] async_short_count=%u async_short_head=%u async_short_cap=%u\n",
-                priv->async_short_count, priv->async_short_head, (unsigned)TCP_ASYNC_SHORT_SLOTS);
+                priv->async_short_count, priv->async_short_head, g_tcp_async_short_cap);
     for (unsigned i = 0; i < priv->async_short_count; i++) {
-        tcp_async_short_slot_t *s = &priv->async_short_slots[(priv->async_short_head + i) % TCP_ASYNC_SHORT_SLOTS];
+        tcp_async_short_slot_t *s = &priv->async_short_slots[(priv->async_short_head + i) % g_tcp_async_short_cap];
         uart_printf("[DEBUG] async_short_slots[%u]: seq=%u len=%u retries=%d\n",
                     i, s->seq, (unsigned)s->len, s->retries);
     }
@@ -3942,6 +4192,39 @@ void tcp_accept_begin(int listener, tcp_conn_t *conn)
     conn->state    = TCP_CLOSED;
     l->accept_conn  = conn;
     l->accept_ready = 0;
+}
+
+/*=================================================================
+ * 用意した受け皿を取り下げる(まだ確立していない場合のみ)。
+ *
+ * **受け皿は 1 本しか無い**ので、複数のジョブが順番に accept する構成では
+ * 「待つのをやめる」手段が要る。取り下げずに放置すると、次に別のジョブが
+ * arm するまでの間に確立したコネクションが、待つのをやめたジョブの
+ * tcp_conn_t へ引き渡されてしまう。
+ *
+ * **取り下げる瞬間に確立していることがある。** その場合も受け皿は外すが、
+ * **コネクション自体は呼び出し側が畳まなければならない**(戻り値 1)。
+ * 外さずに `accept_ready` を残すと、次に arm したジョブがその旗を拾って
+ * 「自分が accept した」と誤認する。
+ *
+ * 引数:
+ *   listener - リッスンハンドル
+ *   conn     - tcp_accept_begin() で渡した受け皿(別のものなら何もしない)
+ * 戻り値:
+ *   1=取り下げたが既に確立していた(呼び出し側が close すること)
+ *   0=何もしなかった、または確立前に取り下げた
+ * コール元:
+ *   nvmet_io_release_arm()
+ * ===============================================================*/
+int tcp_accept_cancel(int listener, tcp_conn_t *conn)
+{
+    tcp_listener_slot_t *l = tcp_listener_for(listener);
+    if (!l) return 0;
+    if (l->accept_conn != conn) return 0;
+    int was_ready = l->accept_ready;
+    l->accept_conn  = NULL;
+    l->accept_ready = 0;
+    return was_ready ? 1 : 0;
 }
 
 /*=================================================================
@@ -4166,6 +4449,13 @@ void tcp_input_addr(const uint8_t *pkt, uint16_t len,
                 break;  /* SYN|ACK など、既存コネクションの通常処理へ落とす */
             }
         }
+        /* **リスナは全コアで共有している。** RSS で受信を複数コアへ散らすと、
+         * 別々の 4-tuple の SYN が同時にここへ入りうるので、「受け皿を掴む /
+         * 待ち行列の枠を取る」までは排他する。**受け皿の奪い合いは
+         * `accept_conn->state` を SYN_RCVD にするところまで守らないと防げない**
+         * (見てから書くまでの間に他コアが同じ受け皿を見てしまう)。
+         * SYN のときしか通らない冷たい経路なので費用は無い。 */
+        smp_spin_lock(&s_listener_lock);
         for (unsigned li = 0; li < TCP_LISTENER_TOTAL; li++) {
             tcp_listener_slot_t *l = &s_listeners[li];
             if (l->in_use &&
@@ -4189,6 +4479,7 @@ void tcp_input_addr(const uint8_t *pkt, uint16_t len,
                      * するのと同じく黙って捨てる(RST を返すと相手の接続が
                      * 即死する -- 段階 1 の教訓)。 */
                     g_tcp_backlog_overflow_count++;
+                    smp_spin_unlock(&s_listener_lock);
                     if (g_tcp_backlog_overflow_count <= 8u) {
                         uart_printf("[TCP] backlog: 受け皿も待ち行列も無く SYN を破棄 "
                                     "(local_port=%u, 深さ=%u)\n",
@@ -4198,11 +4489,13 @@ void tcp_input_addr(const uint8_t *pkt, uint16_t len,
                 }
             }
         }
+        if (matched_listener < 0) smp_spin_unlock(&s_listener_lock);
     }
     if (matched_listener >= 0) {
         tcp_listener_slot_t *l = &s_listeners[matched_listener];
         int slot = tcp_find_free_slot();
         if (slot < 0) {
+            smp_spin_unlock(&s_listener_lock);
             uart_printf("[!] TCP: 空きコネクションスロットが無く受動openのSYNを破棄 "
                         "(local_port=%u, 最大%u本)\n", dst_port, TCP_MAX_CONNS);
         }
@@ -4230,6 +4523,10 @@ void tcp_input_addr(const uint8_t *pkt, uint16_t len,
                 l->pending_estab[backlog_index] = 0;
                 l->pending_used[backlog_index]  = 1;
             }
+            /* ここまでで受け皿(state=SYN_RCVD)と待ち行列の枠を確保し終えた。
+             * 以降は自分が掴んだ tcp_conn_t しか触らないので排他を外す
+             * (SYN|ACK の送信をロックの中でやらない)。 */
+            smp_spin_unlock(&s_listener_lock);
 
             aconn->rcv_seq = seg_seq + 1;  /* SYN消費分 */
             aconn->snd_mss = TCP_MSS_DEFAULT_RFC879;
@@ -4586,12 +4883,44 @@ void tcp_input_addr(const uint8_t *pkt, uint16_t len,
             } else if (tcp_seq_gt(seq, conn->rcv_seq)) {
                 if(ts_log_mode()&TS_MODE_HOTPATH) ts_log(TS_MK(TS_FILE_TCP, TS_FUNC_tcp_input, 9), tcp_conn_arg(conn, payload_len));
             }
-            if (accepted_inorder && payload_len == conn->snd_mss) {
+            /* **「ちょうどフルサイズのときだけ間引く」ではいけない。**
+             * NVMe/TCP の PDU は 4120B / 8240B のように MSS(9204)ちょうどには
+             * ならないので、この条件だと**間引きが一度も効かず毎セグメント
+             * ACK を返す**ことになる。実測で、相手が送るデータセグメント
+             * 1 個につき **1.22 個の ACK** を返しており(Linux の遅延 ACK なら
+             * 0.5)、**相手の CPU をこちらの ACK 処理で食い潰していた**
+             * (4K read で相手の cpu0 が 100%)。
+             *
+             * 受け取ったセグメントの大きさによらず数えて、
+             * `g_tcp_ack_threshold` 個ごとに 1 回返す。**遅らせても止まらない
+             * のは、次のコマンドを送るときに ACK が相乗りするから**
+             * (確立後のセグメントは常に ACK ビットを立てる)。
+             * `ackthresh 1` が従来の挙動 = 陰性対照。
+             *
+             * **ただし小さいセグメントは即 ACK する。** 間引く対象を大きさで
+             * 絞らないと、write の応答 PDU(24 バイト)まで待たせてしまい
+             * 512B write が 5〜8% 落ちる。閾値は MSS の 1/8
+             * (`g_tcp_ack_min_seg` で調整可能。0 = 大きさを見ない)。 */
+            uint32_t ack_min = (g_tcp_ack_min_seg != 0u)
+                             ? g_tcp_ack_min_seg : (uint32_t)(conn->snd_mss / 8u);
+            if (accepted_inorder && payload_len >= ack_min) {
                 priv->unacked_full_segments++;
                 if (priv->unacked_full_segments >= g_tcp_ack_threshold) {
                     tcp_send_segment(conn, priv, TCP_FLAG_ACK, NULL, 0);
                     priv->unacked_full_segments = 0;
                 }
+            } else if (g_tcp_ack_piggyback && priv->ack_piggy_ok &&
+                       priv->recv_upcall != NULL) {
+                /* **応答へ相乗りさせる。** upcall を持つ = 受け取ったものに
+                 * 対して必ず応答を出すコネクション(nvmet の IO キュー)なので、
+                 * ここで裸の ACK を出すと 1 コマンドが 2 パケットになる。
+                 * 応答は同じ tick のうちに出て ACK を運ぶので、**遅延は
+                 * 増えない**。応答が出なかったときは呼び出し側が
+                 * `tcp_ack_flush()` で必ず吐き出す(下の nvmet の排出ループ)。 */
+                priv->ack_deferred = (uint8_t)((g_tcp_ack_piggyback > 255u)
+                                               ? 255u : g_tcp_ack_piggyback);
+                s_ack_deferred_any[core] = 1;
+                priv->unacked_full_segments = 0;
             } else {
                 tcp_send_segment(conn, priv, TCP_FLAG_ACK, NULL, 0);
                 priv->unacked_full_segments = 0;

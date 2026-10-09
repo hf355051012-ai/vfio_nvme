@@ -88,6 +88,16 @@ void nvme_build_write_sqe(nvme_sqe_t *sqe, uint32_t nsid, uint64_t slba, uint32_
                           uint32_t total_len, int use_inline);
 /* 1 で in-capsule write を止め、R2T 経路へ倒す(A/B 用の恒久デバッグ機能)。 */
 void nvme_set_incapsule_disable(int off);
+/* 1 周で受信処理を何回進めるか(`tcprxburst`)。1=従来。詳細は nvme.c。 */
+extern volatile uint32_t g_nvme_rx_burst;
+
+/* イニシエータのパイプライン計装(シェルの `plstat`)。詳細は nvme.c。 */
+extern volatile uint64_t g_pl_loops;
+extern volatile uint64_t g_pl_submits;
+extern volatile uint64_t g_pl_completes;
+extern volatile uint64_t g_pl_scan_steps;
+extern volatile uint64_t g_pl_slot_steps;
+
 /* NVMe/TCP の同時 outstanding 数(1..NVME_IO_QDEPTH)。 */
 void     nvme_set_io_qdepth(unsigned d);
 unsigned nvme_io_qdepth(void);

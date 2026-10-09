@@ -589,7 +589,11 @@ static void nvme_build_set_features_num_queues_sqe(nvme_sqe_t *sqe)
     wr32le(&sqe->cdw0, NVME_ADM_CMD_SET_FEATURES | ((uint32_t)NVME_PSDT_SGL_MPTR_CONTIGUOUS << 8));
     nvme_set_sgl(sqe, 0);
     wr32le(&sqe->cdw10, 0x07u);        /* FID=7: Number of Queues */
-    wr32le(&sqe->cdw11, 0x00010001u);  /* NSQR=1, NCQR=1 (IO SQ/CQ各1本を要求) */
+    /* **NSQR / NCQR は 0's based**。0 = IO SQ/CQ を各 1 本要求する、の意味。
+     * 以前は 0x00010001(= 各 2 本)を送っていて、実際に張るのは 1 本だけ
+     * なのに 2 本要求していた。相手が「要求された本数ぶん受け皿を用意して
+     * 待つ」実装だと、使われない受け皿が残って次の接続を食う。 */
+    wr32le(&sqe->cdw11, 0x00000000u);  /* NSQR=0, NCQR=0 (IO SQ/CQ各1本を要求) */
 }
 
 typedef enum {
@@ -1137,6 +1141,48 @@ typedef struct {
 
 static nvme_pipeline_slot_t s_pl_slots[NVME_IO_QDEPTH];
 
+/* イニシエータのパイプライン計装(シェルの `plstat`)。**深さを上げても
+ * スループットが伸びない**のが CPU 律速なのか待ちなのかは、これが無いと
+ * 区別できない -- ポーリングループなので CPU 使用率は常に 100% に見える。
+ *
+ *   loops      … while ループを回った回数
+ *   submits    … 送ったコマンド数
+ *   completes  … 完了を刈り取った数
+ *   scan_steps … スロット探索(cid 一致)で舐めた要素数の総和
+ *   slot_steps … ループ内のスロット走査で舐めた要素数の総和
+ *
+ * **completes/loops が 1 を大きく下回るなら待ち、1 前後なら 1 周のコストが
+ * そのまま 1 コマンドのコストになっている**(= CPU 律速)。 */
+/* 1 周で受信処理を何回進めるか(`tcprxburst`)。**1 が従来の挙動。**
+ *
+ * nvme_pipeline_rx_tick() は 1 回で 1 状態しか進めないので、応答 PDU 1 個を
+ * 完了させるのに「ヘッダ受信」「本体受信」の 2 回が要る。1 周 1 回だと
+ * **1 周あたりの完了が 0.5 件**にしかならず、その結果 1 周で送信ループに
+ * 積まれるコマンドも 0.5 件になって、**送信をまとめる余地が無くなる**
+ * (1 コマンド 1 セグメントになる)。まとめて進めれば、完了もまとまり、
+ * 送信もまとまる。 */
+/* **既定 32。** 1(元の挙動)だと 1 周あたりの完了が 0.5 件にしかならず、
+ * 送信をまとめる余地が消える。実測は 4 条件とも 16 が同等以上:
+ * 512B write +86% / 512B read +12% / 4K write +13% / 4K read 同等。
+ *
+ * **4K で一度「退行する」と読んだが誤りだった** -- 短経路スロットが
+ * 16 本しかなく、かつ相手の受信ウィンドウが育つ前に測っていたため。
+ * どちらも直したら 4K でも 16 のほうが速い。
+ *
+ * **さらに 16 -> 32 で全条件が伸びた**(512B write +9% / 512B read +8% /
+ * 4K write +29% / 4K read +27%)。**この値は「受信を駆動する回数」**で、
+ * nvme_pipeline_read_rx_tick() -> tcp_recv() -> net_poll_all_and_dispatch()
+ * と辿って NIC を見に行く回数そのもの(受信は push 型 upcall で処理される
+ * ので、rx_tick 自体は「net_poll を回す」ためにある)。**64 以上は
+ * 頭打ちで、128 では落ちる。** */
+volatile uint32_t g_nvme_rx_burst = 32u;
+
+volatile uint64_t g_pl_loops;
+volatile uint64_t g_pl_submits;
+volatile uint64_t g_pl_completes;
+volatile uint64_t g_pl_scan_steps;
+volatile uint64_t g_pl_slot_steps;
+
 typedef enum {
     PL_RX_HDR = 0,
     PL_RX_RSP_REST,
@@ -1162,6 +1208,7 @@ static uint8_t                  s_pl_rest_buf[16 + 4];
 static int nvme_pipeline_find_slot(uint16_t cid)
 {
     for (unsigned i = 0; i < NVME_IO_QDEPTH; i++) {
+        g_pl_scan_steps++;
         if (s_pl_slots[i].in_use && s_pl_slots[i].sent && !s_pl_slots[i].done &&
             s_pl_slots[i].cid == cid) {
             return (int)i;
@@ -1583,6 +1630,7 @@ int nvme_write_pipelined_run(nvme_ctx_t *ctx, uint32_t nsid, uint64_t lba,
         /* 完了済みスロットを刈り取り、集計してから空ける。 */
         for (unsigned i = 0; i < NVME_IO_QDEPTH; i++) {
             if (s_pl_slots[i].in_use && s_pl_slots[i].done) {
+                g_pl_completes++;
                 if (s_pl_slots[i].result == 0) {
                     count++;
                     bytes += s_pl_slots[i].len;
@@ -1595,8 +1643,10 @@ int nvme_write_pipelined_run(nvme_ctx_t *ctx, uint32_t nsid, uint64_t lba,
         }
         /* **実行時の深さまでしか埋めない。** 以前は空いているスロットを全部
          * 埋めていたので、同時数は常に配列の大きさだった。 */
+        g_pl_loops++;
         unsigned inflight_w = 0;
         for (unsigned i = 0; i < NVME_IO_QDEPTH; i++) {
+            g_pl_slot_steps++;
             if (s_pl_slots[i].in_use) inflight_w++;
         }
         for (unsigned i = 0; i < NVME_IO_QDEPTH && inflight_w < s_io_qd; i++) {
@@ -1615,6 +1665,11 @@ int nvme_write_pipelined_run(nvme_ctx_t *ctx, uint32_t nsid, uint64_t lba,
                 cur_lba = nvme_bench_next_lba(ctx, cur_lba, lba, nlb);
             }
         }
+        /* **送信ループ全体を 1 つのバッチにする。** 溜めたぶんは末尾の
+         * nvme_tcp_tx_batch_end() で 1 セグメントとして出る(MSS を超える
+         * 手前で自動的に区切られる)。まとめないと 1 コマンド 1 パケットに
+         * なり、相手の受信処理が 1 コマンドごとに走る。 */
+        nvme_tcp_tx_batch_begin();
         for (unsigned i = 0; i < NVME_IO_QDEPTH; i++) {
             if (s_pl_slots[i].in_use && !s_pl_slots[i].sent) {
                 uint16_t cid = 0;
@@ -1642,9 +1697,13 @@ int nvme_write_pipelined_run(nvme_ctx_t *ctx, uint32_t nsid, uint64_t lba,
                 }
                 s_pl_slots[i].cid  = cid;
                 s_pl_slots[i].sent = 1;
+                g_pl_submits++;
             }
         }
-        nvme_pipeline_rx_tick(ctx);
+        /* **必ず出し切る。** 呼ばないと溜めたコマンドがワイヤに出ないまま
+         * 相手の応答を待つことになり、そのまま止まる。 */
+        nvme_tcp_tx_batch_end(&ctx->io);
+        for (uint32_t k = 0; k < g_nvme_rx_burst; k++) nvme_pipeline_rx_tick(ctx);
         nvme_pipeline_h2c_pump(ctx);
         job_scheduler_tick();
     }
@@ -1752,6 +1811,7 @@ static int nvme_pipeline_read_find_slot(uint16_t cid)
 {
     nvme_rd_state_t *rd = &s_rd[smp_core_index()];
     for (unsigned i = 0; i < NVME_IO_QDEPTH; i++) {
+        g_pl_scan_steps++;
         if (rd->slots[i].in_use && rd->slots[i].sent && !rd->slots[i].done &&
             rd->slots[i].cid == cid) {
             return (int)i;
@@ -2187,6 +2247,7 @@ int nvme_read_pipelined_run(nvme_ctx_t *ctx, uint32_t nsid, uint64_t lba,
         /* 完了済みスロットを刈り取り、集計してから空ける。 */
         for (unsigned i = 0; i < NVME_IO_QDEPTH; i++) {
             if (rd->slots[i].in_use && rd->slots[i].done) {
+                g_pl_completes++;
                 if (rd->slots[i].result == 0) {
                     count++;
                     bytes += rd->slots[i].len;
@@ -2205,8 +2266,10 @@ int nvme_read_pipelined_run(nvme_ctx_t *ctx, uint32_t nsid, uint64_t lba,
             if (m == 0u) m = 1u;
             if (m < max_inflight) max_inflight = (unsigned)m;
         }
+        g_pl_loops++;
         unsigned inflight = 0;
         for (unsigned i = 0; i < NVME_IO_QDEPTH; i++) {
+            g_pl_slot_steps++;
             if (rd->slots[i].in_use) inflight++;
         }
         for (unsigned i = 0; i < NVME_IO_QDEPTH && inflight < max_inflight; i++) {
@@ -2222,6 +2285,10 @@ int nvme_read_pipelined_run(nvme_ctx_t *ctx, uint32_t nsid, uint64_t lba,
                 cur_lba = nvme_bench_next_lba(ctx, cur_lba, lba, nlb);
             }
         }
+        /* 送信ループ全体を 1 バッチに(write 側と同じ理由)。**read の
+         * コマンドは 72 バイトなので、MSS 9204 なら 127 個が 1 パケットに
+         * 収まる。** */
+        nvme_tcp_tx_batch_begin();
         for (unsigned i = 0; i < NVME_IO_QDEPTH; i++) {
             if (rd->slots[i].in_use && !rd->slots[i].sent) {
                 uint16_t cid = 0;
@@ -2245,9 +2312,11 @@ int nvme_read_pipelined_run(nvme_ctx_t *ctx, uint32_t nsid, uint64_t lba,
                 }
                 rd->slots[i].cid  = cid;
                 rd->slots[i].sent = 1;
+                g_pl_submits++;
             }
         }
-        nvme_pipeline_read_rx_tick(ctx);
+        nvme_tcp_tx_batch_end(&ctx->io);   /* 必ず出し切る */
+        for (uint32_t k = 0; k < g_nvme_rx_burst; k++) nvme_pipeline_read_rx_tick(ctx);
         job_scheduler_tick();
     }
 

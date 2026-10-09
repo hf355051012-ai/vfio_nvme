@@ -10,6 +10,46 @@
 
 int g_nvmet_force_pull = 0;
 
+/* 広告する IO キュー(= 同時に受け付ける IO コネクション)の本数。
+ * **1 にすると複数化を入れる前とまったく同じ挙動になる**(陰性対照)。
+ * `nvmetqueues` で変えられるが、**効くのは次のセッションから** -- ホストとは
+ * Set Features(Number of Queues)で 1 回だけ合意するため。 */
+volatile uint32_t g_nvmet_io_queues = NVMET_IO_QUEUES;
+
+/*=================================================================
+ * このセッションで arm してよい IO キューの本数。
+ *
+ * Set Features(Number of Queues)を受ける前は 1 本だけにしておく。
+ * **Linux は Connect(qid=0)の直後に必ず Set Features を出す**ので実際には
+ * 上書きされるが、出さないホストでも 1 本は繋げるようにしておく
+ * (複数化を入れる前の挙動)。
+ *
+ * 引数:
+ *   ctx - ターゲットコンテキスト
+ * 戻り値:
+ *   1..NVMET_IO_QUEUES
+ * コール元:
+ *   nvmet_io_job_step_impl()
+ * ===============================================================*/
+static unsigned nvmet_io_queue_count(const nvmet_ctx_t *ctx)
+{
+    uint32_t n = ctx->io_queues_granted;
+    if (n == 0u) n = 1u;
+    if (n > NVMET_IO_QUEUES) n = NVMET_IO_QUEUES;
+    return (unsigned)n;
+}
+
+/*=================================================================
+ * `g_nvmet_io_queues` を 1..NVMET_IO_QUEUES に丸める。
+ * ===============================================================*/
+static unsigned nvmet_io_queues_cap(void)
+{
+    uint32_t n = g_nvmet_io_queues;
+    if (n == 0u) n = 1u;
+    if (n > NVMET_IO_QUEUES) n = NVMET_IO_QUEUES;
+    return (unsigned)n;
+}
+
 #define NVMET_ACCEPT_TIMEOUT_MS    30000u
 /* IO キューが切れてから admin キューを相手が閉じるのを待つ上限。Linux は
  * 即座に CC.SHN を書いて閉じるので通常は数 ms しか使わない。 */
@@ -412,6 +452,82 @@ static int nvmet_nsid_in_range(uint32_t nsid)
 
 /*=================================================================
  * SMART の 128bit カウンタを 1 つ書く。上位 8 バイトは 0。
+ * ===============================================================*/
+_Static_assert(NVMET_STAT_CORES == SMP_MAX_CORES,
+               "統計スロットの本数は SMP_MAX_CORES と合わせること");
+
+/*=================================================================
+ * このコアが使う統計スロットの番号。
+ *
+ * **IO のホットパスから毎コマンド呼ばれる**ので、`smp_core_index()` を
+ * 読んで範囲を切るだけにする(分岐 1 個)。
+ *
+ * 戻り値:
+ *   0..NVMET_STAT_CORES-1
+ * コール元:
+ *   nvmet_io_dispatch()
+ * ===============================================================*/
+static inline unsigned nvmet_stat_slot(void)
+{
+    unsigned c = smp_core_index();
+    return (c < NVMET_STAT_CORES) ? c : 0u;
+}
+
+/*=================================================================
+ * コアごとに分けてある統計を足し合わせる。SMART / Keep Alive / 表示という
+ * 冷たい経路からしか呼ばない。NULL のポインタは無視する。
+ *
+ * 引数:
+ *   ctx - 対象コントローラ
+ *   read_bytes / write_bytes / read_cmds / write_cmds /
+ *   write_incapsule / write_h2c - 合計の格納先(不要なら NULL)
+ * コール元:
+ *   nvmet_build_smart_log(), nvmet_admin_job_step(), nvmet_io_job_end()
+ * ===============================================================*/
+void nvmet_stat_totals(const nvmet_ctx_t *ctx, uint64_t *read_bytes, uint64_t *write_bytes,
+                       uint64_t *read_cmds, uint64_t *write_cmds,
+                       uint32_t *write_incapsule, uint32_t *write_h2c)
+{
+    uint64_t rb = 0, wb = 0, rc = 0, wc = 0;
+    uint32_t wi = 0, wh = 0;
+    for (unsigned c = 0; c < NVMET_STAT_CORES; c++) {
+        rb += ctx->stat[c].read_bytes;
+        wb += ctx->stat[c].write_bytes;
+        rc += ctx->stat[c].read_cmds;
+        wc += ctx->stat[c].write_cmds;
+        wi += ctx->stat[c].write_incapsule;
+        wh += ctx->stat[c].write_h2c;
+    }
+    if (read_bytes)      *read_bytes = rb;
+    if (write_bytes)     *write_bytes = wb;
+    if (read_cmds)       *read_cmds = rc;
+    if (write_cmds)      *write_cmds = wc;
+    if (write_incapsule) *write_incapsule = wi;
+    if (write_h2c)       *write_h2c = wh;
+}
+
+/*=================================================================
+ * 統計を全コアぶん 0 に戻す(プロセス起動時だけ)。
+ *
+ * 引数:
+ *   ctx - 対象コントローラ
+ * コール元:
+ *   nvmet_job_start()
+ * ===============================================================*/
+void nvmet_stat_clear(nvmet_ctx_t *ctx)
+{
+    for (unsigned c = 0; c < NVMET_STAT_CORES; c++) {
+        ctx->stat[c].read_bytes      = 0;
+        ctx->stat[c].write_bytes     = 0;
+        ctx->stat[c].read_cmds       = 0;
+        ctx->stat[c].write_cmds      = 0;
+        ctx->stat[c].write_incapsule = 0;
+        ctx->stat[c].write_h2c       = 0;
+    }
+}
+
+/*=================================================================
+ * 128bit のリトルエンディアン値を書く。
  *
  * **必ず 16 バイトぶんゼロにしてから下位を書く。** 上位に残骸があると
  * 値が桁ごと跳ねる(ホストは 128bit として読む)。
@@ -455,12 +571,14 @@ static void nvmet_build_smart_log(nvmet_ctx_t *ctx, uint8_t *buf)
     buf[NVME_SMART_OFF_PERCENT_USED] = 0;
 
     /* 512 バイト x 1000 = 512000 バイトで 1 単位。切り上げる。 */
-    uint64_t dur = (ctx->stat_read_bytes  + 511999ull) / 512000ull;
-    uint64_t duw = (ctx->stat_write_bytes + 511999ull) / 512000ull;
+    uint64_t rb = 0, wb = 0, rc = 0, wc = 0;
+    nvmet_stat_totals(ctx, &rb, &wb, &rc, &wc, NULL, NULL);
+    uint64_t dur = (rb + 511999ull) / 512000ull;
+    uint64_t duw = (wb + 511999ull) / 512000ull;
     nvmet_wr128le(&buf[NVME_SMART_OFF_DATA_UNITS_READ], dur);
     nvmet_wr128le(&buf[NVME_SMART_OFF_DATA_UNITS_WRIT], duw);
-    nvmet_wr128le(&buf[NVME_SMART_OFF_HOST_READS],  ctx->stat_read_cmds);
-    nvmet_wr128le(&buf[NVME_SMART_OFF_HOST_WRITES], ctx->stat_write_cmds);
+    nvmet_wr128le(&buf[NVME_SMART_OFF_HOST_READS],  rc);
+    nvmet_wr128le(&buf[NVME_SMART_OFF_HOST_WRITES], wc);
 
     nvmet_wr128le(&buf[NVME_SMART_OFF_CTRL_BUSY_TIME], 0);
     nvmet_wr128le(&buf[NVME_SMART_OFF_POWER_CYCLES],   1);
@@ -611,11 +729,12 @@ static void nvmet_record_error(nvmet_ctx_t *ctx, uint16_t cid, uint16_t status)
     ctx->error_count++;
     nvmet_zero(ctx->error_slot, sizeof(ctx->error_slot));
     wr64le(&ctx->error_slot[NVME_ERR_OFF_COUNT], ctx->error_count);
-    wr16le(&ctx->error_slot[NVME_ERR_OFF_SQID],  ctx->err_sqid);
+    const nvmet_core_stat_t *ecs = &ctx->stat[nvmet_stat_slot()];
+    wr16le(&ctx->error_slot[NVME_ERR_OFF_SQID],  ecs->err_sqid);
     wr16le(&ctx->error_slot[NVME_ERR_OFF_CMDID], cid);
     wr16le(&ctx->error_slot[NVME_ERR_OFF_STATUS], status);
-    wr64le(&ctx->error_slot[NVME_ERR_OFF_LBA],   ctx->err_lba);
-    wr32le(&ctx->error_slot[NVME_ERR_OFF_NSID],  ctx->err_nsid);
+    wr64le(&ctx->error_slot[NVME_ERR_OFF_LBA],   ecs->err_lba);
+    wr32le(&ctx->error_slot[NVME_ERR_OFF_NSID],  ecs->err_nsid);
 }
 
 static void nvmet_build_cqe(nvmet_ctx_t *ctx, nvme_cqe_t *cqe, uint16_t cid,
@@ -660,11 +779,13 @@ static int nvmet_feat_current(const nvmet_ctx_t *ctx, uint32_t fid, uint32_t *ou
     }
 
     switch (fid) {
-    case NVME_FEAT_NUM_QUEUES:
-        /* Set Features の応答と同じ 0's based の規約。NSQA=NCQA=0 = 各 1 本。
-         * **ここを素の本数(1)にすると 2 本要求されたことになる。** */
-        *out = 0u;
+    case NVME_FEAT_NUM_QUEUES: {
+        /* **0's based**。NSQA=NCQA=(本数-1)。素の本数を入れると 1 本多く
+         * 要求されたことになる。合意前(io_queues_granted=0)は 1 本。 */
+        uint32_t nq = (uint32_t)nvmet_io_queue_count(ctx) - 1u;
+        *out = nq | (nq << 16);
         return 0;
+    }
     case NVME_FEAT_VOLATILE_WC:
         /* Identify Controller の VWC=0(揮発書き込みキャッシュ無し)と揃える。 */
         *out = 0u;
@@ -731,9 +852,10 @@ static int nvmet_admin_dispatch(nvmet_ctx_t *ctx, const nvme_sqe_t *sqe,
 
     /* エラーを Error Information ログへ残すための文脈(admin は qid=0)。
      * **Fabrics コマンドは nsid のワードを fctype に使う**ので入れない。 */
-    ctx->err_sqid = 0;
-    ctx->err_nsid = (opcode == NVME_FABRIC_CMD) ? 0u : rd32le(&sqe->nsid);
-    ctx->err_lba  = 0;
+    nvmet_core_stat_t *acs = &ctx->stat[nvmet_stat_slot()];
+    acs->err_sqid = 0;
+    acs->err_nsid = (opcode == NVME_FABRIC_CMD) ? 0u : rd32le(&sqe->nsid);
+    acs->err_lba  = 0;
 
     ts_log(TS_MK(TS_FILE_NVMET, TS_FUNC_nvmet_admin_dispatch, 0),
            (opcode == NVME_FABRIC_CMD)
@@ -761,8 +883,21 @@ static int nvmet_admin_dispatch(nvmet_ctx_t *ctx, const nvme_sqe_t *sqe,
                 ctx->kato_ms    = rd32le(&sqe->cdw12);
                 ctx->aen_config = 0;
                 /* 通常のサブシステムのときだけ IO キューの受け皿を用意する
-                 * (Discovery コントローラは admin のみ)。 */
-                if (!ctx->is_discovery) ctx->io_armed = 1;
+                 * (Discovery コントローラは admin のみ)。
+                 *
+                 * **合意前は 1 本**。Linux はこの直後に Set Features
+                 * (Number of Queues)を出してくるのでそこで本数が決まるが、
+                 * 出さないホストでも 1 本は繋げるようにしておく。 */
+                ctx->io_queues_granted = 1u;
+                /* 前のセッションの KATO 切れの旗が残っていたら捨てる
+                 * (IO キューが 1 本も繋がらないまま切れた場合に残りうる)。 */
+                ctx->kato_expired = 0;
+                if (!ctx->is_discovery) {
+                    ctx->io_armed = 1;
+                    /* **arm 権を admin から手放す。** これで IO ジョブの 1 本が
+                     * accept の受け皿を用意できるようになる。 */
+                    ctx->io_arm_owner = NVMET_ARM_FREE;
+                }
                 nvmet_build_cqe(ctx, &cqe, ctx->admin.last_cid, 1u, 0);
                 uart_printf("[nvmet:%s] Fabrics Connect (qid=0, admin) 受理 (ctrlr_id=1%s)\n",
                             ctx->label, ctx->is_discovery ? ", Discovery コントローラ" : "");
@@ -967,11 +1102,29 @@ static int nvmet_admin_dispatch(nvmet_ctx_t *ctx, const nvme_sqe_t *sqe,
         }
 
         switch (fid) {
-        case NVME_FEAT_NUM_QUEUES:
-            /* 要求値は無視して常にこちらの本数を返す(SPDK と同じ)。 */
-            nvmet_build_cqe(ctx, &cqe, ctx->admin.last_cid, 0x00000000u, 0);  /* NSQA=0, NCQA=0 (0's based) = SQ/CQ各1本 */
+        case NVME_FEAT_NUM_QUEUES: {
+            /* **ホストの要求とこちらの上限の小さいほうを許諾する。**
+             * cdw11 は NSQR(15:0)/ NCQR(31:16)でどちらも **0's based**。
+             * SQ と CQ は NVMe/TCP では 1 本のコネクションに対 1 なので、
+             * 小さいほうに合わせる。
+             *
+             * **許諾した本数は「これから arm する IO キューの本数」でもある。**
+             * ホストが使わない本数まで arm したままにすると、その受け皿が
+             * 次の admin 接続の SYN を食べてしまう(Discovery のあとで
+             * IO の accept が admin 用 SYN を食べた D1 の事故と同じ形)。 */
+            uint32_t nsqr = (val & 0xFFFFu) + 1u;
+            uint32_t ncqr = ((val >> 16) & 0xFFFFu) + 1u;
+            uint32_t want = (nsqr < ncqr) ? nsqr : ncqr;
+            uint32_t cap  = (uint32_t)nvmet_io_queues_cap();
+            uint32_t give = (want < cap) ? want : cap;
+            ctx->io_queues_granted = give;
+            uint32_t nq = give - 1u;   /* 応答も 0's based */
+            uart_printf("[nvmet:%s] Set Features(Number of Queues): 要求=%u 許諾=%u本\n",
+                        ctx->label, (unsigned)want, (unsigned)give);
+            nvmet_build_cqe(ctx, &cqe, ctx->admin.last_cid, nq | (nq << 16), 0);
             nvmet_tcp_send_resp(&ctx->admin, &cqe);
             return 1;
+        }
         case NVME_FEAT_ASYNC_EVENT:
             ctx->aen_config = val;
             nvmet_build_cqe(ctx, &cqe, ctx->admin.last_cid, ctx->aen_config, 0);
@@ -1221,6 +1374,10 @@ static job_result_t nvmet_admin_session_finish(job_t *self, nvmet_admin_job_ctx_
     nvmet_tcp_close(&ctx->admin);
     ctx->is_discovery = 0;
     ctx->session_done = 0;
+    /* **IO キューの受け皿を全部畳ませる。** ARM/ACCEPT_WAIT で待っている
+     * ジョブはこれを見て arm 権を手放し、WAIT_ADMIN_READY へ戻る。 */
+    ctx->io_armed          = 0;
+    ctx->io_queues_granted = 0;
     ctx->ctrlr_id          = 0;
     ctx->cc                = 0;
     ctx->cc_en             = 0;
@@ -1294,7 +1451,9 @@ static job_result_t nvmet_admin_job_step(job_t *self)
      * step)なので問題ない。 */
     if (ctx->kato_ms != 0 && !ctx->kato_expired &&
         ctx->admin.tcp.state == TCP_ESTABLISHED) {
-        uint64_t io_count = ctx->stat_read_cmds + ctx->stat_write_cmds;
+        uint64_t rc = 0, wc = 0;
+        nvmet_stat_totals(ctx, NULL, NULL, &rc, &wc, NULL, NULL);
+        uint64_t io_count = rc + wc;
         if (io_count != jc->kato_last_io_count) {
             jc->kato_last_io_count = io_count;
             ctx->last_cmd_tick     = timer_now();
@@ -1324,6 +1483,13 @@ static job_result_t nvmet_admin_job_step(job_t *self)
     switch ((nvmet_admin_state_t)self->state) {
 
     case NADM_ST_ARM:
+        /* **arm 権を IO ジョブが握っている間は待つ。** listener の受け皿
+         * (`accept_conn`)は 1 本しか無いので、ここで無条件に上書きすると、
+         * ACCEPT_WAIT のまま取り残された IO ジョブが次に poll した瞬間に
+         * **admin 宛に確立したコネクションを横取りする**。セッション終了で
+         * `io_armed` を落としてあるので、IO 側は次の tick で手放す。 */
+        if (ctx->io_arm_owner >= 0) return JOB_WAITING;
+        ctx->io_arm_owner = NVMET_ARM_ADMIN;
         nvmet_tcp_accept_arm(&ctx->admin, ctx->listener);
         jc->wait_started_ticks = timer_now();
         self->state = NADM_ST_ACCEPT_WAIT;
@@ -1331,6 +1497,9 @@ static job_result_t nvmet_admin_job_step(job_t *self)
 
     case NADM_ST_ACCEPT_WAIT:
         if (tcp_accept_ready_poll(ctx->listener)) {
+            /* IO ジョブと同じ理由で、確立したコネクションのコアへ移る
+             * (下の NIO_ST_ACCEPT_WAIT のコメント参照)。 */
+            job_pin_to_core(self, ctx->admin.tcp.owner_core);
             uart_printf("[nvmet:%s] adminキュー接続完了\n", ctx->label);
             nvmet_tcp_xfer_reset(&jc->xfer, jc->icreq_buf, NVME_TCP_ICREQ_LEN);
             jc->wait_started_ticks = timer_now();
@@ -1662,66 +1831,11 @@ static int nvmet_dsm_apply(nvmet_ctx_t *ctx, nvmet_ns_t *ns, const uint8_t *rang
         if (nvmet_zero_lba_range(ns, slba, nlb) != 0) {
             uart_printf("[!] nvmet: DSM範囲が名前空間外 (range=%u slba=%u nlb=%u)\n",
                         i, (uint32_t)slba, nlb);
-            ctx->err_lba = slba;   /* Error Information ログに載せる LBA */
+            ctx->stat[nvmet_stat_slot()].err_lba = slba;   /* Error Information ログに載せる LBA */
             return -1;
         }
     }
     return 0;
-}
-
-/*=================================================================
- * 進行中の write コマンド(R2T を出してデータ待ち)のスロットを 1 つ確保する。
- *
- * 引数:
- *   ctx - ターゲットコンテキスト
- * 戻り値:
- *   スロット番号。空きが無ければ -1
- * コール元:
- *   nvmet_io_dispatch_cmd()
- * ===============================================================*/
-static int nvmet_pending_write_alloc(nvmet_ctx_t *ctx)
-{
-    for (unsigned i = 0; i < NVMET_MAX_PENDING_WRITES; i++) {
-        if (!ctx->pending_writes[i].in_use) return (int)i;
-    }
-    return -1;
-}
-
-/*=================================================================
- * 進行中の write コマンドから cid が一致するスロットを探す(受信した
- * H2CData をどのコマンドのものか対応付けるのに使う)。
- *
- * 引数:
- *   ctx - ターゲットコンテキスト
- *   cid - 探すコマンド id
- * 戻り値:
- *   スロット番号。見つからなければ -1
- * コール元:
- *   nvmet_io_job_h2c_validate(), nvmet_io_rx_upcall()
- * ===============================================================*/
-static int nvmet_pending_write_find(nvmet_ctx_t *ctx, uint16_t cid)
-{
-    for (unsigned i = 0; i < NVMET_MAX_PENDING_WRITES; i++) {
-        if (ctx->pending_writes[i].in_use && ctx->pending_writes[i].cid == cid) return (int)i;
-    }
-    return -1;
-}
-
-/*=================================================================
- * IO キューでストリーム desync らしき異常(想定外の PDU 種別、未知の cccid、
- * datao 不一致など)を検出した際に、TCP 層の詳細状態を表示する診断ヘルパ。
- *
- * 引数:
- *   ctx    - ターゲットコンテキスト
- *   reason - 検出した異常の説明
- * コール元:
- *   nvmet_io_job_h2c_validate(), nvmet_io_job_step_impl()
- * ===============================================================*/
-static void nvmet_io_debug_desync(nvmet_ctx_t *ctx, const char *reason)
-{
-    uart_printf("\n[DEBUG] ==== IOキューdesync検出: %s ====\n", reason);
-    tcp_debug_dump_rx(&ctx->io.tcp);
-    uart_printf("[DEBUG] ==== ここまで ====\n\n");
 }
 
 typedef enum {
@@ -1749,7 +1863,7 @@ typedef enum {
 /* push型受信のパーサ相(nvmet_io_rx_upcall()、2026-08-13)。 */
 typedef enum { PRX_HDR, PRX_PSH, PRX_HDGST, PRX_DATA, PRX_DDGST } nvmet_prx_phase_t;
 
-/* NVMET_READY_RING は nvmet.h(ctx->dsm_stage[] と段数を合わせるため)。 */
+/* NVMET_READY_RING は nvmet.h(jc->dsm_stage[] と段数を合わせるため)。 */
 #define NVMET_READY_CMD  0u   /* CapsuleCmd受信完了(hdr/sqe/data配置済み) */
 #define NVMET_READY_H2C  1u   /* H2CDataラウンド受信完了 */
 typedef struct {
@@ -1769,6 +1883,22 @@ typedef struct {
 
 typedef struct {
     nvmet_ctx_t      *ctx;
+    /* このジョブが担当する IO キューの番号(0..NVMET_IO_QUEUES-1)。
+     * **NVMe の qid は +1**(qid=0 は admin)。 */
+    unsigned          qidx;
+    /* **IO キューのコネクションはジョブごとに持つ。** nvmet_ctx_t に 1 本だけ
+     * 置いていた頃の名残で `ctx->io` を参照しているところが残っていると、
+     * 2 本目のキューが 1 本目の受信バッファを壊す。 */
+    nvmet_tcp_conn_t  io;
+    /* accept が成立して ICReq 以降へ進んだ = ctx->io_open に数えられている。 */
+    int               connected;
+    /* このキューが dispatch した IO コマンド数(`nvmetqueues` で表示)。
+     * **セッションをまたいで積む** -- ホストが繋ぎ直しても偏りの傾向を
+     * 見たいので、0 に戻すのは `nvmet` の起動時だけ。 */
+    uint64_t          stat_cmds;
+    /* R2T を出してデータ待ちの write。**キューごとに独立**(cid はキューの
+     * 中でしか一意でないので、共有すると別キューの同じ cid と衝突する)。 */
+    nvmet_pending_write_t pending_writes[NVMET_MAX_PENDING_WRITES];
     uint16_t          port;
     uint64_t          wait_started_ticks;  /* ARM〜ICRESP_SEND段階での待ち開始時刻(NVMET_ACCEPT_TIMEOUT_MS、timeout_ms()で判定) */
     nvmet_tcp_xfer_t  xfer;
@@ -1783,7 +1913,7 @@ typedef struct {
     uint16_t          ttag;
     uint32_t          datao;
     uint32_t          datal;
-    int               h2c_slot;  /* nvmet_io_job_h2c_validate()が確定させるctx->pending_writes[]のインデックス */
+    int               h2c_slot;  /* nvmet_io_job_h2c_validate()が確定させるjc->pending_writes[]のインデックス */
     uint8_t          *cmd_data_dst;
     int               incap_write_committed;
     uint8_t           data_buf[NVMET_IO_DATA_BUF_MAX] __attribute__((aligned(64)));
@@ -1819,22 +1949,140 @@ typedef struct {
     nvmet_ready_t     ready[NVMET_READY_RING];
     volatile uint32_t ready_head;            /* upcallが積む(生産) */
     volatile uint32_t ready_tail;            /* jobが取り出す(消費) */
+    /* Dataset Management の範囲リスト。**ready-ring のスロットと 1 対 1** で
+     * 割り当てるので、DSM が続けて届いても互いを踏まない。ring 側に持たせると
+     * スロットの間隔が 4KB 開いて **hot path(通常の read/write)の TLB を
+     * 荒らす**ので、こちらへ置いてある。**キューごとに要る**(ready-ring が
+     * キューごとに独立しているため)。 */
+    uint8_t           dsm_stage[NVMET_READY_RING][NVMET_DSM_STAGE_BYTES] __attribute__((aligned(64)));
 } nvmet_io_job_ctx_t;
 
-static nvmet_io_job_ctx_t s_io_job_pool[NVMET_MAX_INSTANCES];
+static nvmet_io_job_ctx_t s_io_job_pool[NVMET_MAX_INSTANCES][NVMET_IO_QUEUES];
 
 static nvmet_ctx_t *s_instance_owner[NVMET_MAX_INSTANCES];
 
-static job_result_t nvmet_io_job_end(job_t *self, nvmet_ctx_t *ctx, int close_io, const char *reason)
+/*=================================================================
+ * 進行中の write コマンド(R2T を出してデータ待ち)のスロットを 1 つ確保する。
+ *
+ * **スロットは IO キューごとに独立**。cid はキューの中でしか一意でないので、
+ * 全キューで 1 組を共有すると別キューの同じ cid を掴む。
+ *
+ * 引数:
+ *   jc - IO ジョブ状態
+ * 戻り値:
+ *   スロット番号。空きが無ければ -1
+ * コール元:
+ *   nvmet_io_dispatch_cmd()
+ * ===============================================================*/
+static int nvmet_pending_write_alloc(nvmet_io_job_ctx_t *jc)
 {
-    uart_printf("[nvmet:%s] write内訳: in-capsule=%u件 R2T+H2CData=%u件\n",
-                ctx->label, ctx->write_incapsule_count, ctx->write_h2c_count);
-    uart_printf("[nvmet:%s] セッション終了(%s)、次のクライアントを待ちます\n", ctx->label, reason);
-    tcp_clear_recv_upcall(&ctx->io.tcp);
-    if (close_io) {
-        nvmet_tcp_close(&ctx->io);
+    for (unsigned i = 0; i < NVMET_MAX_PENDING_WRITES; i++) {
+        if (!jc->pending_writes[i].in_use) return (int)i;
     }
-    ctx->io_connected = 0;
+    return -1;
+}
+
+/*=================================================================
+ * 進行中の write コマンドから cid が一致するスロットを探す(受信した
+ * H2CData をどのコマンドのものか対応付けるのに使う)。
+ *
+ * 引数:
+ *   jc  - IO ジョブ状態
+ *   cid - 探すコマンド id
+ * 戻り値:
+ *   スロット番号。見つからなければ -1
+ * コール元:
+ *   nvmet_io_job_h2c_validate(), nvmet_io_rx_upcall()
+ * ===============================================================*/
+static int nvmet_pending_write_find(nvmet_io_job_ctx_t *jc, uint16_t cid)
+{
+    for (unsigned i = 0; i < NVMET_MAX_PENDING_WRITES; i++) {
+        if (jc->pending_writes[i].in_use && jc->pending_writes[i].cid == cid) return (int)i;
+    }
+    return -1;
+}
+
+/*=================================================================
+ * IO キューでストリーム desync らしき異常(想定外の PDU 種別、未知の cccid、
+ * datao 不一致など)を検出した際に、TCP 層の詳細状態を表示する診断ヘルパ。
+ *
+ * 引数:
+ *   jc     - IO ジョブ状態
+ *   reason - 検出した異常の説明
+ * コール元:
+ *   nvmet_io_job_h2c_validate(), nvmet_io_job_step_impl()
+ * ===============================================================*/
+static void nvmet_io_debug_desync(nvmet_io_job_ctx_t *jc, const char *reason)
+{
+    uart_printf("\n[DEBUG] ==== IOキュー%u desync検出: %s ====\n", jc->qidx + 1u, reason);
+    tcp_debug_dump_rx(&jc->io.tcp);
+    uart_printf("[DEBUG] ==== ここまで ====\n\n");
+}
+
+/*=================================================================
+ * accept の受け皿(arm 権)をこのジョブが握っていれば手放す。
+ *
+ * **listener の `accept_conn` は 1 本しか無い**ので、待つのをやめるときは
+ * 必ず外すこと。外さずに WAIT_ADMIN_READY へ戻ると、次に admin が
+ * accept したコネクションの引き渡し先がこのジョブの `jc->io` のままになる。
+ *
+ * 引数:
+ *   jc - IO ジョブ状態
+ * コール元:
+ *   nvmet_io_job_end(), nvmet_io_job_step_impl()
+ * ===============================================================*/
+static void nvmet_io_release_arm(nvmet_io_job_ctx_t *jc)
+{
+    nvmet_ctx_t *ctx = jc->ctx;
+    if (ctx->io_arm_owner != (int)jc->qidx) return;
+    if (tcp_accept_cancel(ctx->listener, &jc->io.tcp)) {
+        /* **取り下げる瞬間に確立していた。** 誰も引き取らないまま放置すると
+         * TCP_MAX_CONNS のスロットを握った孤児になるので畳む。 */
+        uart_printf("[nvmet:%s] IOキュー%u: 受け皿を外す直前に確立していたので畳みます\n",
+                    ctx->label, jc->qidx + 1u);
+        nvmet_tcp_close(&jc->io);
+    }
+    ctx->io_arm_owner = NVMET_ARM_FREE;
+}
+
+/*=================================================================
+ * IO キュー 1 本を畳んで次の接続待ちへ戻す。
+ *
+ * **最後の 1 本が閉じたときだけ session_done を立てる。** 複数キューでは
+ * ホストが 1 本ずつ順に閉じてくるので、1 本目で立てると admin が linger を
+ * 始めてしまい、まだ生きているキューを残したままセッションを畳む。
+ *
+ * 引数:
+ *   self / jc - このジョブ、IO ジョブ状態
+ *   close_io  - コネクションを能動 close するか
+ *   reason    - ログに出す終了理由
+ * 戻り値:
+ *   JOB_WAITING(常駐サーバとして継続)
+ * コール元:
+ *   nvmet_io_job_step_impl() ほか
+ * ===============================================================*/
+static job_result_t nvmet_io_job_end(job_t *self, nvmet_io_job_ctx_t *jc, int close_io, const char *reason)
+{
+    nvmet_ctx_t *ctx = jc->ctx;
+
+    tcp_clear_recv_upcall(&jc->io.tcp);
+    if (close_io) {
+        nvmet_tcp_close(&jc->io);
+    }
+    /* 受け皿を握ったまま待っている途中で畳まれることがある(セッション終了、
+     * Ctrl+C、accept 待ちタイムアウト)。**必ず取り下げる。** */
+    nvmet_io_release_arm(jc);
+
+    if (jc->connected) {
+        jc->connected = 0;
+        if (ctx->io_open > 0) (void)__atomic_sub_fetch(&ctx->io_open, 1u, __ATOMIC_ACQ_REL);
+    }
+    for (unsigned i = 0; i < NVMET_MAX_PENDING_WRITES; i++) {
+        jc->pending_writes[i].in_use = 0;
+    }
+
+    uart_printf("[nvmet:%s] IOキュー%u 終了(%s)、残り %d 本\n",
+                ctx->label, jc->qidx + 1u, reason, ctx->io_open);
 
     /* **admin キューはここで閉じない。** Linux ホストは切断時に
      * 「IO キュー切断 -> admin へ CC.SHN(Property Set offset 0x14)-> admin 切断」
@@ -1845,14 +2093,23 @@ static job_result_t nvmet_io_job_end(job_t *self, nvmet_ctx_t *ctx, int close_io
      * 生かして応答を続け、後始末は admin job(nvmet_admin_session_finish())が
      * 行う。コントローラ状態(ctrlr_id/cc/cc_en)もそれまで応答に要るので
      * ここではリセットしない。 */
-    ctx->io_armed = 0;
-    for (unsigned i = 0; i < NVMET_MAX_PENDING_WRITES; i++) {
-        ctx->pending_writes[i].in_use = 0;
+    if (ctx->io_open == 0) {
+        uint32_t w_inc = 0, w_h2c = 0;
+        nvmet_stat_totals(ctx, NULL, NULL, NULL, NULL, &w_inc, &w_h2c);
+        uart_printf("[nvmet:%s] write内訳: in-capsule=%u件 R2T+H2CData=%u件\n",
+                    ctx->label, w_inc, w_h2c);
+        uart_printf("[nvmet:%s] セッション終了、次のクライアントを待ちます\n", ctx->label);
+        for (unsigned c = 0; c < NVMET_STAT_CORES; c++) {
+            ctx->stat[c].write_incapsule = 0;
+            ctx->stat[c].write_h2c       = 0;
+        }
+        ctx->io_armed     = 0;
+        /* **KATO 切れの旗はここで消す。** 走っていたキューを全部畳み終えた
+         * 印で、1 本目に消すと残りのキューが生き残る。 */
+        ctx->kato_expired = 0;
+        ctx->session_done = 1;  /* admin jobへ「セッション終了、ARMし直せ」を伝える */
     }
-    ctx->write_incapsule_count = 0;
-    ctx->write_h2c_count       = 0;
 
-    ctx->session_done = 1;  /* admin jobへ「セッション終了、ARMし直せ」を伝える */
     self->state = NIO_ST_WAIT_ADMIN_READY;
     return JOB_WAITING;
 }
@@ -1874,10 +2131,10 @@ static job_result_t nvmet_io_job_recv_fail(job_t *self, nvmet_io_job_ctx_t *jc, 
     if (tcp_abort_requested()) {
         tcp_clear_abort_request();
         uart_printf("[nvmet:%s] Ctrl+Cで中断\n", ctx->label);
-        return nvmet_io_job_end(self, ctx, 1, "Ctrl+C中断");
+        return nvmet_io_job_end(self, jc, 1, "Ctrl+C中断");
     }
-    if (ctx->io.tcp.state != TCP_ESTABLISHED) {
-        return nvmet_io_job_end(self, ctx, 1, "IOキューが切断された");
+    if (jc->io.tcp.state != TCP_ESTABLISHED) {
+        return nvmet_io_job_end(self, jc, 1, "IOキューが切断された");
     }
     nvmet_tcp_xfer_reset(&jc->xfer, jc->hdr_buf, NVME_TCP_HDR_LEN);
     self->state = NIO_ST_RECV_PDU_HDR;
@@ -1890,33 +2147,33 @@ static job_result_t nvmet_io_job_recv_fail(job_t *self, nvmet_io_job_ctx_t *jc, 
  * すると受信先バッファの安全な範囲が保証されない)。
  *
  * 引数:
- *   self / jc / ctx - このジョブ、IO ジョブ状態、ターゲットコンテキスト
+ *   self / jc - このジョブ、IO ジョブ状態
  * 戻り値:
  *   JOB_WAITING(検証を通れば受信状態へ、失敗ならセッション終了)
  * コール元:
  *   nvmet_io_job_step_impl()
  * ===============================================================*/
-static job_result_t nvmet_io_job_h2c_validate(job_t *self, nvmet_io_job_ctx_t *jc, nvmet_ctx_t *ctx)
+static job_result_t nvmet_io_job_h2c_validate(job_t *self, nvmet_io_job_ctx_t *jc)
 {
-    int slot = nvmet_pending_write_find(ctx, jc->cccid);
+    int slot = nvmet_pending_write_find(jc, jc->cccid);
     if (slot < 0) {
         uart_printf("[!] nvmet: 未知のcccid=%uのH2CDataを受信\n", jc->cccid);
-        nvmet_io_debug_desync(ctx, "未知のcccid");
-        return nvmet_io_job_end(self, ctx, 1, "desync検出(未知のcccid)");
+        nvmet_io_debug_desync(jc, "未知のcccid");
+        return nvmet_io_job_end(self, jc, 1, "desync検出(未知のcccid)");
     }
-    nvmet_pending_write_t *pw = &ctx->pending_writes[slot];
+    nvmet_pending_write_t *pw = &jc->pending_writes[slot];
     if (jc->datao != pw->received) {
         uart_printf("[!] nvmet: H2CDataのdataoが不一致 (cid=%u 期待=%u 受信=%u)\n",
                     jc->cccid, pw->received, jc->datao);
-        nvmet_io_debug_desync(ctx, "datao不一致");
-        return nvmet_io_job_end(self, ctx, 1, "desync検出(datao不一致)");
+        nvmet_io_debug_desync(jc, "datao不一致");
+        return nvmet_io_job_end(self, jc, 1, "desync検出(datao不一致)");
     }
     if (pw->received + jc->datal > pw->write_len) {
         uart_printf("[!] nvmet: H2CDataがwrite_lenを超過 "
                     "(cid=%u received=%u datal=%u write_len=%u)\n",
                     jc->cccid, pw->received, jc->datal, pw->write_len);
-        nvmet_io_debug_desync(ctx, "write_len超過");
-        return nvmet_io_job_end(self, ctx, 1, "desync検出(write_len超過)");
+        nvmet_io_debug_desync(jc, "write_len超過");
+        return nvmet_io_job_end(self, jc, 1, "desync検出(write_len超過)");
     }
     jc->h2c_slot = slot;
     nvmet_tcp_xfer_reset(&jc->xfer, &pw->disk[pw->slba * NVMET_LBA_SIZE + jc->datao], jc->datal);
@@ -1942,11 +2199,16 @@ static job_result_t nvmet_io_job_h2c_validate(job_t *self, nvmet_io_job_ctx_t *j
  * コール元:
  *   nvmet_io_job_step_impl()
  * ===============================================================*/
-static void nvmet_io_dispatch_cmd(nvmet_ctx_t *ctx, const uint8_t *hdr_buf,
+static void nvmet_io_dispatch_cmd(nvmet_io_job_ctx_t *jc, const uint8_t *hdr_buf,
                                    const uint8_t *sqe_buf, uint16_t cid,
                                    uint32_t dlen, int incap_committed,
                                    const uint8_t *data)
 {
+    nvmet_ctx_t *ctx = jc->ctx;
+    /* **このキューが何コマンド捌いたか。** 複数キュー化してからは「ホストが
+     * どのキューへ振っているか」が性能の説明に要る(1 本に偏っているのか
+     * 均等なのかで、遅い原因の見当が正反対になる)。`nvmetqueues` で表示。 */
+    jc->stat_cmds++;
     nvme_sqe_t sqe;
     volatile_fast_copy((volatile uint8_t *)&sqe,
                         (const volatile uint8_t *)sqe_buf, NVME_SQE_LEN);
@@ -1954,11 +2216,13 @@ static void nvmet_io_dispatch_cmd(nvmet_ctx_t *ctx, const uint8_t *hdr_buf,
     nvme_cqe_t  cqe;
     nvmet_ns_t *ns;   /* nsid から引いた対象の名前空間(下の else-if で確定)*/
 
-    /* エラーを Error Information ログへ残すための文脈(IO は qid=1)。
+    /* エラーを Error Information ログへ残すための文脈。**sqid は
+     * このジョブが担当する IO キューの番号 + 1**(qid=0 は admin)。
      * LBA を持つコマンドだけが、エラーを返す直前に err_lba を入れる。 */
-    ctx->err_sqid = 1;
-    ctx->err_nsid = (opcode == NVME_FABRIC_CMD) ? 0u : rd32le(&sqe.nsid);
-    ctx->err_lba  = 0;
+    nvmet_core_stat_t *dcs = &ctx->stat[nvmet_stat_slot()];
+    dcs->err_sqid = (uint16_t)(jc->qidx + 1u);
+    dcs->err_nsid = (opcode == NVME_FABRIC_CMD) ? 0u : rd32le(&sqe.nsid);
+    dcs->err_lba  = 0;
 
     {
         volatile ts_nvme_pdu_t info = {0};
@@ -1976,25 +2240,42 @@ static void nvmet_io_dispatch_cmd(nvmet_ctx_t *ctx, const uint8_t *hdr_buf,
     if (opcode == NVME_FABRIC_CMD) {
         uint32_t fctype = rd32le(&sqe.nsid) & 0xFFu;
         if (fctype == NVME_FABRIC_FCTYPE_CONNECT) {
-            ctx->io_connected = 1;
-            nvmet_build_cqe(ctx, &cqe, cid, ctx->ctrlr_id, 0);
-            uart_printf("[nvmet:%s] Fabrics Connect (qid=1, IO) 受理\n", ctx->label);
+            /* **qid を確認する。** ホストは IO キューを qid=1,2,... の順に
+             * 張るが、どの TCP コネクションがどの qid になるかは accept の
+             * 順で決まるだけなので、こちらは受け取った qid をそのまま記録して
+             * 応答する(NVMe/TCP では 1 コネクション = 1 キューで、キュー間の
+             * 対応付けは cntlid だけで足りる)。
+             *
+             * **qid=0 が来たら、それは admin 用のコネクションを IO の受け皿が
+             * 食べてしまったということ。** D1 で discovery のあとに踏んだのと
+             * 同じ形なので、黙って受理せずエラーで返す。 */
+            uint32_t qid = rd32le(&sqe.cdw10) >> 16;
+            if (qid == 0u) {
+                uart_printf("[!] nvmet: IOキュー%u に qid=0(admin)のConnectが来た -- "
+                            "admin用の接続を横取りしています\n", jc->qidx + 1u);
+                nvmet_build_cqe(ctx, &cqe, cid, 0u, (uint16_t)NVMET_SC_INVALID_FIELD);
+            } else {
+                nvmet_build_cqe(ctx, &cqe, cid, ctx->ctrlr_id, 0);
+                uart_printf("[nvmet:%s] Fabrics Connect (qid=%u, IO) 受理 [キュー%u/%u]\n",
+                            ctx->label, (unsigned)qid, jc->qidx + 1u,
+                            nvmet_io_queue_count(ctx));
+            }
         } else {
             uart_printf("[!] nvmet: IOキューで想定外のFabricsコマンド (fctype=0x%x)\n", fctype);
             nvmet_build_cqe(ctx, &cqe, cid, 0u, (uint16_t)NVMET_SC_GENERIC_ERROR);
         }
-        nvmet_tcp_send_resp(&ctx->io, &cqe);
+        nvmet_tcp_send_resp(&jc->io, &cqe);
     } else if (!ctx->cc_en) {
         uart_printf("[!] nvmet: CC.EN=0のためIOコマンドを拒否 (opcode=0x%x)\n", opcode);
         nvmet_build_cqe(ctx, &cqe, cid, 0u, (uint16_t)NVMET_SC_GENERIC_ERROR);
-        nvmet_tcp_send_resp(&ctx->io, &cqe);
+        nvmet_tcp_send_resp(&jc->io, &cqe);
     } else if (opcode == NVME_IO_CMD_FLUSH) {
         /* 名前空間の実体は RAM ディスクで揮発性キャッシュを持たないため、
          * Flush は成功を返すだけでよい(仕様上も準拠)。返さないとホスト側で
          * fsync/sync が失敗する。**nsid=0xFFFFFFFF(全名前空間)で来ることが
          * あるので、ここは名前空間の解決より前に置く。** */
         nvmet_build_cqe(ctx, &cqe, cid, 0u, 0);
-        nvmet_tcp_send_resp(&ctx->io, &cqe);
+        nvmet_tcp_send_resp(&jc->io, &cqe);
     } else if ((ns = nvmet_ns_get(ctx, rd32le(&sqe.nsid))) == NULL) {
         /* Read / Write / Write Zeroes / DSM は必ず 1 つの名前空間を指す。
          * **ゼロクリアされた領域を返してはいけない**(ホストが実在しない
@@ -2002,37 +2283,38 @@ static void nvmet_io_dispatch_cmd(nvmet_ctx_t *ctx, const uint8_t *hdr_buf,
         uart_printf("[!] nvmet: IOコマンドのnsid=%u が無効 (opcode=0x%x)\n",
                     rd32le(&sqe.nsid), opcode);
         nvmet_build_cqe(ctx, &cqe, cid, 0u, (uint16_t)NVMET_SC_INVALID_NS);
-        nvmet_tcp_send_resp(&ctx->io, &cqe);
+        nvmet_tcp_send_resp(&jc->io, &cqe);
     } else if (opcode == NVME_IO_CMD_READ) {
         uint64_t slba    = (uint64_t)rd32le(&sqe.cdw10) | ((uint64_t)rd32le(&sqe.cdw11) << 32);
         uint32_t nlb     = (rd32le(&sqe.cdw12) & 0xFFFFu) + 1u;
         uint64_t end_lba = slba + nlb;
         ts_log(TS_MK(TS_FILE_NVMET, TS_FUNC_nvmet_io_dispatch_cmd, 1), nlb * NVMET_LBA_SIZE);
-        ctx->err_lba = slba;
+        dcs->err_lba = slba;
 
         if (end_lba > ns->lba_count) {
             uart_printf("[!] nvmet: Read範囲外 (slba=%u nlb=%u)\n", (uint32_t)slba, nlb);
             nvmet_build_cqe(ctx, &cqe, cid, 0u, (uint16_t)NVMET_SC_GENERIC_ERROR);
-            nvmet_tcp_send_resp(&ctx->io, &cqe);
+            nvmet_tcp_send_resp(&jc->io, &cqe);
         } else if ((uint64_t)nlb * NVMET_LBA_SIZE > NVMET_MAX_TRANSFER_BYTES) {
             uart_printf("[!] nvmet: Read転送量がMDTS超過 (slba=%u nlb=%u)\n",
                         (uint32_t)slba, nlb);
             nvmet_build_cqe(ctx, &cqe, cid, 0u, (uint16_t)NVMET_SC_GENERIC_ERROR);
-            nvmet_tcp_send_resp(&ctx->io, &cqe);
+            nvmet_tcp_send_resp(&jc->io, &cqe);
         } else {
-            ctx->stat_read_bytes += (uint64_t)nlb * NVMET_LBA_SIZE;   /* SMART の data_units_read */
-            ctx->stat_read_cmds++;
+            nvmet_core_stat_t *cs = &ctx->stat[nvmet_stat_slot()];
+            cs->read_bytes += (uint64_t)nlb * NVMET_LBA_SIZE;   /* SMART の data_units_read */
+            cs->read_cmds++;
             nvmet_build_cqe(ctx, &cqe, cid, 0u, 0);
             /* ダイジェスト有効時もゼロコピーのまま送れる
              * (nvmet_tcp_send_c2h_async() が送信元から直接 CRC を算出する)。 */
-            int c2h_rc = nvmet_tcp_send_c2h_async(&ctx->io, cid,
+            int c2h_rc = nvmet_tcp_send_c2h_async(&jc->io, cid,
                                                    &ns->disk[slba * NVMET_LBA_SIZE],
                                                    nlb * NVMET_LBA_SIZE);
             if (c2h_rc != 0) {
                 uart_printf("[!] nvmet: C2HData送信失敗、エラー応答を試みる "
                             "(slba=%u nlb=%u)\n", (uint32_t)slba, nlb);
                 nvmet_build_cqe(ctx, &cqe, cid, 0u, (uint16_t)NVMET_SC_GENERIC_ERROR);
-                nvmet_tcp_send_resp(&ctx->io, &cqe);
+                nvmet_tcp_send_resp(&jc->io, &cqe);
             }
         }
     } else if (opcode == NVME_IO_CMD_WRITE) {
@@ -2041,48 +2323,50 @@ static void nvmet_io_dispatch_cmd(nvmet_ctx_t *ctx, const uint8_t *hdr_buf,
         uint64_t end_lba   = slba + nlb;
         uint32_t write_len = nlb * NVMET_LBA_SIZE;
         ts_log(TS_MK(TS_FILE_NVMET, TS_FUNC_nvmet_io_dispatch_cmd, 2), write_len);
-        ctx->err_lba = slba;
+        dcs->err_lba = slba;
 
         if (dlen > 0) {
             if (incap_committed) {
-                ctx->write_incapsule_count++;
-                ctx->stat_write_bytes += write_len;   /* SMART の data_units_written */
-                ctx->stat_write_cmds++;
+                nvmet_core_stat_t *cs = &ctx->stat[nvmet_stat_slot()];
+                cs->write_incapsule++;
+                cs->write_bytes += write_len;   /* SMART の data_units_written */
+                cs->write_cmds++;
                 nvmet_build_cqe(ctx, &cqe, cid, 0u, 0);
             } else {
                 uart_printf("[!] nvmet: Write範囲外/過大 (slba=%u nlb=%u)\n", (uint32_t)slba, nlb);
                 nvmet_build_cqe(ctx, &cqe, cid, 0u, (uint16_t)NVMET_SC_GENERIC_ERROR);
             }
-            nvmet_tcp_send_resp(&ctx->io, &cqe);
+            nvmet_tcp_send_resp(&jc->io, &cqe);
         } else if (end_lba > ns->lba_count || write_len > NVMET_IO_DATA_BUF_MAX) {
             uart_printf("[!] nvmet: Write範囲外/過大 (slba=%u nlb=%u)\n", (uint32_t)slba, nlb);
             nvmet_build_cqe(ctx, &cqe, cid, 0u, (uint16_t)NVMET_SC_GENERIC_ERROR);
-            nvmet_tcp_send_resp(&ctx->io, &cqe);
+            nvmet_tcp_send_resp(&jc->io, &cqe);
         } else {
-            int slot = nvmet_pending_write_alloc(ctx);
+            int slot = nvmet_pending_write_alloc(jc);
             if (slot < 0) {
                 uart_printf("[!] nvmet: 同時書き込み上限(%u件)を超過、"
                             "コマンドを拒否 (cid=%u)\n", NVMET_MAX_PENDING_WRITES, cid);
                 nvmet_build_cqe(ctx, &cqe, cid, 0u, (uint16_t)NVMET_SC_GENERIC_ERROR);
-                nvmet_tcp_send_resp(&ctx->io, &cqe);
+                nvmet_tcp_send_resp(&jc->io, &cqe);
             } else {
-                ctx->write_h2c_count++;
-                ctx->stat_write_bytes += write_len;   /* SMART の data_units_written */
-                ctx->stat_write_cmds++;
-                ctx->pending_writes[slot].in_use    = 1;
-                ctx->pending_writes[slot].cid       = cid;
-                ctx->pending_writes[slot].slba      = slba;
-                ctx->pending_writes[slot].write_len = write_len;
-                ctx->pending_writes[slot].received  = 0;
-                ctx->pending_writes[slot].disk      = ns->disk;
+                nvmet_core_stat_t *cs = &ctx->stat[nvmet_stat_slot()];
+                cs->write_h2c++;
+                cs->write_bytes += write_len;   /* SMART の data_units_written */
+                cs->write_cmds++;
+                jc->pending_writes[slot].in_use    = 1;
+                jc->pending_writes[slot].cid       = cid;
+                jc->pending_writes[slot].slba      = slba;
+                jc->pending_writes[slot].write_len = write_len;
+                jc->pending_writes[slot].received  = 0;
+                jc->pending_writes[slot].disk      = ns->disk;
 
-                uint32_t max_h2c = nvmet_tcp_max_h2c_data(&ctx->io);
+                uint32_t max_h2c = nvmet_tcp_max_h2c_data(&jc->io);
                 uint32_t round   = (write_len > max_h2c) ? max_h2c : write_len;
-                if (nvmet_tcp_send_r2t(&ctx->io, cid, 0, round) != 0) {
+                if (nvmet_tcp_send_r2t(&jc->io, cid, 0, round) != 0) {
                     uart_printf("[!] nvmet: R2T送信失敗 (cid=%u)\n", cid);
-                    ctx->pending_writes[slot].in_use = 0;
+                    jc->pending_writes[slot].in_use = 0;
                     nvmet_build_cqe(ctx, &cqe, cid, 0u, (uint16_t)NVMET_SC_GENERIC_ERROR);
-                    nvmet_tcp_send_resp(&ctx->io, &cqe);
+                    nvmet_tcp_send_resp(&jc->io, &cqe);
                 }
             }
         }
@@ -2091,7 +2375,7 @@ static void nvmet_io_dispatch_cmd(nvmet_ctx_t *ctx, const uint8_t *hdr_buf,
          * **0's based**(DSM の範囲リストの NLB とは違う)。 */
         uint64_t slba = (uint64_t)rd32le(&sqe.cdw10) | ((uint64_t)rd32le(&sqe.cdw11) << 32);
         uint32_t nlb  = (rd32le(&sqe.cdw12) & 0xFFFFu) + 1u;
-        ctx->err_lba = slba;
+        dcs->err_lba = slba;
 
         if (nvmet_zero_lba_range(ns, slba, nlb) != 0) {
             uart_printf("[!] nvmet: Write Zeroes範囲外 (slba=%u nlb=%u)\n", (uint32_t)slba, nlb);
@@ -2099,7 +2383,7 @@ static void nvmet_io_dispatch_cmd(nvmet_ctx_t *ctx, const uint8_t *hdr_buf,
         } else {
             nvmet_build_cqe(ctx, &cqe, cid, 0u, 0);
         }
-        nvmet_tcp_send_resp(&ctx->io, &cqe);
+        nvmet_tcp_send_resp(&jc->io, &cqe);
     } else if (opcode == NVME_IO_CMD_DSM) {
         /* NR(cdw10 bit7:0)は **0's based**。範囲リストは 16 バイト x NR で
          * ホストから送られてくる。 */
@@ -2123,11 +2407,11 @@ static void nvmet_io_dispatch_cmd(nvmet_ctx_t *ctx, const uint8_t *hdr_buf,
         } else {
             nvmet_build_cqe(ctx, &cqe, cid, 0u, 0);
         }
-        nvmet_tcp_send_resp(&ctx->io, &cqe);
+        nvmet_tcp_send_resp(&jc->io, &cqe);
     } else {
         uart_printf("[!] nvmet: 未対応のIOコマンド (opcode=0x%x)\n", opcode);
         nvmet_build_cqe(ctx, &cqe, cid, 0u, (uint16_t)NVMET_SC_GENERIC_ERROR);
-        nvmet_tcp_send_resp(&ctx->io, &cqe);
+        nvmet_tcp_send_resp(&jc->io, &cqe);
     }
 }
 
@@ -2143,11 +2427,12 @@ static void nvmet_io_dispatch_cmd(nvmet_ctx_t *ctx, const uint8_t *hdr_buf,
  * コール元:
  *   nvmet_io_job_step_impl()
  * ===============================================================*/
-static void nvmet_io_dispatch_h2c(nvmet_ctx_t *ctx, int h2c_slot,
+static void nvmet_io_dispatch_h2c(nvmet_io_job_ctx_t *jc, int h2c_slot,
                                    const uint8_t *hdr_buf, uint16_t cccid,
                                    uint16_t ttag, uint32_t datao, uint32_t datal)
 {
-    nvmet_pending_write_t *pw = &ctx->pending_writes[h2c_slot];
+    nvmet_ctx_t           *ctx = jc->ctx;
+    nvmet_pending_write_t *pw  = &jc->pending_writes[h2c_slot];
 
     {
         volatile ts_nvme_pdu_t info = {0};
@@ -2165,19 +2450,19 @@ static void nvmet_io_dispatch_h2c(nvmet_ctx_t *ctx, int h2c_slot,
     pw->received += datal;
     if (pw->received < pw->write_len) {
         uint32_t remain  = pw->write_len - pw->received;
-        uint32_t max_h2c = nvmet_tcp_max_h2c_data(&ctx->io);
+        uint32_t max_h2c = nvmet_tcp_max_h2c_data(&jc->io);
         uint32_t round   = (remain > max_h2c) ? max_h2c : remain;
-        if (nvmet_tcp_send_r2t(&ctx->io, pw->cid, pw->received, round) != 0) {
+        if (nvmet_tcp_send_r2t(&jc->io, pw->cid, pw->received, round) != 0) {
             uart_printf("[!] nvmet: R2T送信失敗 (cid=%u)\n", pw->cid);
             nvme_cqe_t cqe;
             nvmet_build_cqe(ctx, &cqe, pw->cid, 0u, (uint16_t)NVMET_SC_GENERIC_ERROR);
-            nvmet_tcp_send_resp(&ctx->io, &cqe);
+            nvmet_tcp_send_resp(&jc->io, &cqe);
             pw->in_use = 0;
         }
     } else {
         nvme_cqe_t cqe;
         nvmet_build_cqe(ctx, &cqe, pw->cid, 0u, 0);
-        nvmet_tcp_send_resp(&ctx->io, &cqe);
+        nvmet_tcp_send_resp(&jc->io, &cqe);
         pw->in_use = 0;
     }
 }
@@ -2291,7 +2576,7 @@ static void nvmet_prx_dispatch(nvmet_io_job_ctx_t *jc, nvmet_ctx_t *ctx)
              * nvmet_ready_push_cmd() が使うのと同じ番号で、dispatch されるまで
              * 再利用されない。 */
             jc->prx_data_dst =
-                (volatile uint8_t *)ctx->dsm_stage[jc->ready_head % NVMET_READY_RING];
+                (volatile uint8_t *)jc->dsm_stage[jc->ready_head % NVMET_READY_RING];
         }
         if (jc->prx_data_need > 0 && opcode == NVME_IO_CMD_WRITE) {
             /* **nsid を見て名前空間を選ぶ。** 無効なら RAM ディスクへ直接置く
@@ -2321,9 +2606,9 @@ static void nvmet_prx_dispatch(nvmet_io_job_ctx_t *jc, nvmet_ctx_t *ctx)
         jc->prx_datao = rd32le(&jc->prx_psh[4]);
         jc->prx_datal = rd32le(&jc->prx_psh[8]);
         jc->prx_data_need = jc->prx_datal;
-        int slot = nvmet_pending_write_find(ctx, jc->prx_cccid);
+        int slot = nvmet_pending_write_find(jc, jc->prx_cccid);
         if (slot < 0) { jc->prx_error = 1; return; }
-        nvmet_pending_write_t *pw = &ctx->pending_writes[slot];
+        nvmet_pending_write_t *pw = &jc->pending_writes[slot];
         if (jc->prx_datao != pw->received ||
             pw->received + jc->prx_datal > pw->write_len) {
             jc->prx_error = 1; return;
@@ -2366,7 +2651,7 @@ static void nvmet_io_rx_upcall(void *arg, const volatile uint8_t *data, uint16_t
                 /* plen はヘッダ・両ダイジェストを含む総長なので、
                  * pull 経路と同じヘルパでデータ本体だけを取り出す。 */
                 (void)plen;
-                jc->prx_data_need = nvmet_tcp_parse_cmd_dlen(&ctx->io, jc->prx_hdr);
+                jc->prx_data_need = nvmet_tcp_parse_cmd_dlen(&jc->io, jc->prx_hdr);
                 if (jc->prx_psh_need == 0 || jc->prx_psh_need > NVME_SQE_LEN) {
                     jc->prx_error = 1; break;   /* IOキューのCMD/H2Cはhlen=72/24のみ */
                 }
@@ -2385,7 +2670,7 @@ static void nvmet_io_rx_upcall(void *arg, const volatile uint8_t *data, uint16_t
             i += take;
             if (jc->prx_psh_off < jc->prx_psh_need) break;
 
-            if (ctx->io.hdgst) {
+            if (jc->io.hdgst) {
                 jc->prx_dgst_off = 0;
                 jc->prx_phase = PRX_HDGST;
             } else {
@@ -2402,10 +2687,10 @@ static void nvmet_io_rx_upcall(void *arg, const volatile uint8_t *data, uint16_t
             i += take;
             if (jc->prx_dgst_off < 4u) break;
 
-            if (nvmet_tcp_verify_hdgst(&ctx->io, jc->prx_hdr, NVME_TCP_HDR_LEN,
+            if (nvmet_tcp_verify_hdgst(&jc->io, jc->prx_hdr, NVME_TCP_HDR_LEN,
                                         jc->prx_psh, jc->prx_psh_need, jc->prx_dgst) != 0) {
                 /* 理由を伝えてから畳む(prx_error は上位が拾って終了させる)。 */
-                nvmet_tcp_send_term(&ctx->io, NVME_TCP_FES_HDR_DIGEST_ERR, 0,
+                nvmet_tcp_send_term(&jc->io, NVME_TCP_FES_HDR_DIGEST_ERR, 0,
                                      jc->prx_hdr, NVME_TCP_HDR_LEN);
                 jc->prx_error = 1;
                 break;
@@ -2422,7 +2707,7 @@ static void nvmet_io_rx_upcall(void *arg, const volatile uint8_t *data, uint16_t
             volatile_fast_copy(jc->prx_data_dst + jc->prx_data_off, data + i, take);
             if (ts_rx_on) jc->prx_copy_ns += (uint32_t)get_ns_from(cpt0);
             /* CRC は受信ストリームから直接積む(コピー先を読み直さない)。 */
-            if (ctx->io.ddgst) {
+            if (jc->io.ddgst) {
                 jc->prx_ddgst_crc = crc32c(jc->prx_ddgst_crc, data + i, take);
             }
             jc->prx_data_off += take;
@@ -2433,7 +2718,7 @@ static void nvmet_io_rx_upcall(void *arg, const volatile uint8_t *data, uint16_t
                     ts_log(TS_MK(TS_FILE_NVMET, TS_FUNC_nvmet_io_rx_upcall, 1),
                            (0x43u << 24) | ((uint32_t)get_ns_from(jc->prx_start_tick) & 0xFFFFFFu));
                 }
-                if (ctx->io.ddgst) {
+                if (jc->io.ddgst) {
                     jc->prx_dgst_off = 0;
                     jc->prx_phase = PRX_DDGST;
                 } else {
@@ -2451,7 +2736,7 @@ static void nvmet_io_rx_upcall(void *arg, const volatile uint8_t *data, uint16_t
             i += take;
             if (jc->prx_dgst_off < 4u) break;
 
-            if (nvmet_tcp_check_ddgst_crc(&ctx->io, jc->prx_ddgst_crc, jc->prx_dgst) != 0) {
+            if (nvmet_tcp_check_ddgst_crc(&jc->io, jc->prx_ddgst_crc, jc->prx_dgst) != 0) {
                 jc->prx_error = 1;
                 break;
             }
@@ -2480,25 +2765,36 @@ static job_result_t nvmet_io_job_step_impl(job_t *self)
     nvmet_io_job_ctx_t *jc  = (nvmet_io_job_ctx_t *)self->ctx;
     nvmet_ctx_t         *ctx = jc->ctx;
 
+    /* **既定は「毎 tick 走る」。** 眠ってよい状態(未接続の待機、arm 権待ち、
+     * コマンド待ち)だけが自分で job_park() して抜ける。ここで一度起こして
+     * おくことで、park し忘れではなく unpark し忘れのほうを潰してある
+     * (park し忘れは性能が戻るだけ、unpark し忘れは反応が止まる)。 */
+    job_unpark(self);
+
     if (self->cancel_requested && (nvmet_io_state_t)self->state != NIO_ST_WAIT_ADMIN_READY) {
         int io_open = ((nvmet_io_state_t)self->state >= NIO_ST_ICREQ_RECV);
         self->cancel_requested = 0;
-        return nvmet_io_job_end(self, ctx, io_open, "job stopでキャンセル");
+        return nvmet_io_job_end(self, jc, io_open, "job stopでキャンセル");
     }
 
     /* admin ジョブが Keep Alive タイムアウトを検出した(D7)。**自分の
      * コネクションは自分で畳む** -- upcall の解除など後始末が
-     * nvmet_io_job_end() に集約してあるため。**旗はここで消費する**
-     * (admin 側で消すと、この tick が回る前に消えてしまう)。 */
-    if (ctx->kato_expired) {
-        ctx->kato_expired = 0;
-        if ((nvmet_io_state_t)self->state != NIO_ST_WAIT_ADMIN_READY) {
-            int io_open = ((nvmet_io_state_t)self->state >= NIO_ST_ICREQ_RECV);
-            return nvmet_io_job_end(self, ctx, io_open, "Keep Aliveタイムアウト");
-        }
+     * nvmet_io_job_end() に集約してあるため。
+     *
+     * **旗はここで消さない。** 複数キューでは走っているキュー全部を畳む
+     * 必要があるので、1 本目が消すと残りが生き残る。消すのは
+     * nvmet_io_job_end() で最後の 1 本が閉じたときと、admin が次の
+     * Fabrics Connect(qid=0)を受理したとき。 */
+    if (ctx->kato_expired && (nvmet_io_state_t)self->state != NIO_ST_WAIT_ADMIN_READY) {
+        int io_open = ((nvmet_io_state_t)self->state >= NIO_ST_ICREQ_RECV);
+        return nvmet_io_job_end(self, jc, io_open, "Keep Aliveタイムアウト");
     }
 
-    if((uint32_t)self->state != 0x10)
+    /* 定常状態(PUSH_RUN)と待機(WAIT_ADMIN_READY)は毎 tick 通るので記録しない。
+     * **待機を外したのは IO ジョブが複数になったから** -- 眠っているジョブが
+     * 4 本ぶん毎 tick 積むと ts リングが状態遷移で埋まって使い物にならない。 */
+    if ((nvmet_io_state_t)self->state != NIO_ST_PUSH_RUN &&
+        (nvmet_io_state_t)self->state != NIO_ST_WAIT_ADMIN_READY)
         ts_log(TS_MK(TS_FILE_NVMET, TS_FUNC_nvmet_io_job_step_impl, 10), (uint32_t)self->state);
 
     switch ((nvmet_io_state_t)self->state) {
@@ -2512,42 +2808,114 @@ static job_result_t nvmet_io_job_step_impl(job_t *self)
             ctx->stop_requested = 1;
             return JOB_WAITING;
         }
-        if (!ctx->io_armed) return JOB_WAITING;
+        /* **合意した本数を超えるキューは待ち続ける。** 使われない受け皿を
+         * arm したまま残すと、その受け皿が次の admin 接続の SYN を食べる。
+         *
+         * **ここで眠る。** ジョブは常に上限(NVMET_IO_QUEUES)ぶん spawn して
+         * あるので、1 本しか使わないセッションでは残り 3 本がこの状態で
+         * 待ち続ける。眠らせないと 3 本が毎 tick スケジューラのロックを
+         * 取り合い、実際に流れているキューの受信周期がそのぶん延びる。
+         * 起床は JOB_IDLE_TICK_DIVISOR 周期の様子見だけで足りる(io_armed が
+         * 立つのは接続確立という ms スケールの出来事)。 */
+        if (!ctx->io_armed || jc->qidx >= nvmet_io_queue_count(ctx)) {
+            job_park(self, NULL, NULL);
+            return JOB_WAITING;
+        }
         self->state = NIO_ST_ARM;
         return JOB_WAITING;
 
     case NIO_ST_ARM:
-        uart_printf("[nvmet:%s] IOキュー接続待ち (port=%u)\n", ctx->label, (unsigned)jc->port);
-        nvmet_tcp_accept_arm(&ctx->io, ctx->listener);
+        /* セッションが先に終わっていたら arm しない。 */
+        if (!ctx->io_armed || jc->qidx >= nvmet_io_queue_count(ctx)) {
+            self->state = NIO_ST_WAIT_ADMIN_READY;
+            return JOB_WAITING;
+        }
+        /* **arm 権は 1 ジョブずつ。** listener の受け皿は 1 本しか無いので、
+         * 2 本目以降は先客が accept して手放すまで待つ。ホストは IO キューを
+         * 1 本ずつ順に張ってくる(Linux の nvme_tcp_alloc_queue())ので、
+         * これで取りこぼさない。間に合わなかった SYN は listen backlog が
+         * 拾って ESTABLISHED まで進めておいてくれる。
+         *
+         * **先客待ちのあいだは眠る。** 手放されるのは前のキューが accept した
+         * ときで、これも ms スケールの出来事。 */
+        if (ctx->io_arm_owner != NVMET_ARM_FREE) {
+            job_park(self, NULL, NULL);
+            return JOB_WAITING;
+        }
+        ctx->io_arm_owner = (int)jc->qidx;
+        uart_printf("[nvmet:%s] IOキュー%u 接続待ち (port=%u)\n",
+                    ctx->label, jc->qidx + 1u, (unsigned)jc->port);
+        nvmet_tcp_accept_arm(&jc->io, ctx->listener);
         jc->wait_started_ticks = timer_now();
         self->state = NIO_ST_ACCEPT_WAIT;
         return JOB_WAITING;
 
     case NIO_ST_ACCEPT_WAIT:
+        /* セッションが終わった(admin が畳んだ / 最後のキューが閉じた)。
+         * **受け皿を取り下げてから戻る**(取り下げないと、次に admin が
+         * accept したコネクションがこのジョブの jc->io へ渡ってしまう)。 */
+        if (!ctx->io_armed) {
+            nvmet_io_release_arm(jc);
+            self->state = NIO_ST_WAIT_ADMIN_READY;
+            return JOB_WAITING;
+        }
+        /* **poll してよいのは arm 権を持っているジョブだけ。** 持っていない
+         * ジョブが呼ぶと、armed なジョブ宛に確立したコネクションを横取りする。 */
+        if (ctx->io_arm_owner != (int)jc->qidx) return JOB_WAITING;
         if (tcp_accept_ready_poll(ctx->listener)) {
-            uart_printf("[nvmet:%s] IOキュー接続完了\n", ctx->label);
+            /* **受け皿を次のジョブへ譲る。** これで 2 本目以降が arm できる。 */
+            ctx->io_arm_owner = NVMET_ARM_FREE;
+            /* **確立したコネクションのコアへ自分を移す。**
+             *
+             * 受信フレームは 4-tuple のハッシュで担当コアへ配られるので、
+             * このコネクションを触るのはそのコアだけにしないといけない
+             * (受信 upcall と、このジョブの送信が同じ tcp_priv_t を
+             * 別コアから同時に触ると壊れる)。**accept したコアが
+             * そのまま担当コア**なので、ジョブをそこへ移せば揃う。
+             * 単一コアのときは今のコアと同じなので何も起きない。 */
+            job_pin_to_core(self, jc->io.tcp.owner_core);
+            jc->connected = 1;
+            (void)__atomic_add_fetch(&ctx->io_open, 1u, __ATOMIC_ACQ_REL);
+            /* **ACK の相乗りはキューが多いときだけ得。** 相手に余裕が
+             * ある(= 多キューで直列化して待っている)条件では +9% だが、
+             * 相手が飽和している 1〜3 本では **ACK が送信のペーシングに
+             * 効いている**ので 4〜16% 損をする。実測に基づく閾値。 */
+            tcp_set_ack_piggyback(&jc->io.tcp,
+                                  ctx->io_queues_granted >= NVMET_ACKPIGGY_MIN_QUEUES);
+            uart_printf("[nvmet:%s] IOキュー%u 接続完了 (%d/%u本)\n",
+                        ctx->label, jc->qidx + 1u, ctx->io_open,
+                        nvmet_io_queue_count(ctx));
             nvmet_tcp_xfer_reset(&jc->xfer, jc->icreq_buf, NVME_TCP_ICREQ_LEN);
+            /* **ICReq のタイムアウトは accept からの経過で測る。** ARM 時刻の
+             * ままだと、ホストが繋いでくるまで長く待った 2 本目以降で
+             * 残り時間がほとんど無くなる。 */
+            jc->wait_started_ticks = timer_now();
             self->state = NIO_ST_ICREQ_RECV;
             return JOB_WAITING;
         }
         if (tcp_abort_requested()) {
             tcp_clear_abort_request();
             uart_printf("[nvmet:%s] Ctrl+Cで中断\n", ctx->label);
-            return nvmet_io_job_end(self, ctx, 0, "Ctrl+C中断");
+            return nvmet_io_job_end(self, jc, 0, "Ctrl+C中断");
         }
-        if (timeout_ms(jc->wait_started_ticks, NVMET_ACCEPT_TIMEOUT_MS)) {
+        /* **タイムアウトを見るのは「まだ 1 本も繋がっていない」ときだけ。**
+         * 既に別のキューが動いているなら、ホストが残りを張ってこないだけ
+         * かもしれない(要求より少ない本数しか使わないホストもいる)ので、
+         * セッションを畳んではいけない。 */
+        if (ctx->io_open == 0 &&
+            timeout_ms(jc->wait_started_ticks, NVMET_ACCEPT_TIMEOUT_MS)) {
             uart_printf("[!] nvmet: IOキュー接続待ちタイムアウト\n");
-            return nvmet_io_job_end(self, ctx, 0, "IOキュー接続待ちタイムアウト");
+            return nvmet_io_job_end(self, jc, 0, "IOキュー接続待ちタイムアウト");
         }
         return JOB_WAITING;
 
     case NIO_ST_ICREQ_RECV: {
-        int r = nvmet_tcp_recv_poll(&ctx->io, &jc->xfer);
-        if (r < 0) return nvmet_io_job_end(self, ctx, 1, "IO ICReq受信失敗");
+        int r = nvmet_tcp_recv_poll(&jc->io, &jc->xfer);
+        if (r < 0) return nvmet_io_job_end(self, jc, 1, "IO ICReq受信失敗");
         if (r == 0) {
             if (timeout_ms(jc->wait_started_ticks, NVMET_ACCEPT_TIMEOUT_MS)) {
                 uart_printf("[!] NVMe/TCP target: IO ICReq受信タイムアウト\n");
-                return nvmet_io_job_end(self, ctx, 1, "IO ICReq受信タイムアウト");
+                return nvmet_io_job_end(self, jc, 1, "IO ICReq受信タイムアウト");
             }
             return JOB_WAITING;
         }
@@ -2565,8 +2933,8 @@ static job_result_t nvmet_io_job_step_impl(job_t *self)
     }
 
     case NIO_ST_ICRESP_SEND:
-        if (nvmet_tcp_send_icresp(&ctx->io, jc->icreq_buf) != 0) {
-            return nvmet_io_job_end(self, ctx, 1, "IO ICResp送信失敗");
+        if (nvmet_tcp_send_icresp(&jc->io, jc->icreq_buf) != 0) {
+            return nvmet_io_job_end(self, jc, 1, "IO ICResp送信失敗");
         }
         /* ダイジェスト有効時も push 型のまま扱える(パーサが PRX_HDGST/
          * PRX_DDGST 相を持ち、データダイジェストは受信ストリームから逐次
@@ -2578,10 +2946,10 @@ static job_result_t nvmet_io_job_step_impl(job_t *self)
             jc->prx_error   = 0;
             jc->ready_head  = 0;
             jc->ready_tail  = 0;
-            tcp_set_recv_upcall(&ctx->io.tcp, nvmet_io_rx_upcall, jc);
+            tcp_set_recv_upcall(&jc->io.tcp, nvmet_io_rx_upcall, jc);
             self->state = NIO_ST_PUSH_RUN;
-            uart_printf("[nvmet:%s] IOキュー push型(inline upcall)受信を有効化 (hdgst=%u ddgst=%u)\n",
-                        ctx->label, ctx->io.hdgst, ctx->io.ddgst);
+            uart_printf("[nvmet:%s] IOキュー%u push型(inline upcall)受信を有効化 (hdgst=%u ddgst=%u)\n",
+                        ctx->label, jc->qidx + 1u, jc->io.hdgst, jc->io.ddgst);
         } else {
             jc->push_mode = 0;
             nvmet_tcp_xfer_reset(&jc->xfer, jc->hdr_buf, NVME_TCP_HDR_LEN);
@@ -2592,40 +2960,61 @@ static job_result_t nvmet_io_job_step_impl(job_t *self)
     case NIO_ST_PUSH_RUN: {
         if (tcp_abort_requested()) {
             tcp_clear_abort_request();
-            tcp_clear_recv_upcall(&ctx->io.tcp);
+            tcp_clear_recv_upcall(&jc->io.tcp);
             uart_printf("[nvmet:%s] Ctrl+Cで中断\n", ctx->label);
-            return nvmet_io_job_end(self, ctx, 1, "Ctrl+C中断");
+            return nvmet_io_job_end(self, jc, 1, "Ctrl+C中断");
         }
         if (jc->prx_error) {
-            tcp_clear_recv_upcall(&ctx->io.tcp);
+            tcp_clear_recv_upcall(&jc->io.tcp);
             uart_printf("[!] nvmet: push受信パースエラー(ストリーム同期崩れ/ring溢れ)\n");
-            return nvmet_io_job_end(self, ctx, 1, "push受信パースエラー");
+            return nvmet_io_job_end(self, jc, 1, "push受信パースエラー");
         }
+        /* **この排出の間に出る応答 PDU を 1 セグメントへ束ねる。**
+         * kernel/SPDK は応答を 3〜4 個ずつ 1 パケットに載せてくるのに、
+         * こちらは 1 PDU = 1 セグメントで、**相手の受信パケット/コマンドが
+         * 4〜6 倍**になっていた。**`_end` を必ず通ること**(溜めたまま
+         * park すると応答が止まる)。 */
+        nvmet_tcp_tx_batch_begin(&jc->io);
         while (jc->ready_tail != jc->ready_head) {
             nvmet_ready_t *rd = &jc->ready[jc->ready_tail % NVMET_READY_RING];
             uint64_t dsp0 = timer_now();
             if (rd->kind == NVMET_READY_CMD) {
-                nvmet_io_dispatch_cmd(ctx, rd->hdr, rd->sqe, rd->cid, rd->dlen, rd->incap_committed, rd->data_dst);
+                nvmet_io_dispatch_cmd(jc, rd->hdr, rd->sqe, rd->cid, rd->dlen, rd->incap_committed, rd->data_dst);
             } else {
-                nvmet_io_dispatch_h2c(ctx, rd->h2c_slot, rd->hdr, rd->cccid, rd->ttag, rd->datao, rd->datal);
+                nvmet_io_dispatch_h2c(jc, rd->h2c_slot, rd->hdr, rd->cccid, rd->ttag, rd->datao, rd->datal);
             }
             ts_log(TS_MK(TS_FILE_NVMET, TS_FUNC_nvmet_io_job_step_impl, 1), (0x42u << 24) | ((uint32_t)get_ns_from(dsp0) & 0xFFFFFFu));
             jc->ready_tail++;
         }
+        (void)nvmet_tcp_tx_batch_end(&jc->io);
+        /* **応答へ相乗りできなかった ACK をここで返す。** 応答を出して
+         * いれば何もしない(相乗り済み)。出していないときに返さないと
+         * 相手が RTO まで待つ。 */
+        (void)tcp_ack_flush(&jc->io.tcp);
         /* 相手のFIN(切断) -- ready-ring排出後にセッション終了。 */
-        if (ctx->io.tcp.state != TCP_ESTABLISHED && ctx->io.tcp.state != TCP_SYN_RCVD) {
-            tcp_clear_recv_upcall(&ctx->io.tcp);
-            return nvmet_io_job_end(self, ctx, 1, "IOキューが切断された");
+        if (jc->io.tcp.state != TCP_ESTABLISHED && jc->io.tcp.state != TCP_SYN_RCVD) {
+            tcp_clear_recv_upcall(&jc->io.tcp);
+            return nvmet_io_job_end(self, jc, 1, "IOキューが切断された");
+        }
+        /* **コマンドが無いあいだは眠る。** 起床条件は ready-ring が空でない
+         * ことそのものなので、**反応時間は 1 tick も増えない**(upcall が
+         * ready_head を進めた次の tick でスケジューラが起こす)。
+         * ホストが繋いだだけで使っていないキューは、これでほぼ無料になる。
+         *
+         * 上の 3 つ(Ctrl+C / パースエラー / 切断)を見るのが
+         * JOB_IDLE_TICK_DIVISOR 周期に落ちるが、いずれも ms を争わない。 */
+        if (jc->ready_tail == jc->ready_head && !tcp_ack_owed(&jc->io.tcp)) {
+            job_park(self, &jc->ready_head, &jc->ready_tail);
         }
         return JOB_WAITING;
     }
 
     case NIO_ST_RECV_PDU_HDR: {
-        int r = nvmet_tcp_recv_poll(&ctx->io, &jc->xfer);
+        int r = nvmet_tcp_recv_poll(&jc->io, &jc->xfer);
         if (r < 0) return nvmet_io_job_recv_fail(self, jc, ctx);
         if (r == 0) {
-            if (ctx->io.tcp.state != TCP_ESTABLISHED) {
-                return nvmet_io_job_end(self, ctx, 1, "IOキューが切断された");
+            if (jc->io.tcp.state != TCP_ESTABLISHED) {
+                return nvmet_io_job_end(self, jc, 1, "IOキューが切断された");
             }
             return JOB_WAITING;
         }
@@ -2644,26 +3033,26 @@ static job_result_t nvmet_io_job_step_impl(job_t *self)
             g_nvmet_tcp_term_recv++;
             uart_printf("[!] nvmet: IOキューで H2C TermReq 受信 -- "
                         "相手がプロトコル誤りを検出しました\n");
-            return nvmet_io_job_end(self, ctx, 1, "H2C TermReq 受信");
+            return nvmet_io_job_end(self, jc, 1, "H2C TermReq 受信");
         } else {
             uart_printf("[!] nvmet: IOキューで想定外のPDU種別 (type=%u)\n", pdu_type);
             /* **相手に理由を伝えてから畳む。** 伝えないと相手のログには
              * 「接続が切れた」としか残らない。 */
-            nvmet_tcp_send_term(&ctx->io, NVME_TCP_FES_INVALID_PDU_HDR, 0,
+            nvmet_tcp_send_term(&jc->io, NVME_TCP_FES_INVALID_PDU_HDR, 0,
                                  jc->hdr_buf, NVME_TCP_HDR_LEN);
-            nvmet_io_debug_desync(ctx, "想定外のPDU種別");
-            return nvmet_io_job_end(self, ctx, 1, "desync検出(想定外のPDU種別)");
+            nvmet_io_debug_desync(jc, "想定外のPDU種別");
+            return nvmet_io_job_end(self, jc, 1, "desync検出(想定外のPDU種別)");
         }
         return JOB_WAITING;
     }
 
     case NIO_ST_RECV_CMD_SQE: {
-        int r = nvmet_tcp_recv_poll(&ctx->io, &jc->xfer);
+        int r = nvmet_tcp_recv_poll(&jc->io, &jc->xfer);
         if (r < 0) return nvmet_io_job_recv_fail(self, jc, ctx);
         if (r == 0) return JOB_WAITING;
 
         jc->cid  = rd16le(&jc->sqe_buf[2]);
-        jc->dlen = nvmet_tcp_parse_cmd_dlen(&ctx->io, jc->hdr_buf);
+        jc->dlen = nvmet_tcp_parse_cmd_dlen(&jc->io, jc->hdr_buf);
         if (jc->dlen > NVMET_IO_DATA_BUF_MAX) {
             uart_printf("[!] NVMe/TCP target: in-capsuleデータが呼び出し側バッファを超過 "
                         "(dlen=%u max=%u)\n", jc->dlen, (unsigned)NVMET_IO_DATA_BUF_MAX);
@@ -2683,7 +3072,7 @@ static job_result_t nvmet_io_job_step_impl(job_t *self)
                 jc->incap_write_committed = 1;
             }
         }
-        if (ctx->io.hdgst) {
+        if (jc->io.hdgst) {
             nvmet_tcp_xfer_reset(&jc->xfer, jc->dgst_buf, 4u);
             self->state = NIO_ST_RECV_CMD_HDGST;
         } else if (jc->dlen > 0) {
@@ -2696,15 +3085,15 @@ static job_result_t nvmet_io_job_step_impl(job_t *self)
     }
 
     case NIO_ST_RECV_CMD_HDGST: {
-        int r = nvmet_tcp_recv_poll(&ctx->io, &jc->xfer);
+        int r = nvmet_tcp_recv_poll(&jc->io, &jc->xfer);
         if (r < 0) return nvmet_io_job_recv_fail(self, jc, ctx);
         if (r == 0) return JOB_WAITING;
-        if (nvmet_tcp_verify_hdgst(&ctx->io, jc->hdr_buf, NVME_TCP_HDR_LEN,
+        if (nvmet_tcp_verify_hdgst(&jc->io, jc->hdr_buf, NVME_TCP_HDR_LEN,
                                     jc->sqe_buf, NVME_SQE_LEN, jc->dgst_buf) != 0) {
             /* ヘッダダイジェストの不一致は致命的(admin 側と同じ理由)。 */
-            nvmet_tcp_send_term(&ctx->io, NVME_TCP_FES_HDR_DIGEST_ERR, 0,
+            nvmet_tcp_send_term(&jc->io, NVME_TCP_FES_HDR_DIGEST_ERR, 0,
                                  jc->hdr_buf, NVME_TCP_HDR_LEN);
-            return nvmet_io_job_end(self, ctx, 1, "ヘッダダイジェスト不一致");
+            return nvmet_io_job_end(self, jc, 1, "ヘッダダイジェスト不一致");
         }
         if (jc->dlen > 0) {
             nvmet_tcp_xfer_reset(&jc->xfer, jc->cmd_data_dst, jc->dlen);
@@ -2716,10 +3105,10 @@ static job_result_t nvmet_io_job_step_impl(job_t *self)
     }
 
     case NIO_ST_RECV_CMD_DATA: {
-        int r = nvmet_tcp_recv_poll(&ctx->io, &jc->xfer);
+        int r = nvmet_tcp_recv_poll(&jc->io, &jc->xfer);
         if (r < 0) return nvmet_io_job_recv_fail(self, jc, ctx);
         if (r == 0) return JOB_WAITING;
-        if (ctx->io.ddgst) {
+        if (jc->io.ddgst) {
             nvmet_tcp_xfer_reset(&jc->xfer, jc->dgst_buf, 4u);
             self->state = NIO_ST_RECV_CMD_DDGST;
         } else {
@@ -2729,10 +3118,10 @@ static job_result_t nvmet_io_job_step_impl(job_t *self)
     }
 
     case NIO_ST_RECV_CMD_DDGST: {
-        int r = nvmet_tcp_recv_poll(&ctx->io, &jc->xfer);
+        int r = nvmet_tcp_recv_poll(&jc->io, &jc->xfer);
         if (r < 0) return nvmet_io_job_recv_fail(self, jc, ctx);
         if (r == 0) return JOB_WAITING;
-        if (nvmet_tcp_verify_ddgst(&ctx->io, jc->cmd_data_dst, jc->dlen, jc->dgst_buf) != 0) {
+        if (nvmet_tcp_verify_ddgst(&jc->io, jc->cmd_data_dst, jc->dlen, jc->dgst_buf) != 0) {
             nvmet_tcp_xfer_reset(&jc->xfer, jc->hdr_buf, NVME_TCP_HDR_LEN);
             self->state = NIO_ST_RECV_PDU_HDR;
             return JOB_WAITING;
@@ -2750,7 +3139,7 @@ static job_result_t nvmet_io_job_step_impl(job_t *self)
             ts_log(TS_MK(TS_FILE_NVMET, TS_FUNC_nvmet_io_job_step_impl, 2), (0x41u << 24) | (pull_ns & 0xFFFFFFu));
             jc->pull_copy_base_ns = now;   /* 次コマンドの基準 */
         }
-        nvmet_io_dispatch_cmd(ctx, jc->hdr_buf, jc->sqe_buf, jc->cid,
+        nvmet_io_dispatch_cmd(jc, jc->hdr_buf, jc->sqe_buf, jc->cid,
                                jc->dlen, jc->incap_write_committed, jc->cmd_data_dst);
         nvmet_tcp_xfer_reset(&jc->xfer, jc->hdr_buf, NVME_TCP_HDR_LEN);
         self->state = NIO_ST_RECV_PDU_HDR;
@@ -2758,41 +3147,41 @@ static job_result_t nvmet_io_job_step_impl(job_t *self)
     }
 
     case NIO_ST_RECV_H2C_REST: {
-        int r = nvmet_tcp_recv_poll(&ctx->io, &jc->xfer);
+        int r = nvmet_tcp_recv_poll(&jc->io, &jc->xfer);
         if (r < 0) return nvmet_io_job_recv_fail(self, jc, ctx);
         if (r == 0) return JOB_WAITING;
         jc->cccid = rd16le(&jc->h2c_rest_buf[0]);
         jc->ttag  = rd16le(&jc->h2c_rest_buf[2]);
         jc->datao = rd32le(&jc->h2c_rest_buf[4]);
         jc->datal = rd32le(&jc->h2c_rest_buf[8]);
-        if (ctx->io.hdgst) {
+        if (jc->io.hdgst) {
             nvmet_tcp_xfer_reset(&jc->xfer, jc->dgst_buf, 4u);
             self->state = NIO_ST_RECV_H2C_HDGST;
             return JOB_WAITING;
         }
-        return nvmet_io_job_h2c_validate(self, jc, ctx);
+        return nvmet_io_job_h2c_validate(self, jc);
     }
 
     case NIO_ST_RECV_H2C_HDGST: {
-        int r = nvmet_tcp_recv_poll(&ctx->io, &jc->xfer);
+        int r = nvmet_tcp_recv_poll(&jc->io, &jc->xfer);
         if (r < 0) return nvmet_io_job_recv_fail(self, jc, ctx);
         if (r == 0) return JOB_WAITING;
-        if (nvmet_tcp_verify_hdgst(&ctx->io, jc->hdr_buf, NVME_TCP_HDR_LEN,
+        if (nvmet_tcp_verify_hdgst(&jc->io, jc->hdr_buf, NVME_TCP_HDR_LEN,
                                     jc->h2c_rest_buf, 16u, jc->dgst_buf) != 0) {
-            nvmet_tcp_send_term(&ctx->io, NVME_TCP_FES_HDR_DIGEST_ERR, 0,
+            nvmet_tcp_send_term(&jc->io, NVME_TCP_FES_HDR_DIGEST_ERR, 0,
                                  jc->hdr_buf, NVME_TCP_HDR_LEN);
-            return nvmet_io_job_end(self, ctx, 1, "ヘッダダイジェスト不一致(H2CData)");
+            return nvmet_io_job_end(self, jc, 1, "ヘッダダイジェスト不一致(H2CData)");
         }
-        return nvmet_io_job_h2c_validate(self, jc, ctx);
+        return nvmet_io_job_h2c_validate(self, jc);
     }
 
     case NIO_ST_RECV_H2C_DATA: {
         uint64_t rp_t0 = timer_now();
-        int r = nvmet_tcp_recv_poll(&ctx->io, &jc->xfer);
+        int r = nvmet_tcp_recv_poll(&jc->io, &jc->xfer);
         ts_log(TS_MK(TS_FILE_NVMET, TS_FUNC_nvmet_io_job_step_impl, 3), (uint32_t)get_us_from(rp_t0));
         if (r < 0) return nvmet_io_job_recv_fail(self, jc, ctx);
         if (r == 0) return JOB_WAITING;
-        if (ctx->io.ddgst && jc->datal > 0) {
+        if (jc->io.ddgst && jc->datal > 0) {
             nvmet_tcp_xfer_reset(&jc->xfer, jc->dgst_buf, 4u);
             self->state = NIO_ST_RECV_H2C_DDGST;
         } else {
@@ -2802,12 +3191,12 @@ static job_result_t nvmet_io_job_step_impl(job_t *self)
     }
 
     case NIO_ST_RECV_H2C_DDGST: {
-        int r = nvmet_tcp_recv_poll(&ctx->io, &jc->xfer);
+        int r = nvmet_tcp_recv_poll(&jc->io, &jc->xfer);
         if (r < 0) return nvmet_io_job_recv_fail(self, jc, ctx);
         if (r == 0) return JOB_WAITING;
         {
-            nvmet_pending_write_t *pw = &ctx->pending_writes[jc->h2c_slot];
-            if (nvmet_tcp_verify_ddgst(&ctx->io,
+            nvmet_pending_write_t *pw = &jc->pending_writes[jc->h2c_slot];
+            if (nvmet_tcp_verify_ddgst(&jc->io,
                                         &pw->disk[pw->slba * NVMET_LBA_SIZE + jc->datao],
                                         jc->datal, jc->dgst_buf) != 0) {
                 nvmet_tcp_xfer_reset(&jc->xfer, jc->hdr_buf, NVME_TCP_HDR_LEN);
@@ -2820,7 +3209,7 @@ static job_result_t nvmet_io_job_step_impl(job_t *self)
     }
 
     case NIO_ST_DISPATCH_H2C: {
-        nvmet_io_dispatch_h2c(ctx, jc->h2c_slot, jc->hdr_buf,
+        nvmet_io_dispatch_h2c(jc, jc->h2c_slot, jc->hdr_buf,
                                jc->cccid, jc->ttag, jc->datao, jc->datal);
         nvmet_tcp_xfer_reset(&jc->xfer, jc->hdr_buf, NVME_TCP_HDR_LEN);
         self->state = NIO_ST_RECV_PDU_HDR;
@@ -2898,8 +3287,13 @@ int nvmet_job_start(nvmet_ctx_t *ctx, uint16_t port, netif_t *bound_ctx, const c
         return -1;
     }
 
-    if (job_active_count() > (unsigned)(JOB_MAX - 2)) {
-        uart_printf("[!] nvmet: ジョブテーブルに空きが不足(admin/io用に2枠必要)\n");
+    /* admin 1 本 + IO キュー NVMET_IO_QUEUES 本。**実行時に本数を減らしても
+     * ジョブは上限ぶん spawn する** -- Set Features の合意はセッションごとに
+     * 変わるので、そのたびにジョブを作り直すより、余ったジョブを
+     * WAIT_ADMIN_READY で眠らせておくほうが単純で安全。 */
+    const unsigned need_jobs = 1u + NVMET_IO_QUEUES;
+    if (job_active_count() + need_jobs > (unsigned)JOB_MAX) {
+        uart_printf("[!] nvmet: ジョブテーブルに空きが不足(admin/io用に%u枠必要)\n", need_jobs);
         return -1;
     }
 
@@ -2909,7 +3303,9 @@ int nvmet_job_start(nvmet_ctx_t *ctx, uint16_t port, netif_t *bound_ctx, const c
         return -1;
     }
 
-    ctx->io_connected      = 0;
+    ctx->io_open           = 0;
+    ctx->io_arm_owner      = NVMET_ARM_FREE;
+    ctx->io_queues_granted = 0;
     ctx->ctrlr_id          = 0;
     ctx->cc                = 0;
     ctx->cc_en             = 0;
@@ -2923,19 +3319,10 @@ int nvmet_job_start(nvmet_ctx_t *ctx, uint16_t port, netif_t *bound_ctx, const c
     ctx->bound_ctx        = bound_ctx;
     ctx->label            = label;
 
-    for (unsigned i = 0; i < NVMET_MAX_PENDING_WRITES; i++) {
-        ctx->pending_writes[i].in_use = 0;
-    }
-    ctx->write_incapsule_count = 0;
-    ctx->write_h2c_count       = 0;
-
     /* SMART / Error Information の統計。**ここでしか 0 に戻さない**
      * (ホストが繋ぎ直しても実コントローラの通電中統計は続く)。 */
     ctx->start_tick       = timer_now();
-    ctx->stat_read_bytes  = 0;
-    ctx->stat_write_bytes = 0;
-    ctx->stat_read_cmds   = 0;
-    ctx->stat_write_cmds  = 0;
+    nvmet_stat_clear(ctx);
     ctx->error_count      = 0;
     nvmet_zero(ctx->error_slot, sizeof(ctx->error_slot));
 
@@ -2979,20 +3366,38 @@ int nvmet_job_start(nvmet_ctx_t *ctx, uint16_t port, netif_t *bound_ctx, const c
         job_pin_to_core(admin_job, bound_ctx->owner_core);
     }
 
-    s_io_job_pool[slot].ctx  = ctx;
-    s_io_job_pool[slot].port = port;
-    job_t *io_job = job_spawn(nvmet_io_job_step, &s_io_job_pool[slot], "nvmet-io");
-    if (!io_job) {
-        uart_printf("[!] nvmet: ジョブ生成失敗(io)\n");
-        tcp_unlisten(listener);
-        s_instance_owner[slot] = NULL;
-        ctx->session_active = 0;
-        return -1;
+    /* **IO キューのジョブは上限ぶん spawn する。** 実際に使う本数は
+     * Set Features(Number of Queues)でセッションごとに決まり、余ったジョブは
+     * WAIT_ADMIN_READY で眠っているだけ(accept の受け皿も用意しない)。 */
+    for (unsigned q = 0; q < NVMET_IO_QUEUES; q++) {
+        nvmet_io_job_ctx_t *ijc = &s_io_job_pool[slot][q];
+        ijc->ctx       = ctx;
+        ijc->port      = port;
+        ijc->qidx      = q;
+        ijc->connected = 0;
+        ijc->stat_cmds = 0;
+        for (unsigned i = 0; i < NVMET_MAX_PENDING_WRITES; i++) {
+            ijc->pending_writes[i].in_use = 0;
+        }
+        job_t *io_job = job_spawn(nvmet_io_job_step, ijc, "nvmet-io");
+        if (!io_job) {
+            uart_printf("[!] nvmet: ジョブ生成失敗(io %u本目)\n", q + 1u);
+            /* 既に spawn した IO ジョブと admin ジョブを畳ませる。
+             * **job の ctx はプール側の要素**なので ctx では引けない。 */
+            job_cancel_by_ctx(&s_admin_job_pool[slot]);
+            for (unsigned k = 0; k < q; k++) job_cancel_by_ctx(&s_io_job_pool[slot][k]);
+            tcp_unlisten(listener);
+            s_instance_owner[slot] = NULL;
+            ctx->session_active = 0;
+            return -1;
+        }
+        job_set_affinity(io_job, bound_ctx);
+        if (bound_ctx) {
+            job_pin_to_core(io_job, bound_ctx->owner_core);
+        }
     }
-    job_set_affinity(io_job, bound_ctx);
-    if (bound_ctx) {
-        job_pin_to_core(io_job, bound_ctx->owner_core);
-    }
+    uart_printf("[nvmet:%s] IOキューを最大 %u 本受け付けます\n",
+                label, nvmet_io_queues_cap());
     return 0;
 }
 
@@ -3078,4 +3483,36 @@ void nvmet_ns_show(nvmet_ctx_t *ctx)
         uart_printf("  AER: 保留なし / 未読の変更 %u 件 / AEN 設定 0x%x\n",
                     ctx->changed_nsid_count, ctx->aen_config);
     }
+}
+
+/*=================================================================
+ * IO キュー(= 同時に受け付ける IO コネクション)の本数と、いまの状態を表示する
+ * (シェルの `nvmetqueues`)。
+ *
+ * `g_nvmet_io_queues` は**次のセッションから**効く。ホストとは Set Features
+ * (Number of Queues)で 1 回だけ合意するので、確立済みのセッションの本数は
+ * 変えられない(変えるとホストが張っていないキューを待つことになる)。
+ *
+ * 引数:
+ *   ctx - ターゲットコンテキスト
+ * コール元:
+ *   シェルの nvmetqueues コマンド
+ * ===============================================================*/
+void nvmet_io_queues_show(const nvmet_ctx_t *ctx)
+{
+    uart_printf("nvmetqueues: 設定=%u本 (上限 %u)  今のセッション: 許諾=%u本 接続中=%d本\n",
+                nvmet_io_queues_cap(), (unsigned)NVMET_IO_QUEUES,
+                (unsigned)ctx->io_queues_granted, ctx->io_open);
+    for (unsigned i = 0; i < NVMET_MAX_INSTANCES; i++) {
+        if (s_instance_owner[i] != ctx) continue;
+        for (unsigned q = 0; q < NVMET_IO_QUEUES; q++) {
+            const nvmet_io_job_ctx_t *jc = &s_io_job_pool[i][q];
+            uart_printf("  キュー%u: %s (tcp state=%u) コマンド %llu 件%s\n", q + 1u,
+                        jc->connected ? "接続中" : "未接続",
+                        (unsigned)jc->io.tcp.state,
+                        (unsigned long long)jc->stat_cmds,
+                        jc->ctx && jc->ctx->io_arm_owner == (int)q ? " [accept待ち]" : "");
+        }
+    }
+    uart_printf("  ※ 変更は次のセッションから効きます(Set Features で合意する値のため)\n");
 }

@@ -77,6 +77,17 @@ static int pf_fmt_uint(uint32_t val, char buf[10])
     return n;
 }
 
+/* 符号なし10進の 64bit 版(最大20桁)。**ポーリング回数のような、32bit だと
+ * 数分で一周してしまうカウンタ**のために要る(`jobpark` の step 回数など)。 */
+static int pf_fmt_uint64(uint64_t val, char buf[20])
+{
+    int n = 0;
+    if (val == 0) { buf[n++] = '0'; return n; }
+    uint64_t v = val;
+    while (v > 0) { buf[n++] = (char)('0' + (unsigned)(v % 10u)); v /= 10u; }
+    return n;
+}
+
 /* 符号なし16進をバッファに逆順で書き、桁数を返す(最大8桁) */
 static int pf_fmt_hex(uint32_t val, int upper, char buf[8])
 {
@@ -85,6 +96,17 @@ static int pf_fmt_hex(uint32_t val, int upper, char buf[8])
     if (val == 0) { buf[n++] = '0'; return n; }
     uint32_t v = val;
     while (v > 0) { buf[n++] = hex[v & 0xF]; v >>= 4; }
+    return n;
+}
+
+/* 符号なし16進の 64bit 版(最大16桁) */
+static int pf_fmt_hex64(uint64_t val, int upper, char buf[16])
+{
+    const char *hex = upper ? "0123456789ABCDEF" : "0123456789abcdef";
+    int n = 0;
+    if (val == 0) { buf[n++] = '0'; return n; }
+    uint64_t v = val;
+    while (v > 0) { buf[n++] = hex[v & 0xFu]; v >>= 4; }
     return n;
 }
 
@@ -131,34 +153,42 @@ void uart_printf(const char *fmt, ...)
             }
         }
 
-        if (*fmt == 'l') fmt++;  /* long 修飾子は読み飛ばす */
+        /* **`ll` は 64bit として扱い、単独の `l` は従来どおり読み飛ばす。**
+         * 既存の呼び出しは `%lu` に 32bit 値を渡しているので、単独 `l` の
+         * 意味を変えると全部壊れる。 */
+        int lng = 0;
+        if (fmt[0] == 'l' && fmt[1] == 'l') { lng = 1; fmt += 2; }
+        else if (*fmt == 'l')               { fmt++; }
 
-        char buf[10];
+        char buf[20];
         int  n;
 
         switch (*fmt) {
         case 'd': case 'i': {
-            int32_t v = (int32_t)va_arg(ap, int);
+            int64_t v = lng ? (int64_t)va_arg(ap, long long) : (int64_t)va_arg(ap, int);
             if (v < 0) {
                 uart_putc('-');
                 if (width > 1) width--;
-                n = pf_fmt_uint((uint32_t)(-v), buf);
+                n = pf_fmt_uint64((uint64_t)(-v), buf);
             } else {
-                n = pf_fmt_uint((uint32_t)v, buf);
+                n = pf_fmt_uint64((uint64_t)v, buf);
             }
             pf_emit(buf, n, pad, width, left);
             break;
         }
         case 'u':
-            n = pf_fmt_uint((uint32_t)va_arg(ap, unsigned int), buf);
+            n = lng ? pf_fmt_uint64((uint64_t)va_arg(ap, unsigned long long), buf)
+                    : pf_fmt_uint((uint32_t)va_arg(ap, unsigned int), buf);
             pf_emit(buf, n, pad, width, left);
             break;
         case 'x':
-            n = pf_fmt_hex((uint32_t)va_arg(ap, unsigned int), 0, buf);
+            n = lng ? pf_fmt_hex64((uint64_t)va_arg(ap, unsigned long long), 0, buf)
+                    : pf_fmt_hex((uint32_t)va_arg(ap, unsigned int), 0, buf);
             pf_emit(buf, n, pad, width, left);
             break;
         case 'X':
-            n = pf_fmt_hex((uint32_t)va_arg(ap, unsigned int), 1, buf);
+            n = lng ? pf_fmt_hex64((uint64_t)va_arg(ap, unsigned long long), 1, buf)
+                    : pf_fmt_hex((uint32_t)va_arg(ap, unsigned int), 1, buf);
             pf_emit(buf, n, pad, width, left);
             break;
         case 'p': {

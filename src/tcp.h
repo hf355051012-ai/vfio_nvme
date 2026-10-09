@@ -11,6 +11,8 @@ extern volatile uint32_t g_tcp_retransmit_count[SMP_MAX_CORES];
 extern volatile uint32_t g_tcp_fast_retransmit_count[SMP_MAX_CORES];
 extern volatile uint32_t g_tcp_dup_ack_count[SMP_MAX_CORES];
 extern volatile uint32_t g_tcp_ack_threshold;
+/* ACK を間引く対象とする受信セグメントの最小長(0 = MSS/8)。`ackminseg`。 */
+extern volatile uint32_t g_tcp_ack_min_seg;
 
 /* ロス注入(シェルの `txdrop <N>`)。0=無効、N ならデータセグメント N 個に 1 個を
  * 送らずに捨てる。ループバックではロスが起きないため、高速再送の検証に要る。 */
@@ -64,6 +66,18 @@ extern volatile uint32_t g_tcp_keepalive_idle_ms;
 extern volatile uint32_t g_tcp_keepalive_intvl_ms;
 extern volatile uint32_t g_tcp_keepalive_probes;
 extern volatile uint32_t g_tcp_keepalive_probe_count;  /* 送った probe 数 */
+
+/* 短い非同期送信の再送リングの実効本数と、満杯で待たされた回数
+ * (シェルの `tcpasync`)。**ここがイニシエータのスループット上限**で、
+ * 512B の in-capsule write はヘッダとデータで 2 本使う。 */
+extern volatile unsigned g_tcp_async_short_cap;
+extern volatile uint64_t g_tcp_async_short_stalls;
+extern volatile uint64_t g_tcp_async_short_winwait;
+extern volatile uint32_t g_tcp_win_last_usable;
+extern volatile uint32_t g_tcp_win_last_outstanding;
+extern volatile uint32_t g_tcp_win_last_cwnd;
+extern volatile uint32_t g_tcp_win_last_sndwin;
+#define TCP_ASYNC_SHORT_CAP_MAX 64u
 extern volatile uint32_t g_tcp_keepalive_drop_count;   /* 応答が無くて畳んだ数 */
 extern volatile uint32_t g_tcp_keepalive_reply_count;  /* 相手の probe に応えた数 */
 
@@ -170,9 +184,40 @@ int  tcp_connect_poll(tcp_conn_t *conn);
 int  tcp_send(tcp_conn_t *conn, const void *buf, uint32_t len);
 
 #define TCP_ASYNC_MAX_LEN 32768u
+
+/* 短い非同期送信の 1 セグメント上限。**512 ではなく 640 にしてある** --
+ * NVMe/TCP の in-capsule write は「72 バイトのヘッダ + 512 バイトのデータ」で
+ * 584 バイトになり、これを 1 セグメントで出せないと 1 コマンドが 2 パケットに
+ * 割れて、相手のパケット処理能力を 2 倍消費する。
+ *
+ * **これは tcp_send_async() がどちらの経路を選ぶかの閾値**で、従来どおり
+ * 小さい制御 PDU だけを短経路へ回す。 */
+#define TCP_ASYNC_SHORT_MAX_LEN 640u
+
+/* 短経路スロット 1 個のバッファ長。**閾値(上)とは別に大きく取ってある。**
+ * tcp_send_async2() は「複数の PDU をまとめた 1 セグメント」をここへ入れる。
+ * まとめたものを長経路(LSO)へ流すと壊れたので、短経路で 1 セグメントとして
+ * 送り切る(CLAUDE.md「まとめた送信を長経路へ流してはいけない」)。 */
+#define TCP_ASYNC_SHORT_SLOT_BYTES 9216u
 int  tcp_send_async(tcp_conn_t *conn, const void *buf, uint16_t len);
 
 int  tcp_send_async_ref(tcp_conn_t *conn, const void *buf, uint16_t len);
+
+/* 2 断片を 1 セグメントとして送る。**PDU のヘッダと本体を別々に送ると
+ * 相手が 2 パケットとして処理する**ので、小さい PDU はまとめること。
+ * 合計が収まらなければ自動で 2 回に分けて従来動作へ落ちる。 */
+int  tcp_send_async2(tcp_conn_t *conn, const void *buf1, uint16_t len1,
+                     const void *buf2, uint16_t len2);
+
+/* まだ ACK されていない送信済みバイト数(Nagle 的な溜め込みの判定用)。 */
+uint32_t tcp_unacked_bytes(const tcp_conn_t *conn);
+
+/* 借りている ACK を返す / 借りているかを見る(相乗りの後始末)。 */
+int tcp_ack_flush(tcp_conn_t *conn);
+void tcp_ack_flush_deferred(void);   /* ポーリング先頭で呼ぶ */
+void tcp_set_ack_piggyback(tcp_conn_t *conn, int on);
+int tcp_ack_owed(const tcp_conn_t *conn);
+extern volatile uint32_t g_tcp_ack_piggyback;
 
 int  tcp_recv(tcp_conn_t *conn, void *buf, uint32_t maxlen, uint32_t timeout_ms);
 
@@ -214,6 +259,10 @@ void     tcp_backlog_stats(unsigned *waiting, unsigned *estab);
 unsigned tcp_backlog_capacity(void);
 
 int  tcp_accept_ready_poll(int listener);
+
+/* 用意した受け皿を取り下げる。1=取り下げた時点で既に確立していた
+ * (呼び出し側が tcp_close() すること)。 */
+int  tcp_accept_cancel(int listener, tcp_conn_t *conn);
 
 void tcp_unlisten(int listener);
 

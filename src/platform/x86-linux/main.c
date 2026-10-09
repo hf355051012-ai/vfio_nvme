@@ -5,6 +5,7 @@
 #include "vfio.h"
 #include "mlx5.h"
 #include "nvme_rdma.h"
+#include "rdma_short.h"
 #include "net.h"
 #include "arp.h"
 #include "ip.h"
@@ -5518,6 +5519,10 @@ static void shell_dispatch(char *line, int s0, int s1)
         }
         uint8_t ov = rdma_cm_responder_resources_override();
         uart_printf("rdmarra: %u%s\n", ov, ov ? " (手動)" : " (HCA 上限を使う)");
+    } else if (strncmp(line, "rshort", 6) == 0) {
+        /* 1〜32B の短い RDMA(write / read / cas / faa)。相手は
+         * tools/rdma_short_peer(librdmacm)。詳細は rdma_short.c。 */
+        rdma_short_shell(line + 6, &s_dev0, &s_dev1);
     } else if (strncmp(line, "rdmatarget", 10) == 0) {
         /* rdmatarget                       -- 現在の設定を表示
          * rdmatarget off                   -- 解除(同一プロセス内のターゲットへ戻す)
@@ -5644,6 +5649,385 @@ static void shell_dispatch(char *line, int s0, int s1)
     } else if (strncmp(line, "ftprobe", 7) == 0) {
         mlx5_probe_flow_table_types(&s_dev0, "pf0");
         mlx5_probe_flow_table_types(&s_dev1, "pf1");
+    } else if (strncmp(line, "nvmetqueues", 11) == 0) {
+        /* nvmetqueues [N]
+         *
+         * ターゲットが受け付ける IO キュー(= IO コネクション)の本数。
+         * **1 にすると複数化を入れる前とまったく同じ挙動になる**ので、
+         * txdrop / mld off と同じ「陰性対照を恒久的に残す」枠。
+         *
+         * **効くのは次のセッションから。** ホストとは Set Features
+         * (Number of Queues)で 1 回だけ合意するので、確立済みのセッションの
+         * 本数は変えられない。A/B するときは Pi5 側で nvme disconnect →
+         * 値を変える → nvme connect の順にする。 */
+        const char *p = line + 11;
+        while (*p == ' ') p++;
+        if (*p != '\0') {
+            int n = atoi(p);
+            if (n < 1 || n > (int)NVMET_IO_QUEUES) {
+                uart_printf("usage: nvmetqueues [1..%u]\n", (unsigned)NVMET_IO_QUEUES);
+                return;
+            }
+            g_nvmet_io_queues = (uint32_t)n;
+        }
+        nvmet_io_queues_show(&s_x86_nvmet);
+    } else if (strncmp(line, "netmt", 5) == 0) {
+        /* netmt [N]
+         *
+         * **受信を N コアへ分散する**(1 = 従来の単一コア = 陰性対照)。
+         *
+         * NIC の受信キューは PF に 1 本しか無いので、**RQ を見るのは常に
+         * 1 コア**。そのコアが TCP/UDP の 4-tuple ハッシュで担当コアを決め、
+         * 自分の担当でなければそのコアのリングへ渡す。**同じコネクションは
+         * 必ず同じコアへ行く**ので、TCP の状態をコアまたぎで触らずに済む。
+         *
+         * nvmet のジョブは **accept した瞬間にそのコネクションのコアへ
+         * 自分を移す**(job_pin_to_core)ので、受信 upcall と送信が同じ
+         * コアに揃う。**送信 SQ は PF に 1 本なので、有効な間だけ
+         * スピンロックで直列化する。**
+         *
+         * **変えるのは接続していないとき。** 既に確立しているコネクションの
+         * 担当コアは変わらないので、混ざると受信と処理が別コアになる。 */
+        const char *p = line + 5;
+        while (*p == ' ') p++;
+        if (*p != '\0') {
+            int n = atoi(p);
+            /* 使うのは core1..coreN(core0 はシェルなので載せない)。 */
+            if (n < 1 || n > (int)SMP_MAX_CORES - 1) {
+                uart_printf("usage: netmt [1..%u]  (core1..coreN を使う)\n",
+                            (unsigned)SMP_MAX_CORES - 1u);
+                return;
+            }
+            if (n >= 2 && smp_boot_core2() != 0) {
+                uart_printf("[!] netmt: core2 の起動に失敗\n");
+                return;
+            }
+            if (n >= 3 && smp_boot_core3() != 0) {
+                uart_printf("[!] netmt: core3 の起動に失敗\n");
+                return;
+            }
+            /* **NIC 側の RSS を先に切り替える。** ここを忘れると、コアだけ
+             * 増やしても全フレームが rxq[0] に来て core1 以外は空回りする。 */
+            if (mlx5_net_set_rss((unsigned)n) != 0) {
+                uart_printf("[!] netmt: RSS の切り替えに失敗(RQT/TIR が作れていない)\n");
+                return;
+            }
+            g_net_mt_cores = (uint32_t)n;
+            for (unsigned c = 0; c < SMP_MAX_CORES; c++) g_net_mt_consumed[c].v = 0;
+        }
+        uart_printf("netmt: %u コアへ分散 (1=従来。NIC の RSS が core1..coreN の RQ へ配る)\n",
+                    g_net_mt_cores);
+        for (unsigned c = 0; c < SMP_MAX_CORES; c++) {
+            if (g_net_mt_consumed[c].v)
+                uart_printf("  core%u が処理した受け渡し: %llu\n", c,
+                            (unsigned long long)g_net_mt_consumed[c].v);
+        }
+    } else if (strncmp(line, "tcprxburst", 10) == 0) {
+        /* tcprxburst [N]
+         *
+         * イニシエータのパイプラインが 1 周で受信処理を何回進めるか。
+         * **1 が従来の挙動(陰性対照)。**
+         *
+         * 受信は 1 回で 1 状態しか進まない(ヘッダ → 本体)ので、1 周 1 回だと
+         * **応答 1 個に 2 周かかり、1 周あたりの完了が 0.5 件**にしかならない。
+         * すると送信ループに積まれるコマンドも 1 周 0.5 件になり、
+         * **複数コマンドを 1 セグメントにまとめる余地が消える。** */
+        const char *p = line + 10;
+        while (*p == ' ') p++;
+        if (*p != '\0') {
+            int n = atoi(p);
+            if (n < 1 || n > 256) { uart_printf("usage: tcprxburst [1..256]\n"); return; }
+            g_nvme_rx_burst = (uint32_t)n;
+        }
+        uart_printf("tcprxburst: %u 回/周\n", g_nvme_rx_burst);
+    } else if (strncmp(line, "tcpnagle", 8) == 0) {
+        /* tcpnagle [off|<周回数>]
+         *
+         * **RFC 896(Nagle)と同じ考え方の溜め込み。** 送信ループ 1 周で
+         * 積まれるコマンドは平均 0.5 個しかないので、毎周出すと結局
+         * 1 コマンド 1 セグメントになる。**未 ACK が 0 なら必ず即送信する**
+         * ので、深さ 1 のレイテンシは悪化しない(溜めるのは、どうせ相手の
+         * ACK 待ちで止まっているときだけ)。
+         *
+         * 指定した周回数だけ保留したら、溜まり具合にかかわらず出す
+         * (相手の遅延 ACK タイマと噛み合って止まらないようにする保険)。
+         * **0 が従来の挙動 = 陰性対照。** */
+        const char *p = line + 8;
+        while (*p == ' ') p++;
+        if (strncmp(p, "off", 3) == 0)   g_nvme_tcp_nagle = 0u;
+        else if (*p >= '0' && *p <= '9') g_nvme_tcp_nagle = (uint32_t)atoi(p);
+        else if (*p != '\0') {
+            uart_printf("usage: tcpnagle [off|<周回数>]\n");
+            return;
+        }
+        uart_printf("tcpnagle: %u 周まで保留  (保留した回数 %llu)\n",
+                    g_nvme_tcp_nagle, (unsigned long long)g_nvme_tcp_nagle_held);
+        g_nvme_tcp_nagle_held = 0;
+    } else if (strncmp(line, "tcpbatch", 8) == 0) {
+        /* tcpbatch [on|off]
+         *
+         * **複数コマンドの PDU を 1 つの TCP セグメントにまとめるか。**
+         * off がまとめる前の挙動(陰性対照)。
+         *
+         * SPDK は 1 パケットに約 8 コマンドを載せてくる(実測 0.122
+         * パケット/コマンド)のに対し、まとめないと 1.13 になる。相手の
+         * 受信処理は**パケット単位**なので、まとめるほど相手の仕事が減る。
+         *
+         * `tcpcoalesce`(1 コマンド内のヘッダ+データをまとめる)とは別物で、
+         * こちらは**コマンドをまたいで**まとめる。 */
+        const char *p = line + 8;
+        while (*p == ' ') p++;
+        if (strncmp(p, "on", 2) == 0)       g_nvme_tcp_batch = 1u;
+        else if (strncmp(p, "off", 3) == 0) g_nvme_tcp_batch = 0u;
+        else if (*p >= '0' && *p <= '9')    g_nvme_tcp_batch = (uint32_t)atoi(p);
+        else if (*p != '\0') {
+            uart_printf("usage: tcpbatch [on|off|<バイト数>]\n");
+            return;
+        }
+        if (g_nvme_tcp_batch == 0u)      uart_printf("tcpbatch: off (1コマンド1セグメント)\n");
+        else if (g_nvme_tcp_batch == 1u) uart_printf("tcpbatch: on (上限は MSS)\n");
+        else                             uart_printf("tcpbatch: on (上限 %u バイト)\n", g_nvme_tcp_batch);
+    } else if (strncmp(line, "rdmacores", 9) == 0) {
+        /* rdmacores [N]
+         *
+         * **RDMA ターゲットの IO キューを何コアへ散らすか**(1=従来)。
+         * SPDK は CPU マスクぶんの reactor(poll group)へ qpair を
+         * round-robin で配り、kernel nvmet-rdma はキューごとに comp_vector を
+         * 変えて別 CPU で完了処理を回す。**どちらも複数コアを使う。**
+         *
+         * **`netmt`(Ethernet の RSS)とは独立**。RDMA は RC QP の CQ を
+         * ジョブが直接ポーリングするので NIC 側の設定は要らず、
+         * **ジョブの pin 先を散らすだけでよい。**
+         *
+         * **効くのは次のセッションから**(既に立っているジョブは動かさない)。
+         * `txdrop` と同じ恒久デバッグ機能。 */
+        const char *p = line + 9;
+        while (*p == 32) p++;
+        if (*p >= 49 && *p <= 51) {
+            int n = *p - 48;
+            if (n >= 2 && smp_boot_core2() != 0) {
+                uart_printf("[!] rdmacores: core2 の起動に失敗\n");
+                return;
+            }
+            if (n >= 3 && smp_boot_core3() != 0) {
+                uart_printf("[!] rdmacores: core3 の起動に失敗\n");
+                return;
+            }
+            g_nvmet_rdma_cores = (uint32_t)n;
+        } else if (*p != 0) {
+            uart_printf("usage: rdmacores [1|2|3]\n");
+            return;
+        }
+        uart_printf("rdmacores: %u コアへ round-robin (1=従来。次のセッションから)\n",
+                    g_nvmet_rdma_cores);
+    } else if (strncmp(line, "rdmastat", 8) == 0) {
+        /* rdmastat [clear]
+         *
+         * **RDMA ターゲットのキューごとの処理量。** 4 本の IO キューが
+         * 1 コアで順に回るので、**遅いときに「均等に分散している」のか
+         * 「1 本に偏っている」のかを見分ける手段がこれしかない**
+         * (TCP 側の `nvmetqueues` に相当するもの)。
+         *
+         * 空回りの割合はポーリングの余裕を表す。**空回りが多いのに遅いなら
+         * CPU 律速ではなく相手待ち**(`plstat` と同じ読み方)。
+         *
+         * **負荷中は常駐シェルが応答しない**ので、`clear` -> 負荷 ->
+         * `rdmastat` と前後で挟んで差を取ること。 */
+        const char *p = line + 8;
+        while (*p == 32) p++;
+        if (*p == 99) {   /* 'c' = clear */
+            for (unsigned q = 0; q <= NVMET_RDMA_IO_QUEUES; q++) {
+                g_nvmetr_polls[q][0] = 0;
+                g_nvmetr_empty[q][0] = 0;
+                g_nvmetr_cmds[q][0]  = 0;
+            }
+            uart_printf("rdmastat: クリアしました\n");
+            return;
+        }
+        uart_printf("rdmastat: キューごとの処理量(qid 0=admin)\n");
+        uint64_t tot_cmds = 0, tot_polls = 0;
+        for (unsigned q = 0; q <= NVMET_RDMA_IO_QUEUES; q++) {
+            uint64_t polls = g_nvmetr_polls[q][0];
+            uint64_t empty = g_nvmetr_empty[q][0];
+            uint64_t cmds  = g_nvmetr_cmds[q][0];
+            if (polls == 0 && cmds == 0) continue;
+            tot_cmds += cmds;
+            tot_polls += polls;
+            uart_printf("  qid=%u polls=%llu empty=%llu (%lu%%) cmds=%llu 1周あたり=%lu.%02lu\n",
+                        q, (unsigned long long)polls, (unsigned long long)empty,
+                        (unsigned long)(polls ? (empty * 100u) / polls : 0u),
+                        (unsigned long long)cmds,
+                        (unsigned long)(polls ? cmds / polls : 0u),
+                        (unsigned long)(polls ? ((cmds * 100u) / polls) % 100u : 0u));
+        }
+        uart_printf("  合計 polls=%llu cmds=%llu\n",
+                    (unsigned long long)tot_polls, (unsigned long long)tot_cmds);
+    } else if (strncmp(line, "ntcopy", 6) == 0) {
+        /* ntcopy [N]
+         *
+         * RDMA の in-capsule write のコピーを**何バイト以上で非一時ストアに
+         * するか**(既定 1024)。0 なら常に非一時。
+         * **512B の write が直前のトラフィック次第で 600k と 777k を
+         * 行き来する**ので、書き込み先がキャッシュに無いときの
+         * read-for-ownership が効いているかを切り分けるために置いた。 */
+        const char *p = line + 6;
+        while (*p == 32) p++;
+        if (*p >= 48 && *p <= 57) g_nvmetr_nt_copy_min = (uint32_t)atoi(p);
+        else if (*p != 0) {
+            uart_printf("usage: ntcopy [バイト数]\n");
+            return;
+        }
+        uart_printf("ntcopy: %u バイト以上を非一時ストアでコピー\n",
+                    g_nvmetr_nt_copy_min);
+    } else if (strncmp(line, "ackpiggy", 8) == 0) {
+        /* ackpiggy [on|off]
+         *
+         * 受信への ACK を、直後に出す応答セグメントへ**相乗り**させるか。
+         * **off が相乗り前の挙動(陰性対照)。**
+         *
+         * 裸の ACK を毎回別セグメントで返すと 1 コマンドが 2 パケットに
+         * なる。応答は同じ tick のうちに出るので、**遅延を増やさずに
+         * パケットを減らせる**(`ackthresh` の間引きと違って待たせない)。
+         * upcall を持つコネクション(nvmet の IO キュー)だけで効く。 */
+        const char *p = line + 8;
+        while (*p == 32) p++;
+        if (strncmp(p, "on", 2) == 0)       g_tcp_ack_piggyback = 1u;
+        else if (strncmp(p, "off", 3) == 0) g_tcp_ack_piggyback = 0u;
+        else if (*p >= 48 && *p <= 57)      g_tcp_ack_piggyback = (uint32_t)atoi(p);
+        else if (*p != 0) {
+            uart_printf("usage: ackpiggy [on|off|<周回数>]\n");
+            return;
+        }
+        uart_printf("ackpiggy: %u 周まで借りる (0=相乗りしない)\n",
+                    g_tcp_ack_piggyback);
+    } else if (strncmp(line, "nvmetbatch", 10) == 0) {
+        /* nvmetbatch [on|off]
+         *
+         * **ターゲット側**で、複数コマンドの応答 PDU を 1 つの TCP セグメント
+         * へ束ねるか。**既定は off。**
+         *
+         * **イニシエータ側の `tcpbatch`(既定 on)とは既定が逆なので、
+         * 同じ旗にはできない。** 測ると相手の受信パケットは 1.53 -> 1.22 個/
+         * コマンドへ減るのに、スループットは 233k -> 213k と 9% 落ちた
+         * (相手の cpu0 は 85% -> 84% で変わらない)。**相手を律速して
+         * いるのはパケット数ではなく、応答を溜めるぶんのレイテンシが
+         * そのまま損になる。** 陰性の記録として残してある。 */
+        const char *p = line + 10;
+        while (*p == ' ') p++;
+        if (strncmp(p, "on", 2) == 0)       g_nvmet_tcp_batch = 1u;
+        else if (strncmp(p, "off", 3) == 0) g_nvmet_tcp_batch = 0u;
+        else if (*p != '\0') {
+            uart_printf("usage: nvmetbatch [on|off]\n");
+            return;
+        }
+        uart_printf("nvmetbatch: %s (ターゲットの応答PDUを1セグメントへ束ねる)\n",
+                    g_nvmet_tcp_batch ? "on" : "off");
+    } else if (strncmp(line, "tcpcoalesce", 11) == 0) {
+        /* tcpcoalesce [on|off]
+         *
+         * in-capsule write のヘッダ(72B)とデータを **1 つの TCP セグメント**
+         * にまとめるか。**off がまとめる前の挙動(陰性対照)。**
+         *
+         * まとめないと 1 コマンドが 2 パケットになり、**相手のパケット処理
+         * 能力を 2 倍消費する**(実測: Pi5 相手に 1 コマンド 2.13 パケット、
+         * 512B write が 131k で頭打ち。まとめると 1.13 パケット / 190k)。
+         *
+         * **コネクション単位ではないので、同じセッションのまま交互に
+         * 切り替えて A/B できる。** 戻し忘れに注意。 */
+        /* **イニシエータ側(in-capsule write)とターゲット側(C2HData)の
+         * 両方をまとめて切り替える。** どちらも「PDU のヘッダと本体を
+         * 別々に送ると相手が 2 パケットとして処理する」という同じ形で、
+         * 方向A ではイニシエータ側、方向B ではターゲット側だけが効くので、
+         * 1 つの旗で両方を倒しても取り違えようがない。 */
+        const char *p = line + 11;
+        while (*p == ' ') p++;
+        if (strncmp(p, "on", 2) == 0)       g_nvme_tcp_coalesce = g_nvmet_tcp_coalesce = 1u;
+        else if (strncmp(p, "off", 3) == 0) g_nvme_tcp_coalesce = g_nvmet_tcp_coalesce = 0u;
+        else if (*p != '\0') {
+            uart_printf("usage: tcpcoalesce [on|off]\n");
+            return;
+        }
+        uart_printf("tcpcoalesce: %s (ヘッダ+データを1セグメントにまとめる)\n",
+                    g_nvme_tcp_coalesce ? "on" : "off");
+    } else if (strncmp(line, "tcpasync", 8) == 0) {
+        /* tcpasync [N|clear]
+         *
+         * 短い非同期送信(<=512B)の再送リングの実効本数。**満杯になると
+         * tcp_send_async_short() が ACK を待ってその場でブロックする**ので、
+         * ここがイニシエータのスループット上限を決める。
+         * **16 が従来値(陰性対照)。**
+         *
+         * **ベンチの合間に変えること。** リングに要素が残っている状態で
+         * 変えると添字がずれて再送内容が壊れる。 */
+        const char *p = line + 8;
+        while (*p == ' ') p++;
+        if (strncmp(p, "clear", 5) == 0) {
+            g_tcp_async_short_stalls = 0;
+            g_tcp_async_short_winwait = 0;
+        } else if (*p != '\0') {
+            int n = atoi(p);
+            if (n < 1 || n > (int)TCP_ASYNC_SHORT_CAP_MAX) {
+                uart_printf("usage: tcpasync [1..%u|clear]\n", (unsigned)TCP_ASYNC_SHORT_CAP_MAX);
+                return;
+            }
+            g_tcp_async_short_cap = (unsigned)n;
+            g_tcp_async_short_stalls = 0;
+            g_tcp_async_short_winwait = 0;
+        }
+        uart_printf("tcpasync: 実効 %u 本 (最大 %u、従来値 16)  満杯待ち %llu 回\n",
+                    g_tcp_async_short_cap, (unsigned)TCP_ASYNC_SHORT_CAP_MAX,
+                    (unsigned long long)g_tcp_async_short_stalls);
+        uart_printf("  送信ウィンドウ待ち %llu 回 (最後: usable=%u outstanding=%u cwnd=%u snd_win=%u)\n",
+                    (unsigned long long)g_tcp_async_short_winwait,
+                    g_tcp_win_last_usable, g_tcp_win_last_outstanding,
+                    g_tcp_win_last_cwnd, g_tcp_win_last_sndwin);
+    } else if (strncmp(line, "plstat", 6) == 0) {
+        /* plstat [clear]
+         *
+         * イニシエータのパイプライン計装。**深さを上げてもスループットが
+         * 伸びない**とき、CPU 律速なのか待ちなのかを分ける唯一の手段
+         * (ポーリングループなので CPU 使用率は常に 100% に見える)。
+         *
+         * **completes/loops が 1 前後なら、1 周のコストがそのまま
+         * 1 コマンドのコストになっている = CPU 律速。** 1 を大きく下回る
+         * なら空回り(待ち)。 */
+        const char *p = line + 6;
+        while (*p == ' ') p++;
+        if (strncmp(p, "clear", 5) == 0) {
+            g_pl_loops = 0; g_pl_submits = 0; g_pl_completes = 0;
+            g_pl_scan_steps = 0; g_pl_slot_steps = 0;
+        }
+        uint64_t lo = g_pl_loops, su = g_pl_submits, co = g_pl_completes;
+        uart_printf("plstat: ループ %llu / 送信 %llu / 完了 %llu\n",
+                    (unsigned long long)lo, (unsigned long long)su,
+                    (unsigned long long)co);
+        uart_printf("  1周あたり完了 %llu.%03llu 件 (1 前後なら CPU 律速)\n",
+                    (unsigned long long)(lo ? co / lo : 0u),
+                    (unsigned long long)(lo ? (co * 1000u / lo) % 1000u : 0u));
+        uart_printf("  1完了あたり走査: cid探索 %llu 要素 / スロット走査 %llu 要素\n",
+                    (unsigned long long)(co ? g_pl_scan_steps / co : 0u),
+                    (unsigned long long)(co ? g_pl_slot_steps / co : 0u));
+    } else if (strncmp(line, "jobpark", 7) == 0) {
+        /* jobpark [on|off|clear]
+         *
+         * 眠っているジョブ(未接続の IO キュー、コマンド待ちの IO キュー)を
+         * スケジューラがロックを取らずに飛ばす最適化の on/off。
+         * **off が「複数キュー化したまま park を入れる前」の挙動**なので、
+         * txdrop / incapsule / nvmetqueues と同じ恒久的な陰性対照。
+         *
+         * **RDMA と違い TCP はコネクション単位の設定ではない**ので、
+         * セッションを張り直さずに交互 A/B できる(この環境の A/B は
+         * 必ず交互に組むこと)。**off のまま忘れないこと。** */
+        const char *p = line + 7;
+        while (*p == ' ') p++;
+        if (strncmp(p, "on", 2) == 0)        g_job_park_enable = 1;
+        else if (strncmp(p, "off", 3) == 0)  g_job_park_enable = 0;
+        else if (strncmp(p, "clear", 5) == 0) job_park_stats_clear();
+        else if (*p != '\0') {
+            uart_printf("usage: jobpark [on|off|clear]\n");
+            return;
+        }
+        job_park_stats_dump();
     } else if (strncmp(line, "nvmens", 6) == 0) {
         /* 名前空間の一覧 / 追加 / 削除。**稼働中に叩くと D6 の AER が発火し、
          * ホストが名前空間を再スキャンする**(D8 と組で確かめる項目)。 */
@@ -5884,6 +6268,7 @@ static void shell_dispatch(char *line, int s0, int s1)
         uart_printf("commands:\n"
                     "  monitor                              HW状態(温度/エラー/PCIe/リンク)\n"
                     "  bench [KB[,KB...]] [r|w|rw] [qd]      NVMe-oF RDMA スループット\n"
+                    "  rshort [connect|verify|lat|bw|sweep|caps|disconnect]  1〜32B の短い RDMA\n"
                     "  tcpbench [KB[,KB...]] [r|w|rw] [hdgst] [ddgst] [digest]\n"
                     "                                        NVMe/TCP スループット(qdは内部固定)\n"
                     "                                        hdgst/ddgst/digest でCRC32Cダイジェストを有効化\n"
@@ -5927,6 +6312,9 @@ static void shell_dispatch(char *line, int s0, int s1)
                     "  fragstat [clear]                      受信側のIP断片組み立ての統計\n"
                     "  qploop [N]                            RC QPの作成/破棄をN回繰り返しFWリソース枯渇を見る\n"
                     "  nvmediscover [dump]                   Discovery Log Pageを取得(dumpで16進出力)\n"
+                    "  nvmens [add <nsid> | del <nsid>]      名前空間の一覧/追加/削除(AERで通知)\n"
+                    "  nvmetqueues [N]                       ターゲットのIOキュー本数(1=従来、最大4。次のセッションから)\n"
+                    "  jobpark [on|off|clear]                眠っているジョブをスケジューラが飛ばす(off=陰性対照)\n"
                     "  nvmet [port] | jobs | help | quit    (↑↓で履歴呼び出し)\n"
                     "  例: bench 8,64,256 rw 8 / tcpbench 64,256 w digest / ts core 1 num 40\n");
     } else if (strncmp(line, "quit", 4) == 0 || strncmp(line, "exit", 4) == 0) {
@@ -6138,11 +6526,58 @@ static void run_shell(int s0, int s1)
  * コール元:
  *   main()
  * ===============================================================*/
+static const char *s_bdf[2];
+static int s_slot[2] = { -1, -1 };
+
+/*=================================================================
+ * BAR0 の一部を **write-combining** に張り替える(rdma_short.c の BlueFlame 用)。
+ * 仮想アドレスは変えない(dev->bar0_base + off のまま)。
+ *
+ * VFIO の BAR マップは UC なので、64 バイトの WQE を MMIO へ書くと複数回の
+ * 書き込みに分かれて BlueFlame にならない。sysfs の resource0_wc は
+ * prefetchable BAR に対して WC の mmap を許す。**vfio-pci が掴んでいても
+ * 開ける**のは CONFIG_IO_STRICT_DEVMEM が無効なとき(この OptiPlex の
+ * 7.0.0-31-generic はそう)。PAT の衝突を避ける手順は vfio_bar_set_wc()。
+ *
+ * 引数:
+ *   dev - PF(pf_index で sysfs のパスを選ぶ)
+ *   off - BAR0 内のオフセット(4KB 境界)
+ *   len - バイト数
+ * 戻り値:
+ *   CPU アドレス、失敗なら NULL
+ * コール元:
+ *   rs_connect()
+ * ===============================================================*/
+void *hal_bar0_map_wc(const mlx5_dev_t *dev, uint64_t off, uint64_t len)
+{
+    const int pf = dev->pf_index ? 1 : 0;
+    if (s_bdf[pf] == NULL) return NULL;
+    if (vfio_bar_set_wc(s_slot[pf], 0, (void *)(uintptr_t)dev->bar0_base, off, len, 1) != 0) {
+        return NULL;
+    }
+    return (void *)(uintptr_t)(dev->bar0_base + off);
+}
+
+/* hal_bar0_map_wc() で WC にしたページを vfio の UC マップへ戻す。**戻さないと、
+ * 同じ UAR 番号を後で割り当てられた QP のドアベル(sfence 無しの 8B 書き)が
+ * WC バッファに溜まったまま NIC へ届かない。** */
+void hal_bar0_unmap_wc(const mlx5_dev_t *dev, void *p, uint64_t len)
+{
+    if (p == NULL) return;
+    const int pf = dev->pf_index ? 1 : 0;
+    vfio_bar_set_wc(s_slot[pf], 0, (void *)(uintptr_t)dev->bar0_base,
+                    (uint64_t)((uintptr_t)p - (uintptr_t)dev->bar0_base), len, 0);
+}
+
 static int run_dual_pf(const char *bdf0, const char *bdf1)
 {
+    s_bdf[0] = bdf0;
+    s_bdf[1] = bdf1;
     uart_printf("\n========== dual-PF bring-up: %s + %s ==========\n", bdf0, bdf1);
     int s0 = vfio_init(bdf0);
     int s1 = vfio_init(bdf1);
+    s_slot[0] = s0;
+    s_slot[1] = s1;
     if (bringup_pf(s0, &s_dev0, 0u, "PF0") != 0) return -1;
     if (bringup_pf(s1, &s_dev1, 1u, "PF1") != 0) return -1;
     run_shell(s0, s1);

@@ -66,12 +66,16 @@ static const char *mlx5_cqe_syndrome_str(uint8_t syndrome)
 
 typedef struct {
     mlx5_dev_t *dev;
-    uint32_t rq_cc;         // RQ用CQの消費カウンタ(単調増加、折り返さない)
-    uint32_t rq_posted_ctr; // RQドアベルへ最後に書いた「投稿済みWQE数」の累計
-    uint32_t rq_rearm_pending;
-    uint32_t sq_pc;         // SQのWQE生成カウンタ(単調増加、論理WQE単位)
-    uint32_t sq_cc;         // SQ占有量の消費カウンタ(論理WQE単位、占有量=sq_pc-sq_cc)
-    uint32_t sq_cq_cc;      // SQ用CQの消費カウンタ(CQ index/owner/doorbell専用、復帰でリセットしない)
+    /* **RQ ごと(= コアごと)に持つ。** RSS を有効にすると各コアが自分の
+     * RQ だけを見るので、消費カウンタと再武装の勘定も分けないと壊れる。 */
+    uint32_t rq_cc[MLX5_NUM_RXQ];
+    uint32_t rq_posted_ctr[MLX5_NUM_RXQ];
+    uint32_t rq_rearm_pending[MLX5_NUM_RXQ];
+    /* **SQ ごと(= コアごと)に持つ。** 送信キューをコアで分けたので、
+     * 生成/消費カウンタも分けないと意味が無い(分けたことで排他が消えた)。 */
+    uint32_t sq_pc[MLX5_NUM_TXQ];    // SQのWQE生成カウンタ(単調増加、論理WQE単位)
+    uint32_t sq_cc[MLX5_NUM_TXQ];    // SQ占有量の消費カウンタ(論理WQE単位、占有量=sq_pc-sq_cc)
+    uint32_t sq_cq_cc[MLX5_NUM_TXQ]; // SQ用CQの消費カウンタ(CQ index/owner/doorbell専用、復帰でリセットしない)
 
     uint64_t last_tx_hw_ts_cycles;
     uint8_t  has_last_tx_hw_ts;
@@ -84,14 +88,58 @@ static mlx5_net_state_t s_state_pf1;
 static netif_t        s_ctx_pf0;
 static netif_t        s_ctx_pf1;
 
-static volatile int s_sq_halted[2];
+/*=================================================================
+ * このコアが見る受信キューの番号。
+ *
+ * **RSS を有効にすると core1..coreN が rxq[0..N-1] を 1 対 1 で見る**
+ * (core0 はシェルなので受信を持たせない。呼ばれない前提だが、
+ * 万一呼ばれても rxq[0] を返して壊れないようにしてある)。
+ * 単一コアのときは常に rxq[0] = 従来どおり。
+ *
+ * 戻り値:
+ *   0..MLX5_NUM_RXQ-1
+ * コール元:
+ *   mlx5_net_poll_recv()
+ * ===============================================================*/
+static inline unsigned mlx5_net_rxq_index(void)
+{
+    if (g_net_mt_cores <= 1u) return 0u;
+    unsigned c = smp_core_index();
+    if (c == 0u) return 0u;
+    unsigned q = c - 1u;
+    return (q < MLX5_NUM_RXQ) ? q : 0u;
+}
+
+static volatile int s_sq_halted[2][MLX5_NUM_TXQ];
+
+_Static_assert(MLX5_NUM_TXQ == SMP_MAX_CORES,
+               "TX キューの添字は smp_core_index() そのものなので本数を合わせること");
+
+/*=================================================================
+ * このコアが使う送信キューの番号。
+ *
+ * **添字はコア番号そのもの**(core0 = シェルも自分の SQ を持つ)。
+ * こうすると SQ のリング状態がコア間で共有されないので、**送信の排他が
+ * 一切要らない**。以前は PF ごとの spinlock で直列化していたが、
+ * `mlx5_net_tx_wait_free_slot()` と同期送信の完了待ちがロックの外で
+ * SQ の CQE を刈っており、完了を二重計上して SQ を過剰投稿していた
+ * (負荷をかけると SYN|ACK がワイヤに出なくなる形で表面化した)。
+ *
+ * 戻り値:
+ *   0..MLX5_NUM_TXQ-1
+ * ===============================================================*/
+static inline unsigned mlx5_net_txq_index(void)
+{
+    unsigned c = smp_core_index();
+    return (c < MLX5_NUM_TXQ) ? c : 0u;
+}
 
 #define MLX5_NET_SQ_RECOVER_WINDOW_MS    10000u
 #define MLX5_NET_SQ_RECOVER_MAX_ATTEMPTS 3u
 #define MLX5_NET_SQ_RECOVER_PROGRESS_WQES 1000u
-static int      s_recover_attempts[2];
-static uint64_t s_recover_window_start[2];
-static uint32_t s_recover_last_cq_cc[2];
+static int      s_recover_attempts[2][MLX5_NUM_TXQ];
+static uint64_t s_recover_window_start[2][MLX5_NUM_TXQ];
+static uint32_t s_recover_last_cq_cc[2][MLX5_NUM_TXQ];
 
 /*=================================================================
  * 状態構造体から PF 番号(0/1)を求める。ログ表示と per-PF 配列の添字に使う。
@@ -109,7 +157,7 @@ static int mlx5_net_pf_index(const mlx5_net_state_t *st)
     return (st == &s_state_pf0) ? 0 : 1;
 }
 
-static int mlx5_net_try_recover(int pf_index, mlx5_dev_t *dev, mlx5_net_state_t *st);
+static int mlx5_net_try_recover(int pf_index, unsigned q, mlx5_dev_t *dev, mlx5_net_state_t *st);
 
 /*=================================================================
  * CQ の cc 番目の CQE が HW によって書かれ済みかを判定し、書かれていれば
@@ -208,12 +256,12 @@ static void mlx5_net_log_hw_ts_delta(mlx5_dev_t *dev, uint64_t cur_cycles,
  * コール元:
  *   mlx5_net_post_frame(), mlx5_net_post_lso_frame()
  * ===============================================================*/
-static void mlx5_net_wqe_commit(mlx5_dev_t *dev, mlx5_net_state_t *st,
+static void mlx5_net_wqe_commit(mlx5_dev_t *dev, mlx5_net_state_t *st, unsigned q,
                                  uint32_t pc, volatile uint8_t *wqe)
 {
     dma_wmb();
 
-    volatile uint8_t *sq_dbr = (volatile uint8_t *)(uintptr_t)(uint64_t)dev->sq_dbr_cpu;
+    volatile uint8_t *sq_dbr = (volatile uint8_t *)(uintptr_t)(uint64_t)dev->txq[q].dbr_cpu;
     uint32_t new_pc = pc + 1u;
     uint32_t hw_new_pc = new_pc * 2u;
     sq_dbr[0] = (uint8_t)(hw_new_pc >> 24);
@@ -231,7 +279,7 @@ static void mlx5_net_wqe_commit(mlx5_dev_t *dev, mlx5_net_state_t *st,
     uint64_t uar_addr = dev->bar0_base + (uint64_t)dev->uarn * 4096u;
     mmio_write64(uar_addr + MLX5_BF_OFFSET, raw64);
 
-    st->sq_pc = new_pc;
+    st->sq_pc[q] = new_pc;
 }
 
 /*=================================================================
@@ -249,7 +297,7 @@ static void mlx5_net_wqe_commit(mlx5_dev_t *dev, mlx5_net_state_t *st,
  * コール元:
  *   mlx5_net_send_frags(), mlx5_net_send_frags_async()
  * ===============================================================*/
-static int mlx5_net_post_frame(mlx5_net_state_t *st, const eth_frag_t *frags, unsigned frag_count)
+static int mlx5_net_post_frame(mlx5_net_state_t *st, unsigned q, const eth_frag_t *frags, unsigned frag_count)
 {
     if (frag_count < 1u || frag_count > ETH_TX_MAX_FRAGS) {
         uart_printf("[mlx5net] send: invalid frag_count (%u)\n", frag_count);
@@ -257,7 +305,7 @@ static int mlx5_net_post_frame(mlx5_net_state_t *st, const eth_frag_t *frags, un
     }
 
     mlx5_dev_t *dev = st->dev;
-    uint32_t pc = st->sq_pc;
+    uint32_t pc = st->sq_pc[q];
     uint32_t slot = pc % MLX5_SQ_WQE_COUNT;
 
     uint32_t total_len = 0;
@@ -292,7 +340,7 @@ static int mlx5_net_post_frame(mlx5_net_state_t *st, const eth_frag_t *frags, un
         data2_pa = mlx5_dma_addr((const volatile void *)((const uint8_t *)frags[0].data + ihs + remaining1));
     } else {
         volatile uint8_t *stage = (volatile uint8_t *)(uintptr_t)
-            ((uint64_t)dev->net_tx_stage_cpu + (uint64_t)(slot) * MLX5_NET_TX_STAGE_SIZE);
+            ((uint64_t)dev->txq[q].stage_cpu + (uint64_t)(slot) * MLX5_NET_TX_STAGE_SIZE);
         uint32_t off = 0;
         for (unsigned f = 0; f < frag_count; f++) {
             volatile_fast_copy(stage + off, frags[f].data, frags[f].len);
@@ -311,7 +359,7 @@ static int mlx5_net_post_frame(mlx5_net_state_t *st, const eth_frag_t *frags, un
     }
 
     volatile uint8_t *wqe =
-        (volatile uint8_t *)(uintptr_t)((uint64_t)dev->sq_wqe_cpu +
+        (volatile uint8_t *)(uintptr_t)((uint64_t)dev->txq[q].wqe_cpu +
                                          (uint64_t)slot * 2u * MLX5_SEND_WQE_BB);
     for (unsigned i = 0; i < 2u * MLX5_SEND_WQE_BB; i++) wqe[i] = 0;
 
@@ -326,7 +374,7 @@ static int mlx5_net_post_frame(mlx5_net_state_t *st, const eth_frag_t *frags, un
     TS_HOT(TS_MK(TS_FILE_MLX5_NET, TS_FUNC_mlx5_net_post_frame, 0),
            ((uint32_t)MLX5_OPCODE_SEND << 24) | (frame_total & 0xFFFFFFu));
 
-    uint32_t qpn_ds = (dev->sqn << 8) | ds_cnt;
+    uint32_t qpn_ds = (dev->txq[q].sqn << 8) | ds_cnt;
     wqe[4] = (uint8_t)(qpn_ds >> 24);
     wqe[5] = (uint8_t)(qpn_ds >> 16);
     wqe[6] = (uint8_t)(qpn_ds >> 8);
@@ -400,7 +448,7 @@ static int mlx5_net_post_frame(mlx5_net_state_t *st, const eth_frag_t *frags, un
         }
     }
 
-    mlx5_net_wqe_commit(dev, st, pc, wqe);
+    mlx5_net_wqe_commit(dev, st, q, pc, wqe);
     return 0;
 }
 
@@ -419,7 +467,7 @@ static int mlx5_net_post_frame(mlx5_net_state_t *st, const eth_frag_t *frags, un
  * コール元:
  *   mlx5_net_send_lso_async()
  * ===============================================================*/
-static int mlx5_net_post_lso_frame(mlx5_net_state_t *st, const void *hdr, uint16_t hdr_len,
+static int mlx5_net_post_lso_frame(mlx5_net_state_t *st, unsigned q, const void *hdr, uint16_t hdr_len,
                                     const void *payload, uint32_t payload_len, uint16_t mss)
 {
     if (hdr_len < 18u || payload_len == 0u) {
@@ -429,7 +477,7 @@ static int mlx5_net_post_lso_frame(mlx5_net_state_t *st, const void *hdr, uint16
     }
 
     mlx5_dev_t *dev = st->dev;
-    uint32_t pc = st->sq_pc;
+    uint32_t pc = st->sq_pc[q];
     uint32_t slot = pc % MLX5_SQ_WQE_COUNT;
 
     uint32_t inline_ds = ((uint32_t)hdr_len - 2u + 15u) / 16u;
@@ -441,7 +489,7 @@ static int mlx5_net_post_lso_frame(mlx5_net_state_t *st, const void *hdr, uint16
     }
 
     volatile uint8_t *wqe =
-        (volatile uint8_t *)(uintptr_t)((uint64_t)dev->sq_wqe_cpu +
+        (volatile uint8_t *)(uintptr_t)((uint64_t)dev->txq[q].wqe_cpu +
                                          (uint64_t)slot * 2u * MLX5_SEND_WQE_BB);
     for (unsigned i = 0; i < 2u * MLX5_SEND_WQE_BB; i++) wqe[i] = 0;
 
@@ -455,7 +503,7 @@ static int mlx5_net_post_lso_frame(mlx5_net_state_t *st, const void *hdr, uint16
     TS_HOT(TS_MK(TS_FILE_MLX5_NET, TS_FUNC_mlx5_net_post_lso_frame, 0),
            ((uint32_t)MLX5_OPCODE_LSO << 24) | (payload_len & 0xFFFFFFu));
 
-    uint32_t qpn_ds = (dev->sqn << 8) | ds_cnt;
+    uint32_t qpn_ds = (dev->txq[q].sqn << 8) | ds_cnt;
     wqe[4] = (uint8_t)(qpn_ds >> 24);
     wqe[5] = (uint8_t)(qpn_ds >> 16);
     wqe[6] = (uint8_t)(qpn_ds >> 8);
@@ -495,14 +543,14 @@ static int mlx5_net_post_lso_frame(mlx5_net_state_t *st, const void *hdr, uint16
         nop_wqe[1] = (uint8_t)(nop_opmod >> 16);
         nop_wqe[2] = (uint8_t)(nop_opmod >> 8);
         nop_wqe[3] = (uint8_t)nop_opmod;
-        uint32_t nop_qpn_ds = (dev->sqn << 8) | 1u;
+        uint32_t nop_qpn_ds = (dev->txq[q].sqn << 8) | 1u;
         nop_wqe[4] = (uint8_t)(nop_qpn_ds >> 24);
         nop_wqe[5] = (uint8_t)(nop_qpn_ds >> 16);
         nop_wqe[6] = (uint8_t)(nop_qpn_ds >> 8);
         nop_wqe[7] = (uint8_t)nop_qpn_ds;
     }
 
-    mlx5_net_wqe_commit(dev, st, pc, wqe);
+    mlx5_net_wqe_commit(dev, st, q, pc, wqe);
     return 0;
 }
 
@@ -517,10 +565,10 @@ static int mlx5_net_post_lso_frame(mlx5_net_state_t *st, const void *hdr, uint16
  * コール元:
  *   mlx5_net_sq_wait_room(), mlx5_net_send_frags()
  * ===============================================================*/
-static int mlx5_net_sq_reap_one(int pf_index, mlx5_dev_t *dev, mlx5_net_state_t *st)
+static int mlx5_net_sq_reap_one(int pf_index, unsigned q, mlx5_dev_t *dev, mlx5_net_state_t *st)
 {
-    uint64_t cq_buf = (uint64_t)dev->sq_cq_buf_cpu;
-    volatile uint8_t *cqe = mlx5_net_cqe_if_ready(cq_buf, st->sq_cq_cc);
+    uint64_t cq_buf = (uint64_t)dev->txq[q].cq_buf_cpu;
+    volatile uint8_t *cqe = mlx5_net_cqe_if_ready(cq_buf, st->sq_cq_cc[q]);
     if (!cqe) {
         return 0;
     }
@@ -532,38 +580,38 @@ static int mlx5_net_sq_reap_one(int pf_index, mlx5_dev_t *dev, mlx5_net_state_t 
         uint8_t syndrome    = cqe[MLX5_ERR_CQE_OFF_SYNDROME];
 
         TS_HOT(TS_MK(TS_FILE_MLX5_NET, TS_FUNC_mlx5_net_sq_reap_one, 0),
-               ((uint32_t)(st->sq_pc & 0xFFFFu) << 16) | (uint32_t)(st->sq_cc & 0xFFFFu));
+               ((uint32_t)(st->sq_pc[q] & 0xFFFFu) << 16) | (uint32_t)(st->sq_cc[q] & 0xFFFFu));
         uart_printf("[mlx5net] SQ完了エラーCQE検出 (sqn=%u, opcode=0x%x=%s, "
                     "syndrome=0x%02x(%s), vendor_synd=0x%02x)\n",
-                    dev->sqn, opcode,
+                    dev->txq[q].sqn, opcode,
                     (opcode == MLX5_CQE_OPCODE_SIG_ERR) ? "SIG_ERR" : "REQ_ERR",
                     syndrome, mlx5_cqe_syndrome_str(syndrome), vendor_synd);
 
-        st->sq_cq_cc++;   // CQ consumer(復帰でリセットしない)
-        st->sq_cc++;      // SQ占有量(この直後の try_recover で 0 リセットされうる)
-        volatile uint32_t *cq_dbr_err = (volatile uint32_t *)(uintptr_t)dev->sq_cq_dbr_cpu;
-        uint32_t cc24_err = st->sq_cq_cc & 0xFFFFFFu;
+        st->sq_cq_cc[q]++;   // CQ consumer(復帰でリセットしない)
+        st->sq_cc[q]++;      // SQ占有量(この直後の try_recover で 0 リセットされうる)
+        volatile uint32_t *cq_dbr_err = (volatile uint32_t *)(uintptr_t)dev->txq[q].cq_dbr_cpu;
+        uint32_t cc24_err = st->sq_cq_cc[q] & 0xFFFFFFu;
         *cq_dbr_err = __builtin_bswap32(cc24_err);
         dcache_clean_range((const void *)cq_dbr_err, sizeof(*cq_dbr_err));
 
-        if (mlx5_net_try_recover(pf_index, dev, st) != 0) {
+        if (mlx5_net_try_recover(pf_index, q, dev, st) != 0) {
             return -1;
         }
         return 2;
     }
 
     TS_HOT(TS_MK(TS_FILE_MLX5_NET, TS_FUNC_mlx5_net_sq_reap_one, 1),
-           ((uint32_t)(st->sq_pc & 0xFFFFu) << 16) | (uint32_t)(st->sq_cc & 0xFFFFu));
+           ((uint32_t)(st->sq_pc[q] & 0xFFFFu) << 16) | (uint32_t)(st->sq_cc[q] & 0xFFFFu));
 
     mlx5_net_log_hw_ts_delta(dev, mlx5_cqe_hw_ts_cycles(cqe),
                               &st->last_tx_hw_ts_cycles, &st->has_last_tx_hw_ts,
                               TS_MK(TS_FILE_MLX5_NET, TS_FUNC_mlx5_net_sq_reap_one, 2));
 
-    st->sq_cq_cc++;   // CQ consumer(復帰でリセットしない)
-    st->sq_cc++;      // SQ占有量(正常時は sq_cq_cc と歩調が揃う)
+    st->sq_cq_cc[q]++;   // CQ consumer(復帰でリセットしない)
+    st->sq_cc[q]++;      // SQ占有量(正常時は sq_cq_cc と歩調が揃う)
 
-    volatile uint32_t *cq_dbr = (volatile uint32_t *)(uintptr_t)dev->sq_cq_dbr_cpu;
-    uint32_t cc24 = st->sq_cq_cc & 0xFFFFFFu;
+    volatile uint32_t *cq_dbr = (volatile uint32_t *)(uintptr_t)dev->txq[q].cq_dbr_cpu;
+    uint32_t cc24 = st->sq_cq_cc[q] & 0xFFFFFFu;
     *cq_dbr = __builtin_bswap32(cc24);
     dcache_clean_range((const void *)cq_dbr, sizeof(*cq_dbr));
 
@@ -582,10 +630,10 @@ static int mlx5_net_sq_reap_one(int pf_index, mlx5_dev_t *dev, mlx5_net_state_t 
  *   mlx5_net_send_frags(), mlx5_net_send_frags_async(),
  *   mlx5_net_send_lso_async(), mlx5_net_tx_wait_free_slot()
  * ===============================================================*/
-static int mlx5_net_sq_wait_room(int pf_index, mlx5_dev_t *dev, mlx5_net_state_t *st)
+static int mlx5_net_sq_wait_room(int pf_index, unsigned q, mlx5_dev_t *dev, mlx5_net_state_t *st)
 {
     for (;;) {
-        int r = mlx5_net_sq_reap_one(pf_index, dev, st);
+        int r = mlx5_net_sq_reap_one(pf_index, q, dev, st);
         if (r < 0) {
             return -1;
         }
@@ -595,8 +643,8 @@ static int mlx5_net_sq_wait_room(int pf_index, mlx5_dev_t *dev, mlx5_net_state_t
     }
 
     uint64_t start = timer_now();
-    while ((st->sq_pc - st->sq_cc) >= MLX5_SQ_WQE_COUNT) {
-        int r = mlx5_net_sq_reap_one(pf_index, dev, st);
+    while ((st->sq_pc[q] - st->sq_cc[q]) >= MLX5_SQ_WQE_COUNT) {
+        int r = mlx5_net_sq_reap_one(pf_index, q, dev, st);
         if (r < 0) {
             return -1;
         }
@@ -605,10 +653,10 @@ static int mlx5_net_sq_wait_room(int pf_index, mlx5_dev_t *dev, mlx5_net_state_t
         }
         if (timeout_ms(start, 1000u)) { // 1秒(eth.cのeth_tx_wait_slot()と同じ)
             TS_HOT(TS_MK(TS_FILE_MLX5_NET, TS_FUNC_mlx5_net_sq_wait_room, 0),
-                   ((uint32_t)(st->sq_pc & 0xFFFFu) << 16) | (uint32_t)(st->sq_cc & 0xFFFFu));
+                   ((uint32_t)(st->sq_pc[q] & 0xFFFFu) << 16) | (uint32_t)(st->sq_cc[q] & 0xFFFFu));
             uart_printf("[mlx5net] TXリング枠待ちタイムアウト (sqn=%u sq_pc=%u sq_cc=%u)\n",
-                        dev->sqn, st->sq_pc, st->sq_cc);
-            mlx5_net_try_recover(pf_index, dev, st);
+                        dev->txq[q].sqn, st->sq_pc[q], st->sq_cc[q]);
+            mlx5_net_try_recover(pf_index, q, dev, st);
             return -1;
         }
     }
@@ -633,20 +681,22 @@ static int mlx5_net_send_frags_async(void *priv, const eth_frag_t *frags, unsign
     mlx5_net_state_t *st = (mlx5_net_state_t *)priv;
     mlx5_dev_t *dev = st->dev;
     int pf_index = mlx5_net_pf_index(st);
+    unsigned q = mlx5_net_txq_index();
 
-    if (s_sq_halted[pf_index]) {
+    if (s_sq_halted[pf_index][q]) {
         return -1;
     }
     TS_HOT(TS_MK(TS_FILE_MLX5_NET, TS_FUNC_mlx5_net_send_frags_async, 0),
-           ((uint32_t)(st->sq_pc & 0xFFFFu) << 16) | (uint32_t)(st->sq_cc & 0xFFFFu));
-    if (mlx5_net_sq_wait_room(pf_index, dev, st) != 0) {
+           ((uint32_t)(st->sq_pc[q] & 0xFFFFu) << 16) | (uint32_t)(st->sq_cc[q] & 0xFFFFu));
+    if (mlx5_net_sq_wait_room(pf_index, q, dev, st) != 0) {
         return -1;
     }
 
     TS_HOT(TS_MK(TS_FILE_MLX5_NET, TS_FUNC_mlx5_net_send_frags_async, 1),
-           ((uint32_t)(st->sq_pc & 0xFFFFu) << 16) | (uint32_t)(st->sq_cc & 0xFFFFu));
+           ((uint32_t)(st->sq_pc[q] & 0xFFFFu) << 16) | (uint32_t)(st->sq_cc[q] & 0xFFFFu));
 
-    return mlx5_net_post_frame(st, frags, frag_count);
+    int rc = mlx5_net_post_frame(st, q, frags, frag_count);
+    return rc;
 }
 
 /*=================================================================
@@ -666,27 +716,30 @@ static int mlx5_net_send_frags(void *priv, const eth_frag_t *frags, unsigned fra
     mlx5_net_state_t *st = (mlx5_net_state_t *)priv;
     mlx5_dev_t *dev = st->dev;
     int pf_index = mlx5_net_pf_index(st);
+    unsigned q = mlx5_net_txq_index();
 
-    if (s_sq_halted[pf_index]) {
+    if (s_sq_halted[pf_index][q]) {
         return -1;
     }
-    if (mlx5_net_sq_wait_room(pf_index, dev, st) != 0) {
+    if (mlx5_net_sq_wait_room(pf_index, q, dev, st) != 0) {
         return -1;
     }
 
-    uint32_t target_pc = st->sq_pc; // このWQEに割り当てられるpc(post後はst->sq_pcが+1される)
+    uint32_t target_pc = st->sq_pc[q]; // このWQEに割り当てられるpc(post後はst->sq_pc[q]が+1される)
 
     TS_HOT(TS_MK(TS_FILE_MLX5_NET, TS_FUNC_mlx5_net_send_frags, 0),
-           ((uint32_t)(st->sq_pc & 0xFFFFu) << 16) | (uint32_t)(st->sq_cc & 0xFFFFu));
+           ((uint32_t)(st->sq_pc[q] & 0xFFFFu) << 16) | (uint32_t)(st->sq_cc[q] & 0xFFFFu));
 
-    if (mlx5_net_post_frame(st, frags, frag_count) != 0) {
+    if (mlx5_net_post_frame(st, q, frags, frag_count) != 0) {
         return -1;
     }
+    /* **完了待ちはロックの外。** CQE を待つ長い区間を握ったままだと
+     * 他コアの送信を止めてしまう。 */
 
     // 自分がポストしたWQE(target_pc)の完了(sq_cc > target_pc)まで待つ。
     uint64_t start = timer_now();
-    while ((int32_t)(st->sq_cc - (target_pc + 1u)) < 0) {
-        int r = mlx5_net_sq_reap_one(pf_index, dev, st);
+    while ((int32_t)(st->sq_cc[q] - (target_pc + 1u)) < 0) {
+        int r = mlx5_net_sq_reap_one(pf_index, q, dev, st);
         if (r < 0) {
             return -1;
         }
@@ -698,9 +751,9 @@ static int mlx5_net_send_frags(void *priv, const eth_frag_t *frags, unsigned fra
         }
         if (timeout_ms(start, 1000u)) { // 1秒(eth.cのrp1_send_frags()と同じ)
             TS_HOT(TS_MK(TS_FILE_MLX5_NET, TS_FUNC_mlx5_net_send_frags, 1),
-                   ((uint32_t)(st->sq_pc & 0xFFFFu) << 16) | (uint32_t)(st->sq_cc & 0xFFFFu));
-            uart_printf("[mlx5net] TXタイムアウト (sqn=%u)\n", dev->sqn);
-            mlx5_net_try_recover(pf_index, dev, st);
+                   ((uint32_t)(st->sq_pc[q] & 0xFFFFu) << 16) | (uint32_t)(st->sq_cc[q] & 0xFFFFu));
+            uart_printf("[mlx5net] TXタイムアウト (sqn=%u)\n", dev->txq[q].sqn);
+            mlx5_net_try_recover(pf_index, q, dev, st);
             return -1;
         }
     }
@@ -726,8 +779,9 @@ static int mlx5_net_send_lso_async(void *priv, const void *hdr, uint16_t hdr_len
     mlx5_net_state_t *st = (mlx5_net_state_t *)priv;
     mlx5_dev_t *dev = st->dev;
     int pf_index = mlx5_net_pf_index(st);
+    unsigned q = mlx5_net_txq_index();
 
-    if (s_sq_halted[pf_index]) {
+    if (s_sq_halted[pf_index][q]) {
         return -1;
     }
     if (payload_len == 0u || payload_len > dev->max_lso_bytes) {
@@ -735,15 +789,16 @@ static int mlx5_net_send_lso_async(void *priv, const void *hdr, uint16_t hdr_len
     }
 
     TS_HOT(TS_MK(TS_FILE_MLX5_NET, TS_FUNC_mlx5_net_send_lso_async, 0),
-           ((uint32_t)(st->sq_pc & 0xFFFFu) << 16) | (uint32_t)(st->sq_cc & 0xFFFFu));
-    if (mlx5_net_sq_wait_room(pf_index, dev, st) != 0) {
+           ((uint32_t)(st->sq_pc[q] & 0xFFFFu) << 16) | (uint32_t)(st->sq_cc[q] & 0xFFFFu));
+    if (mlx5_net_sq_wait_room(pf_index, q, dev, st) != 0) {
         return -1;
     }
 
     TS_HOT(TS_MK(TS_FILE_MLX5_NET, TS_FUNC_mlx5_net_send_lso_async, 1),
-           ((uint32_t)(st->sq_pc & 0xFFFFu) << 16) | (uint32_t)(st->sq_cc & 0xFFFFu));
+           ((uint32_t)(st->sq_pc[q] & 0xFFFFu) << 16) | (uint32_t)(st->sq_cc[q] & 0xFFFFu));
 
-    return mlx5_net_post_lso_frame(st, hdr, hdr_len, payload, payload_len, mss);
+    int rc = mlx5_net_post_lso_frame(st, q, hdr, hdr_len, payload, payload_len, mss);
+    return rc;
 }
 
 /*=================================================================
@@ -752,6 +807,9 @@ static int mlx5_net_send_lso_async(void *priv, const void *hdr, uint16_t hdr_len
  *
  * 引数:
  *   pf_index - 対象 PF
+ * 備考:
+ *   **SQ はコアごとにあるので全キューを出す**(どのコアの SQ が詰まった
+ *   のかは呼び出し側では分からない)。
  * コール元:
  *   mlx5_net_try_recover()
  * ===============================================================*/
@@ -764,20 +822,21 @@ void mlx5_net_dump_sq_debug(int pf_index)
         return;
     }
 
-    uint64_t cq_buf   = (uint64_t)dev->sq_cq_buf_cpu;
-    uint64_t wqe_ring = (uint64_t)dev->sq_wqe_cpu;
+    for (unsigned q = 0; q < MLX5_NUM_TXQ; q++) {
+    uint64_t cq_buf   = (uint64_t)dev->txq[q].cq_buf_cpu;
+    uint64_t wqe_ring = (uint64_t)dev->txq[q].wqe_cpu;
 
-    uart_printf("[mlx5netdbg] PF%d: sqn=%u sq_cqn=%u sq_wqe_cpu=0x%08x%08x\n",
-                pf_index, dev->sqn, dev->sq_cqn,
-                (uint32_t)((uint64_t)dev->sq_wqe_cpu >> 32), (uint32_t)(uint64_t)dev->sq_wqe_cpu);
-    uart_printf("[mlx5netdbg] PF%d: sq_pc=%u sq_cc=%u (diff=%d)\n",
-                pf_index, st->sq_pc, st->sq_cc, (int)(st->sq_pc - st->sq_cc));
+    uart_printf("[mlx5netdbg] PF%d TXQ%u: sqn=%u cqn=%u wqe_cpu=0x%08x%08x\n",
+                pf_index, q, dev->txq[q].sqn, dev->txq[q].cqn,
+                (uint32_t)((uint64_t)dev->txq[q].wqe_cpu >> 32), (uint32_t)(uint64_t)dev->txq[q].wqe_cpu);
+    uart_printf("[mlx5netdbg] PF%d TXQ%u: sq_pc=%u sq_cc=%u (diff=%d)\n",
+                pf_index, q, st->sq_pc[q], st->sq_cc[q], (int)(st->sq_pc[q] - st->sq_cc[q]));
     uart_printf("[mlx5netdbg] PF%d: cq_buf=0x%08x%08x wqe_ring=0x%08x%08x\n",
                 pf_index, (uint32_t)(cq_buf >> 32), (uint32_t)cq_buf,
                 (uint32_t)(wqe_ring >> 32), (uint32_t)wqe_ring);
 
     for (int delta = -1; delta <= 3; delta++) {
-        uint32_t idx = (uint32_t)((int64_t)(st->sq_cc & (MLX5_NET_CQ_NUM_ENTRIES - 1u)) + delta) &
+        uint32_t idx = (uint32_t)((int64_t)(st->sq_cc[q] & (MLX5_NET_CQ_NUM_ENTRIES - 1u)) + delta) &
                        (MLX5_NET_CQ_NUM_ENTRIES - 1u);
         volatile uint8_t *cqe = (volatile uint8_t *)(uintptr_t)(cq_buf + (uint64_t)idx * MLX5_NET_CQE_SIZE);
         dcache_invalidate_range((const void *)cqe, MLX5_NET_CQE_SIZE);
@@ -802,6 +861,7 @@ void mlx5_net_dump_sq_debug(int pf_index)
         uart_printf("  WQE[%2u] opmod_idx_opcode=0x%08x(pc=%u opcode=0x%02x) qpn_ds=0x%08x(ds_cnt=%u)\n",
                     i, opmod, pc_for_slot, (unsigned)(opmod & 0xFFu), qpnds, (unsigned)(qpnds & 0xFFu));
     }
+    }
 }
 
 /*=================================================================
@@ -813,17 +873,17 @@ void mlx5_net_dump_sq_debug(int pf_index)
  * コール元:
  *   mlx5_net_try_recover()
  * ===============================================================*/
-static void mlx5_net_drain_sq_cq(mlx5_dev_t *dev, mlx5_net_state_t *st)
+static void mlx5_net_drain_sq_cq(mlx5_dev_t *dev, mlx5_net_state_t *st, unsigned q)
 {
-    uint64_t cq_buf = (uint64_t)dev->sq_cq_buf_cpu;
-    volatile uint32_t *cq_dbr = (volatile uint32_t *)(uintptr_t)dev->sq_cq_dbr_cpu;
+    uint64_t cq_buf = (uint64_t)dev->txq[q].cq_buf_cpu;
+    volatile uint32_t *cq_dbr = (volatile uint32_t *)(uintptr_t)dev->txq[q].cq_dbr_cpu;
     uint64_t idle_start = timer_now();
     unsigned drained = 0;
     for (;;) {
-        volatile uint8_t *cqe = mlx5_net_cqe_if_ready(cq_buf, st->sq_cq_cc);
+        volatile uint8_t *cqe = mlx5_net_cqe_if_ready(cq_buf, st->sq_cq_cc[q]);
         if (cqe) {
-            st->sq_cq_cc++;   // CQ consumer のみ進める(sq_cc は直後に 0 リセットするので触らない)
-            *cq_dbr = __builtin_bswap32(st->sq_cq_cc & 0xFFFFFFu);
+            st->sq_cq_cc[q]++;   // CQ consumer のみ進める(sq_cc は直後に 0 リセットするので触らない)
+            *cq_dbr = __builtin_bswap32(st->sq_cq_cc[q] & 0xFFFFFFu);
             dcache_clean_range((const void *)cq_dbr, sizeof(*cq_dbr));
             drained++;
             idle_start = timer_now();
@@ -833,7 +893,7 @@ static void mlx5_net_drain_sq_cq(mlx5_dev_t *dev, mlx5_net_state_t *st)
         }
     }
     uart_printf("[mlx5net] SQ復帰: CQを%uエントリ drainし sq_cq_cc=%u へ同期\n",
-                drained, st->sq_cq_cc);
+                drained, st->sq_cq_cc[q]);
 }
 
 /*=================================================================
@@ -849,56 +909,56 @@ static void mlx5_net_drain_sq_cq(mlx5_dev_t *dev, mlx5_net_state_t *st)
  * コール元:
  *   mlx5_net_send_frags(), mlx5_net_sq_reap_one(), mlx5_net_sq_wait_room()
  * ===============================================================*/
-static int mlx5_net_try_recover(int pf_index, mlx5_dev_t *dev, mlx5_net_state_t *st)
+static int mlx5_net_try_recover(int pf_index, unsigned q, mlx5_dev_t *dev, mlx5_net_state_t *st)
 {
-    if (timeout_ms(s_recover_window_start[pf_index], MLX5_NET_SQ_RECOVER_WINDOW_MS)) {
-        s_recover_window_start[pf_index] = timer_now();
-        s_recover_attempts[pf_index] = 0;
+    if (timeout_ms(s_recover_window_start[pf_index][q], MLX5_NET_SQ_RECOVER_WINDOW_MS)) {
+        s_recover_window_start[pf_index][q] = timer_now();
+        s_recover_attempts[pf_index][q] = 0;
     }
 
-    if (st->sq_cq_cc - s_recover_last_cq_cc[pf_index] >= MLX5_NET_SQ_RECOVER_PROGRESS_WQES) {
-        s_recover_attempts[pf_index] = 0;
+    if (st->sq_cq_cc[q] - s_recover_last_cq_cc[pf_index][q] >= MLX5_NET_SQ_RECOVER_PROGRESS_WQES) {
+        s_recover_attempts[pf_index][q] = 0;
     }
-    s_recover_last_cq_cc[pf_index] = st->sq_cq_cc;
+    s_recover_last_cq_cc[pf_index][q] = st->sq_cq_cc[q];
 
-    if (s_recover_attempts[pf_index] == 0) {
+    if (s_recover_attempts[pf_index][q] == 0) {
         ts_log_freeze();
     }
 
-    if ((uint32_t)s_recover_attempts[pf_index] >= MLX5_NET_SQ_RECOVER_MAX_ATTEMPTS) {
+    if ((uint32_t)s_recover_attempts[pf_index][q] >= MLX5_NET_SQ_RECOVER_MAX_ATTEMPTS) {
         uart_printf("[mlx5net] PF%d(sqn=%u): 直近%us間に%u回の自動復帰を試みたため、"
                     "これ以上は諦めます(サーキットブレーカー発動)\n",
-                    pf_index, dev->sqn, MLX5_NET_SQ_RECOVER_WINDOW_MS / 1000u,
-                    (unsigned)s_recover_attempts[pf_index]);
-        s_sq_halted[pf_index] = 1;
+                    pf_index, dev->txq[q].sqn, MLX5_NET_SQ_RECOVER_WINDOW_MS / 1000u,
+                    (unsigned)s_recover_attempts[pf_index][q]);
+        s_sq_halted[pf_index][q] = 1;
         mlx5_net_dump_sq_debug(pf_index);
         mlx5_monitor_dump_saved();
         return -1;
     }
 
-    s_recover_attempts[pf_index]++;
-    ts_log(TS_MK(TS_FILE_MLX5_NET, TS_FUNC_mlx5_net_try_recover, 0), ((uint32_t)pf_index << 24) | (uint32_t)s_recover_attempts[pf_index]);
+    s_recover_attempts[pf_index][q]++;
+    ts_log(TS_MK(TS_FILE_MLX5_NET, TS_FUNC_mlx5_net_try_recover, 0), ((uint32_t)pf_index << 24) | (uint32_t)s_recover_attempts[pf_index][q]);
     uart_printf("[mlx5net] PF%d(sqn=%u): SQ自動復帰を試みます (%u/%u回目)\n",
-                pf_index, dev->sqn, (unsigned)s_recover_attempts[pf_index],
+                pf_index, dev->txq[q].sqn, (unsigned)s_recover_attempts[pf_index][q],
                 MLX5_NET_SQ_RECOVER_MAX_ATTEMPTS);
-    int rc = mlx5_recover_sq(dev);
+    int rc = mlx5_recover_sq(dev, q);
     if (rc < 0) {
-        uart_printf("[mlx5net] PF%d(sqn=%u): SQ自動復帰に失敗しました\n", pf_index, dev->sqn);
-        s_sq_halted[pf_index] = 1;
+        uart_printf("[mlx5net] PF%d(sqn=%u): SQ自動復帰に失敗しました\n", pf_index, dev->txq[q].sqn);
+        s_sq_halted[pf_index][q] = 1;
         mlx5_net_dump_sq_debug(pf_index);
         mlx5_monitor_dump_saved();
         return -1;
     }
 
     if (rc == 1) {
-        s_recover_attempts[pf_index]--;
+        s_recover_attempts[pf_index][q]--;
         return 0;
     }
 
-    mlx5_net_drain_sq_cq(dev, st);
-    st->sq_pc = 0;
-    st->sq_cc = 0;
-    uart_printf("[mlx5net] PF%d(sqn=%u): SQ自動復帰成功、送信を再試行します\n", pf_index, dev->sqn);
+    mlx5_net_drain_sq_cq(dev, st, q);
+    st->sq_pc[q] = 0;
+    st->sq_cc[q] = 0;
+    uart_printf("[mlx5net] PF%d(sqn=%u): SQ自動復帰成功、送信を再試行します\n", pf_index, dev->txq[q].sqn);
     return 0;
 }
 
@@ -919,11 +979,12 @@ static unsigned mlx5_net_tx_wait_free_slot(void *priv)
     mlx5_net_state_t *st = (mlx5_net_state_t *)priv;
     mlx5_dev_t *dev = st->dev;
     int pf_index = mlx5_net_pf_index(st);
+    unsigned q = mlx5_net_txq_index();
 
-    if (!s_sq_halted[pf_index]) {
-        mlx5_net_sq_wait_room(pf_index, dev, st); // 失敗時もベストエフォートでスロット番号だけ返す(直後のsend_frags_async()が改めてエラーを返す)
+    if (!s_sq_halted[pf_index][q]) {
+        mlx5_net_sq_wait_room(pf_index, q, dev, st); // 失敗時もベストエフォートでスロット番号だけ返す(直後のsend_frags_async()が改めてエラーを返す)
     }
-    return (unsigned)(st->sq_pc % MLX5_SQ_WQE_COUNT);
+    return (unsigned)(st->sq_pc[q] % MLX5_SQ_WQE_COUNT);
 }
 
 /*=================================================================
@@ -934,13 +995,13 @@ static unsigned mlx5_net_tx_wait_free_slot(void *priv)
  * コール元:
  *   mlx5_net_rq_flush_rearm()
  * ===============================================================*/
-static inline void mlx5_net_rq_write_dbr(mlx5_dev_t *dev, mlx5_net_state_t *st)
+static inline void mlx5_net_rq_write_dbr(mlx5_dev_t *dev, mlx5_net_state_t *st, unsigned q)
 {
-    volatile uint8_t *rq_dbr = (volatile uint8_t *)(uintptr_t)(uint64_t)dev->rxq[0].dbr_cpu;
-    rq_dbr[0] = (uint8_t)(st->rq_posted_ctr >> 24);
-    rq_dbr[1] = (uint8_t)(st->rq_posted_ctr >> 16);
-    rq_dbr[2] = (uint8_t)(st->rq_posted_ctr >> 8);
-    rq_dbr[3] = (uint8_t)st->rq_posted_ctr;
+    volatile uint8_t *rq_dbr = (volatile uint8_t *)(uintptr_t)(uint64_t)dev->rxq[q].dbr_cpu;
+    rq_dbr[0] = (uint8_t)(st->rq_posted_ctr[q] >> 24);
+    rq_dbr[1] = (uint8_t)(st->rq_posted_ctr[q] >> 16);
+    rq_dbr[2] = (uint8_t)(st->rq_posted_ctr[q] >> 8);
+    rq_dbr[3] = (uint8_t)st->rq_posted_ctr[q];
 }
 
 /*=================================================================
@@ -953,14 +1014,14 @@ static inline void mlx5_net_rq_write_dbr(mlx5_dev_t *dev, mlx5_net_state_t *st)
  * コール元:
  *   mlx5_net_poll_recv()
  * ===============================================================*/
-static inline void mlx5_net_rq_flush_rearm(mlx5_dev_t *dev, mlx5_net_state_t *st)
+static inline void mlx5_net_rq_flush_rearm(mlx5_dev_t *dev, mlx5_net_state_t *st, unsigned q)
 {
-    if (st->rq_rearm_pending == 0u) {
+    if (st->rq_rearm_pending[q] == 0u) {
         return;
     }
-    st->rq_posted_ctr += st->rq_rearm_pending;
-    st->rq_rearm_pending = 0u;
-    mlx5_net_rq_write_dbr(dev, st);
+    st->rq_posted_ctr[q] += st->rq_rearm_pending[q];
+    st->rq_rearm_pending[q] = 0u;
+    mlx5_net_rq_write_dbr(dev, st, q);
 }
 
 /*=================================================================
@@ -979,11 +1040,12 @@ static net_buf_t *mlx5_net_poll_recv(void *priv)
 {
     mlx5_net_state_t *st = (mlx5_net_state_t *)priv;
     mlx5_dev_t *dev = st->dev;
+    unsigned q = mlx5_net_rxq_index();
 
-    mlx5_net_rq_flush_rearm(dev, st);
+    mlx5_net_rq_flush_rearm(dev, st, q);
 
-    uint64_t cq_buf = (uint64_t)dev->rxq[0].cq_buf_cpu;
-    volatile uint8_t *cqe = mlx5_net_cqe_if_ready(cq_buf, st->rq_cc);
+    uint64_t cq_buf = (uint64_t)dev->rxq[q].cq_buf_cpu;
+    volatile uint8_t *cqe = mlx5_net_cqe_if_ready(cq_buf, st->rq_cc[q]);
     if (!cqe) {
         return NULL;
     }
@@ -998,7 +1060,7 @@ static net_buf_t *mlx5_net_poll_recv(void *priv)
     uint8_t hds_ip_ext = cqe[MLX5_CQE_OFF_HDS_IP_EXT];
     int csum_ok = ((hds_ip_ext & MLX5_CQE_L3_OK) != 0) && ((hds_ip_ext & MLX5_CQE_L4_OK) != 0);
 
-    st->rq_cc++;
+    st->rq_cc[q]++;
 
     uint16_t buf_idx = (uint16_t)(wqe_idx % MLX5_RQ_NUM_WQES);
 
@@ -1013,7 +1075,7 @@ static net_buf_t *mlx5_net_poll_recv(void *priv)
         out = net_buf_alloc();
         if (out) {
             volatile uint8_t *src = (volatile uint8_t *)(uintptr_t)
-                ((uint64_t)dev->rxq[0].data_cpu + (uint64_t)buf_idx * MLX5_RQ_BUF_PER_WQE
+                ((uint64_t)dev->rxq[q].data_cpu + (uint64_t)buf_idx * MLX5_RQ_BUF_PER_WQE
                  + MLX5_RX_HEADROOM);
             dcache_invalidate_range((const void *)src, byte_cnt);
             TS_HOT(TS_MK(TS_FILE_MLX5_NET, TS_FUNC_mlx5_net_poll_recv, 2), byte_cnt);
@@ -1030,14 +1092,14 @@ static net_buf_t *mlx5_net_poll_recv(void *priv)
     }
 
     {
-        volatile uint32_t *cq_dbr = (volatile uint32_t *)(uintptr_t)dev->rxq[0].cq_dbr_cpu;
-        uint32_t cc24 = st->rq_cc & 0xFFFFFFu;
+        volatile uint32_t *cq_dbr = (volatile uint32_t *)(uintptr_t)dev->rxq[q].cq_dbr_cpu;
+        uint32_t cc24 = st->rq_cc[q] & 0xFFFFFFu;
         *cq_dbr = __builtin_bswap32(cc24);
         dcache_clean_range((const void *)cq_dbr, sizeof(*cq_dbr));
     }
     TS_HOT(TS_MK(TS_FILE_MLX5_NET, TS_FUNC_mlx5_net_poll_recv, 4), byte_cnt);
 
-    st->rq_rearm_pending++;
+    st->rq_rearm_pending[q]++;
     TS_HOT(TS_MK(TS_FILE_MLX5_NET, TS_FUNC_mlx5_net_poll_recv, 5), byte_cnt);
 
     return out;
@@ -1110,17 +1172,22 @@ static void mlx5_netif_setup(netif_t *ctx, mlx5_net_state_t *st, mlx5_dev_t *dev
     for (unsigned i = 0; i < NDP_CACHE_SIZE; i++) ctx->ndp_cache[i].valid = 0;
 
     st->dev = dev;
-    st->rq_cc = 0;
-    st->rq_posted_ctr = MLX5_RQ_NUM_WQES; // mlx5_create_rq()が既にこの値でドアベルへ書き込み済み
-    st->rq_rearm_pending = 0u;             // 受信ゼロコピーの遅延再武装カウンタ(net init mlx5/再ブリングアップでリセット)
-    st->sq_pc = 0;
-    st->sq_cc = 0;
-    st->sq_cq_cc = 0;   // CQ consumer(setup/再ブリングアップ時は CQ も新規なので 0 起点)
+    for (unsigned q = 0; q < MLX5_NUM_RXQ; q++) {
+        st->rq_cc[q] = 0;
+        st->rq_posted_ctr[q] = MLX5_RQ_NUM_WQES; // mlx5_create_rq()が既にこの値でドアベルへ書き込み済み
+        st->rq_rearm_pending[q] = 0u;            // 受信ゼロコピーの遅延再武装カウンタ
+    }
     {
         int pfi = mlx5_net_pf_index(st);
-        s_sq_halted[pfi] = 0;
-        s_recover_attempts[pfi] = 0;
-        s_recover_window_start[pfi] = timer_now();
+        for (unsigned q = 0; q < MLX5_NUM_TXQ; q++) {
+            st->sq_pc[q] = 0;
+            st->sq_cc[q] = 0;
+            st->sq_cq_cc[q] = 0;   // CQ consumer(setup/再ブリングアップ時は CQ も新規なので 0 起点)
+            s_sq_halted[pfi][q] = 0;
+            s_recover_attempts[pfi][q] = 0;
+            s_recover_window_start[pfi][q] = timer_now();
+            s_recover_last_cq_cc[pfi][q] = 0;
+        }
     }
 }
 
@@ -1135,6 +1202,28 @@ static void mlx5_netif_setup(netif_t *ctx, mlx5_net_state_t *st, mlx5_dev_t *dev
  * コール元:
  *   run_shell()
  * ===============================================================*/
+/*=================================================================
+ * 受信を何コアへ分散するかを NIC 側へ反映する(RSS の on/off)。
+ *
+ * **catch-all の FTE の転送先を差し替えるだけ**なので、コネクションを
+ * 張り直さずに切り替えられる。**ただし既に確立しているコネクションは
+ * ハッシュ先が変わって別コアへ行くので、切り替えは接続していないときに。**
+ *
+ * 引数:
+ *   ncores - 1=従来どおり rxq[0] へ集める、2 以上=その本数へ散らす
+ * 戻り値:
+ *   0=両 PF とも成功、-1=どちらかが失敗
+ * コール元:
+ *   shell_dispatch() の netmt
+ * ===============================================================*/
+int mlx5_net_set_rss(unsigned ncores)
+{
+    int rc = 0;
+    if (s_state_pf0.dev && mlx5_set_rss_enable(s_state_pf0.dev, ncores) != 0) rc = -1;
+    if (s_state_pf1.dev && mlx5_set_rss_enable(s_state_pf1.dev, ncores) != 0) rc = -1;
+    return rc;
+}
+
 int mlx5_net_register_dual(mlx5_dev_t *dev0, mlx5_dev_t *dev1)
 {
     mlx5_netif_setup(&s_ctx_pf0, &s_state_pf0, dev0, "mlx5-pf0",

@@ -3,7 +3,19 @@
 
 #include <stdint.h>
 
-#define JOB_MAX 12u
+/* nvmet が admin 1 + IO キュー NVMET_IO_QUEUES(4)= 5 枠使うので、RDMA 側や
+ * 内蔵イニシエータと同時に立てても足りるだけの余裕を持たせてある。 */
+/* nvmet の admin 1 + IO 16、nvmet-rdma の standalone 1 + IO 4 + CM 1 で 23。 */
+#define JOB_MAX 32u
+
+/* 眠っている(park した)ジョブを念のため step する周期。job_scheduler_tick()
+ * の呼び出し回数で数える。**2 の冪であること**(マスクで判定する)。
+ *
+ * 起床条件を取りこぼしても必ずこの周期で拾えるので、park は「見落とすと
+ * 二度と起きない」形にはならない。逆に言えば park で失われるのは最大
+ * この周期ぶんの反応時間だけ(受信ループ 1 周が 60〜100ns 程度なので
+ * 256 周でも 25us 前後。接続確立やタイムアウトの ms スケールに対して無害)。 */
+#define JOB_IDLE_TICK_DIVISOR 256u
 
 typedef enum {
     JOB_WAITING = 0,  /* まだ完了していない、次tickでまたstep()を呼んでほしい */
@@ -24,6 +36,20 @@ struct job {
     volatile int claimed;
     void *affinity_key;
     int pinned_core;
+    /* 1=眠っている。スケジューラは起床条件が立つか JOB_IDLE_TICK_DIVISOR 回に
+     * 1 回になるまで step を呼ばない。**判定はロックを取らずに行う**ので、
+     * 眠っているジョブのコストは 2〜3 回のロードだけになる。
+     *
+     * これが無いと、接続していない IO キュー(nvmet は上限ぶんジョブを
+     * spawn して余りを待機させる)が毎 tick s_job_lock を 2 回取り、
+     * そのキャッシュラインがコア間を往復して**受信ポーリングの周期が
+     * ジョブ本数に比例して延びる**。 */
+    volatile int idle;
+    /* 即時の起床条件。両方が非 NULL で値が食い違えば次の tick で必ず起こす。
+     * ready-ring の head/tail を指させると「コマンドが届いた」で起きる
+     * (取りこぼしても JOB_IDLE_TICK_DIVISOR で拾えるので lost wakeup は無い)。 */
+    const volatile uint32_t *wake_a;
+    const volatile uint32_t *wake_b;
 };
 
 job_t *job_spawn(job_step_fn step, void *ctx, const char *name);
@@ -31,6 +57,12 @@ job_t *job_spawn(job_step_fn step, void *ctx, const char *name);
 void job_set_affinity(job_t *job, void *affinity_key);
 
 void job_pin_to_core(job_t *job, unsigned core);
+
+/* 自分を眠らせる / 起こす。**ジョブ自身の step() から呼ぶこと**(呼び出し中は
+ * そのジョブを claim しているので、ロック無しで書いてよい)。
+ * wake_a/wake_b は即時に起こしたい条件(不要なら両方 NULL)。 */
+void job_park(job_t *job, const volatile uint32_t *wake_a, const volatile uint32_t *wake_b);
+void job_unpark(job_t *job);
 
 void job_scheduler_tick(void);
 
@@ -46,5 +78,12 @@ unsigned job_cancel_by_ctx(const void *ctx);
 unsigned job_count_by_ctx(const void *ctx);
 
 void job_list_dump(void);
+
+/* park の有効/無効(`jobpark on|off`)。**0 が park を入れる前の挙動**という
+ * 恒久的な陰性対照。**戻し忘れると未接続の IO キューが毎 tick 空回りする。** */
+extern volatile int g_job_park_enable;
+
+void job_park_stats_dump(void);
+void job_park_stats_clear(void);
 
 #endif /* JOB_H */

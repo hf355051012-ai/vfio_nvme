@@ -10,6 +10,9 @@ int vfio_is_ready(void);
 
 void *vfio_map_bar(int dev, int bar, uint64_t *size_out);
 
+/* BAR の [off, off+len) を同じ仮想アドレスのまま WC(wc=1)/ vfio の UC(wc=0)へ張り替える。 */
+int vfio_bar_set_wc(int dev, int bar, void *bar_va, uint64_t off, uint64_t len, int wc);
+
 /* デバイス dev の config space 32bit 読み書き。 */
 uint32_t vfio_cfg_read32(int dev, uint32_t offset);
 void     vfio_cfg_write32(int dev, uint32_t offset, uint32_t val);

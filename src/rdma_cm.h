@@ -73,6 +73,7 @@ typedef struct {
 
     int      reuse_gsi;
     uint8_t  rc_qp_index;
+    uint8_t  rc_cs_req;   /* RC QP の qpc.cs_req(0=無効、0x11=read/atomic の応答を CQE へ)*/
 
     volatile uint8_t send_buf[RDMA_CM_MAD_SIZE];
     volatile uint8_t recv_buf[MLX5_GRH_BYTES + RDMA_CM_MAD_SIZE];
@@ -86,7 +87,17 @@ typedef struct {
     uint16_t rej_reason;  // REJ を受けたときの理由コード(0=なし)
 
     int      rtu_phase_done;
+
+    /* REP の PRIVATE_DATA 先頭(active 側のみ)。**librdmacm の rdma_accept() に
+     * 渡した private_data がそのままここに載る**ので、相手が登録した MR の
+     * アドレスと rkey を受け取る経路になる(rdma_short.c)。 */
+    uint8_t  rep_priv[64];
 } rdma_cm_ctx_t;
+
+/* 確立済みの接続を CM の DREQ で畳み、DREP を待つ(同期、GSI を直接回す)。
+ * **CM ジョブが終わってから呼ぶこと**(GSI の CQ を取り合う)。
+ * 戻り値: 0=DREP を受けた、-1=送信失敗、1=待ち切れ(相手は TIMEWAIT へ進む)。 */
+int rdma_cm_disconnect(rdma_cm_ctx_t *ctx, uint32_t wait_ms);
 
 job_result_t rdma_cm_job_step(job_t *self);
 

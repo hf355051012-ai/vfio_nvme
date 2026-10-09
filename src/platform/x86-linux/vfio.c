@@ -10,6 +10,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdlib.h>
 #include <errno.h>
 
 #define VFIO_MAX_DEVICES 4
@@ -23,6 +24,9 @@ typedef struct {
     uint64_t cfg_off;   /* config region のデバイス fd 内オフセット */
     uint64_t cfg_size;
     char     bdf[32];
+    uint64_t bar_off[6]; /* BAR の region のデバイス fd 内オフセット(vfio_map_bar で記録)*/
+    uint64_t bar_size[6];
+    int      bar_sysfs[6]; /* 1=BAR を sysfs の resource<N> から mmap した */
 } vfio_dev_t;
 
 static vfio_dev_t s_dev[VFIO_MAX_DEVICES];
@@ -241,15 +245,136 @@ void *vfio_map_bar(int dev, int bar, uint64_t *size_out)
         uart_printf("[vfio] slot%d BAR%d は mmap 不可 or サイズ 0\n", dev, bar);
         return 0;
     }
-    void *va = mmap(0, rinfo.size, PROT_READ | PROT_WRITE, MAP_SHARED,
-                    s_dev[dev].fd, (off_t)rinfo.offset);
+    /* **BAR は sysfs の resource<N> から mmap する(vfio の fd からは mmap しない)。**
+     * vfio-pci は BAR を mmap されると、カーネル内でも BAR 全体を pci_iomap()
+     * (UC-)するので、PAT にその型が BAR 全体ぶん登録され、**後から一部の
+     * ページを write-combining にできなくなる**(BlueFlame が使えない。
+     * vfio_bar_set_wc() 参照)。sysfs の mmap も実効の型は同じ UC- なので、
+     * 既存のレジスタ/ドアベルの扱いは変わらない。開けなければ従来の vfio へ。 */
+    void *va = MAP_FAILED;
+    const char *bar_env = getenv("VFIO_NVME_BAR");   /* "vfio" で従来の vfio の mmap(A/B 用)*/
+    if (!(bar_env != 0 && strcmp(bar_env, "vfio") == 0)) {
+        char path[96];
+        snprintf(path, sizeof(path), "/sys/bus/pci/devices/%s/resource%d", s_dev[dev].bdf, bar);
+        int sfd = open(path, O_RDWR | O_SYNC);
+        if (sfd >= 0) {
+            va = mmap(0, rinfo.size, PROT_READ | PROT_WRITE, MAP_SHARED, sfd, 0);
+            close(sfd);
+        }
+        s_dev[dev].bar_sysfs[bar] = (va != MAP_FAILED);
+    }
+    if (va == MAP_FAILED) {
+        va = mmap(0, rinfo.size, PROT_READ | PROT_WRITE, MAP_SHARED,
+                  s_dev[dev].fd, (off_t)rinfo.offset);
+    }
     if (va == MAP_FAILED) {
         uart_printf("[vfio] slot%d BAR%d mmap 失敗 (errno=%d)\n", dev, bar, errno);
         return 0;
     }
     if (size_out) *size_out = rinfo.size;
-    uart_printf("[vfio] slot%d BAR%d を mmap (size=0x%x)\n", dev, bar, (unsigned)rinfo.size);
+    s_dev[dev].bar_off[bar] = rinfo.offset;
+    s_dev[dev].bar_size[bar] = rinfo.size;
+    uart_printf("[vfio] slot%d BAR%d を mmap (size=0x%x、%s)\n", dev, bar, (unsigned)rinfo.size,
+                s_dev[dev].bar_sysfs[bar] ? "sysfs resource" : "vfio");
     return va;
+}
+
+/* BAR の [off, off+len) を UC(sysfs か vfio、vfio_map_bar と同じ経路)で MAP_FIXED する。 */
+static int bar_map_uc_fixed(int dev, int bar, uint8_t *va, uint64_t off, uint64_t len)
+{
+    void *p = MAP_FAILED;
+    if (s_dev[dev].bar_sysfs[bar]) {
+        char path[96];
+        snprintf(path, sizeof(path), "/sys/bus/pci/devices/%s/resource%d", s_dev[dev].bdf, bar);
+        int fd = open(path, O_RDWR | O_SYNC);
+        if (fd >= 0) {
+            p = mmap(va, len, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, (off_t)off);
+            close(fd);
+        }
+    } else {
+        p = mmap(va, len, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, s_dev[dev].fd,
+                 (off_t)(s_dev[dev].bar_off[bar] + off));
+    }
+    return (p == (void *)va) ? 0 : -1;
+}
+
+/*=================================================================
+ * vfio_map_bar() でマップした BAR のうち [off, off+len) だけを、同じ仮想
+ * アドレスのまま **write-combining**(sysfs の resource<bar>_wc)へ張り替える。
+ * wc=0 なら UC へ戻す。BlueFlame(rdma_short.c)用。
+ *
+ * **x86 の PAT は同じ物理ページに別の型を許さない。** 型の衝突があると
+ * resource0_wc の mmap は**黙って UC- に格下げされる**(実機で踏んだ。BF に
+ * 書いた WQE を NIC が捨てる形で出る。`rshort bfprobe` で判定できる)。
+ * 衝突の元は 2 つあった:
+ *   1. vfio の fd から BAR を mmap すると、vfio-pci がカーネル内で BAR 全体を
+ *      pci_iomap() する。これはユーザ空間からは外せない -> vfio_map_bar() で
+ *      BAR を sysfs の resource<N> から mmap するようにした。
+ *   2. ユーザ空間の mmap も BAR 全体ぶん登録され、**そのページだけ munmap
+ *      しても元の mmap が全部消えるまで登録が残る**(kernel 7.0 で確認)。
+ *      -> BAR を「前 / そのページ / 後」の 3 つの mmap に組み直す。前と後を
+ *      MAP_FIXED し直すと元の mmap はそのページだけになり、それを munmap
+ *      すると登録が外れる。MAP_FIXED の置き換えは mmap_lock の中で行われる
+ *      ので、**他コアがその間に前後のページを触っても待たされるだけで落ちない**。
+ *      (MTRR では救えない: この機材は BAR を含む 1GB が MTRR で UC 指定で、
+ *      重なりでは UC が勝つ。)
+ *
+ * 引数:
+ *   dev    - スロット番号
+ *   bar    - BAR 番号
+ *   bar_va - vfio_map_bar() が返したアドレス
+ *   off    - BAR 内オフセット(4KB 境界)
+ *   len    - バイト数
+ *   wc     - 1=WC へ、0=vfio の UC へ戻す
+ * 戻り値:
+ *   0=成功、-1=失敗(失敗時は UC のマップへ戻すよう試みる)
+ * コール元:
+ *   hal_bar0_map_wc(), hal_bar0_unmap_wc()
+ * ===============================================================*/
+int vfio_bar_set_wc(int dev, int bar, void *bar_va, uint64_t off, uint64_t len, int wc)
+{
+    if (!dev_ok(dev) || bar < 0 || bar > 5) return -1;
+    uint8_t *base = (uint8_t *)bar_va;
+    uint8_t *va = base + off;
+    const uint64_t size = s_dev[dev].bar_size[bar];
+    if (off + len > size) return -1;
+    void *p = MAP_FAILED;
+    if (wc) {
+        /* 前と後を張り直す(元の mmap をこのページだけに縮める)。 */
+        if (off > 0 && bar_map_uc_fixed(dev, bar, base, 0, off) != 0) {
+            uart_printf("[vfio] BAR%d の前半を張り直せない (errno=%d)\n", bar, errno);
+            return -1;
+        }
+        if (off + len < size && bar_map_uc_fixed(dev, bar, va + len, off + len, size - off - len) != 0) {
+            uart_printf("[vfio] BAR%d の後半を張り直せない (errno=%d)\n", bar, errno);
+            return -1;
+        }
+    }
+    /* このページを先に明示的に外す。MAP_FIXED の置き換えは新しいマップを張った
+     * 後で古い方を片付けるので、置き換えに任せると古い UC- の登録が残った状態で
+     * WC を登録しようとして、また UC- に格下げされる。 */
+    if (munmap(va, len) != 0) {
+        uart_printf("[vfio] munmap(BAR%d+0x%llx) 失敗 (errno=%d)\n", bar,
+                    (unsigned long long)off, errno);
+        return -1;
+    }
+    if (wc) {
+        char path[96];
+        snprintf(path, sizeof(path), "/sys/bus/pci/devices/%s/resource%d_wc", s_dev[dev].bdf, bar);
+        int fd = open(path, O_RDWR | O_SYNC);
+        if (fd >= 0) {
+            p = mmap(va, len, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, (off_t)off);
+            close(fd);
+        }
+        if (p == va) return 0;
+        uart_printf("[vfio] %s の mmap 失敗 (errno=%d) -- UC へ戻す\n", path, errno);
+    }
+    if (bar_map_uc_fixed(dev, bar, va, off, len) != 0) {
+        uart_printf("[vfio] BAR%d+0x%llx を UC へ戻せない (errno=%d)\n", bar,
+                    (unsigned long long)off, errno);
+        return -1;
+    }
+    return wc ? -1 : 0;
 }
 
 /*=================================================================

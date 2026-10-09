@@ -23,8 +23,14 @@ static uint32_t s_standalone_resident_generation;
 
 /* IO キュー(queue_id=1)。admin の CM 確立を検出した時点で spawn する。
  * self_label / peer_mac はコールバックに渡らないのでここへ控えておく。 */
-static nvmet_rdma_ctx_t s_standalone_io_ctx;
-static int         s_standalone_io_spawned;
+/* **IO キューはコネクションごとに 1 個。** 1 個 1MB 強あるので .bss を見て
+ * 増やすこと。**GSI(QP1)は 1 PF に 1 つしか置けない**ので、CM の受動
+ * accept を同時に 2 つ回してはいけない -- **確立するたびに次の 1 本を
+ * 立てる**(1 本ずつ順に張ってくる Linux の挙動と合う)。 */
+static nvmet_rdma_ctx_t s_standalone_io_ctx[NVMET_RDMA_IO_QUEUES];
+static int         s_standalone_io_spawned;   /* 立てた acceptor の本数 */
+static void nvmetr_spawn_io_queue(nvmet_rdma_ctx_t *admin_ctx, unsigned idx);
+static void nvmetr_on_io_established(nvmet_rdma_ctx_t *self);
 static const char *s_standalone_self_label;
 static uint8_t     s_standalone_peer_mac[6];
 
@@ -58,13 +64,28 @@ static void nvmetr_zero_v64(volatile uint8_t *p, uint32_t len)
  * コール元:
  *   nvmet_rdma_job_step()
  * ===============================================================*/
-#define NVMETR_NT_COPY_MIN 1024u
+/* **この長さ以上のコピーを非一時ストアにする**(既定 1024)。実行時に
+ * 変えられるようにしてある(シェルの `ntcopy`) -- 512B の in-capsule write
+ * が直前のトラフィック次第で 600k と 777k を行き来するので、**書き込み先が
+ * キャッシュに無いときの read-for-ownership** が原因かを切り分けるため。 */
+volatile uint32_t g_nvmetr_nt_copy_min = 1024u;
+
+/* [計装] キューごとのポーリング周回数・空回り・コマンド数(シェルの `rdmastat`)。
+ * **4 本の IO キューが 1 コアで順に回るので、どのキューが仕事をしているかが
+ * 見えないと「均等に散っている」と「1 本に偏っている」を取り違える。**
+ * 統計カウンタは volatile にすること -- 素の uint64_t だとコンパイラが
+ * 巡回ループ内の ++ をレジスタにまとめ、他コアの clear が古い値で復活する
+ * (`jobpark` のカウンタで実際に踏んだ)。
+ * 1 キュー 1 キャッシュライン(8 x 8B)に離して false sharing を避ける。 */
+volatile uint64_t g_nvmetr_polls[NVMET_RDMA_IO_QUEUES + 1u][8];
+volatile uint64_t g_nvmetr_empty[NVMET_RDMA_IO_QUEUES + 1u][8];
+volatile uint64_t g_nvmetr_cmds[NVMET_RDMA_IO_QUEUES + 1u][8];
 
 static void nvmetr_copy_in_capsule(volatile uint8_t *dst, const volatile uint8_t *src,
                                     uint32_t len)
 {
 #if defined(__x86_64__)
-    if (len >= NVMETR_NT_COPY_MIN &&
+    if (len >= g_nvmetr_nt_copy_min &&
         ((uintptr_t)dst % 16u) == 0u && ((uintptr_t)src % 16u) == 0u) {
         __m128i *d = (__m128i *)(uintptr_t)dst;
         const __m128i *sp = (const __m128i *)(uintptr_t)src;
@@ -252,6 +273,22 @@ static void nvmetr_parse_command(nvmet_rdma_ctx_t *ctx, const volatile uint8_t *
         p->need_data_move = 1;
         p->data_move_is_write = 1; // ターゲット->ホストへRDMA_WRITEで押し込む
     } else if (p->opcode == NVME_ADM_CMD_SET_FEATURES) {
+        /* **Number of Queues(FID=0x07)に本数を返す。** 以前は全 FID に
+         * dw0=0 を返しており、0's based なので**ホストには「IO キュー
+         * 1 本」と伝わっていた**。これが RDMA が 1 コネクションしか
+         * 張れなかった直接の原因(RC QP が 2 本しか無かったのとは別の話)。
+         * NSQR/NCQR も 0's based なので +1 してから比べる。 */
+        if ((p->cdw10 & 0xFFu) == NVME_FEAT_NUM_QUEUES) {
+            uint32_t nsqr = (p->cdw11 & 0xFFFFu) + 1u;
+            uint32_t ncqr = ((p->cdw11 >> 16) & 0xFFFFu) + 1u;
+            uint32_t want = (nsqr < ncqr) ? nsqr : ncqr;
+            uint32_t give = (want < NVMET_RDMA_IO_QUEUES) ? want : NVMET_RDMA_IO_QUEUES;
+            if (give == 0u) give = 1u;
+            ctx->ctrl->io_queues_granted = give;
+            p->resp_dw0 = ((give - 1u) << 16) | (give - 1u);
+            uart_printf("[nvmet-rdma] Number of Queues: 要求 %u 本 -> %u 本を許諾\n",
+                        want, give);
+        }
     } else if (p->opcode == NVME_ADM_CMD_KEEP_ALIVE) {
         /* 応答するだけ(need_data_move=0 のまま成功 CQE を返す)。 */
     } else if (p->opcode == NVME_IO_CMD_FLUSH) {
@@ -681,7 +718,11 @@ job_result_t nvmet_rdma_job_step(job_t *self)
 
     if (ctx->stop_requested || self->cancel_requested) {
         if (ctx == &s_standalone_ctx)    s_standalone_resident = 0;
-        if (ctx == &s_standalone_io_ctx) s_standalone_io_spawned = 0;
+        for (unsigned k = 0; k < NVMET_RDMA_IO_QUEUES; k++) {
+            if (ctx == &s_standalone_io_ctx[k] && s_standalone_io_spawned > (int)k) {
+                s_standalone_io_spawned = (int)k;
+            }
+        }
         return JOB_DONE;
     }
 
@@ -900,6 +941,11 @@ job_result_t nvmet_rdma_job_step(job_t *self)
             return ctx->failed ? JOB_DONE : JOB_WAITING;
         }
 
+        unsigned qi_stat = (ctx->queue_id <= NVMET_RDMA_IO_QUEUES)
+                           ? (unsigned)ctx->queue_id : NVMET_RDMA_IO_QUEUES;
+        unsigned recv_stat = 0;
+        g_nvmetr_polls[qi_stat][0]++;
+
         for (unsigned iter = 0; iter < NVMET_RDMA_MAX_PENDING * 3u; iter++) {
             int is_send = 0;
             uint32_t recv_len = 0;
@@ -943,6 +989,7 @@ job_result_t nvmet_rdma_job_step(job_t *self)
                 }
                 unsigned slot = ctx->pl.rq_order[ctx->pl.rq_head % NVMET_RDMA_MAX_PENDING];
                 ctx->pl.rq_head++;
+                recv_stat++;
                 dcache_invalidate_range((const void *)(uintptr_t)ctx->pl.recv_bufs[slot], recv_len);
                 nvmetr_parse_command(ctx, ctx->pl.recv_bufs[slot], &ctx->pl.pending[slot]);
                 {
@@ -1049,6 +1096,11 @@ job_result_t nvmet_rdma_job_step(job_t *self)
                 }
             }
         }
+        if (recv_stat == 0u) {
+            g_nvmetr_empty[qi_stat][0]++;
+        } else {
+            g_nvmetr_cmds[qi_stat][0] += recv_stat;
+        }
         return JOB_WAITING;
     }
 
@@ -1083,6 +1135,91 @@ static volatile uint8_t *nvmetr_ramdisk_slot0(void)
     return s_rd0;
 }
 
+/* **既定は 3 コアへ分散。** 1 コアに 4 本の IO キューを載せると、コアの
+ * 3/4 が空の CQ を覗くだけで消える(実測: 1 tick 約 93ns x 4000万回 =
+ * 5 秒中 3.7 秒)。**その結果 512B write 4 キューが 641〜758k で徘徊し、
+ * kernel(772k、ばらつき ±1.8%)に負けていた。** 3 コアへ散らすと 801k で
+ * 安定して kernel を上回る。`rdmacores 1` が従来の挙動(陰性対照)。
+ *
+ * **キュー本数が少ないときの割り当ては変わらない**(idx%ncores は idx が
+ * ncores 未満なら idx そのもの)ので、1〜3 本のときの退行はありえない。 */
+volatile uint32_t g_nvmet_rdma_cores = 3u;
+
+static nvmet_rdma_ctx_t *s_standalone_admin_ctx_for_io;
+
+/*=================================================================
+ * IO キュー idx 番の CM acceptor を立てる。
+ *
+ * **GSI は admin のものをポインタのまま共有する**(値コピーにすると
+ * sq_pc/rq_pc/cq_cc が二重管理になり、REP が「送ったつもりでワイヤに
+ * 出ない」という静かな失敗を起こす。実機で踏んだ本物のバグ)。
+ * **RC QP の添字は idx+1**(0 番は admin が使う)。
+ *
+ * 引数:
+ *   admin_ctx - admin キューの ctx(GSI とコントローラ状態の供給元)
+ *   idx       - IO キュー番号(0 起点)
+ * コール元:
+ *   nvmetr_on_admin_established(), nvmetr_on_io_established()
+ * ===============================================================*/
+static void nvmetr_spawn_io_queue(nvmet_rdma_ctx_t *admin_ctx, unsigned idx)
+{
+    if (idx >= NVMET_RDMA_IO_QUEUES) return;
+    nvmet_rdma_ctx_t *io = &s_standalone_io_ctx[idx];
+
+    for (uint32_t i = 0; i < sizeof(*io); i++) ((uint8_t *)io)[i] = 0;
+    dcache_clean_range((const void *)io, sizeof(*io));
+
+    static const uint8_t dummy_mac[6] = {0, 0, 0, 0, 0, 0};
+    rdma_cm_fill_addr(&io->cm, admin_ctx->cm.dev, s_standalone_self_label,
+                      "__no_such_net_ctx__", 0u, 0u, dummy_mac, s_standalone_peer_mac);
+    /* fill_addr のゼロクリアの「後」に共有すること(先だと消える)。 */
+    io->cm.gsi_qp      = admin_ctx->cm.gsi_qp;
+    io->cm.reuse_gsi   = 1;
+    io->cm.rc_qp_index = (uint8_t)(idx + 1u);
+    io->cm.skip_ping   = 1;
+    io->cm.is_active   = 0;
+    io->ctrl           = admin_ctx->ctrl;  /* コントローラ状態は共有 */
+    io->queue_id       = (uint16_t)(idx + 1u);
+    io->pipeline_enabled = 1;
+    io->on_established = nvmetr_on_io_established;
+
+    job_t *io_job = job_spawn(nvmet_rdma_job_step, io, "nvmet-rdma-io");
+    if (!io_job) {
+        uart_printf("[!] nvmet-rdma: IOキュー%u用ジョブ生成失敗(ジョブテーブル満杯)\n",
+                    idx + 1u);
+        return;
+    }
+    io_job->state = NVMETR_ST_CM_SPAWN;
+    /* **SPDK の poll group と同じ考え方で round-robin に配る。**
+     * core0 はシェルなので使わない。RC QP の WQE/CQ はキューごとに
+     * 独立している(rcqp[])ので、コアをまたいで共有するものは無い。 */
+    uint32_t ncores = g_nvmet_rdma_cores;
+    if (ncores == 0u) ncores = 1u;
+    unsigned core = 1u + (idx % ncores);
+    job_pin_to_core(io_job, core);
+    s_standalone_io_spawned = (int)idx + 1;
+    uart_printf("[nvmet-rdma] IOキュー%u のCM listenerを起動しました(core%u、GSIはadminと共有)\n",
+                idx + 1u, core);
+}
+
+/*=================================================================
+ * IO キューが確立したら次の 1 本の acceptor を立てる。
+ *
+ * **同時に 2 本を arm してはいけない** -- GSI は 1 本しかなく、受信 CQE を
+ * どちらが拾うかが決まらない(TCP の listener で受け皿が 1 本しか無いのと
+ * 同じ形)。ホストが要求した本数(Set Features で合意)まで立てる。
+ * ===============================================================*/
+static void nvmetr_on_io_established(nvmet_rdma_ctx_t *self)
+{
+    if (!s_standalone_admin_ctx_for_io) return;
+    unsigned idx = (unsigned)(self - &s_standalone_io_ctx[0]);
+    uint32_t granted = self->ctrl ? self->ctrl->io_queues_granted : 1u;
+    if (granted == 0u) granted = 1u;
+    if (idx + 1u < granted && idx + 1u < NVMET_RDMA_IO_QUEUES) {
+        nvmetr_spawn_io_queue(s_standalone_admin_ctx_for_io, idx + 1u);
+    }
+}
+
 /*=================================================================
  * admin キューが established になった直後に 1 度だけ呼ばれる。IO キュー用の
  * 2 本目の CM listener を立てる。
@@ -1094,36 +1231,9 @@ static volatile uint8_t *nvmetr_ramdisk_slot0(void)
  * ===============================================================*/
 static void nvmetr_on_admin_established(nvmet_rdma_ctx_t *admin_ctx)
 {
-    if (!admin_ctx->enable_io_queue || s_standalone_io_spawned) return;
-
-    for (uint32_t i = 0; i < sizeof(s_standalone_io_ctx); i++) {
-        ((uint8_t *)&s_standalone_io_ctx)[i] = 0;
-    }
-    dcache_clean_range((const void *)&s_standalone_io_ctx, sizeof(s_standalone_io_ctx));
-
-    static const uint8_t dummy_mac[6] = {0, 0, 0, 0, 0, 0};
-    rdma_cm_fill_addr(&s_standalone_io_ctx.cm, admin_ctx->cm.dev, s_standalone_self_label,
-                      "__no_such_net_ctx__", 0u, 0u, dummy_mac, s_standalone_peer_mac);
-    /* fill_addr のゼロクリアの「後」に共有すること(先だと消える)。 */
-    s_standalone_io_ctx.cm.gsi_qp      = admin_ctx->cm.gsi_qp;
-    s_standalone_io_ctx.cm.reuse_gsi   = 1;
-    s_standalone_io_ctx.cm.rc_qp_index = 1;
-    s_standalone_io_ctx.cm.skip_ping   = 1;
-    s_standalone_io_ctx.cm.is_active   = 0;
-    s_standalone_io_ctx.ctrl           = admin_ctx->ctrl;  /* コントローラ状態は共有 */
-    s_standalone_io_ctx.queue_id       = 1;
-    s_standalone_io_ctx.pipeline_enabled = 1;
-
-    job_t *io_job = job_spawn(nvmet_rdma_job_step, &s_standalone_io_ctx, "nvmet-rdma-io");
-    if (!io_job) {
-        uart_printf("[!] nvmet-rdma: IOキュー用ジョブ生成失敗(ジョブテーブル満杯)\n");
-        return;
-    }
-    io_job->state = NVMETR_ST_CM_SPAWN;
-    job_pin_to_core(io_job, 1u);
-    s_standalone_io_spawned = 1;
-    uart_printf("[nvmet-rdma] IOキュー用のCM listenerを起動しました(GSIはadminと共有)\n");
-}
+    if (!admin_ctx->enable_io_queue || s_standalone_io_spawned > 0) return;
+    s_standalone_admin_ctx_for_io = admin_ctx;
+    nvmetr_spawn_io_queue(admin_ctx, 0);}
 
 /*=================================================================
  * admin キューの切断を検出したときに 1 度だけ呼ばれる。NVMe-oF の意味論上、
@@ -1134,8 +1244,11 @@ static void nvmetr_on_admin_disconnected(nvmet_rdma_ctx_t *admin_ctx)
 {
     (void)admin_ctx;
     if (!s_standalone_io_spawned) return;
-    nvmetr_destroy_qp_if_valid(s_standalone_io_ctx.cm.dev, &s_standalone_io_ctx.cm.rc_qp);
-    s_standalone_io_ctx.stop_requested = 1;
+    for (int k = 0; k < s_standalone_io_spawned; k++) {
+        nvmetr_destroy_qp_if_valid(s_standalone_io_ctx[k].cm.dev,
+                                   &s_standalone_io_ctx[k].cm.rc_qp);
+        s_standalone_io_ctx[k].stop_requested = 1;
+    }
     s_standalone_io_spawned = 0;
     uart_printf("[nvmet-rdma] IOキューも道連れに終了させます\n");
 }
@@ -1162,13 +1275,14 @@ void nvmet_rdma_run_standalone(mlx5_dev_t *dev, const char *self_label, const ui
         /* 前回のジョブを確実に止めてから作り直す。止めずに spawn すると
          * 同一 ctx を 2 つのジョブが触る(RDMA CM の segfault と同型)。 */
         s_standalone_ctx.stop_requested = 1;
-        if (s_standalone_io_spawned) s_standalone_io_ctx.stop_requested = 1;
+        for (int k = 0; k < s_standalone_io_spawned; k++) s_standalone_io_ctx[k].stop_requested = 1;
         job_cancel_by_ctx(&s_standalone_ctx.cm);
-        job_cancel_by_ctx(&s_standalone_io_ctx.cm);
+        for (unsigned k = 0; k < NVMET_RDMA_IO_QUEUES; k++) job_cancel_by_ctx(&s_standalone_io_ctx[k].cm);
         uint64_t t0 = timer_now();
         while (!timeout_ms(t0, 2000u)) job_scheduler_tick();
-        if (s_standalone_io_spawned) {
-            nvmetr_destroy_qp_if_valid(s_standalone_io_ctx.cm.dev, &s_standalone_io_ctx.cm.rc_qp);
+        for (int k = 0; k < s_standalone_io_spawned; k++) {
+            nvmetr_destroy_qp_if_valid(s_standalone_io_ctx[k].cm.dev,
+                                       &s_standalone_io_ctx[k].cm.rc_qp);
         }
         nvmetr_destroy_qp_if_valid(s_standalone_ctx.cm.dev, &s_standalone_ctx.cm.rc_qp);
         nvmetr_destroy_qp_if_valid(s_standalone_ctx.cm.dev, s_standalone_ctx.cm.gsi_qp);
@@ -1208,6 +1322,19 @@ void nvmet_rdma_run_standalone(mlx5_dev_t *dev, const char *self_label, const ui
     job->state = NVMETR_ST_CM_SPAWN;
     if (smp_boot_core1() == 0) job_pin_to_core(job, 1u);
     else uart_printf("[!] nvmet-rdma: core1起動に失敗、core0のまま動作します\n");
+
+    /* **IO キューを散らす先のコアは、キューを立てる前に起こしておく。**
+     * 起きていないコアへ pin すると、そのジョブは誰にも回されず黙って
+     * 止まる(接続はするが 1 コマンドも進まない、という形で出る)。
+     * 起動に失敗したら分散数をそのぶん下げる。 */
+    while (g_nvmet_rdma_cores >= 3u && smp_boot_core3() != 0) {
+        uart_printf("[!] nvmet-rdma: core3起動に失敗、分散を2コアへ下げます\n");
+        g_nvmet_rdma_cores = 2u;
+    }
+    while (g_nvmet_rdma_cores >= 2u && smp_boot_core2() != 0) {
+        uart_printf("[!] nvmet-rdma: core2起動に失敗、分散を1コアへ下げます\n");
+        g_nvmet_rdma_cores = 1u;
+    }
 
     s_standalone_resident            = 1;
     s_standalone_resident_generation = dev->bringup_generation;

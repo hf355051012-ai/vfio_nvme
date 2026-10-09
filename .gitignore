@@ -14,4 +14,6 @@ tags
 
 # 開発補助スクリプトも公開しない(ローカルには残す)
 clang_calltree.py
-tools/
+tools/*
+# 例外: rshort(src/rdma_short.c)の相手側。これが無いと機能を使えないので公開する
+!tools/rdma_short_peer.c

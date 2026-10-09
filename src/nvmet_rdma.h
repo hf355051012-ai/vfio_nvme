@@ -23,6 +23,33 @@
  * 実機では qd=12 の 64k write が 830 -> 2 MiB/s に落ちた。 */
 #define NVMET_RDMA_MAX_PENDING 256u
 
+/* **IO キュー(= RC QP、= コネクション)の本数の上限。**
+ * 0 番の RC QP は admin が使うので、上限は MLX5_NUM_RCQP - 1 まで上げられる。
+ * **以前は 1 本固定**で、Set Features(Number of Queues)も常に 0(=1 本)を
+ * 返していたため、ホストから見ても 1 本しか張れなかった。 */
+#define NVMET_RDMA_IO_QUEUES 4u
+
+/* 非一時ストアへ切り替えるコピー長の下限(`ntcopy`)。0 で常に非一時。 */
+extern volatile uint32_t g_nvmetr_nt_copy_min;
+
+/* [計装] キューごとのポーリング周回数 / 空回り / コマンド数(`rdmastat`)。
+ * 添字は queue_id(0=admin、1..=IO)。第 2 添字は 1 キュー 1 キャッシュライン
+ * に離すためのパディングで、使うのは [0] だけ。 */
+extern volatile uint64_t g_nvmetr_polls[NVMET_RDMA_IO_QUEUES + 1u][8];
+extern volatile uint64_t g_nvmetr_empty[NVMET_RDMA_IO_QUEUES + 1u][8];
+extern volatile uint64_t g_nvmetr_cmds[NVMET_RDMA_IO_QUEUES + 1u][8];
+
+/* **IO キューのジョブを何コアへ散らすか**(シェルの `rdmacores`)。1=従来。
+ * SPDK は起動時の CPU マスクぶん reactor(poll group)を持ち、新しい qpair を
+ * **round-robin で poll group へ割り当てる**。kernel nvmet-rdma はキューごとに
+ * comp_vector を変えて別 CPU の workqueue で完了処理を回す。**どちらも
+ * 複数コアを使う**ので、それに合わせる。
+ *
+ * **RDMA は RSS を通らない**(RC QP の CQ をジョブが直接ポーリングする)ので、
+ * NIC 側の設定は要らず、**ジョブの pin 先を散らすだけでよい**。
+ * `netmt`(Ethernet の RSS)とは独立。 */
+extern volatile uint32_t g_nvmet_rdma_cores;
+
 /* Identify Controller の MAXCMD として広告する値(ホストの同時発行数の上限)。
  * SQ は 64 WQEBB なので、1 コマンドあたり最大 2 WQE として 32 まで。 */
 #define NVMET_RDMA_MAXCMD 128u
@@ -42,6 +69,9 @@ typedef enum {
 
 typedef struct {
     uint16_t ctrlr_id;   /* 固定値1(nvme_rdma.cのcntlidと一致させる) */
+    /* Set Features(Number of Queues)でホストと合意した IO キュー本数。
+     * **ホストの要求とこちらの上限の小さいほう。** 0 = まだ合意していない。 */
+    volatile uint32_t io_queues_granted;
     uint32_t cc;
     int      cc_en;
 

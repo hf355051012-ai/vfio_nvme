@@ -5,6 +5,7 @@
 #include "uart.h"
 #include "arp.h"
 #include "ipv6.h"
+#include "tcp.h"   /* tcp_ack_flush_deferred(): 相乗りできなかった ACK の返却 */
 #include "timer.h"
 
 volatile uint32_t g_neigh_cache_ttl_ms = NEIGH_CACHE_TTL_DEFAULT_MS;
@@ -628,6 +629,22 @@ int net_dup_addr_detect(netif_t *ctx)
 
 #define NET_POLL_BATCH_MAX 64u
 
+/* ---- 受信フレームのコア間配送(マルチコア分散) --------------------------
+ *
+ * **NIC の受信キューは PF に 1 本しか無い**ので、RQ を見るのは常に
+ * netif の owner_core 1 コア。そこで 4-tuple のハッシュから担当コアを決め、
+ * 自分の担当でなければ相手コアのリングへ積む。渡された側は
+ * net_poll_all_and_dispatch() の先頭で自分のリングを消費する。
+ *
+ * **同じコネクションは必ず同じコアへ行く**ので、TCP の状態
+ * (s_conns[core] / s_priv[core])をコアまたぎで触ることにはならない。
+ * net_buf は所有コアを持つので、渡した先で解放してよい(net_buf.c)。 */
+volatile uint32_t g_net_mt_cores = 1u;   /* 1 = 従来の単一コア(陰性対照) */
+volatile net_mt_counter_t g_net_mt_consumed[SMP_MAX_CORES];
+
+
+
+
 /*=================================================================
  * 自コアが担当する全インターフェースを巡回し、受信フレームを 1 インター
  * フェースあたり最大 NET_POLL_BATCH_MAX 個まで取り出して eth_dispatch()
@@ -645,18 +662,48 @@ int net_poll_all_and_dispatch(void)
     netif_t *prev = g_active_ctx;
     int got_frame = 0;
 
+    /* **RSS 有効時は core1..coreN が自分の RQ だけを見る。**
+     * NIC が 4-tuple のハッシュで配るので、同じコネクションのフレームは
+     * 必ず同じコアへ届く -- ソフトウェアで配り直す必要はない。
+     * **core0(シェル)は受信を持たない**(入力待ちで止まるとその RQ の
+     * コネクションが進まなくなるため)。
+     * 単一コアのときは従来どおり owner_core だけが見る。 */
+    unsigned n = g_net_mt_cores;
+    if (n > 1u) {
+        if (core == 0u || core > n) {
+            netif_activate(prev);
+            return 0;
+        }
+    }
+
+    /* **受信フレーム数はローカルに溜めて、最後に 1 回だけ書く。**
+     * volatile な 64bit の read-modify-write を**フレームごとに**回すと
+     * read が目に見えて落ちる(512B read 264k -> 168k、4K read 184k -> 144k)。
+     * `g_net_mt_cores > 1` にしただけで分散していなくても落ちるので、
+     * 「分散が遅い」と誤読しかけた。**診断カウンタの代金は、診断したい
+     * 効果と同じ桁になりうる。** */
+    unsigned consumed = 0;
+
+    /* **前の巡回で応答へ相乗りできなかった ACK をここで返す。**
+     * 借りが無ければ何もしない(コアごとの旗 1 個を見るだけ)。 */
+    tcp_ack_flush_deferred();
+
     for (unsigned i = 0; i < s_registered_count; i++) {
         netif_t *ctx = s_registered[i];
-        if (ctx->owner_core != core || !ctx->is_poll_owner) {
+        if (!ctx->is_poll_owner) {
             continue;
         }
+        if (n <= 1u && ctx->owner_core != core) {
+            continue;   /* 単一コア: 持ち主だけ */
+        }
         netif_activate(ctx);
-        for (unsigned n = 0; n < NET_POLL_BATCH_MAX; n++) {
+        for (unsigned k = 0; k < NET_POLL_BATCH_MAX; k++) {
             net_buf_t *nb = ctx->nic->poll_recv(ctx->nic_priv); // -> rp1_poll_recv / mlx5_net_poll_recv
             if (!nb) {
                 break;
             }
             got_frame = 1;
+            consumed++;
             netif_t *owner = netif_resolve_frame_owner(ctx, nb);
             if (owner != ctx) {
                 netif_activate(owner);
@@ -667,6 +714,10 @@ int net_poll_all_and_dispatch(void)
                 netif_activate(ctx);
             }
         }
+    }
+
+    if (n > 1u && consumed != 0u) {
+        g_net_mt_consumed[core].v += consumed;
     }
 
     netif_activate(prev);

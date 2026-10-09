@@ -71,6 +71,27 @@ int nvme_tcp_recv_poll(nvme_tcp_conn_t *c, nvme_tcp_xfer_t *x);
 int nvme_tcp_send_icreq(nvme_tcp_conn_t *c);
 
 extern volatile uint32_t g_nvme_tcp_hdgst_corrupt;  /* 検証用 */
+
+/* in-capsule write のヘッダとデータを 1 つの TCP セグメントにまとめるか
+ * (シェルの `tcpcoalesce`)。**0 が「まとめる前」の挙動 = 陰性対照。**
+ * まとめないと 1 コマンドが 2 パケットになり、相手のパケット処理能力を
+ * 2 倍消費する(実測で write 512B が 131k -> 190k)。 */
+extern volatile uint32_t g_nvme_tcp_coalesce;
+
+/* 複数コマンドの PDU を 1 つの TCP セグメントにまとめるか(`tcpbatch`)。
+ * **0 がまとめる前の挙動 = 陰性対照。** SPDK は 1 パケットに約 8 コマンドを
+ * 載せてくる(実測 0.122 パケット/コマンド)のに対し、まとめないと 1.13。
+ * 相手の受信処理は**パケット単位**なので、まとめるほど相手の仕事が減る。 */
+extern volatile uint32_t g_nvme_tcp_batch;
+
+/* Nagle 的な溜め込み(0=しない)。**未 ACK が 0 なら必ず即送信する**ので、
+ * 深さ 1 のレイテンシは悪化しない。`tcpnagle <周回数>`。 */
+extern volatile uint32_t g_nvme_tcp_nagle;
+extern volatile uint64_t g_nvme_tcp_nagle_held;
+
+void nvme_tcp_tx_batch_begin(void);
+int  nvme_tcp_tx_batch_end(nvme_tcp_conn_t *c);
+int  nvme_tcp_tx_flush(nvme_tcp_conn_t *c);
 extern volatile uint32_t g_nvme_tcp_term_sent;
 extern volatile uint32_t g_nvme_tcp_term_recv;
 

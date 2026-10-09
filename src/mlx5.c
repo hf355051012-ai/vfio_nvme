@@ -59,12 +59,14 @@ static int mlx5_create_tis(mlx5_dev_t *dev, uint32_t tdn, uint32_t *out_tisn);
 static int mlx5_create_rq(mlx5_dev_t *dev, unsigned rxq_idx, uint32_t cqn, uint32_t pdn, uint32_t uarn, uint32_t mkey, uint32_t *out_rqn);
 static int mlx5_modify_rq_to_rdy(mlx5_dev_t *dev, uint32_t rqn);
 static int mlx5_create_tir(mlx5_dev_t *dev, uint32_t rqn, uint32_t tdn, uint32_t *out_tirn);
+static int mlx5_create_rqt(mlx5_dev_t *dev, const uint32_t *rqns, unsigned n, uint32_t *out_rqtn);
+static int mlx5_create_tir_rss(mlx5_dev_t *dev, uint32_t rqtn, uint32_t tdn, uint32_t *out_tirn);
 static int mlx5_nic_vport_enable_allmulti(mlx5_dev_t *dev);
 static int mlx5_create_flow_table_nic_rx(mlx5_dev_t *dev, uint32_t *out_table_id);
 static int mlx5_set_flow_table_root_nic_rx(mlx5_dev_t *dev, uint32_t table_id);
 static int mlx5_create_flow_group_catchall(mlx5_dev_t *dev, uint32_t table_id, uint32_t *out_group_id);
-static int mlx5_set_fte_fwd_tir(mlx5_dev_t *dev, uint32_t table_id, uint32_t group_id, uint32_t tirn);
-static int mlx5_create_sq(mlx5_dev_t *dev, uint32_t cqn, uint32_t pdn, uint32_t uarn, uint32_t tisn, uint32_t *out_sqn);
+static int mlx5_set_fte_fwd_tir(mlx5_dev_t *dev, uint32_t table_id, uint32_t group_id, uint32_t tirn, int modify);
+static int mlx5_create_sq(mlx5_dev_t *dev, unsigned q, uint32_t cqn, uint32_t pdn, uint32_t uarn, uint32_t tisn, uint32_t *out_sqn);
 static int mlx5_modify_sq_to_rdy(mlx5_dev_t *dev, uint32_t sqn);
 static int mlx5_set_port_admin_status_up(mlx5_dev_t *dev);
 static int mlx5_query_port_oper_status(mlx5_dev_t *dev, uint8_t *out_oper_status);
@@ -133,25 +135,29 @@ int mlx5_hca_bringup(mlx5_dev_t *dev, const char *label, int monitor_only) {
     dev->bringup_generation++;
 
     {
-        static uintptr_t s_qpcq_buf[2], s_qpcq_dbr[2];
-        static uintptr_t s_qp2cq_buf[2], s_qp2cq_dbr[2];
+        static uintptr_t s_rcqp_cq_buf[2][MLX5_NUM_RCQP], s_rcqp_cq_dbr[2][MLX5_NUM_RCQP];
+        static uintptr_t s_rcqp_wqe[2][MLX5_NUM_RCQP], s_rcqp_dbr[2][MLX5_NUM_RCQP];
         static uintptr_t s_gsicq_buf[2], s_gsicq_dbr[2];
         /* 段階3: Ethernet(mlx5_net)経路の RQ/SQ CQ + RQ 受信データバッファ。 */
         static uintptr_t s_rqcq_buf[2][MLX5_NUM_RXQ], s_rqcq_dbr[2][MLX5_NUM_RXQ];
-        static uintptr_t s_sqcq_buf[2], s_sqcq_dbr[2];
+        static uintptr_t s_sqcq_buf[2][MLX5_NUM_TXQ], s_sqcq_dbr[2][MLX5_NUM_TXQ];
         static uintptr_t s_rqdata[2][MLX5_NUM_RXQ];
         static uintptr_t s_cmdq[2], s_outmbox[2], s_inmbox[2], s_fwpages[2];
         static uintptr_t s_eqbuf[2];
-        static uintptr_t s_rqwqe[2][MLX5_NUM_RXQ], s_rqdbr[2][MLX5_NUM_RXQ], s_sqwqe[2], s_sqdbr[2];
-        static uintptr_t s_sqtxframe[2], s_nettxstage[2];
-        static uintptr_t s_qpwqe[2], s_qpdbr[2], s_gsiwqe[2], s_gsidbr[2];
-        static uintptr_t s_qp2wqe[2], s_qp2dbr[2];
+        static uintptr_t s_rqwqe[2][MLX5_NUM_RXQ], s_rqdbr[2][MLX5_NUM_RXQ];
+        static uintptr_t s_sqwqe[2][MLX5_NUM_TXQ], s_sqdbr[2][MLX5_NUM_TXQ];
+        static uintptr_t s_nettxstage[2][MLX5_NUM_TXQ];
+        static uintptr_t s_sqtxframe[2];
+        static uintptr_t s_gsiwqe[2], s_gsidbr[2];
         unsigned pf = dev->pf_index;
-        if (s_qpcq_buf[pf] == 0) {
-            s_qpcq_buf[pf]  = (uintptr_t)dma_alloc(MLX5_CQ_BUF_SIZE, 4096u, DMA_COHERENT).cpu;
-            s_qpcq_dbr[pf]  = (uintptr_t)dma_alloc(MLX5_CQ_DBR_SIZE, 64u,   DMA_COHERENT).cpu;
-            s_qp2cq_buf[pf] = (uintptr_t)dma_alloc(MLX5_CQ_BUF_SIZE, 4096u, DMA_COHERENT).cpu;
-            s_qp2cq_dbr[pf] = (uintptr_t)dma_alloc(MLX5_CQ_DBR_SIZE, 64u,   DMA_COHERENT).cpu;
+        if (s_rcqp_cq_buf[pf][0] == 0) {
+            /* **RC QP はキューごとに 1 組ずつ。** 昔は 2 本決め打ちだった。 */
+            for (unsigned k = 0; k < MLX5_NUM_RCQP; k++) {
+                s_rcqp_cq_buf[pf][k] = (uintptr_t)dma_alloc(MLX5_CQ_BUF_SIZE, 4096u, DMA_COHERENT).cpu;
+                s_rcqp_cq_dbr[pf][k] = (uintptr_t)dma_alloc(MLX5_CQ_DBR_SIZE, 64u,   DMA_COHERENT).cpu;
+                s_rcqp_wqe[pf][k]    = (uintptr_t)dma_alloc(MLX5_QP_WQE_BUF_SIZE, 4096u, DMA_DEVICE).cpu;
+                s_rcqp_dbr[pf][k]    = (uintptr_t)dma_alloc(MLX5_QP_DBR_SIZE, 64u,   DMA_DEVICE).cpu;
+            }
             s_gsicq_buf[pf] = (uintptr_t)dma_alloc(MLX5_CQ_BUF_SIZE, 4096u, DMA_COHERENT).cpu;
             s_gsicq_dbr[pf] = (uintptr_t)dma_alloc(MLX5_CQ_DBR_SIZE, 64u,   DMA_COHERENT).cpu;
             for (unsigned q = 0; q < MLX5_NUM_RXQ; q++) {
@@ -161,28 +167,29 @@ int mlx5_hca_bringup(mlx5_dev_t *dev, const char *label, int monitor_only) {
                 s_rqwqe[pf][q]    = (uintptr_t)dma_alloc(MLX5_RQ_WQE_SIZE, 4096u, DMA_DEVICE).cpu;
                 s_rqdbr[pf][q]    = (uintptr_t)dma_alloc(MLX5_RQ_DBR_SIZE, 64u,   DMA_DEVICE).cpu;
             }
-            s_sqcq_buf[pf] = (uintptr_t)dma_alloc(MLX5_SQ_CQ_BUF_SIZE, 4096u, DMA_COHERENT).cpu;
-            s_sqcq_dbr[pf] = (uintptr_t)dma_alloc(MLX5_SQ_CQ_DBR_SIZE, 64u,   DMA_COHERENT).cpu;
+            /* **送信キューはコアごとに 1 本ずつ**(排他を無くすため)。 */
+            for (unsigned q = 0; q < MLX5_NUM_TXQ; q++) {
+                s_sqcq_buf[pf][q]   = (uintptr_t)dma_alloc(MLX5_SQ_CQ_BUF_SIZE, 4096u, DMA_COHERENT).cpu;
+                s_sqcq_dbr[pf][q]   = (uintptr_t)dma_alloc(MLX5_SQ_CQ_DBR_SIZE, 64u,   DMA_COHERENT).cpu;
+                s_sqwqe[pf][q]      = (uintptr_t)dma_alloc(MLX5_SQ_WQE_SIZE, 4096u, DMA_DEVICE).cpu;
+                s_sqdbr[pf][q]      = (uintptr_t)dma_alloc(MLX5_SQ_DBR_SIZE, 64u,   DMA_DEVICE).cpu;
+                s_nettxstage[pf][q] = (uintptr_t)dma_alloc(MLX5_NET_TX_STAGE_TOTAL_SIZE, 64u, DMA_DEVICE).cpu;
+            }
             s_cmdq[pf]       = (uintptr_t)dma_alloc(4096u,                                4096u, DMA_DEVICE).cpu;
             s_outmbox[pf]    = (uintptr_t)dma_alloc(MLX5_CMD_MBOX_CHAIN_BLOCKS * MLX5_CMD_MBOX_ALIGN, MLX5_CMD_MBOX_ALIGN, DMA_DEVICE).cpu;
             s_inmbox[pf]     = (uintptr_t)dma_alloc(MLX5_CMD_MBOX_CHAIN_BLOCKS * MLX5_CMD_MBOX_ALIGN, MLX5_CMD_MBOX_ALIGN, DMA_DEVICE).cpu;
             s_fwpages[pf]    = (uintptr_t)dma_alloc((uint64_t)MLX5_MAX_FW_PAGES * MLX5_FW_PAGE_SIZE, 4096u, DMA_DEVICE).cpu;
             s_eqbuf[pf]      = (uintptr_t)dma_alloc(MLX5_EQ_BUF_SIZE,                     4096u, DMA_DEVICE).cpu;
-            s_sqwqe[pf]      = (uintptr_t)dma_alloc(MLX5_SQ_WQE_SIZE,                     4096u, DMA_DEVICE).cpu;
-            s_sqdbr[pf]      = (uintptr_t)dma_alloc(MLX5_SQ_DBR_SIZE,                     64u,   DMA_DEVICE).cpu;
             s_sqtxframe[pf]  = (uintptr_t)dma_alloc(MLX5_SQ_TX_FRAME_SIZE,                64u,   DMA_DEVICE).cpu;
-            s_nettxstage[pf] = (uintptr_t)dma_alloc(MLX5_NET_TX_STAGE_TOTAL_SIZE,         64u,   DMA_DEVICE).cpu;
-            s_qpwqe[pf]      = (uintptr_t)dma_alloc(MLX5_QP_WQE_BUF_SIZE,                 4096u, DMA_DEVICE).cpu;
-            s_qpdbr[pf]      = (uintptr_t)dma_alloc(MLX5_QP_DBR_SIZE,                     64u,   DMA_DEVICE).cpu;
             s_gsiwqe[pf]     = (uintptr_t)dma_alloc(MLX5_GSI_WQE_BUF_SIZE,                4096u, DMA_DEVICE).cpu;
             s_gsidbr[pf]     = (uintptr_t)dma_alloc(MLX5_GSI_DBR_SIZE,                    64u,   DMA_DEVICE).cpu;
-            s_qp2wqe[pf]     = (uintptr_t)dma_alloc(MLX5_QP_WQE_BUF_SIZE,                 4096u, DMA_DEVICE).cpu;
-            s_qp2dbr[pf]     = (uintptr_t)dma_alloc(MLX5_QP_DBR_SIZE,                     64u,   DMA_DEVICE).cpu;
         }
-        dev->qp_cq_buf_cpu  = s_qpcq_buf[pf];
-        dev->qp_cq_dbr_cpu  = s_qpcq_dbr[pf];
-        dev->qp2_cq_buf_cpu = s_qp2cq_buf[pf];
-        dev->qp2_cq_dbr_cpu = s_qp2cq_dbr[pf];
+        for (unsigned k = 0; k < MLX5_NUM_RCQP; k++) {
+            dev->rcqp[k].cq_buf_cpu = s_rcqp_cq_buf[pf][k];
+            dev->rcqp[k].cq_dbr_cpu = s_rcqp_cq_dbr[pf][k];
+            dev->rcqp[k].wqe_cpu    = s_rcqp_wqe[pf][k];
+            dev->rcqp[k].dbr_cpu    = s_rcqp_dbr[pf][k];
+        }
         dev->gsi_cq_buf_cpu = s_gsicq_buf[pf];
         dev->gsi_cq_dbr_cpu = s_gsicq_dbr[pf];
         for (unsigned q = 0; q < MLX5_NUM_RXQ; q++) {
@@ -192,23 +199,21 @@ int mlx5_hca_bringup(mlx5_dev_t *dev, const char *label, int monitor_only) {
             dev->rxq[q].wqe_cpu    = s_rqwqe[pf][q];
             dev->rxq[q].dbr_cpu    = s_rqdbr[pf][q];
         }
-        dev->sq_cq_buf_cpu  = s_sqcq_buf[pf];
-        dev->sq_cq_dbr_cpu  = s_sqcq_dbr[pf];
+        for (unsigned q = 0; q < MLX5_NUM_TXQ; q++) {
+            dev->txq[q].cq_buf_cpu = s_sqcq_buf[pf][q];
+            dev->txq[q].cq_dbr_cpu = s_sqcq_dbr[pf][q];
+            dev->txq[q].wqe_cpu    = s_sqwqe[pf][q];
+            dev->txq[q].dbr_cpu    = s_sqdbr[pf][q];
+            dev->txq[q].stage_cpu  = s_nettxstage[pf][q];
+        }
         dev->cmdq_cpu        = s_cmdq[pf];
         dev->out_mbox_cpu    = s_outmbox[pf];
         dev->in_mbox_cpu     = s_inmbox[pf];
         dev->fw_pages_cpu    = s_fwpages[pf];
         dev->eq_buf_cpu      = s_eqbuf[pf];
-        dev->sq_wqe_cpu      = s_sqwqe[pf];
-        dev->sq_dbr_cpu      = s_sqdbr[pf];
         dev->sq_tx_frame_cpu = s_sqtxframe[pf];
-        dev->net_tx_stage_cpu = s_nettxstage[pf];
-        dev->qp_wqe_cpu      = s_qpwqe[pf];
-        dev->qp_dbr_cpu      = s_qpdbr[pf];
         dev->gsi_wqe_cpu     = s_gsiwqe[pf];
         dev->gsi_dbr_cpu     = s_gsidbr[pf];
-        dev->qp2_wqe_cpu     = s_qp2wqe[pf];
-        dev->qp2_dbr_cpu     = s_qp2dbr[pf];
     }
 
     uint32_t fw_rev = mlx5_read32(dev, MLX5_ISEG_FW_REV);
@@ -432,6 +437,29 @@ int mlx5_hca_bringup(mlx5_dev_t *dev, const char *label, int monitor_only) {
         uart_printf("mlx5: RXQ[%u] ok: cqn=%u rqn=%u tirn=%u\n", q, cqn, rqn, tirn);
     }
 
+    /* **全 RQ を束ねた RQT と、それを引く RSS の TIR。** 作るだけで、
+     * catch-all の転送先は既定では rxq[0] の直接 TIR のまま(従来の挙動)。
+     * `netmt N` で mlx5_set_rss_enable() が張り替える。
+     * **失敗しても致命的にしない** -- RSS が使えないだけで単一コアでは動く。 */
+    for (unsigned n = 2u; n <= MLX5_NUM_RXQ; n++) {
+        uint32_t rqns[MLX5_NUM_RXQ];
+        /* **rxq[0..n-1] を繰り返して表を埋める。** 表の大きさは固定の
+         * MLX5_NUM_RXQ(2 の冪)にしておき、中身の繰り返しで「散らす本数」を
+         * 決める。こうすると RQT を作り直さずに本数を変えられる。 */
+        for (unsigned i = 0; i < MLX5_NUM_RXQ; i++) rqns[i] = dev->rxq[i % n].rqn;
+        if (mlx5_create_rqt(dev, rqns, MLX5_NUM_RXQ, &dev->rqtn[n]) != 0) {
+            uart_printf("mlx5: CREATE_RQT(%u本) failed -- RSS はこの本数では使えない\n", n);
+            dev->rqtn[n] = 0;
+        } else if (mlx5_create_tir_rss(dev, dev->rqtn[n], tdn, &dev->rss_tirn[n]) != 0) {
+            uart_printf("mlx5: CREATE_TIR(RSS %u本) failed\n", n);
+            dev->rss_tirn[n] = 0;
+        } else {
+            dev->rss_ready[n] = 1u;
+            uart_printf("mlx5: RSS[%u本] ok: rqtn=%u tirn=%u\n",
+                        n, dev->rqtn[n], dev->rss_tirn[n]);
+        }
+    }
+
     uint32_t table_id = 0;
     if (mlx5_create_flow_table_nic_rx(dev, &table_id) != 0) {
         uart_printf("mlx5: CREATE_FLOW_TABLE failed\n");
@@ -454,32 +482,40 @@ int mlx5_hca_bringup(mlx5_dev_t *dev, const char *label, int monitor_only) {
 
     if (g_mlx5_skip_fte_experiment) {
         uart_printf("mlx5: SET_FLOW_TABLE_ENTRY SKIPPED (experiment: g_mlx5_skip_fte_experiment=1)\n");
-    } else if (mlx5_set_fte_fwd_tir(dev, table_id, group_id, dev->rxq[0].tirn) != 0) {
+    } else if (mlx5_set_fte_fwd_tir(dev, table_id, group_id, dev->rxq[0].tirn, 0) != 0) {
         uart_printf("mlx5: SET_FLOW_TABLE_ENTRY failed\n");
         return -1;
     } else {
         uart_printf("mlx5: SET_FLOW_TABLE_ENTRY ok (catch-all -> rxq[0].tirn=%u)\n", dev->rxq[0].tirn);
     }
+    /* **張り替えに使うので覚えておく。** `netmt N` で転送先を RSS TIR へ
+     * 差し替えて受信を複数コアへ分散する(mlx5_set_rss_enable)。 */
+    dev->rx_ft_table_id = table_id;
+    dev->rx_ft_group_id = group_id;
+    dev->rx_ft_valid    = 1u;
 
-    uint32_t sq_cqn = 0;
-    if (mlx5_create_cq(dev, uarn, eqn, (uint64_t)dev->sq_cq_buf_cpu, (uint64_t)dev->sq_cq_dbr_cpu, &sq_cqn) != 0) {
-        uart_printf("mlx5: CREATE_CQ(SQ) failed\n");
-        return -1;
+    /* **SQ はコアごとに 1 本作る**(添字 = コア番号)。TIS は共有でよい。
+     * 全部ここで作っておけば、`netmt N` の切り替えで作り直さずに済む。 */
+    for (unsigned q = 0; q < MLX5_NUM_TXQ; q++) {
+        uint32_t sq_cqn = 0;
+        if (mlx5_create_cq(dev, uarn, eqn, (uint64_t)dev->txq[q].cq_buf_cpu,
+                           (uint64_t)dev->txq[q].cq_dbr_cpu, &sq_cqn) != 0) {
+            uart_printf("mlx5: CREATE_CQ(SQ%u) failed\n", q);
+            return -1;
+        }
+        uint32_t sqn = 0;
+        if (mlx5_create_sq(dev, q, sq_cqn, pdn, uarn, tisn, &sqn) != 0) {
+            uart_printf("mlx5: CREATE_SQ(%u) failed\n", q);
+            return -1;
+        }
+        if (mlx5_modify_sq_to_rdy(dev, sqn) != 0) {
+            uart_printf("mlx5: MODIFY_SQ(sqn=%u, RST->RDY) failed\n", sqn);
+            return -1;
+        }
+        dev->txq[q].cqn = sq_cqn;
+        dev->txq[q].sqn = sqn;
+        uart_printf("mlx5: TXキュー%u ok: cqn=%u sqn=%u\n", q, sq_cqn, sqn);
     }
-    uart_printf("mlx5: CREATE_CQ(SQ) ok: cqn=%u\n", sq_cqn);
-
-    uint32_t sqn = 0;
-    if (mlx5_create_sq(dev, sq_cqn, pdn, uarn, tisn, &sqn) != 0) {
-        uart_printf("mlx5: CREATE_SQ failed\n");
-        return -1;
-    }
-    uart_printf("mlx5: CREATE_SQ ok: sqn=%u\n", sqn);
-
-    if (mlx5_modify_sq_to_rdy(dev, sqn) != 0) {
-        uart_printf("mlx5: MODIFY_SQ(RST->RDY) failed\n");
-        return -1;
-    }
-    uart_printf("mlx5: MODIFY_SQ(RST->RDY) ok\n");
 
     {
         uint16_t applied_mtu = 1518u;
@@ -517,8 +553,7 @@ int mlx5_hca_bringup(mlx5_dev_t *dev, const char *label, int monitor_only) {
     // dev->rxq[q].{cqn,rqn,tirn} は上記のRXキュー生成ループで設定済み。
     dev->tdn = tdn;
     dev->tisn = tisn;
-    dev->sq_cqn = sq_cqn;
-    dev->sqn = sqn;
+    // dev->txq[q].{cqn,sqn} は上記のTXキュー生成ループで設定済み。
 
     (void)mlx5_nic_vport_enable_allmulti(dev);
     mlx5_dump_nic_vport_context(dev, "bring-up 直後");
@@ -1029,6 +1064,7 @@ static int mlx5_set_issi(mlx5_dev_t *dev, uint16_t issi) {
 
 #define MLX5_CAP_TYPE_GENERAL 0u
 #define MLX5_CAP_TYPE_ETHERNET_OFFLOADS 1u
+#define MLX5_CAP_TYPE_ATOMIC 3u
 #define MLX5_CAP_TYPE_ROCE 4u
 #define MLX5_HCA_CAP_OPMOD_CUR 1u
 
@@ -1117,6 +1153,51 @@ static int mlx5_query_hca_cap_eth_offloads(mlx5_dev_t *dev, uint32_t *out_max_ls
         max_lso_bytes = MLX5_LSO_MAX_BYTES_CAP;
     }
     *out_max_lso_bytes = max_lso_bytes;
+    return 0;
+}
+
+/*=================================================================
+ * QUERY_HCA_CAP(ATOMIC、current)を読む。struct mlx5_ifc_atomic_caps_bits
+ * のうち、短い RDMA 転送(rdma_short.c)が見る 4 項目だけを取り出す。
+ *
+ *   byte  8 bit7-6 atomic_req_8B_endianness_mode(0=BE / 1=ホスト順)
+ *   byte  8 bit1   supported_atomic_req_8B_endianness_mode_1
+ *   byte 18-19     atomic_operations(bit0 CS / bit1 FA / bit2 拡張CS / bit3 拡張FA)
+ *   byte 22-23     atomic_size_qp(bit n = 2^n バイトの atomic に対応)
+ *
+ * 引数:
+ *   dev - 対象 HCA
+ *   out - 格納先
+ * 戻り値:
+ *   0=成功、-1=コマンド失敗
+ * コール元:
+ *   rdma_short_shell()
+ * ===============================================================*/
+int mlx5_query_atomic_caps(mlx5_dev_t *dev, mlx5_atomic_caps_t *out) {
+    uint8_t in[16] = {0};
+    in[0] = (uint8_t)(MLX5_CMD_OP_QUERY_HCA_CAP >> 8);
+    in[1] = (uint8_t)(MLX5_CMD_OP_QUERY_HCA_CAP & 0xffu);
+    uint16_t op_mod = (uint16_t)((MLX5_CAP_TYPE_ATOMIC << 1) | MLX5_HCA_CAP_OPMOD_CUR);
+    in[6] = (uint8_t)(op_mod >> 8);
+    in[7] = (uint8_t)(op_mod & 0xffu);
+
+    uint8_t out_buf[16 + MLX5_HCA_CAP_BYTES];
+    int rc = mlx5_cmd_exec(dev, in, sizeof(in), out_buf, sizeof(out_buf));
+    if (rc != 0) {
+        return rc;
+    }
+    if (out_buf[0] != 0) {
+        uint32_t syndrome = ((uint32_t)out_buf[4] << 24) | ((uint32_t)out_buf[5] << 16) |
+                             ((uint32_t)out_buf[6] << 8) | out_buf[7];
+        uart_printf("mlx5: QUERY_HCA_CAP(atomic): command status=0x%02x syndrome=0x%08x\n",
+                    out_buf[0], syndrome);
+        return -1;
+    }
+    const uint8_t *c = &out_buf[16];
+    out->req_endianness_mode = (uint8_t)(c[8] >> 6);
+    out->supported_endianness_mode_1 = (uint8_t)((c[8] >> 1) & 0x01u);
+    out->operations = (uint16_t)(((uint16_t)c[18] << 8) | c[19]);
+    out->size_qp = (uint16_t)(((uint16_t)c[22] << 8) | c[23]);
     return 0;
 }
 
@@ -1767,7 +1848,176 @@ static int mlx5_create_tir(mlx5_dev_t *dev, uint32_t rqn, uint32_t tdn, uint32_t
     return 0;
 }
 
+#define MLX5_CMD_OP_CREATE_RQT 0x916u
+
+/*=================================================================
+ * CREATE_RQT で「RQ を束ねた表(indirection table)」を作る。RSS の TIR は
+ * ハッシュ値でこの表を引いて配送先 RQ を決める。
+ *
+ * **オフセットの根拠**(推測せず OptiPlex のカーネルヘッダ mlx5_ifc.h の
+ * mlx5_ifc_create_rqt_in_bits / rqtc_bits を読んだ): rqt_context は in の
+ * byte 32 から。その中で rqt_max_size = byte 22-23、
+ * rqt_actual_size = byte 26-27、rq_num[] = byte 240 から 4 バイトずつ
+ * (下位 24bit が RQ 番号)。
+ *
+ * 引数:
+ *   dev       - 対象 HCA
+ *   rqns      - 束ねる RQ 番号の配列
+ *   n         - その本数(2 の冪であること)
+ *   out_rqtn  - RQT 番号の格納先
+ * 戻り値:
+ *   0=成功、-1=コマンド失敗
+ * コール元:
+ *   mlx5_hca_bringup()
+ * ===============================================================*/
+static int mlx5_create_rqt(mlx5_dev_t *dev, const uint32_t *rqns, unsigned n, uint32_t *out_rqtn) {
+    uint8_t in[272 + 4u * MLX5_NUM_RXQ];
+    for (unsigned i = 0; i < sizeof(in); i++) {
+        in[i] = 0;
+    }
+    in[0] = (uint8_t)(MLX5_CMD_OP_CREATE_RQT >> 8);
+    in[1] = (uint8_t)(MLX5_CMD_OP_CREATE_RQT & 0xffu);
+
+    in[32 + 22] = (uint8_t)(n >> 8);   /* rqt_max_size */
+    in[32 + 23] = (uint8_t)n;
+    in[32 + 26] = (uint8_t)(n >> 8);   /* rqt_actual_size */
+    in[32 + 27] = (uint8_t)n;
+    for (unsigned i = 0; i < n; i++) {
+        unsigned off = 32u + 240u + 4u * i;
+        in[off + 1] = (uint8_t)(rqns[i] >> 16);
+        in[off + 2] = (uint8_t)(rqns[i] >> 8);
+        in[off + 3] = (uint8_t)rqns[i];
+    }
+
+    uint8_t out[16];
+    int rc = mlx5_cmd_exec(dev, in, (uint32_t)(272u + 4u * n), out, sizeof(out));
+    if (rc != 0) {
+        return rc;
+    }
+    if (out[0] != 0) {
+        uint32_t syndrome = ((uint32_t)out[4] << 24) | ((uint32_t)out[5] << 16) |
+                             ((uint32_t)out[6] << 8) | out[7];
+        uart_printf("mlx5: CREATE_RQT: command status=0x%02x syndrome=0x%08x\n", out[0], syndrome);
+        return -1;
+    }
+    if (out_rqtn) {
+        *out_rqtn = ((uint32_t)out[9] << 16) | ((uint32_t)out[10] << 8) | out[11];
+    }
+    return 0;
+}
+
+/*=================================================================
+ * RSS の TIR を作る。RQT をハッシュで引いて配送先 RQ を決める。
+ *
+ * **同じコネクションは必ず同じ RQ へ行く**(4-tuple の Toeplitz ハッシュ)
+ * ので、受信したコアがそのままそのコネクションの担当コアになる。
+ * ソフトウェア側でハッシュを合わせる必要はない。
+ *
+ * **オフセットの根拠**(mlx5_ifc_tirc_bits。tirc は in の byte 32 から):
+ * disp_type = byte 4 の上位 4bit、indirect_table = byte 33-35、
+ * rx_hash_fn = byte 36 の上位 4bit、transport_domain = byte 37-39、
+ * toeplitz key = byte 40 から 40 バイト、
+ * rx_hash_field_selector_outer = byte 80-83。
+ *
+ * **ハッシュ対象は IPv4 + TCP の 4-tuple。** 当てはまらないフレーム
+ * (ARP/ICMP/UDP)はハッシュが立たず RQT の先頭 = rxq[0] = core1 へ落ちる。
+ * 近隣キャッシュのような netif 共有の状態を触るのはそれらなので、
+ * 1 コアへ寄せておくほうが安全。
+ *
+ * 引数:
+ *   dev      - 対象 HCA
+ *   rqtn     - 引く RQT
+ *   tdn      - transport domain
+ *   out_tirn - TIR 番号の格納先
+ * 戻り値:
+ *   0=成功、-1=コマンド失敗
+ * コール元:
+ *   mlx5_hca_bringup()
+ * ===============================================================*/
+static int mlx5_create_tir_rss(mlx5_dev_t *dev, uint32_t rqtn, uint32_t tdn, uint32_t *out_tirn) {
+    uint8_t in[272];
+    for (unsigned i = 0; i < sizeof(in); i++) {
+        in[i] = 0;
+    }
+    in[0] = (uint8_t)(MLX5_CMD_OP_CREATE_TIR >> 8);
+    in[1] = (uint8_t)(MLX5_CMD_OP_CREATE_TIR & 0xffu);
+
+    in[32 + 4] = (uint8_t)(1u << 4);            /* disp_type = INDIRECT */
+    in[32 + 33] = (uint8_t)(rqtn >> 16);        /* indirect_table */
+    in[32 + 34] = (uint8_t)(rqtn >> 8);
+    in[32 + 35] = (uint8_t)rqtn;
+    in[32 + 36] = (uint8_t)(2u << 4);           /* rx_hash_fn = TOEPLITZ */
+    in[32 + 37] = (uint8_t)(tdn >> 16);
+    in[32 + 38] = (uint8_t)(tdn >> 8);
+    in[32 + 39] = (uint8_t)tdn;
+
+    /* Toeplitz の鍵。**素性の分かっている標準の RSS 鍵を使う。**
+     * 最初は `0x6d + i*0x1f` のような等差数列で埋めたが、**Toeplitz は鍵を
+     * シフトレジスタとして使うので、規則的な鍵だと入力ビットが出力の下位
+     * ビットへ効かず、全コネクションが同じバケツへ落ちた**(実機で 5 本とも
+     * 同じコアになった)。固定値なのは、起動ごとに分散先が変わると測定が
+     * 再現しないため。 */
+    static const uint8_t rss_key[40] = {
+        0x6du, 0x5au, 0x56u, 0xdau, 0x25u, 0x5bu, 0x0eu, 0xc2u,
+        0x41u, 0x67u, 0x25u, 0x3du, 0x43u, 0xa3u, 0x8fu, 0xb0u,
+        0xd0u, 0xcau, 0x2bu, 0xcbu, 0xaeu, 0x7bu, 0x30u, 0xb4u,
+        0x77u, 0xcbu, 0x2du, 0xa3u, 0x80u, 0x30u, 0xf2u, 0x0cu,
+        0x6au, 0x42u, 0xb7u, 0x3bu, 0xbeu, 0xacu, 0x01u, 0xfau,
+    };
+    for (unsigned i = 0; i < 40u; i++) {
+        in[32 + 40 + i] = rss_key[i];
+    }
+
+    /* rx_hash_field_selector_outer:
+     * l3_prot_type=0(IPv4)/ l4_prot_type=0(TCP)/ selected_fields =
+     * SRC_IP|DST_IP|L4_SPORT|L4_DPORT = 0xF */
+    in[32 + 83] = 0x0F;
+
+    uint8_t out[16];
+    int rc = mlx5_cmd_exec(dev, in, sizeof(in), out, sizeof(out));
+    if (rc != 0) {
+        return rc;
+    }
+    if (out[0] != 0) {
+        uint32_t syndrome = ((uint32_t)out[4] << 24) | ((uint32_t)out[5] << 16) |
+                             ((uint32_t)out[6] << 8) | out[7];
+        uart_printf("mlx5: CREATE_TIR(RSS): command status=0x%02x syndrome=0x%08x\n", out[0], syndrome);
+        return -1;
+    }
+    if (out_tirn) {
+        *out_tirn = ((uint32_t)out[9] << 16) | ((uint32_t)out[10] << 8) | out[11];
+    }
+    return 0;
+}
+
+/*=================================================================
+ * catch-all の FTE の転送先を、直接 TIR(rxq[0])と RSS TIR で張り替える。
+ * **受信を複数コアへ分散するかの切り替えそのもの。**
+ *
+ * 引数:
+ *   dev - 対象 HCA
+ *   on  - 1=RSS TIR へ、0=rxq[0] の直接 TIR へ
+ * 戻り値:
+ *   0=成功、-1=失敗(RSS 未作成を含む)
+ * コール元:
+ *   mlx5_net_set_rss()
+ * ===============================================================*/
+int mlx5_set_rss_enable(mlx5_dev_t *dev, unsigned ncores) {
+    if (!dev || !dev->rx_ft_valid) return -1;
+    uint32_t tirn;
+    if (ncores <= 1u) {
+        tirn = dev->rxq[0].tirn;          /* 従来どおり 1 本へ集める */
+    } else {
+        if (ncores > MLX5_NUM_RXQ) ncores = MLX5_NUM_RXQ;
+        /* **番号 0 は有効な TIR 番号**なので、0 を未作成の印にはできない。 */
+        if (!dev->rss_ready[ncores]) return -1;
+        tirn = dev->rss_tirn[ncores];
+    }
+    return mlx5_set_fte_fwd_tir(dev, dev->rx_ft_table_id, dev->rx_ft_group_id, tirn, 1);
+}
+
 #define MLX5_CMD_OP_CREATE_SQ 0x904u
+
 #define MLX5_CMD_OP_MODIFY_SQ 0x905u
 #define MLX5_SQC_STATE_RST    0u
 #define MLX5_SQC_STATE_RDY    1u
@@ -1780,6 +2030,7 @@ static int mlx5_create_tir(mlx5_dev_t *dev, uint32_t rqn, uint32_t tdn, uint32_t
  *
  * 引数:
  *   dev      - 対象 HCA
+ *   q        - 送信キュー番号(添字 = コア番号)
  *   cqn      - 完了を受け取る CQ
  *   pdn      - 所属 PD
  *   uarn     - 使用する UAR
@@ -1790,8 +2041,8 @@ static int mlx5_create_tir(mlx5_dev_t *dev, uint32_t rqn, uint32_t tdn, uint32_t
  * コール元:
  *   mlx5_hca_bringup()
  * ===============================================================*/
-static int mlx5_create_sq(mlx5_dev_t *dev, uint32_t cqn, uint32_t pdn, uint32_t uarn, uint32_t tisn, uint32_t *out_sqn) {
-    volatile uint8_t *dbr = (volatile uint8_t *)(uintptr_t)(uint64_t)dev->sq_dbr_cpu;
+static int mlx5_create_sq(mlx5_dev_t *dev, unsigned q, uint32_t cqn, uint32_t pdn, uint32_t uarn, uint32_t tisn, uint32_t *out_sqn) {
+    volatile uint8_t *dbr = (volatile uint8_t *)(uintptr_t)(uint64_t)dev->txq[q].dbr_cpu;
     for (unsigned i = 0; i < MLX5_SQ_DBR_SIZE; i++) {
         dbr[i] = 0;
     }
@@ -1821,7 +2072,7 @@ static int mlx5_create_sq(mlx5_dev_t *dev, uint32_t cqn, uint32_t pdn, uint32_t 
     in[94] = (uint8_t)(uarn >> 8);
     in[95] = (uint8_t)uarn;
 
-    uint64_t dbr_pa = mlx5_dma_addr((volatile void *)(uintptr_t)(uint64_t)dev->sq_dbr_cpu);
+    uint64_t dbr_pa = mlx5_dma_addr((volatile void *)(uintptr_t)(uint64_t)dev->txq[q].dbr_cpu);
     for (unsigned b = 0; b < 8; b++) {
         in[96 + b] = (uint8_t)(dbr_pa >> (56 - 8 * b));
     }
@@ -1830,7 +2081,7 @@ static int mlx5_create_sq(mlx5_dev_t *dev, uint32_t cqn, uint32_t pdn, uint32_t 
     in[114] = 0u; // log_wq_pg_sz=0 (4KB)
     in[115] = 4u; // log_wq_sz=4 (16 WQEBB)
 
-    uint64_t wqe_pa = mlx5_dma_addr((volatile void *)(uintptr_t)(uint64_t)dev->sq_wqe_cpu);
+    uint64_t wqe_pa = mlx5_dma_addr((volatile void *)(uintptr_t)(uint64_t)dev->txq[q].wqe_cpu);
     for (unsigned b = 0; b < 8; b++) {
         in[272 + b] = (uint8_t)(wqe_pa >> (56 - 8 * b));
     }
@@ -2498,6 +2749,15 @@ static int mlx5_nic_vport_enable_roce(mlx5_dev_t *dev) {
  *   rdma_cm_setup_rc()
  * ===============================================================*/
 int mlx5_qp_create_rc(mlx5_dev_t *dev, mlx5_qp_t *qp, uint8_t qp_index) {
+    return mlx5_qp_create_rc_ex(dev, qp, qp_index, 0u);
+}
+
+/* cs_req: requester scatter to CQE(qpc.cs_req、bit 0x630 = byte 198)。
+ * 0x11 にすると、signaled な RDMA READ / ATOMIC の応答データ(32B まで)を
+ * NIC がバッファではなく **CQE の先頭 32B に書く**(CQE の op_own bit2 が印)。
+ * 書き込みが CQE 1 本で済む。Linux の mlx5_ib も sq_sig_all の QP では既定で
+ * 0x11 にする(configure_requester_scat_cqe())。 */
+int mlx5_qp_create_rc_ex(mlx5_dev_t *dev, mlx5_qp_t *qp, uint8_t qp_index, uint8_t cs_req) {
     if (mlx5_nic_vport_enable_roce(dev) != 0) {
         uart_printf("mlx5qp: MODIFY_NIC_VPORT_CONTEXT(roce_en) failed\n");
         return -1;
@@ -2577,6 +2837,7 @@ int mlx5_qp_create_rc(mlx5_dev_t *dev, mlx5_qp_t *qp, uint8_t qp_index) {
         qpc[160 + b] = (uint8_t)(dbr_pa >> (56 - 8 * b));
     } // dbr_addr(byte160-167)
     qpc[172] = (uint8_t)(MLX5_NON_ZERO_RQ & 0x07u); // rq_type(byte172下位3bit)
+    qpc[198] = cs_req; // cs_req(bit 0x630)。0=従来どおりバッファへ
 
     // wq_umem_valid=0(既に全体ゼロ初期化済み、物理アドレスpas[]方式を使う)。
     unsigned pas_off = 24 + MLX5_QPC_BYTES + 8 + 4 + 4; // = 272
@@ -3660,13 +3921,22 @@ static int mlx5_create_flow_group_catchall(mlx5_dev_t *dev, uint32_t table_id, u
  * コール元:
  *   mlx5_hca_bringup()
  * ===============================================================*/
-static int mlx5_set_fte_fwd_tir(mlx5_dev_t *dev, uint32_t table_id, uint32_t group_id, uint32_t tirn) {
+static int mlx5_set_fte_fwd_tir(mlx5_dev_t *dev, uint32_t table_id, uint32_t group_id, uint32_t tirn, int modify) {
     uint8_t in[840];
     for (unsigned i = 0; i < sizeof(in); i++) {
         in[i] = 0;
     }
     in[0] = (uint8_t)(MLX5_CMD_OP_SET_FLOW_TABLE_ENTRY >> 8);
     in[1] = (uint8_t)(MLX5_CMD_OP_SET_FLOW_TABLE_ENTRY & 0xffu);
+    if (modify) {
+        /* **既にある FTE を書き換えるときは op_mod=1 + modify_enable_mask。**
+         * op_mod=0 のまま同じ flow_index へ SET し直すと FW が拒否する
+         * (受信の分散を切り替えるときに実機で踏んだ)。ビット位置は
+         * mlx5_ifc.h の MLX5_SET_FTE_MODIFY_ENABLE_MASK_DESTINATION_LIST = 2、
+         * modify_enable_mask のバイト位置は set_fte_in の bit 0xd8 = byte 27。 */
+        in[7]  = 1u;          /* op_mod = 1(modify)*/
+        in[27] = 1u << 2;     /* modify_enable_mask = DESTINATION_LIST */
+    }
     in[16] = (uint8_t)MLX5_FLOW_TABLE_TYPE_NIC_RX;
     in[21] = (uint8_t)(table_id >> 16);
     in[22] = (uint8_t)(table_id >> 8);
@@ -4153,16 +4423,16 @@ static int mlx5_query_wq_state(mlx5_dev_t *dev, uint16_t opcode, uint32_t objn,
  *
  * 引数:
  *   dev - 対象 HCA
- *   sqn - 対象 SQ
+ *   q   - 送信キュー番号(添字 = コア番号)
  * 戻り値:
  *   0=復帰した、-1=失敗
  * コール元:
  *   mlx5_net_try_recover()
  * ===============================================================*/
-int mlx5_recover_sq(mlx5_dev_t *dev) {
+int mlx5_recover_sq(mlx5_dev_t *dev, unsigned q) {
     uint8_t state = 0xFFu;
-    if (mlx5_query_wq_state(dev, MLX5_CMD_OP_QUERY_SQ, dev->sqn, &state, NULL, NULL) != 0) {
-        uart_printf("mlx5: SQ(sqn=%u) recovery: QUERY_SQ失敗\n", dev->sqn);
+    if (mlx5_query_wq_state(dev, MLX5_CMD_OP_QUERY_SQ, dev->txq[q].sqn, &state, NULL, NULL) != 0) {
+        uart_printf("mlx5: SQ(sqn=%u) recovery: QUERY_SQ失敗\n", dev->txq[q].sqn);
         return -1;
     }
     if (state == MLX5_SQC_STATE_RDY) {
@@ -4170,17 +4440,17 @@ int mlx5_recover_sq(mlx5_dev_t *dev) {
     }
     if (state != MLX5_SQC_STATE_ERR) {
         uart_printf("mlx5: SQ(sqn=%u) recovery: 想定外の状態(state=%u)、復帰を諦めます\n",
-                    dev->sqn, state);
+                    dev->txq[q].sqn, state);
         return -1;
     }
-    uart_printf("mlx5: SQ(sqn=%u) がERROR状態です、ERR->RST->RDYで復帰を試みます\n", dev->sqn);
-    if (mlx5_modify_sq_state(dev, dev->sqn, MLX5_SQC_STATE_ERR, MLX5_SQC_STATE_RST) != 0) {
+    uart_printf("mlx5: SQ(sqn=%u) がERROR状態です、ERR->RST->RDYで復帰を試みます\n", dev->txq[q].sqn);
+    if (mlx5_modify_sq_state(dev, dev->txq[q].sqn, MLX5_SQC_STATE_ERR, MLX5_SQC_STATE_RST) != 0) {
         return -1;
     }
-    if (mlx5_modify_sq_state(dev, dev->sqn, MLX5_SQC_STATE_RST, MLX5_SQC_STATE_RDY) != 0) {
+    if (mlx5_modify_sq_state(dev, dev->txq[q].sqn, MLX5_SQC_STATE_RST, MLX5_SQC_STATE_RDY) != 0) {
         return -1;
     }
-    uart_printf("mlx5: SQ(sqn=%u) 復帰完了、RDYへ戻りました\n", dev->sqn);
+    uart_printf("mlx5: SQ(sqn=%u) 復帰完了、RDYへ戻りました\n", dev->txq[q].sqn);
     return 0;
 }
 
@@ -4263,9 +4533,9 @@ static void mlx5_monitor_dump_dev(mlx5_dev_t *dev, const char *label) {
     }
     uint8_t sq_state = 0xFFu;
     uint32_t sq_hw = 0, sq_sw = 0;
-    if (mlx5_query_wq_state(dev, MLX5_CMD_OP_QUERY_SQ, dev->sqn, &sq_state, &sq_hw, &sq_sw) == 0) {
+    if (mlx5_query_wq_state(dev, MLX5_CMD_OP_QUERY_SQ, dev->txq[0].sqn, &sq_state, &sq_hw, &sq_sw) == 0) {
         uart_printf("mlx5: [%s] SQ(sqn=%u): state=%u(0=RST,1=RDY,3=ERR) hw_counter=%u sw_counter=%u\n",
-                    label, dev->sqn, sq_state, sq_hw, sq_sw);
+                    label, dev->txq[0].sqn, sq_state, sq_hw, sq_sw);
     }
 
     uint8_t rqcq_status = 0xFFu, rqcq_st = 0xFFu;
@@ -4276,9 +4546,9 @@ static void mlx5_monitor_dump_dev(mlx5_dev_t *dev, const char *label) {
     }
     uint8_t sqcq_status = 0xFFu, sqcq_st = 0xFFu;
     uint32_t sqcq_cc = 0, sqcq_pc = 0;
-    if (mlx5_query_cq_state(dev, dev->sq_cqn, &sqcq_status, &sqcq_st, &sqcq_cc, &sqcq_pc) == 0) {
+    if (mlx5_query_cq_state(dev, dev->txq[0].cqn, &sqcq_status, &sqcq_st, &sqcq_cc, &sqcq_pc) == 0) {
         uart_printf("mlx5: [%s] SQ's CQ(cqn=%u): status=%u st=%u consumer_counter=%u producer_counter=%u\n",
-                    label, dev->sq_cqn, sqcq_status, sqcq_st, sqcq_cc, sqcq_pc);
+                    label, dev->txq[0].cqn, sqcq_status, sqcq_st, sqcq_cc, sqcq_pc);
     }
 }
 

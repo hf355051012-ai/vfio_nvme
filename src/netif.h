@@ -211,6 +211,30 @@ void netif_unregister(netif_t *ctx);
 
 int net_poll_all_and_dispatch(void);
 
+/* **受信を複数コアへ分散するときの担当コア数**(1 = 従来の単一コア)。
+ *
+ * NIC の受信キューは PF に 1 本しか無いので、**RQ を見るのは常に 1 コア
+ * (netif の owner_core)**。そのコアが TCP の 4-tuple ハッシュで担当コアを
+ * 決め、自分の担当でなければそのコアのリングへ渡す。渡された側は
+ * net_poll_all_and_dispatch() の中でリングを消費する。
+ *
+ * **同じコネクションは必ず同じコアへ行く**ので、TCP の状態(s_conns[core])を
+ * コアをまたいで触ることにはならない。 */
+extern volatile uint32_t g_net_mt_cores;
+
+/* フレームを担当コアへ渡した回数と、リング満杯で捨てた数(`netmt` で表示)。 */
+extern volatile uint64_t g_net_mt_handoff;
+extern volatile uint64_t g_net_mt_dropped;
+/* 各コアが処理した受信フレーム数(`netmt` で表示)。**1 コア 1 キャッシュライン
+ * にする。** 素の配列だと 4 コアぶんが 1 ラインに同居し、診断カウンタ自身が
+ * コア間でラインを往復させて、測ろうとしている分散の効果を潰す。 */
+typedef struct {
+    uint64_t v;
+    uint8_t  pad[56];
+} __attribute__((aligned(64))) net_mt_counter_t;
+extern volatile net_mt_counter_t g_net_mt_consumed[SMP_MAX_CORES];
+
+
 /*=================================================================
  * dst へ送るとき、実際に L2 アドレスを解決すべき相手(次ホップ)の IPv4 を
  * 返す。同一サブネットなら宛先そのもの、サブネット外ならゲートウェイ。

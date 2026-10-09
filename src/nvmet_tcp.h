@@ -6,13 +6,35 @@
 #include "nvme_types.h"
 #include "nvme_tcp_pdu.h"  /* NVME_TCP_HDR_LEN(下記API群のヘッダバッファサイズに使う) */
 
+/* **コマンドをまたいで応答 PDU を 1 セグメントへ束ねる**ときの上限。
+ * 短経路スロットの実容量(TCP_ASYNC_SHORT_SLOT_BYTES)と同じにする --
+ * まとめたものを長経路(LSO)へ流すと壊れる(CLAUDE.md)。 */
+#define NVMET_TCP_TX_BATCH_MAX 9216u
+
 typedef struct {
     tcp_conn_t tcp;
     uint16_t   maxdata;
     uint16_t   last_cid;
     uint8_t    hdgst;
     uint8_t    ddgst;
+    /* **送信の溜め込み(コネクションごと)。** kernel/SPDK は応答 PDU を
+     * 3〜4 個ずつ 1 セグメントに載せてくるのに、こちらは 1 PDU = 1 セグメント
+     * だった(実測: 相手の受信パケット/コマンドが自製 1.18〜2.00 に対し
+     * kernel 0.27〜0.37 / SPDK 0.23〜0.32)。 */
+    uint8_t    tx_batching;
+    uint32_t   tx_batch_len;
+    uint8_t    tx_batch[NVMET_TCP_TX_BATCH_MAX];
 } nvmet_tcp_conn_t;
+
+/* バッチ区間。囲んだ中でだけ溜め込み、`_end` で必ず吐き出す
+ * (囲まない経路 -- admin など -- は従来どおり即送信)。 */
+void nvmet_tcp_tx_batch_begin(nvmet_tcp_conn_t *c);
+int  nvmet_tcp_tx_batch_end(nvmet_tcp_conn_t *c);
+int  nvmet_tcp_tx_flush(nvmet_tcp_conn_t *c);
+
+/* コマンドをまたいで応答 PDU を 1 セグメントへ束ねるか(`tcpbatch`)。
+ * **0 が束ねる前の挙動 = 陰性対照。** */
+extern volatile uint32_t g_nvmet_tcp_batch;
 
 void nvmet_tcp_accept_arm(nvmet_tcp_conn_t *c, int listener);
 
@@ -60,6 +82,12 @@ int nvmet_tcp_verify_ddgst(const nvmet_tcp_conn_t *c,
 int nvmet_tcp_send_icresp(nvmet_tcp_conn_t *c, const uint8_t icreq_buf[NVME_TCP_ICREQ_LEN]);
 
 /* 検証用: 次に送る N 個のヘッダダイジェストをわざと壊す。 */
+/* C2HData の PDU ヘッダと本体を 1 つの TCP セグメントにまとめるか
+ * (シェルの `tcpcoalesce` がイニシエータ側と一緒に切り替える)。
+ * **0 が「まとめる前」の挙動 = 陰性対照。** まとめないと read 応答 1 個が
+ * 2 パケットになり、相手のパケット処理能力を 2 倍消費する。 */
+extern volatile uint32_t g_nvmet_tcp_coalesce;
+
 extern volatile uint32_t g_nvmet_tcp_hdgst_corrupt;
 extern volatile uint32_t g_nvmet_tcp_hdgst_verify_fail;
 extern volatile uint32_t g_nvmet_tcp_term_sent;
