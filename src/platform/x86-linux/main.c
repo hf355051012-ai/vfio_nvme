@@ -2,6 +2,7 @@
 #include "timer.h"
 #include "smp.h"
 #include "crc32c.h"
+#include "crypto.h"
 #include "vfio.h"
 #include "mlx5.h"
 #include "nvme_rdma.h"
@@ -6599,6 +6600,15 @@ int main(int argc, char **argv)
 
     int rc = 0;
     rc |= crc32c_selftest();
+    {
+        /* 認証 / TLS 用の暗号部品(crypto.c)。期待値は OpenSSL で作り直した
+         * FIPS 180-4 / RFC 4231 / RFC 5869 / RFC 8448 の値。 */
+        char err[64];
+        const int crc = crypto_selftest(err, sizeof(err));
+        uart_printf("[selftest] crypto(SHA-256/384/512, HMAC, HKDF, Expand-Label, base64, CRC-32) -> %s%s%s\n",
+                    crc == 0 ? "OK" : "NG(", crc == 0 ? "" : err, crc == 0 ? "" : ")");
+        rc |= crc;
+    }
     timer_selftest();
     spinlock_selftest();
     smp_selftest();
