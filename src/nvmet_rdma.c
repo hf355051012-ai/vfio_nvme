@@ -494,14 +494,15 @@ static void nvmetr_destroy_qp_if_valid(mlx5_dev_t *dev, mlx5_qp_t *qp)
  * コール元:
  *   nvmetr_check_gsi_disconnect()
  * ===============================================================*/
-static void nvmetr_build_drep(nvmet_rdma_ctx_t *ctx, uint64_t dreq_tid, uint32_t dreq_local_comm_id)
+static void nvmetr_build_drep(nvmet_rdma_ctx_t *ctx, uint64_t dreq_tid, uint32_t my_comm_id,
+                              uint32_t dreq_local_comm_id)
 {
     volatile uint8_t *buf = ctx->cm.send_buf;
     for (unsigned i = 0; i < RDMA_CM_MAD_SIZE; i++) buf[i] = 0;
     ib_mad_hdr_build(buf, IB_MGMT_CLASS_CM, IB_CM_CLASS_VERSION, IB_MGMT_METHOD_SEND,
                      dreq_tid, CM_DREP_ATTR_ID, 0);
     volatile uint8_t *p = &buf[IB_MAD_HDR_LEN];
-    wr32be_ib(&p[0], ctx->cm.local_comm_id); // LOCAL_COMM_ID(自分自身)
+    wr32be_ib(&p[0], my_comm_id);            // LOCAL_COMM_ID(畳まれる接続のこちら側)
     wr32be_ib(&p[4], dreq_local_comm_id);    // REMOTE_COMM_ID = DREQ.LOCAL_COMM_IDのecho
 }
 
@@ -576,19 +577,11 @@ static int nvmetr_check_gsi_disconnect(nvmet_rdma_ctx_t *ctx, job_t *self)
         return 0;
     }
 
-    int is_send = 0;
-    uint32_t recv_len = 0;
-    uint8_t synd = 0;
-    int rc = mlx5_qp_poll_cqe_gsi(ctx->cm.dev, ctx->cm.gsi_qp, &is_send, &recv_len, &synd);
-    if (rc <= 0 || is_send) {
-        return 0; // 何も無い、または自分のSEND完了(DREP送信完了通知等)
-    }
-
-    dcache_invalidate_range((const void *)(uintptr_t)ctx->cm.recv_buf, recv_len);
-    if (rdma_cm_recv_attr_id(ctx->cm.recv_buf) != CM_DREQ_ATTR_ID) {
-        // DREQ以外(想定外の再送等) -- 再度RECVを構えて無視する。
-        mlx5_qp_post_recv_gsi(ctx->cm.dev, ctx->cm.gsi_qp, (void *)(uintptr_t)ctx->cm.recv_buf,
-                              sizeof(ctx->cm.recv_buf));
+    /* GSI の CQ を直接のぞかず、rdma_cm.c の振り分けから DREQ だけを受け取る。
+     * 以前は直接ポーリングして DREQ 以外を捨てていたので、IO キューの CM が
+     * 待っている RTU を横取りして 3 秒待たせていた(段階 C で RDMA の認証つき
+     * 接続が 5 秒かかっていたのもこれ)。 */
+    if (rdma_cm_take_dreq(&ctx->cm, NULL) != 1) {
         return 0;
     }
 
@@ -596,21 +589,32 @@ static int nvmetr_check_gsi_disconnect(nvmet_rdma_ctx_t *ctx, job_t *self)
     uint64_t dreq_tid            = rd64be(&ctx->cm.recv_buf[MLX5_GRH_BYTES + 8]);
     uint32_t dreq_local_comm_id  = rd32be_ib(&p[0]);
     uint32_t dreq_remote_comm_id = rd32be_ib(&p[4]);
-    uint32_t dreq_remote_qpn     = ((uint32_t)p[8] << 16) | ((uint32_t)p[9] << 8) | p[10];
+    int is_admin = (dreq_remote_comm_id == ctx->cm.local_comm_id);
 
-    if (dreq_remote_comm_id != ctx->cm.local_comm_id || dreq_remote_qpn != ctx->cm.rc_qp.qpn) {
-        mlx5_qp_post_recv_gsi(ctx->cm.dev, ctx->cm.gsi_qp, (void *)(uintptr_t)ctx->cm.recv_buf,
-                              sizeof(ctx->cm.recv_buf));
-        return 0;
+    /* **どの接続宛ての DREQ にも DREP を返す。** Linux のホストは IO キューの
+     * DREQ を先に送り、DREP が来ないとその DREQ の時間切れ(約 5 秒)を待って
+     * から admin の DREQ を送る。前の接続の DREQ の再送(こちらの DREP が
+     * 落ちた場合)にも、その comm_id のまま DREP を返せば相手は畳める。 */
+    const char *who = "admin";
+    if (!is_admin) {
+        who = "既に畳んだ接続";
+        for (int k = 0; k < s_standalone_io_spawned; k++) {
+            if (s_standalone_io_ctx[k].cm.local_comm_id == dreq_remote_comm_id) {
+                who = "IOキュー";
+                break;
+            }
+        }
     }
-
-    uart_printf("[nvmet-rdma] CM DREQ受信 (comm_id=0x%08x) -- DREP送信、次の接続を待つ状態へ戻ります\n",
-                ctx->cm.local_comm_id);
-    nvmetr_build_drep(ctx, dreq_tid, dreq_local_comm_id);
+    uart_printf("[nvmet-rdma] CM DREQ受信 (%s、comm_id=0x%08x) -- DREP送信%s\n", who,
+                dreq_remote_comm_id, is_admin ? "、次の接続を待つ状態へ戻ります" : "");
+    nvmetr_build_drep(ctx, dreq_tid, dreq_remote_comm_id, dreq_local_comm_id);
     dcache_clean_range((const void *)(uintptr_t)ctx->cm.send_buf, sizeof(ctx->cm.send_buf));
     mlx5_qp_post_send_ud(ctx->cm.dev, ctx->cm.gsi_qp, (const void *)(uintptr_t)ctx->cm.send_buf,
                          RDMA_CM_MAD_SIZE, 1u /* GSI宛は常にQPN=1固定[フェーズd] */,
                          IB_QP1_QKEY, ctx->cm.peer_gid, ctx->cm.peer_mac);
+    if (!is_admin) {
+        return 0;   /* IO キューの QP は admin の DREQ で道連れに畳む */
+    }
 
     nvmetr_reset_admin_for_reconnect(ctx, self);
     return 1;
@@ -1367,6 +1371,9 @@ static void nvmetr_on_admin_disconnected(nvmet_rdma_ctx_t *admin_ctx)
     (void)admin_ctx;
     if (!s_standalone_io_spawned) return;
     for (int k = 0; k < s_standalone_io_spawned; k++) {
+        /* まだ REQ を待っている IO キューの受け皿(ホストが張る前に切った等)を
+         * 止める。残すと次の接続の admin 宛ての REQ を横取りする。 */
+        job_cancel_by_ctx(&s_standalone_io_ctx[k].cm);
         nvmetr_destroy_qp_if_valid(s_standalone_io_ctx[k].cm.dev,
                                    &s_standalone_io_ctx[k].cm.rc_qp);
         s_standalone_io_ctx[k].stop_requested = 1;

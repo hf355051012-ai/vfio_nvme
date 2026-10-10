@@ -71,6 +71,13 @@ extern volatile uint32_t g_tcp_keepalive_probe_count;  /* 送った probe 数 */
  * (シェルの `tcpasync`)。**ここがイニシエータのスループット上限**で、
  * 512B の in-capsule write はヘッダとデータで 2 本使う。 */
 extern volatile unsigned g_tcp_async_short_cap;
+/* 1 = これから送る長さまで含めて受信ウィンドウに収まるまで待つ(既定)。
+ * 0 = 従来の「未確認 < ウィンドウ」だけを見る判定(陰性対照、`tcpasync winlen off`)。 */
+extern volatile unsigned g_tcp_short_win_len;
+/* 相手の受信ウィンドウを超えて送った回数(0=通常、1=LSO)と最後の様子(計測)。 */
+extern volatile uint64_t g_tcp_win_over[2];
+extern volatile uint32_t g_tcp_win_over_last_off, g_tcp_win_over_last_len, g_tcp_win_over_last_win;
+extern volatile uint64_t g_tcp_zwp_count;   /* 窓が足りないときに送った窓の確認の数 */
 extern volatile uint64_t g_tcp_async_short_stalls;
 extern volatile uint64_t g_tcp_async_short_winwait;
 extern volatile uint32_t g_tcp_win_last_usable;

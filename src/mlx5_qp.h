@@ -30,9 +30,13 @@ int mlx5_qp_post_send_ud(mlx5_dev_t *dev, mlx5_qp_t *qp, const void *data, uint3
                           uint32_t remote_qpn, uint32_t remote_qkey,
                           const uint8_t remote_gid[16], const uint8_t remote_mac[6]);
 
+/* 受信先は GSI のリング(buf は使わない)。届いたデータは mlx5_qp_gsi_last_rx() で読む。 */
 int mlx5_qp_post_recv_gsi(mlx5_dev_t *dev, mlx5_qp_t *qp, void *buf, uint32_t buf_len);
 
 int mlx5_qp_poll_cqe_gsi(mlx5_dev_t *dev, mlx5_qp_t *qp, int *out_is_send,
                           uint32_t *out_recv_len, uint8_t *out_syndrome);
+
+/* 直前に mlx5_qp_poll_cqe_gsi() が拾った受信完了のデータ(GRH 40 バイトから)。 */
+const volatile uint8_t *mlx5_qp_gsi_last_rx(mlx5_dev_t *dev);
 
 #endif /* MLX5_QP_DATAPATH_H */

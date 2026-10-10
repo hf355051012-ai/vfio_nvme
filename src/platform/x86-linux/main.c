@@ -6017,9 +6017,20 @@ static void shell_dispatch(char *line, int s0, int s1)
          * 変えると添字がずれて再送内容が壊れる。 */
         const char *p = line + 8;
         while (*p == ' ') p++;
-        if (strncmp(p, "clear", 5) == 0) {
+        if (strncmp(p, "winlen", 6) == 0) {
+            /* tcpasync winlen on|off -- 送る長さまで含めて受信ウィンドウを守るか。
+             * off が直す前の判定(陰性対照)。**戻し忘れると相手の窓を超えて
+             * 送り、Linux に捨てられて再送タイムアウトを待つ。** */
+            const char *q = p + 6;
+            while (*q == ' ') q++;
+            if (strncmp(q, "on", 2) == 0) g_tcp_short_win_len = 1u;
+            else if (strncmp(q, "off", 3) == 0) g_tcp_short_win_len = 0u;
+            uart_printf("tcpasync winlen: %s\n", g_tcp_short_win_len ? "on(既定)" : "off(従来の判定)");
+            return;
+        } else if (strncmp(p, "clear", 5) == 0) {
             g_tcp_async_short_stalls = 0;
             g_tcp_async_short_winwait = 0;
+            g_tcp_win_over[0] = g_tcp_win_over[1] = 0;
         } else if (*p != '\0') {
             int n = atoi(p);
             if (n < 1 || n > (int)TCP_ASYNC_SHORT_CAP_MAX) {
@@ -6037,6 +6048,11 @@ static void shell_dispatch(char *line, int s0, int s1)
                     (unsigned long long)g_tcp_async_short_winwait,
                     g_tcp_win_last_usable, g_tcp_win_last_outstanding,
                     g_tcp_win_last_cwnd, g_tcp_win_last_sndwin);
+        uart_printf("  受信ウィンドウ超えの送信 通常 %llu 回 / LSO %llu 回 (最後: 未確認から %u バイト先に %u バイト、窓 %u)"
+                    "  窓の確認 %llu 回\n",
+                    (unsigned long long)g_tcp_win_over[0], (unsigned long long)g_tcp_win_over[1],
+                    g_tcp_win_over_last_off, g_tcp_win_over_last_len, g_tcp_win_over_last_win,
+                    (unsigned long long)g_tcp_zwp_count);
     } else if (strncmp(line, "plstat", 6) == 0) {
         /* plstat [clear]
          *

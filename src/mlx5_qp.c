@@ -7,6 +7,7 @@
 #include "net.h"
 #include "ib_mad.h"
 #include "timestamp.h"
+#include "platform.h"
 
 #define MLX5_QP_CQE_SIZE        64u
 #define MLX5_QP_CQ_NUM_ENTRIES  (MLX5_CQ_BUF_SIZE / MLX5_QP_CQE_SIZE) // 1024
@@ -586,13 +587,63 @@ uint8_t mlx5_qp_last_cqe_opcode(mlx5_dev_t *dev, mlx5_qp_t *qp) {
     return (uint8_t)(cqe[MLX5_CQE_OFF_OP_OWN] >> 4);
 }
 
+/* GSI の受信バッファは GSI の持ち物(WQE ごとに 1 枠のリング)。
+ *
+ * **以前は投稿した側のバッファ(各 CM コンテキストの recv_buf)を WQE に
+ * 入れていた。** GSI は admin と IO キューで 1 本を共有しているので、
+ * 受信完了を拾った側と WQE を投稿した側が違うことがあり、拾った側は
+ * 自分の recv_buf に残っていた古い MAD を読んでいた(DREQ を見落として
+ * 繋ぎ直しが通らなくなった)。リングの枠は WQE の番号で決まるので、
+ * 受信完了の wqe_counter から届いた場所が一意に分かる。 */
+#define MLX5_GSI_RX_SLOT  512u
+#define MLX5_GSI_RX_SLOTS 256u      /* log_rq_size=8 と同じ */
+static struct {
+    mlx5_dev_t *dev;
+    volatile uint8_t *ring;
+    const volatile uint8_t *last;   /* 直前の受信完了のデータ */
+} s_gsi_rx[2];
+
+static int mlx5_gsi_rx_index(mlx5_dev_t *dev) {
+    for (int i = 0; i < 2; i++) {
+        if (s_gsi_rx[i].dev == dev) return i;
+    }
+    for (int i = 0; i < 2; i++) {
+        mlx5_dev_t *expected = NULL;
+        if (__atomic_compare_exchange_n(&s_gsi_rx[i].dev, &expected, dev, 0,
+                                        __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE) ||
+            expected == dev) {
+            return i;
+        }
+    }
+    return 0;
+}
+
+static volatile uint8_t *mlx5_gsi_rx_ring(mlx5_dev_t *dev) {
+    int i = mlx5_gsi_rx_index(dev);
+    if (s_gsi_rx[i].ring == NULL) {
+        s_gsi_rx[i].ring = (volatile uint8_t *)dma_alloc((uint64_t)MLX5_GSI_RX_SLOT * MLX5_GSI_RX_SLOTS,
+                                                         4096u, DMA_COHERENT).cpu;
+    }
+    return s_gsi_rx[i].ring;
+}
+
+/* 直前に mlx5_qp_poll_cqe_gsi() が拾った受信完了のデータ(GRH 40 バイトから)。 */
+const volatile uint8_t *mlx5_qp_gsi_last_rx(mlx5_dev_t *dev) {
+    return s_gsi_rx[mlx5_gsi_rx_index(dev)].last;
+}
+
+/* buf は使わない(受信先は GSI のリング。上のコメント)。buf_len は長さの上限にだけ使う。 */
 int mlx5_qp_post_recv_gsi(mlx5_dev_t *dev, mlx5_qp_t *qp, void *buf, uint32_t buf_len) {
+    (void)buf;
     uint32_t pc = qp->rq_pc;
-    uint32_t idx = pc & 255u; // log_rq_size=8 -- 256エントリ
+    uint32_t idx = pc & (MLX5_GSI_RX_SLOTS - 1u); // log_rq_size=8 -- 256エントリ
     volatile uint8_t *rq_base = (volatile uint8_t *)(uintptr_t)(uint64_t)dev->gsi_wqe_cpu;
     volatile uint8_t *wqe = rq_base + (uint64_t)idx * 16u;
+    volatile uint8_t *ring = mlx5_gsi_rx_ring(dev);
+    if (ring == NULL) return -1;
+    buf = (void *)(uintptr_t)(ring + (uint64_t)idx * MLX5_GSI_RX_SLOT);
 
-    uint32_t byte_count = buf_len;
+    uint32_t byte_count = buf_len < MLX5_GSI_RX_SLOT ? buf_len : MLX5_GSI_RX_SLOT;
     wqe[0] = (uint8_t)(byte_count >> 24);
     wqe[1] = (uint8_t)(byte_count >> 16);
     wqe[2] = (uint8_t)(byte_count >> 8);
@@ -703,6 +754,11 @@ int mlx5_qp_poll_cqe_gsi(mlx5_dev_t *dev, mlx5_qp_t *qp, int *out_is_send,
         if (out_recv_len) {
             *out_recv_len = byte_cnt;
         }
+        /* 受信完了の wqe_counter = 消費した RQ の WQE の番号 = リングの枠 */
+        uint32_t wqe_idx = (((uint32_t)cqe[60] << 8) | cqe[61]) & (MLX5_GSI_RX_SLOTS - 1u);
+        volatile uint8_t *ring = mlx5_gsi_rx_ring(dev);
+        s_gsi_rx[mlx5_gsi_rx_index(dev)].last =
+            ring ? ring + (uint64_t)wqe_idx * MLX5_GSI_RX_SLOT : NULL;
     }
 
     volatile ts_rdma_t ts_ok = {0};

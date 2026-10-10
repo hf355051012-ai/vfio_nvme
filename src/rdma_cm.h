@@ -99,6 +99,12 @@ typedef struct {
  * 戻り値: 0=DREP を受けた、-1=送信失敗、1=待ち切れ(相手は TIMEWAIT へ進む)。 */
 int rdma_cm_disconnect(rdma_cm_ctx_t *ctx, uint32_t wait_ms);
 
+/* 共有 GSI から DREQ を 1 つ取り出して ctx->recv_buf へ写す(宛先は問わない)。
+ * GSI の受信は rdma_cm.c が振り分けているので、**GSI の CQ を直接ポーリング
+ * しないこと**(ほかの受け皿宛ての REQ / RTU を横取りする)。
+ * 戻り値: 1=取り出した、0=無い、-1=GSI の CQE エラー */
+int rdma_cm_take_dreq(rdma_cm_ctx_t *ctx, uint32_t *out_len);
+
 job_result_t rdma_cm_job_step(job_t *self);
 
 uint16_t rdma_cm_recv_attr_id(const volatile uint8_t *recv_buf);

@@ -285,6 +285,187 @@ static void rdma_cm_parse_rep(rdma_cm_ctx_t *ctx, const volatile uint8_t *recv_b
 }
 
 /*=================================================================
+ * 共有 GSI の受信の振り分け。
+ *
+ * GSI(QP1)は 1 ポートに 1 本しか無く、自作 RDMA ターゲットでは admin と
+ * IO キューの CM、それに admin の切断検出(DREQ 待ち)が同じ 1 本を
+ * のぞいている。**受信完了を拾った側がその MAD の宛先とは限らない**ので、
+ * 拾った MAD はいったんここの待ち行列に入れ、各自が「自分の欲しいもの」を
+ * 取り出す(REQ は REQ 待ちの受け皿、RTU は comm_id が合う受け皿、DREQ は
+ * admin の切断処理)。以前は拾った側が自分に関係なければ捨てていたので、
+ * IO キューの RTU を admin が横取りして 3 秒待たせ、DREQ を取りこぼして
+ * 繋ぎ直しが通らなくなっていた。
+ *
+ * 拾われずに残った MAD は CM_MUX_AGE_MS で捨てる(相手が再送してくる)。
+ * GSI の CQ は複数のコアから触られるので、ポーリングごと spinlock で守る。
+ * ===============================================================*/
+#define CM_MUX_SLOTS  8u
+#define CM_MUX_AGE_MS 3000u
+#define CM_MUX_PREPOST 16u          /* GSI を作ったときに投稿しておく受信 WQE の数 */
+
+typedef struct {
+    mlx5_dev_t *dev;
+    volatile uint32_t lock;
+    struct {
+        uint8_t  used;
+        uint16_t attr;
+        uint32_t len;
+        uint64_t t;
+        uint8_t  mad[MLX5_GRH_BYTES + RDMA_CM_MAD_SIZE];
+    } q[CM_MUX_SLOTS];
+} cm_mux_t;
+
+static cm_mux_t s_cm_mux[2];
+
+static cm_mux_t *cm_mux_for(mlx5_dev_t *dev) {
+    for (unsigned i = 0; i < 2; i++) {
+        if (s_cm_mux[i].dev == dev) return &s_cm_mux[i];
+    }
+    for (unsigned i = 0; i < 2; i++) {
+        mlx5_dev_t *expected = NULL;
+        if (__atomic_compare_exchange_n(&s_cm_mux[i].dev, &expected, dev, 0,
+                                        __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE) || expected == dev) {
+            return &s_cm_mux[i];
+        }
+    }
+    return &s_cm_mux[0];
+}
+
+static void cm_mux_lock(cm_mux_t *m) {
+    while (__atomic_exchange_n(&m->lock, 1u, __ATOMIC_ACQUIRE)) {
+        __builtin_ia32_pause();
+    }
+}
+
+static void cm_mux_unlock(cm_mux_t *m) {
+    __atomic_store_n(&m->lock, 0u, __ATOMIC_RELEASE);
+}
+
+/* GSI を作り直したら、前の GSI で拾って残っている MAD を捨てる。 */
+static void cm_mux_reset(mlx5_dev_t *dev) {
+    cm_mux_t *m = cm_mux_for(dev);
+    cm_mux_lock(m);
+    for (unsigned i = 0; i < CM_MUX_SLOTS; i++) m->q[i].used = 0;
+    cm_mux_unlock(m);
+}
+
+/* MAD のペイロード(MAD ヘッダの後ろ)。CM の各メッセージは先頭が
+ * LOCAL_COMM_ID、その次が REMOTE_COMM_ID。 */
+static inline const uint8_t *cm_mad_payload(const uint8_t *mad) {
+    return &mad[MLX5_GRH_BYTES + IB_MAD_HDR_LEN];
+}
+
+static inline uint32_t cm_be32(const uint8_t *p) {
+    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];
+}
+
+/*=================================================================
+ * GSI の CQ を空になるまで拾って待ち行列へ入れ、want() が受け取ると
+ * 言った最も古い MAD を ctx->recv_buf へ写して返す。
+ *
+ * 引数:
+ *   ctx       - 取り出す側の CM コンテキスト(GSI と recv_buf を使う)
+ *   want      - attr とペイロードを見て、受け取るなら 1 を返す
+ *   out_len   - 受け取った長さ(NULL 可)
+ *   out_synd  - CQE エラーのときの syndrome(NULL 可)
+ * 戻り値:
+ *   1=受け取った、0=無い、-1=GSI の CQE エラー
+ * コール元:
+ *   rdma_cm_job_step(), rdma_cm_disconnect(), rdma_cm_take_dreq()
+ * ===============================================================*/
+typedef int (*cm_want_fn)(const rdma_cm_ctx_t *ctx, uint16_t attr, const uint8_t *payload);
+
+static int cm_gsi_take(rdma_cm_ctx_t *ctx, cm_want_fn want, uint32_t *out_len, uint8_t *out_synd) {
+    cm_mux_t *m = cm_mux_for(ctx->dev);
+    int ret = 0;
+    cm_mux_lock(m);
+    for (unsigned n = 0; n < 32u; n++) {
+        int is_send = 0;
+        uint32_t len = 0;
+        uint8_t synd = 0;
+        int rc = mlx5_qp_poll_cqe_gsi(ctx->dev, ctx->gsi_qp, &is_send, &len, &synd);
+        if (rc == 0) break;
+        if (rc < 0) {
+            if (out_synd) *out_synd = synd;
+            ret = -1;
+            break;
+        }
+        if (is_send) continue;      /* 自分たちが送った MAD の送信完了 */
+        const volatile uint8_t *rx = mlx5_qp_gsi_last_rx(ctx->dev);
+        unsigned slot = 0;
+        for (unsigned i = 0; i < CM_MUX_SLOTS; i++) {   /* 空き、無ければ最も古い枠 */
+            if (!m->q[i].used) { slot = i; break; }
+            if (m->q[i].t < m->q[slot].t) slot = i;
+        }
+        if (len > sizeof(m->q[slot].mad)) len = sizeof(m->q[slot].mad);
+        for (uint32_t b = 0; rx && b < len; b++) m->q[slot].mad[b] = rx[b];
+        m->q[slot].len  = len;
+        m->q[slot].attr = rx ? rdma_cm_recv_attr_id(rx) : 0;
+        m->q[slot].t    = timer_now();
+        m->q[slot].used = (rx != NULL);
+        /* 消費した受信 WQE の代わりを投稿する(受信先は GSI のリング) */
+        mlx5_qp_post_recv_gsi(ctx->dev, ctx->gsi_qp, (void *)(uintptr_t)ctx->recv_buf,
+                              sizeof(ctx->recv_buf));
+    }
+    if (ret == 0) {
+        int pick = -1;
+        for (unsigned i = 0; i < CM_MUX_SLOTS; i++) {
+            if (!m->q[i].used) continue;
+            if (timeout_ms(m->q[i].t, CM_MUX_AGE_MS)) {
+                /* 誰も受け取らなかった。相手の再送に任せる。**捨てたものは必ず
+                 * 表示する** -- 相手が REJ を返していたのに捨てていて 3 時間
+                 * 気付かなかったことがある(CLAUDE.md)。 */
+                const uint8_t *pl = cm_mad_payload(m->q[i].mad);
+                uart_printf("rdma_cm: 受け手の居ない MAD を捨てた attr_id=0x%04x "
+                            "local_comm=0x%08x remote_comm=0x%08x\n",
+                            m->q[i].attr, cm_be32(&pl[0]), cm_be32(&pl[4]));
+                m->q[i].used = 0;
+                continue;
+            }
+            if (!want(ctx, m->q[i].attr, cm_mad_payload(m->q[i].mad))) continue;
+            if (pick < 0 || m->q[i].t < m->q[pick].t) pick = (int)i;
+        }
+        if (pick >= 0) {
+            for (uint32_t b = 0; b < m->q[pick].len; b++) ctx->recv_buf[b] = m->q[pick].mad[b];
+            if (out_len) *out_len = m->q[pick].len;
+            m->q[pick].used = 0;
+            ret = 1;
+        }
+    }
+    cm_mux_unlock(m);
+    return ret;
+}
+
+static int cm_want_rep_or_rej(const rdma_cm_ctx_t *ctx, uint16_t attr, const uint8_t *pl) {
+    /* REP / REJ の REMOTE_COMM_ID はこちらの LOCAL_COMM_ID */
+    return (attr == CM_REP_ATTR_ID || attr == CM_REJ_ATTR_ID) && cm_be32(&pl[4]) == ctx->local_comm_id;
+}
+
+static int cm_want_req(const rdma_cm_ctx_t *ctx, uint16_t attr, const uint8_t *pl) {
+    (void)ctx; (void)pl;
+    return attr == CM_REQ_ATTR_ID;
+}
+
+static int cm_want_rtu(const rdma_cm_ctx_t *ctx, uint16_t attr, const uint8_t *pl) {
+    return attr == CM_RTU_ATTR_ID && cm_be32(&pl[4]) == ctx->local_comm_id;
+}
+
+static int cm_want_drep(const rdma_cm_ctx_t *ctx, uint16_t attr, const uint8_t *pl) {
+    return attr == CM_DREP_ATTR_ID && cm_be32(&pl[4]) == ctx->local_comm_id;
+}
+
+static int cm_want_dreq(const rdma_cm_ctx_t *ctx, uint16_t attr, const uint8_t *pl) {
+    (void)ctx; (void)pl;
+    return attr == CM_DREQ_ATTR_ID;
+}
+
+/* 共有 GSI から DREQ を 1 つ取り出して ctx->recv_buf へ写す(宛先は問わない。
+ * どの接続の DREQ かは呼び出し側が REMOTE_COMM_ID で判断する)。 */
+int rdma_cm_take_dreq(rdma_cm_ctx_t *ctx, uint32_t *out_len) {
+    return cm_gsi_take(ctx, cm_want_dreq, out_len, NULL);
+}
+
+/*=================================================================
  * GSI QP を 1 本作って RTS まで遷移させ、初回 RECV WQE を投稿する。
  * GID テーブル index0 への自 GID 登録(RC QP 側とも共有)もここで行う。
  *
@@ -330,10 +511,13 @@ static int rdma_cm_setup_gsi(rdma_cm_ctx_t *ctx) {
         uart_printf("rdma_cm: FAILED (GSI QP state transitions)\n");
         return -1;
     }
-    if (mlx5_qp_post_recv_gsi(ctx->dev, ctx->gsi_qp, (void *)(uintptr_t)ctx->recv_buf,
-                              sizeof(ctx->recv_buf)) != 0) {
-        uart_printf("rdma_cm: FAILED (GSI post_recv)\n");
-        return -1;
+    cm_mux_reset(ctx->dev);
+    for (unsigned i = 0; i < CM_MUX_PREPOST; i++) {
+        if (mlx5_qp_post_recv_gsi(ctx->dev, ctx->gsi_qp, (void *)(uintptr_t)ctx->recv_buf,
+                                  sizeof(ctx->recv_buf)) != 0) {
+            uart_printf("rdma_cm: FAILED (GSI post_recv)\n");
+            return -1;
+        }
     }
     return 0;
 }
@@ -351,11 +535,9 @@ static int rdma_cm_setup_gsi(rdma_cm_ctx_t *ctx) {
  *   rdma_cm_job_step()
  * ===============================================================*/
 static int rdma_cm_setup_gsi_reused(rdma_cm_ctx_t *ctx) {
-    if (mlx5_qp_post_recv_gsi(ctx->dev, ctx->gsi_qp, (void *)(uintptr_t)ctx->recv_buf,
-                              sizeof(ctx->recv_buf)) != 0) {
-        uart_printf("rdma_cm: FAILED (GSI post_recv, reused)\n");
-        return -1;
-    }
+    /* 受信 WQE は GSI を作った側が投稿済みで、拾うたびに cm_gsi_take() が
+     * 補充する(受信先も GSI のリング)。ここで足すことは無い。 */
+    (void)ctx;
     return 0;
 }
 
@@ -439,20 +621,15 @@ job_result_t rdma_cm_job_step(job_t *self) {
     }
 
     case RDMA_CM_ST_ACTIVE_WAIT_REP: {
-        int is_send = 0;
-        uint32_t recv_len = 0;
         uint8_t synd = 0;
-        int rc = mlx5_qp_poll_cqe_gsi(ctx->dev, ctx->gsi_qp, &is_send, &recv_len, &synd);
+        int rc = cm_gsi_take(ctx, cm_want_rep_or_rej, NULL, &synd);
         if (rc < 0) {
             uart_printf("rdma_cm: FAILED (GSI CQE error syndrome=0x%02x)\n", synd);
             ctx->failed = 1;
             self->state = RDMA_CM_ST_DONE_FAIL;
             return JOB_DONE;
         }
-        if (rc == 1 && is_send) {
-            uart_printf("rdma_cm: [DBG] REQ 送信完了CQE 取得 (synd=0x%02x)\n", synd);
-        }
-        if (rc == 1 && !is_send) {
+        if (rc == 1) {
             dcache_invalidate_range((const void *)(uintptr_t)ctx->recv_buf, sizeof(ctx->recv_buf));
             if (rdma_cm_recv_attr_id(ctx->recv_buf) == CM_REP_ATTR_ID) {
                 rdma_cm_parse_rep(ctx, ctx->recv_buf);
@@ -475,16 +652,6 @@ job_result_t rdma_cm_job_step(job_t *self) {
                 self->state = RDMA_CM_ST_DONE_FAIL;
                 return JOB_DONE;
             }
-            // REP/REJ 以外(想定外)は無視して再度RECVを構える。
-            {
-                const volatile uint8_t *pp = &ctx->recv_buf[MLX5_GRH_BYTES + IB_MAD_HDR_LEN];
-                uart_printf("rdma_cm: [DBG] 想定外MAD attr_id=0x%04x local_comm=0x%08x "
-                            "remote_comm=0x%08x (自分の local_comm=0x%08x)\n",
-                            rdma_cm_recv_attr_id(ctx->recv_buf),
-                            rd32be_ib(&pp[0]), rd32be_ib(&pp[4]), ctx->local_comm_id);
-            }
-            mlx5_qp_post_recv_gsi(ctx->dev, ctx->gsi_qp, (void *)(uintptr_t)ctx->recv_buf,
-                                  sizeof(ctx->recv_buf));
             return JOB_WAITING;
         }
         if (timeout_ms(ctx->state_deadline, RDMA_CM_REQ_RETRY_TIMEOUT_MS)) {
@@ -585,31 +752,22 @@ job_result_t rdma_cm_job_step(job_t *self) {
     }
 
     case RDMA_CM_ST_PASSIVE_WAIT_REQ: {
-        int is_send = 0;
-        uint32_t recv_len = 0;
         uint8_t synd = 0;
-        int rc = mlx5_qp_poll_cqe_gsi(ctx->dev, ctx->gsi_qp, &is_send, &recv_len, &synd);
+        int rc = cm_gsi_take(ctx, cm_want_req, NULL, &synd);
         if (rc < 0) {
             uart_printf("rdma_cm: FAILED (GSI CQE error syndrome=0x%02x)\n", synd);
             ctx->failed = 1;
             self->state = RDMA_CM_ST_DONE_FAIL;
             return JOB_DONE;
         }
-        if (rc == 1 && !is_send) {
-            dcache_invalidate_range((const void *)(uintptr_t)ctx->recv_buf, sizeof(ctx->recv_buf));
-            if (rdma_cm_recv_attr_id(ctx->recv_buf) == CM_REQ_ATTR_ID) {
-                rdma_cm_parse_req(ctx, ctx->recv_buf);
-                ctx->tid = rd64be(&ctx->recv_buf[MLX5_GRH_BYTES + 8]); // MADヘッダのtidをそのまま流用(REP/RTUで踏襲)
-                ctx->local_comm_id = (uint32_t)(timer_now() & 0xFFFFFFFFu) ^ 0x5A5A5A5Au;
-                uart_printf("rdma_cm: REQ received (remote_comm_id=0x%08x peer_qpn=%u peer_psn=%u)\n",
-                            ctx->remote_comm_id, ctx->peer_rc_qpn, ctx->peer_starting_psn);
-                mlx5_qp_post_recv_gsi(ctx->dev, ctx->gsi_qp, (void *)(uintptr_t)ctx->recv_buf,
-                                      sizeof(ctx->recv_buf)); // 次に来るRTU用に構え直す
-                self->state = RDMA_CM_ST_PASSIVE_MODIFY_QP;
-                return JOB_WAITING;
-            }
-            mlx5_qp_post_recv_gsi(ctx->dev, ctx->gsi_qp, (void *)(uintptr_t)ctx->recv_buf,
-                                  sizeof(ctx->recv_buf));
+        if (rc == 1) {
+            rdma_cm_parse_req(ctx, ctx->recv_buf);
+            ctx->tid = rd64be(&ctx->recv_buf[MLX5_GRH_BYTES + 8]); // MADヘッダのtidをそのまま流用(REP/RTUで踏襲)
+            ctx->local_comm_id = (uint32_t)(timer_now() & 0xFFFFFFFFu) ^ 0x5A5A5A5Au;
+            uart_printf("rdma_cm: REQ received (remote_comm_id=0x%08x peer_qpn=%u peer_psn=%u)\n",
+                        ctx->remote_comm_id, ctx->peer_rc_qpn, ctx->peer_starting_psn);
+            self->state = RDMA_CM_ST_PASSIVE_MODIFY_QP;
+            return JOB_WAITING;
         }
         return JOB_WAITING; // クライアント接続待ちはタイムアウトしない(nvmet.cのACCEPT_WAITと同じ方針)
     }
@@ -656,33 +814,22 @@ job_result_t rdma_cm_job_step(job_t *self) {
     }
 
     case RDMA_CM_ST_PASSIVE_WAIT_RTU: {
-        int is_send = 0;
-        uint32_t recv_len = 0;
-        uint8_t synd = 0;
-        int rc = mlx5_qp_poll_cqe_gsi(ctx->dev, ctx->gsi_qp, &is_send, &recv_len, &synd);
-        if (rc == 1 && !is_send) {
-            dcache_invalidate_range((const void *)(uintptr_t)ctx->recv_buf, sizeof(ctx->recv_buf));
-            if (rdma_cm_recv_attr_id(ctx->recv_buf) == CM_RTU_ATTR_ID) {
-                uart_printf("rdma_cm: RTU received (passive)\n");
-                if (ctx->skip_ping) {
-                    mlx5_qp_post_recv_gsi(ctx->dev, ctx->gsi_qp, (void *)(uintptr_t)ctx->recv_buf,
-                                          sizeof(ctx->recv_buf));
-                    ctx->rtu_phase_done = 1;
-                    self->state = RDMA_CM_ST_DONE_OK;
-                    return JOB_DONE;
-                }
-                self->state = RDMA_CM_ST_PASSIVE_PING_WAIT;
-                return JOB_WAITING;
+        int rc = cm_gsi_take(ctx, cm_want_rtu, NULL, NULL);
+        if (rc == 1) {
+            uart_printf("rdma_cm: RTU received (passive)\n");
+            if (ctx->skip_ping) {
+                ctx->rtu_phase_done = 1;
+                self->state = RDMA_CM_ST_DONE_OK;
+                return JOB_DONE;
             }
+            self->state = RDMA_CM_ST_PASSIVE_PING_WAIT;
+            return JOB_WAITING;
         }
         if (timeout_ms(ctx->state_deadline, RDMA_CM_RTU_WAIT_TIMEOUT_MS)) {
             uart_printf("rdma_cm: RTU not observed within %ums, but RC QP is already RTS "
                         "-- proceeding anyway (IBTA semantics)\n",
                         RDMA_CM_RTU_WAIT_TIMEOUT_MS);
             if (ctx->skip_ping) {
-                // 上と同じ理由でGSIへもう1個RECV WQEを構えてから終了する。
-                mlx5_qp_post_recv_gsi(ctx->dev, ctx->gsi_qp, (void *)(uintptr_t)ctx->recv_buf,
-                                      sizeof(ctx->recv_buf));
                 ctx->rtu_phase_done = 1;
                 self->state = RDMA_CM_ST_DONE_OK;
                 return JOB_DONE;
@@ -806,10 +953,6 @@ void rdma_cm_fill_addr(rdma_cm_ctx_t *ctx, mlx5_dev_t *dev, const char *self_lab
  *   rdma_short_disconnect()、nvme_rdma.c の nvmer_send_dreq()
  * ===============================================================*/
 int rdma_cm_disconnect(rdma_cm_ctx_t *ctx, uint32_t wait_ms) {
-    if (mlx5_qp_post_recv_gsi(ctx->dev, ctx->gsi_qp, (void *)(uintptr_t)ctx->recv_buf,
-                              sizeof(ctx->recv_buf)) != 0) {
-        return -1;
-    }
     volatile uint8_t *buf = ctx->send_buf;
     for (unsigned i = 0; i < RDMA_CM_MAD_SIZE; i++) {
         buf[i] = 0;
@@ -833,24 +976,15 @@ int rdma_cm_disconnect(rdma_cm_ctx_t *ctx, uint32_t wait_ms) {
 
     uint64_t start = timer_now();
     while (!timeout_ms(start, wait_ms)) {
-        int is_send = 0;
-        uint32_t recv_len = 0;
         uint8_t synd = 0;
-        int rc = mlx5_qp_poll_cqe_gsi(ctx->dev, ctx->gsi_qp, &is_send, &recv_len, &synd);
+        int rc = cm_gsi_take(ctx, cm_want_drep, NULL, &synd);
         if (rc < 0) {
             uart_printf("rdma_cm: DREQ: GSI CQE error syndrome=0x%02x\n", synd);
             return -1;
         }
-        if (rc == 1 && !is_send) {
-            dcache_invalidate_range((const void *)(uintptr_t)ctx->recv_buf, sizeof(ctx->recv_buf));
-            uint16_t attr = rdma_cm_recv_attr_id(ctx->recv_buf);
-            if (attr == CM_DREP_ATTR_ID) {
-                uart_printf("rdma_cm: DREP received -- 切断完了\n");
-                return 0;
-            }
-            uart_printf("rdma_cm: DREQ 待ち中に想定外 MAD attr_id=0x%04x\n", attr);
-            mlx5_qp_post_recv_gsi(ctx->dev, ctx->gsi_qp, (void *)(uintptr_t)ctx->recv_buf,
-                                  sizeof(ctx->recv_buf));
+        if (rc == 1) {
+            uart_printf("rdma_cm: DREP received -- 切断完了\n");
+            return 0;
         }
     }
     uart_printf("rdma_cm: DREP を待ち切れませんでした(%ums)\n", wait_ms);

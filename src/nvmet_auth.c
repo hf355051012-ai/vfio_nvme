@@ -160,13 +160,22 @@ static void on_negotiate(nvmet_auth_sess_t *s, const uint8_t *d, uint32_t len) {
         }
         s->concat = 1;
     }
-    if (napd != 1 || len < 8u + 64u) {
-        fail(s, FAIL_HASH_UNUSABLE, "protocol descriptor が 1 個でない");
+    /* 記述子(64 バイト)が NAPD 個並ぶ。規格は 2 個以上を受け付けることを勧めているので、
+     * 並びの中から DH-HMAC-CHAP(KX-HMAC-CHAP)の記述子を探す。
+     * 見つからなければ「方式が使えない」(規格 2.4 の 8.3.4.4.1)。 */
+    if (len < 8u + 64u * (uint32_t)napd) {
+        fail(s, FAIL_INCORRECT_PAYLOAD, "Negotiate が NAPD 個の記述子より短い");
         return;
     }
-    const uint8_t *pd = d + 8;   /* authid, rsvd, halen, dhlen, idlist[60] */
-    if (pd[0] != AUTH_ID_DHCHAP) {
-        fail(s, FAIL_INCORRECT_PAYLOAD, "authid が DH-HMAC-CHAP でない");
+    const uint8_t *pd = NULL;   /* authid, rsvd, halen, dhlen, idlist[60] */
+    for (unsigned i = 0; i < napd; i++) {
+        if (d[8u + 64u * i] == AUTH_ID_DHCHAP) {
+            pd = d + 8u + 64u * i;
+            break;
+        }
+    }
+    if (pd == NULL) {
+        fail(s, FAIL_NOT_USABLE, "DH-HMAC-CHAP の記述子が無い");
         return;
     }
     const uint8_t halen = pd[2], dhlen = pd[3];
@@ -235,6 +244,12 @@ static void on_reply(nvmet_auth_sess_t *s, const uint8_t *d, uint32_t len, const
         crypto_wipe(s->dh_priv, sizeof(s->dh_priv));
         uart_printf("[auth] 共有秘密を計算(%s、%u us)\n", nvme_auth_dh_name(s->dhgid),
                     (unsigned)get_us_from(t0));
+    }
+    /* C2 は C1 と違っていなければならない(規格 2.4 の 8.3.4.5.4)。同じなら、
+     * こちらの R2 の計算がホストの R1 の計算と同じ材料になり、応答の使い回しを許す。 */
+    if (cvalid && memcmp(d + 16u + hl, s->c1, hl) == 0) {
+        fail(s, FAIL_FAILED, "C2 が C1 と同じ");
+        return;
     }
     uint8_t expect[CRYPTO_HASH_MAX], ca1[CRYPTO_HASH_MAX];
     nvme_auth_augment(s->hashid, s->dhgid, s->skey, s->skey_len, s->c1, ca1);

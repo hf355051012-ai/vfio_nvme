@@ -135,6 +135,7 @@ void tcp_copy_stats_get(uint64_t *c2_ns, uint64_t *c2_by,
  * (4K write で実測 91k、64 本なら 118k)。配列は最初から
  * TCP_ASYNC_SHORT_SLOTS 本あるので、増やしてもメモリは増えない。 */
 volatile unsigned g_tcp_async_short_cap = 64u;
+volatile unsigned g_tcp_short_win_len = 1u;
 
 /* 満杯で待たされた回数(`tcpasync` で表示)。**送信側が詰まっているかを
  * 見る唯一の手段。** */
@@ -879,6 +880,67 @@ static void tcp_deliver_data(tcp_priv_t *priv, const volatile uint8_t *data, uin
  * ===============================================================*/
 static int tcp_send_segment(tcp_conn_t *conn, tcp_priv_t *priv, uint8_t flags,
                              const void *data, uint16_t data_len);
+
+/* [計測] 相手の受信ウィンドウの右端(snd_una + snd_win)を超えるデータを送った回数。
+ * Linux は超えた分を捨てる(TcpExtBeyondWindow)ので、0 でなければ再送待ちが起きる。
+ * path: 0=通常の 1 セグメント、1=LSO。`tcpasync` が表示する。 */
+volatile uint64_t g_tcp_win_over[2];
+volatile uint32_t g_tcp_win_over_last_off, g_tcp_win_over_last_len, g_tcp_win_over_last_win;
+
+/*=================================================================
+ * 相手の受信ウィンドウが 0 の間に、窓が開いたかを確かめる(持続タイマ、RFC 9293 3.8.6.1)。
+ *
+ * **ウィンドウ 0 のときにデータを送ってはいけない。** 以前は 0 を 1 と
+ * みなして 1 バイト送っていたが、Linux は窓を超えた分を捨てる
+ * (TcpExtBeyondWindow)ので、その 1 バイトの再送タイムアウト(200 ms)を
+ * ウィンドウが 0 になるたびに待っていた(256KiB 書き込み qd32 が 30 MiB/s)。
+ *
+ * 確認は Linux の tcp_xmit_probe_skb() と同じ「**seq = 未確認の先頭 - 1、
+ * 長さ 0**」。相手は既に受け取った範囲なので、現在のウィンドウを載せた
+ * ACK を必ず返す。ウィンドウの更新は相手から自発的にも来るので、これは
+ * その更新が落ちたときの保険である。
+ *
+ * 引数:
+ *   conn / priv - 対象コネクション
+ *   since       - 呼び出し側が持つ待ち始めの時刻(0 で初期化しておく)
+ *   stuck       - 窓が足りずに送れない状態か(窓が 0、または未確認が無いのに
+ *                 窓が次のセグメントより小さい)。0 なら待ち時間を初期化する
+ * コール元:
+ *   tcp_send(), tcp_short_wait(), tcp_send_async_ex()
+ * ===============================================================*/
+#define TCP_ZWP_INTERVAL_MS 200u
+volatile uint64_t g_tcp_zwp_count;
+
+static void tcp_window_probe(tcp_conn_t *conn, tcp_priv_t *priv, uint64_t *since, int stuck)
+{
+    if (!stuck) {
+        *since = 0;
+        return;
+    }
+    if (*since == 0) {
+        *since = timer_now();
+        return;
+    }
+    if (!timeout_ms(*since, TCP_ZWP_INTERVAL_MS)) return;
+    uint32_t saved = conn->snd_seq;
+    conn->snd_seq = priv->snd_una - 1u;
+    tcp_send_segment(conn, priv, TCP_FLAG_ACK, NULL, 0);
+    conn->snd_seq = saved;
+    g_tcp_zwp_count++;
+    *since = timer_now();
+}
+
+static inline void tcp_win_check(const tcp_conn_t *conn, const tcp_priv_t *priv,
+                                 uint32_t data_len, unsigned path)
+{
+    if (data_len == 0u || conn->state != TCP_ESTABLISHED) return;
+    if (tcp_seq_gt(conn->snd_seq + data_len, priv->snd_una + conn->snd_win)) {
+        g_tcp_win_over[path]++;
+        g_tcp_win_over_last_off = conn->snd_seq - priv->snd_una;
+        g_tcp_win_over_last_len = data_len;
+        g_tcp_win_over_last_win = conn->snd_win;
+    }
+}
 
 /* このコアで ACK を借りているコネクションがあるか。**0 のときは走査を
  * まるごと飛ばす**ので、nvmet を動かしていない経路には費用がかからない。 */
@@ -1645,6 +1707,7 @@ static int tcp_send_segment(tcp_conn_t *conn, tcp_priv_t *priv, uint8_t flags,
                              const void *data, uint16_t data_len)
 {
     unsigned core = smp_core_index();
+    tcp_win_check(conn, priv, data_len, 0u);
 
     /* **確立後のセグメントは必ず ACK ビットを立てて現在の rcv_seq を運ぶ**
      * ので、借りていた ACK はこれで返せる(相乗り)。 */
@@ -1807,6 +1870,7 @@ static int tcp_send_segment_lso(tcp_conn_t *conn, tcp_priv_t *priv,
                                  const void *data, uint32_t data_len)
 {
     unsigned core = smp_core_index();
+    tcp_win_check(conn, priv, data_len, 1u);
 
     if (g_tcp_tx_drop_every != 0u && tcp_tx_should_drop(data_len)) {
         return 0;  /* 送ったことにして捨てる(ロス注入、txdrop) */
@@ -3312,6 +3376,7 @@ int tcp_send(tcp_conn_t *conn, const void *buf, uint32_t len)
     uint32_t rto_ms = priv->rto_ms;
     int      window_retransmitted = 0;  /* 現在の未確認ウィンドウ内で再送が起きたか(Karnのアルゴリズム) */
     int      retransmit_attempts = 0;   /* 連続再送回数(進捗があるたびリセット) */
+    uint64_t zwp_since = 0;             /* 相手の窓が 0 になってからの時刻(持続タイマ) */
 
     while (tcp_seq_lt(priv->snd_una, end_seq)) {
         if (timeout_ms(overall_start, TCP_SEND_OVERALL_TIMEOUT_MS)) {
@@ -3337,7 +3402,9 @@ int tcp_send(tcp_conn_t *conn, const void *buf, uint32_t len)
          * そのまま -- そのデータは相手の順序不正バッファを占めているため。 */
         uint32_t cwnd_window = priv->cwnd + tcp_sacked_bytes(priv);
         if (cwnd_window < usable_window) usable_window = cwnd_window;
-        if (usable_window == 0) usable_window = 1u;
+        /* ウィンドウ 0 の間は送らない(下の送信ループに入らない)。窓が開いたかは
+         * tcp_zero_window_probe() が確かめる。 */
+        tcp_window_probe(conn, priv, &zwp_since, conn->snd_win == 0u);
 
         if (tcp_seq_lt(snd_nxt, end_seq) && !tcp_seq_lt(snd_nxt, priv->snd_una + usable_window)) {
             if (usable_window != last_logged_swin) {
@@ -3605,7 +3672,7 @@ static int tcp_send_async_enqueue(tcp_conn_t *conn, tcp_priv_t *priv,
  * ===============================================================*/
 /* 短経路のスロットが空き、送信ウィンドウに余地ができるまで待つ。0=空いた、-1=中断。
  * tcp_send_async_short2() と tcp_send_async_reserve() が共有する。 */
-static int tcp_short_wait(tcp_conn_t *conn, tcp_priv_t *priv)
+static int tcp_short_wait(tcp_conn_t *conn, tcp_priv_t *priv, uint32_t len)
 {
     while (priv->async_short_count >= g_tcp_async_short_cap) {
         g_tcp_async_short_stalls++;
@@ -3617,11 +3684,35 @@ static int tcp_short_wait(tcp_conn_t *conn, tcp_priv_t *priv)
         }
     }
 
+    /* **これから送る長さまで含めてウィンドウに収まるまで待つ。** 以前は
+     * 「未確認のバイト数 < ウィンドウ」だけを見ていたので、窓の残りが 1 バイト
+     * でもあれば 8KB のセグメントを丸ごと送っていた。Linux は窓を超えた分を
+     * 捨てる(TcpExtBeyondWindow)ので、こちらは再送タイムアウトの 200 ms を
+     * 待つことになる。方向 A の 4KiB 書き込み qd128 が 0.5〜5k IOPS に落ち、
+     * TLS で相手が落としていないのに再送していたのはこれだった。 */
+    /* **輻輳ウィンドウ(cwnd)で止めるのは未確認のデータがあるときだけ。**
+     * 未確認が 0 なら cwnd に関係なく 1 セグメントは送ってよい(RFC 5681 の
+     * 「cwnd は 1 SMSS を下回らない」)。短経路の ACK は cwnd を育てないので、
+     * 確立時の小さい cwnd(実測 4,280)のまま 2 コマンドをまとめた 8,336 バイトを
+     * 送ろうとして、未確認 0 のまま永久に待った(2026-10-10 に踏んだ)。
+     * 相手の受信ウィンドウ(snd_win)は常に守る。 */
     uint32_t outstanding   = conn->snd_seq - priv->snd_una;
-    uint32_t usable_window = conn->snd_win;
-    if (priv->cwnd < usable_window) usable_window = priv->cwnd;
-    if (usable_window == 0) usable_window = 1u;
-    while (usable_window <= outstanding) {
+#define TCP_SHORT_USABLE()                                                        \
+    ((outstanding > 0u && priv->cwnd < conn->snd_win) ? priv->cwnd : conn->snd_win)
+    uint32_t usable_window = TCP_SHORT_USABLE();
+    const int legacy = !g_tcp_short_win_len;
+    if (legacy) {                       /* 陰性対照: 従来の判定(outstanding < window、窓 0 は 1 とみなす) */
+        len = 1u;
+        if (usable_window == 0) usable_window = 1u;
+    }
+    uint64_t probe_since = 0;
+    while (outstanding + len > usable_window) {
+        /* 窓が 0、または未確認が無いのに窓がこのセグメントより小さいときは、
+         * 相手の窓の更新を待ちつつ、来なければ窓を確かめる(データは送らない)。 */
+        if (!legacy) {
+            tcp_window_probe(conn, priv, &probe_since,
+                             conn->snd_win == 0u || (outstanding == 0u && conn->snd_win < len));
+        }
         g_tcp_async_short_winwait++;
         g_tcp_win_last_usable      = usable_window;
         g_tcp_win_last_outstanding = outstanding;
@@ -3633,10 +3724,10 @@ static int tcp_short_wait(tcp_conn_t *conn, tcp_priv_t *priv)
             return -1;
         }
         outstanding   = conn->snd_seq - priv->snd_una;
-        usable_window = conn->snd_win;
-        if (priv->cwnd < usable_window) usable_window = priv->cwnd;
-        if (usable_window == 0) usable_window = 1u;
+        usable_window = TCP_SHORT_USABLE();
+        if (legacy && usable_window == 0) usable_window = 1u;
     }
+#undef TCP_SHORT_USABLE
 
     return 0;
 }
@@ -3645,7 +3736,7 @@ static int tcp_send_async_short2(tcp_conn_t *conn, tcp_priv_t *priv,
                                  const void *buf, uint16_t len,
                                  const void *buf2, uint16_t len2)
 {
-    if (tcp_short_wait(conn, priv) != 0) return -1;
+    if (tcp_short_wait(conn, priv, (uint32_t)len + len2) != 0) return -1;
 
     uint32_t seq = conn->snd_seq;
     uint16_t total = (uint16_t)(len + len2);
@@ -3735,9 +3826,12 @@ static int tcp_send_async_ex(tcp_conn_t *conn, const void *buf, uint16_t len, in
             uint32_t cw = priv->cwnd + tcp_sacked_bytes(priv);
             if (cw < usable_window) usable_window = cw;
         }
-        if (usable_window == 0) usable_window = 1u;
         uint32_t room = (usable_window > outstanding) ? (usable_window - outstanding) : 0u;
+        uint64_t probe_since = 0;
         while (room == 0) {
+            /* 窓が 0 の間は送らずに待つ(以前は 1 とみなして 1 バイト送り、
+             * Linux に捨てられて再送タイムアウトを待っていた)。 */
+            tcp_window_probe(conn, priv, &probe_since, conn->snd_win == 0u);
             tcp_poll_once();
             if (tcp_abort_requested() ||
                 (conn->state != TCP_ESTABLISHED && conn->state != TCP_CLOSE_WAIT)) {
@@ -3749,7 +3843,6 @@ static int tcp_send_async_ex(tcp_conn_t *conn, const void *buf, uint16_t len, in
                 uint32_t cw = priv->cwnd + tcp_sacked_bytes(priv);
                 if (cw < usable_window) usable_window = cw;
             }
-            if (usable_window == 0) usable_window = 1u;
             room = (usable_window > outstanding) ? (usable_window - outstanding) : 0u;
         }
 
@@ -3878,7 +3971,7 @@ uint8_t *tcp_send_async_reserve(tcp_conn_t *conn, uint16_t len)
     if (len == 0 || len > TCP_ASYNC_SHORT_SLOT_BYTES) return NULL;
     tcp_priv_t *priv = tcp_priv_for(conn);
     if (!priv) return NULL;
-    if (tcp_short_wait(conn, priv) != 0) return NULL;
+    if (tcp_short_wait(conn, priv, len) != 0) return NULL;
     const unsigned slot_idx = (priv->async_short_head + priv->async_short_count) % g_tcp_async_short_cap;
     return (uint8_t *)priv->async_short_slots[slot_idx].buf;
 }
