@@ -3671,7 +3671,7 @@ static int tcp_send_async_enqueue(tcp_conn_t *conn, tcp_priv_t *priv,
  *   tcp_send_async_ex()
  * ===============================================================*/
 /* 短経路のスロットが空き、送信ウィンドウに余地ができるまで待つ。0=空いた、-1=中断。
- * tcp_send_async_short2() と tcp_send_async_reserve() が共有する。 */
+ * tcp_send_async_short3() と tcp_send_async_reserve() が共有する。 */
 static int tcp_short_wait(tcp_conn_t *conn, tcp_priv_t *priv, uint32_t len)
 {
     while (priv->async_short_count >= g_tcp_async_short_cap) {
@@ -3732,14 +3732,15 @@ static int tcp_short_wait(tcp_conn_t *conn, tcp_priv_t *priv, uint32_t len)
     return 0;
 }
 
-static int tcp_send_async_short2(tcp_conn_t *conn, tcp_priv_t *priv,
+static int tcp_send_async_short3(tcp_conn_t *conn, tcp_priv_t *priv,
                                  const void *buf, uint16_t len,
-                                 const void *buf2, uint16_t len2)
+                                 const void *buf2, uint16_t len2,
+                                 const void *buf3, uint16_t len3)
 {
-    if (tcp_short_wait(conn, priv, (uint32_t)len + len2) != 0) return -1;
+    if (tcp_short_wait(conn, priv, (uint32_t)len + len2 + len3) != 0) return -1;
 
     uint32_t seq = conn->snd_seq;
-    uint16_t total = (uint16_t)(len + len2);
+    uint16_t total = (uint16_t)(len + len2 + len3);
     if(ts_log_mode()&0x1) ts_log(TS_MK(TS_FILE_TCP, TS_FUNC_tcp_send_async_short, 0), tcp_conn_arg(conn, total));
 
     /* **先に再送スロットへ連結してから、そこから送る。** こうすると 2 つの
@@ -3753,6 +3754,7 @@ static int tcp_send_async_short2(tcp_conn_t *conn, tcp_priv_t *priv,
     tcp_async_short_slot_t *slot = &priv->async_short_slots[slot_idx];
     volatile_fast_copy(slot->buf, buf, len);
     if (len2 > 0) volatile_fast_copy(slot->buf + len, buf2, len2);
+    if (len3 > 0) volatile_fast_copy(slot->buf + len + len2, buf3, len3);
 
     if (tcp_send_segment(conn, priv, TCP_FLAG_PSH | TCP_FLAG_ACK, slot->buf, total) != 0) {
         return -1;
@@ -3799,7 +3801,7 @@ static int tcp_send_async_ex(tcp_conn_t *conn, const void *buf, uint16_t len, in
     }
 
     if (!is_ref && len <= TCP_ASYNC_SHORT_MAX_LEN) {
-        return tcp_send_async_short2(conn, priv, buf, len, NULL, 0);
+        return tcp_send_async_short3(conn, priv, buf, len, NULL, 0, NULL, 0);
     }
 
     if (len > TCP_ASYNC_MAX_LEN) {
@@ -3925,27 +3927,50 @@ uint32_t tcp_unacked_bytes(const tcp_conn_t *conn)
 int tcp_send_async2(tcp_conn_t *conn, const void *buf1, uint16_t len1,
                     const void *buf2, uint16_t len2)
 {
+    return tcp_send_async3(conn, buf1, len1, buf2, len2, NULL, 0);
+}
+
+/*=================================================================
+ * 3 つの断片を **1 つの TCP セグメント**として非同期に送る。
+ * tcp_send_async2() の 3 断片版で、NVMe/TCP のデータダイジェスト
+ * (ヘッダ + データ + DDGST 4 バイト)を 1 セグメントで出すために使う。
+ * 合計が 1 セグメントに収まらなければ、断片ごとに分けて従来どおり送る。
+ *
+ * 引数:
+ *   conn        - 対象コネクション
+ *   buf1 / len1 - 1 断片目(PDU ヘッダなど)
+ *   buf2 / len2 - 2 断片目(データ本体。無ければ NULL / 0)
+ *   buf3 / len3 - 3 断片目(データダイジェスト。無ければ NULL / 0)
+ * 戻り値:
+ *   キューイングした合計バイト数、-1=失敗
+ * コール元:
+ *   tcp_send_async2(), nvme_tcp_tx_put(), nvmet_tcp_tx_put()
+ * ===============================================================*/
+int tcp_send_async3(tcp_conn_t *conn, const void *buf1, uint16_t len1,
+                    const void *buf2, uint16_t len2,
+                    const void *buf3, uint16_t len3)
+{
     uint32_t seg_cap = conn->snd_mss ? (uint32_t)conn->snd_mss : 1400u;
     if (seg_cap > TCP_ASYNC_SHORT_SLOT_BYTES) seg_cap = TCP_ASYNC_SHORT_SLOT_BYTES;
-    if ((uint32_t)len1 + (uint32_t)len2 > seg_cap) {
+    if ((uint32_t)len1 + (uint32_t)len2 + (uint32_t)len3 > seg_cap) {
         int r1 = tcp_send_async(conn, buf1, len1);
         if (r1 < 0) return -1;
-        if (len2 == 0) return r1;
-        int r2 = tcp_send_async(conn, buf2, len2);
-        if (r2 < 0) return -1;
-        return r1 + r2;
+        int r2 = 0, r3 = 0;
+        if (len2 != 0 && (r2 = tcp_send_async(conn, buf2, len2)) < 0) return -1;
+        if (len3 != 0 && (r3 = tcp_send_async(conn, buf3, len3)) < 0) return -1;
+        return r1 + r2 + r3;
     }
     if (conn->state != TCP_ESTABLISHED && conn->state != TCP_CLOSE_WAIT) {
-        uart_printf("[!] tcp_send_async2: ESTABLISHED/CLOSE_WAITでない (state=%d)\n", (int)conn->state);
+        uart_printf("[!] tcp_send_async3: ESTABLISHED/CLOSE_WAITでない (state=%d)\n", (int)conn->state);
         return -1;
     }
-    if (len1 + len2 == 0) return 0;
+    if (len1 + len2 + len3 == 0) return 0;
     tcp_priv_t *priv = tcp_priv_for(conn);
     if (!priv) {
-        uart_printf("[!] tcp_send_async2: 未登録のconn\n");
+        uart_printf("[!] tcp_send_async3: 未登録のconn\n");
         return -1;
     }
-    return tcp_send_async_short2(conn, priv, buf1, len1, buf2, len2);
+    return tcp_send_async_short3(conn, priv, buf1, len1, buf2, len2, buf3, len3);
 }
 
 /*=================================================================

@@ -61,7 +61,8 @@ uint32_t nvme_tcp_ddgst_len(const nvme_tcp_conn_t *c, uint32_t dlen)
 
 /* 送信バッチへ 1 PDU を積む(定義は下)。バッチ区間外なら即送信する。 */
 static int nvme_tcp_tx_put(nvme_tcp_conn_t *c, const void *p1, uint32_t l1,
-                            const void *p2, uint32_t l2);
+                            const void *p2, uint32_t l2,
+                            const void *p3, uint32_t l3);
 
 volatile uint32_t g_nvme_tcp_hdgst_corrupt;  /* 検証用(シェルの `hdgstcorrupt`)*/
 volatile uint32_t g_nvme_tcp_term_sent;
@@ -303,7 +304,7 @@ int nvme_tcp_send_cmd_async(nvme_tcp_conn_t *c, const nvme_sqe_t *sqe, uint16_t 
 
     nvme_tcp_append_hdgst(c, s_cmd_async_buf, NVME_TCP_CMD_PDU_LEN);
 
-    if (nvme_tcp_tx_put(c, s_cmd_async_buf, NVME_TCP_CMD_PDU_LEN + hd, NULL, 0) != 0) {
+    if (nvme_tcp_tx_put(c, s_cmd_async_buf, NVME_TCP_CMD_PDU_LEN + hd, NULL, 0, NULL, 0) != 0) {
         uart_printf("[!] NVMe/TCP: CapsuleCmd非同期送信失敗 (cid=%u)\n", cid);
         return -1;
     }
@@ -424,7 +425,7 @@ int nvme_tcp_tx_batch_end(nvme_tcp_conn_t *c)
 }
 
 /*=================================================================
- * PDU(最大 2 断片)を送信バッチへ積む。バッチ区間の外なら即送信する。
+ * PDU(最大 3 断片)を送信バッチへ積む。バッチ区間の外なら即送信する。
  *
  * 1 セグメントに収まらなくなる手前で自動的にフラッシュするので、
  * **溜まった内容が MSS を超えて分割されることはない**(分割されると
@@ -434,22 +435,26 @@ int nvme_tcp_tx_batch_end(nvme_tcp_conn_t *c)
  *   c        - 送信先コネクション
  *   p1 / l1  - PDU ヘッダ
  *   p2 / l2  - データ本体(無ければ NULL / 0)
+ *   p3 / l3  - データダイジェスト(無ければ NULL / 0)
  * 戻り値:
  *   0=成功、-1=失敗
  * コール元:
  *   nvme_tcp_send_cmd_async(), nvme_tcp_send_cmd_inline_async()
  * ===============================================================*/
 static int nvme_tcp_tx_put(nvme_tcp_conn_t *c, const void *p1, uint32_t l1,
-                            const void *p2, uint32_t l2)
+                            const void *p2, uint32_t l2,
+                            const void *p3, uint32_t l3)
 {
-    uint32_t need = l1 + l2;
+    uint32_t need = l1 + l2 + l3;
     if (c->tls) {
         /* TLS: 溜めずに暗号化して送る(溜まっていれば先に出す)*/
         if (nvme_tcp_tx_flush(c) != 0) return -1;
-        return nvme_tls_send_or_fail(c, p1, l1, p2, l2) ? -1 : 0;
+        if (nvme_tls_send_or_fail(c, p1, l1, p2, l2)) return -1;
+        return (l3 != 0u && nvme_tls_send_or_fail(c, p3, l3, NULL, 0)) ? -1 : 0;
     }
     if (!s_tx_batching) {
-        return tcp_send_async2(&c->tcp, p1, (uint16_t)l1, p2, (uint16_t)l2) < 0 ? -1 : 0;
+        return tcp_send_async3(&c->tcp, p1, (uint16_t)l1, p2, (uint16_t)l2,
+                               p3, (uint16_t)l3) < 0 ? -1 : 0;
     }
     uint32_t cap = c->tcp.snd_mss ? (uint32_t)c->tcp.snd_mss : 1400u;
     if (cap > NVME_TCP_TX_BATCH_MAX) cap = NVME_TCP_TX_BATCH_MAX;
@@ -458,7 +463,8 @@ static int nvme_tcp_tx_put(nvme_tcp_conn_t *c, const void *p1, uint32_t l1,
     if (need > cap) {
         /* 1 個で収まらない(大きい in-capsule)。溜め分を出してから直接送る。 */
         if (nvme_tcp_tx_flush(c) != 0) return -1;
-        return tcp_send_async2(&c->tcp, p1, (uint16_t)l1, p2, (uint16_t)l2) < 0 ? -1 : 0;
+        return tcp_send_async3(&c->tcp, p1, (uint16_t)l1, p2, (uint16_t)l2,
+                               p3, (uint16_t)l3) < 0 ? -1 : 0;
     }
     if (s_tx_batch_len + need > cap) {
         if (nvme_tcp_tx_flush(c) != 0) return -1;
@@ -468,6 +474,10 @@ static int nvme_tcp_tx_put(nvme_tcp_conn_t *c, const void *p1, uint32_t l1,
     if (l2 > 0u) {
         volatile_fast_copy((volatile uint8_t *)&s_tx_batch[s_tx_batch_len + l1],
                             (const volatile uint8_t *)p2, l2);
+    }
+    if (l3 > 0u) {
+        volatile_fast_copy((volatile uint8_t *)&s_tx_batch[s_tx_batch_len + l1 + l2],
+                            (const volatile uint8_t *)p3, l3);
     }
     s_tx_batch_len += need;
     return 0;
@@ -507,15 +517,14 @@ int nvme_tcp_send_cmd_inline_async(nvme_tcp_conn_t *c, const nvme_sqe_t *sqe,
      * 先に飽和する弱いホストでは上限が半分になる**(実測: 512B write で
      * 1 コマンドあたり 2.13 パケット、142k IOPS で頭打ち)。
      *
-     * まとめられるのはデータダイジェスト無しで合計が収まるときだけ。
-     * ダイジェストがあると 3 断片目が付くので従来経路へ落とす。 */
+     * データダイジェストがあるときは、それを 3 断片目として同じセグメントに入れる。 */
     /* **1 セグメントに収まる限りまとめる。** 判定を 640(経路選択の閾値)では
      * なくスロットの実容量にしてあるので、**4K の in-capsule write(72+4096)も
      * 1 パケットで出る**。収まらなければ tcp_send_async2() が自動で 2 回に
      * 分けるが、そこへ来ないよう先に条件で切っておく。 */
     if (c->tls) {
         /* TLS: ヘッダとデータを同じレコード列へ。ダイジェストがあれば続けて */
-        if (nvme_tcp_tx_put(c, s_icd_hdr, hdr_len, src, dlen) != 0) return -1;
+        if (nvme_tcp_tx_put(c, s_icd_hdr, hdr_len, src, dlen, NULL, 0) != 0) return -1;
         if (dd) {
             uint8_t d[NVME_TCP_DGST_LEN];
             wr32le(d, ~crc32c(0xFFFFFFFFu, src, dlen));
@@ -524,9 +533,11 @@ int nvme_tcp_send_cmd_inline_async(nvme_tcp_conn_t *c, const nvme_sqe_t *sqe,
         if (out_cid) *out_cid = cid;
         return 0;
     }
-    if (g_nvme_tcp_coalesce && dd == 0 &&
-        (uint32_t)hdr_len + dlen <= TCP_ASYNC_SHORT_SLOT_BYTES) {
-        if (nvme_tcp_tx_put(c, s_icd_hdr, hdr_len, src, dlen) != 0) {
+    if (g_nvme_tcp_coalesce &&
+        (uint32_t)hdr_len + dlen + dd <= TCP_ASYNC_SHORT_SLOT_BYTES) {
+        uint8_t dg[NVME_TCP_DGST_LEN];
+        if (dd) wr32le(dg, ~crc32c(0xFFFFFFFFu, src, dlen));
+        if (nvme_tcp_tx_put(c, s_icd_hdr, hdr_len, src, dlen, dd ? dg : NULL, dd) != 0) {
             uart_printf("[!] NVMe/TCP: CapsuleCmd(in-capsule)送信失敗 (cid=%u)\n", cid);
             return -1;
         }

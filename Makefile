@@ -19,7 +19,7 @@ TARGET    := $(BUILD_DIR)/vfio_nvme
 PLATFORM_OBJS := console hal_timer hal_smp hal_dma vfio main
 
 # アーキ非依存コア: mlx5 ドライバ + RoCEv2/NVMe-oF + TCP/IP + 計測基盤。
-CORE_OBJS := crc32c crypto crypto_dh crypto_aes crypto_x25519 tls13 timer mlx5 mlx5_qp timestamp netif net_buf \
+CORE_OBJS := crc32c crypto crypto_dh crypto_aes crypto_aes_x86 crypto_x25519 tls13 timer mlx5 mlx5_qp timestamp netif net_buf \
              job rdma_cm nvme_rdma nvmet_rdma rdma_short \
              mlx5_net tcp ip ipv6 ipfrag udp arp icmp pmtu \
              nvmet nvme_auth nvmet_auth nvmet_tls nvme nvmet_tcp nvme_tcp
@@ -38,6 +38,9 @@ $(BUILD_DIR)/%.o: $(SRC_DIR)/platform/x86-linux/%.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/%.o: $(SRC_DIR)/%.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/%.o: $(SRC_DIR)/%.S | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 # mlx5.c は -O0 固定。-O2 だと ENABLE_HCA 直後の QUERY_ISSI が実機で毎回失敗する

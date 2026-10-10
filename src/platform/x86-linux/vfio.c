@@ -16,8 +16,12 @@
 #define VFIO_MAX_DEVICES 4
 
 static int s_container = -1;
-static int s_group     = -1;
-static int s_grpnum    = -1;
+
+/* 開いた IOMMU グループ。2 つの PF が同じグループのこともあれば(OptiPlex)、
+ * 別々のグループのこともある(Precision)。別々なら同じコンテナへ順に入れる
+ * (DMA の対応付けはコンテナ単位なので、後から入れたグループにも反映される)。 */
+static struct { int fd; int num; } s_grp[VFIO_MAX_DEVICES];
+static int s_ngrp = 0;
 
 typedef struct {
     int      fd;        /* device fd(-1=未使用) */
@@ -41,7 +45,7 @@ static int        s_ndev = 0;
  * 戻り値:
  *   グループ番号。取得できなければ -1
  * コール元:
- *   container_open_once()
+ *   group_open()
  * ===============================================================*/
 static int read_iommu_group(const char *bdf)
 {
@@ -61,46 +65,50 @@ static int read_iommu_group(const char *bdf)
 }
 
 /*=================================================================
- * VFIO コンテナと IOMMU グループを初回だけ開き、TYPE1 IOMMU を設定する。
- * 2 枚目以降の PF は同じコンテナを共有する。
+ * VFIO コンテナを初回だけ開き、BDF の IOMMU グループをそのコンテナへ入れる。
+ * 既に入れたグループならその fd を返す。TYPE1 IOMMU の設定は最初の
+ * グループを入れたときに 1 回だけ行う(VFIO_SET_IOMMU はグループが 1 つ以上
+ * 入ったコンテナにしか発行できず、2 回目は要らない)。
  *
  * 引数:
- *   bdf - PCI アドレス
+ *   bdf    - PCI アドレス
+ *   grpnum - 得たグループ番号の格納先
  * 戻り値:
- *   0=成功、-1=失敗
+ *   グループの fd。失敗なら -1
  * コール元:
  *   vfio_init()
  * ===============================================================*/
-static int container_open_once(const char *bdf)
+static int group_open(const char *bdf, int *grpnum_out)
 {
-    if (s_container >= 0) {
-        int g = read_iommu_group(bdf);
-        if (g != s_grpnum) {
-            uart_printf("[vfio] %s は別 IOMMU グループ %d(既存 %d)-- 未対応\n",
-                        bdf, g, s_grpnum);
-            return -1;
-        }
-        return 0;
-    }
-
     int grpnum = read_iommu_group(bdf);
     if (grpnum < 0) return -1;
-
-    s_container = open("/dev/vfio/vfio", O_RDWR);
-    if (s_container < 0) {
-        uart_printf("[vfio] open(/dev/vfio/vfio) 失敗 (errno=%d) -- vfio 未ロード?\n", errno);
+    *grpnum_out = grpnum;
+    for (int i = 0; i < s_ngrp; i++) {
+        if (s_grp[i].num == grpnum) return s_grp[i].fd;
+    }
+    if (s_ngrp >= VFIO_MAX_DEVICES) {
+        uart_printf("[vfio] IOMMU グループ数上限\n");
         return -1;
     }
-    if (ioctl(s_container, VFIO_GET_API_VERSION) != VFIO_API_VERSION ||
-        !ioctl(s_container, VFIO_CHECK_EXTENSION, VFIO_TYPE1_IOMMU)) {
-        uart_printf("[vfio] VFIO API/TYPE1 IOMMU 非対応\n");
-        goto fail;
+
+    const int first = (s_container < 0);
+    if (first) {
+        s_container = open("/dev/vfio/vfio", O_RDWR);
+        if (s_container < 0) {
+            uart_printf("[vfio] open(/dev/vfio/vfio) 失敗 (errno=%d) -- vfio 未ロード?\n", errno);
+            return -1;
+        }
+        if (ioctl(s_container, VFIO_GET_API_VERSION) != VFIO_API_VERSION ||
+            !ioctl(s_container, VFIO_CHECK_EXTENSION, VFIO_TYPE1_IOMMU)) {
+            uart_printf("[vfio] VFIO API/TYPE1 IOMMU 非対応\n");
+            goto fail;
+        }
     }
 
     char grppath[64];
     snprintf(grppath, sizeof(grppath), "/dev/vfio/%d", grpnum);
-    s_group = open(grppath, O_RDWR);
-    if (s_group < 0) {
+    int gfd = open(grppath, O_RDWR);
+    if (gfd < 0) {
         uart_printf("[vfio] open(%s) 失敗 (errno=%d) -- vfio-pci にバインド済み?\n",
                     grppath, errno);
         goto fail;
@@ -109,22 +117,25 @@ static int container_open_once(const char *bdf)
     struct vfio_group_status gstat;
     memset(&gstat, 0, sizeof(gstat));
     gstat.argsz = sizeof(gstat);
-    if (ioctl(s_group, VFIO_GROUP_GET_STATUS, &gstat) < 0 ||
+    if (ioctl(gfd, VFIO_GROUP_GET_STATUS, &gstat) < 0 ||
         !(gstat.flags & VFIO_GROUP_FLAGS_VIABLE)) {
         uart_printf("[vfio] グループ %d が VIABLE でない(同一グループの他デバイスも要バインド)\n", grpnum);
+        close(gfd);
         goto fail;
     }
-    if (ioctl(s_group, VFIO_GROUP_SET_CONTAINER, &s_container) < 0 ||
-        ioctl(s_container, VFIO_SET_IOMMU, VFIO_TYPE1_IOMMU) < 0) {
-        uart_printf("[vfio] SET_CONTAINER/SET_IOMMU 失敗 (errno=%d)\n", errno);
+    if (ioctl(gfd, VFIO_GROUP_SET_CONTAINER, &s_container) < 0 ||
+        (first && ioctl(s_container, VFIO_SET_IOMMU, VFIO_TYPE1_IOMMU) < 0)) {
+        uart_printf("[vfio] SET_CONTAINER/SET_IOMMU 失敗 (グループ %d、errno=%d)\n", grpnum, errno);
+        close(gfd);
         goto fail;
     }
-    s_grpnum = grpnum;
-    return 0;
+    s_grp[s_ngrp].fd  = gfd;
+    s_grp[s_ngrp].num = grpnum;
+    s_ngrp++;
+    return gfd;
 
 fail:
-    if (s_group >= 0)     { close(s_group);     s_group = -1; }
-    if (s_container >= 0) { close(s_container); s_container = -1; }
+    if (first && s_container >= 0) { close(s_container); s_container = -1; }
     return -1;
 }
 
@@ -149,11 +160,13 @@ int vfio_init(const char *pci_bdf)
         uart_printf("[vfio] デバイス数上限\n");
         return -1;
     }
-    if (container_open_once(pci_bdf) != 0) {
+    int grpnum = -1;
+    int gfd = group_open(pci_bdf, &grpnum);
+    if (gfd < 0) {
         return -1;
     }
 
-    int fd = ioctl(s_group, VFIO_GROUP_GET_DEVICE_FD, pci_bdf);
+    int fd = ioctl(gfd, VFIO_GROUP_GET_DEVICE_FD, pci_bdf);
     if (fd < 0) {
         uart_printf("[vfio] VFIO_GROUP_GET_DEVICE_FD(%s) 失敗 (errno=%d)\n", pci_bdf, errno);
         return -1;
@@ -185,7 +198,7 @@ int vfio_init(const char *pci_bdf)
     snprintf(s_dev[slot].bdf, sizeof(s_dev[slot].bdf), "%s", pci_bdf);
 
     uart_printf("[vfio] %s を掴んだ (slot=%d, group=%d, regions=%u, config=%u)\n",
-                pci_bdf, slot, s_grpnum, (unsigned)dinfo.num_regions, (unsigned)rinfo.size);
+                pci_bdf, slot, grpnum, (unsigned)dinfo.num_regions, (unsigned)rinfo.size);
     return slot;
 }
 

@@ -125,7 +125,13 @@ typedef struct {
     uint8_t rk[11 * 16];         /* 展開した鍵 */
     uint8_t hpow[8][16];         /* GHASH の鍵 H = E(K, 0) の 1〜8 乗(バイト順を反転した表現)。
                                   * 8 ブロックをまとめて畳むために先に計算しておく */
+    uint8_t hkar[8][16];         /* hpow[i] の上位 64 ビットと下位 64 ビットの XOR(下位 64 ビットに置く)。
+                                  * Karatsuba 法で 1 ブロックの掛け算を 3 回にするため */
 } crypto_aes128gcm_t;
+
+/* 8 ブロックのループ本体を手書きのアセンブリ(crypto_aes_x86.S、AVX)で回すか。
+ * -1 = CPU が AVX を持てば使う(既定)、0 = 使わない(C の組込み関数の版。陰性対照と比較用)。 */
+extern int crypto_aes_asm;
 
 void crypto_aes128_encrypt_block(const uint8_t key[16], const uint8_t in[16], uint8_t out[16]);
 void crypto_aes128gcm_init(crypto_aes128gcm_t *c, const uint8_t key[16]);

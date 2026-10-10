@@ -84,27 +84,32 @@ int nvmet_tcp_tx_batch_end(nvmet_tcp_conn_t *c)
 }
 
 /*=================================================================
- * 1〜2 断片の PDU を送る。バッチ区間の中なら溜め込み、外なら即送信する。
+ * 1〜3 断片の PDU を送る。バッチ区間の中なら溜め込み、外なら即送信する。
  *
  * 引数:
  *   c        - 対象コネクション
  *   p1 / l1  - 1 断片目(PDU ヘッダ)
  *   p2 / l2  - 2 断片目(本体。無ければ NULL/0)
+ *   p3 / l3  - 3 断片目(データダイジェスト。無ければ NULL/0)
  * 戻り値:
  *   0=成功、-1=失敗
  * コール元:
  *   nvmet_tcp_send_r2t(), nvmet_tcp_send_resp(), nvmet_tcp_send_c2h_async()
  * ===============================================================*/
 static int nvmet_tcp_tx_put(nvmet_tcp_conn_t *c, const void *p1, uint32_t l1,
-                             const void *p2, uint32_t l2)
+                             const void *p2, uint32_t l2,
+                             const void *p3, uint32_t l3)
 {
-    uint32_t need = l1 + l2;
-    if (c->tls) return nvmet_tls_send(c->tls, &c->tcp, p1, l1, p2, l2);   /* TLS は束ねない */
+    uint32_t need = l1 + l2 + l3;
+    if (c->tls) {   /* TLS は束ねない */
+        if (nvmet_tls_send(c->tls, &c->tcp, p1, l1, p2, l2) != 0) return -1;
+        return l3 != 0u ? nvmet_tls_send(c->tls, &c->tcp, p3, l3, NULL, 0) : 0;
+    }
     if (!c->tx_batching || need > NVMET_TCP_TX_BATCH_MAX) {
         /* **溜まっているものを先に出してから**送る(順序を崩さない)。 */
         if (nvmet_tcp_tx_flush(c) != 0) return -1;
-        return tcp_send_async2(&c->tcp, p1, (uint16_t)l1,
-                               p2, (uint16_t)l2) < 0 ? -1 : 0;
+        return tcp_send_async3(&c->tcp, p1, (uint16_t)l1, p2, (uint16_t)l2,
+                               p3, (uint16_t)l3) < 0 ? -1 : 0;
     }
     if (c->tx_batch_len + need > NVMET_TCP_TX_BATCH_MAX) {
         if (nvmet_tcp_tx_flush(c) != 0) return -1;
@@ -116,6 +121,11 @@ static int nvmet_tcp_tx_put(nvmet_tcp_conn_t *c, const void *p1, uint32_t l1,
         volatile_fast_copy((volatile uint8_t *)&c->tx_batch[c->tx_batch_len],
                             (const volatile uint8_t *)p2, l2);
         c->tx_batch_len += l2;
+    }
+    if (l3 != 0u) {
+        volatile_fast_copy((volatile uint8_t *)&c->tx_batch[c->tx_batch_len],
+                            (const volatile uint8_t *)p3, l3);
+        c->tx_batch_len += l3;
     }
     return 0;
 }
@@ -502,7 +512,7 @@ int nvmet_tcp_send_r2t(nvmet_tcp_conn_t *c, uint16_t cid,
     }
     ts_log(TS_MK(TS_FILE_NVMET_TCP, TS_FUNC_nvmet_tcp_send_r2t, 1), c->tcp.snd_seq);
 
-    if (nvmet_tcp_tx_put(c, s_r2t_buf, total, NULL, 0) != 0) {
+    if (nvmet_tcp_tx_put(c, s_r2t_buf, total, NULL, 0, NULL, 0) != 0) {
         uart_printf("[!] NVMe/TCP target: R2T送信失敗 (cid=%u offset=%u len=%u)\n", cid, r2to, r2tl);
         return -1;
     }
@@ -537,7 +547,7 @@ int nvmet_tcp_send_resp(nvmet_tcp_conn_t *c, const nvme_cqe_t *cqe)
         ts_log_nvme_tcp_pdu(TS_MK(TS_FILE_NVMET_TCP, TS_FUNC_nvmet_tcp_send_resp, 0), &info);
     }
 
-    if (nvmet_tcp_tx_put(c, s_resp_buf, total, NULL, 0) != 0) {
+    if (nvmet_tcp_tx_put(c, s_resp_buf, total, NULL, 0, NULL, 0) != 0) {
         uart_printf("[!] NVMe/TCP target: Response Capsule送信失敗 (cid=%u)\n", cqe->cid);
         return -1;
     }
@@ -699,11 +709,13 @@ int nvmet_tcp_send_c2h_async(nvmet_tcp_conn_t *c, uint16_t cid,
      *
      * ゼロコピー(`tcp_send_async_ref`)は捨てて再送スロットへ写すことになるが、
      * **どのみち再送用に控える必要がある**ので増える費用はコピー 1 回だけ。
-     * データダイジェストがあるときは 3 断片目が付くのでまとめない。 */
-    if (g_nvmet_tcp_coalesce && dd == 0u &&
-        (uint32_t)NVME_TCP_DATA_PDU_LEN + hd + dlen <= TCP_ASYNC_SHORT_SLOT_BYTES) {
+     * データダイジェストがあるときは、それを 3 断片目として同じセグメントに入れる。 */
+    if (g_nvmet_tcp_coalesce &&
+        (uint32_t)NVME_TCP_DATA_PDU_LEN + hd + dlen + dd <= TCP_ASYNC_SHORT_SLOT_BYTES) {
+        uint8_t dg[4];
+        if (dd) wr32le(dg, ~crc32c(0xFFFFFFFFu, src, dlen));  /* 最終反転 */
         if (nvmet_tcp_tx_put(c, hdr, (uint32_t)NVME_TCP_DATA_PDU_LEN + hd,
-                             src, dlen) != 0) {
+                             src, dlen, dd ? dg : NULL, dd) != 0) {
             uart_printf("[!] NVMe/TCP target: C2HData非同期送信失敗 (cid=%u)\n", cid);
             return -1;
         }
