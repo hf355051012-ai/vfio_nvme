@@ -92,6 +92,17 @@ typedef struct {
      * 渡した private_data がそのままここに載る**ので、相手が登録した MR の
      * アドレスと rkey を受け取る経路になる(rdma_short.c)。 */
     uint8_t  rep_priv[64];
+
+    /* REP(passive 側)/ REQ(active 側、cma_hdr の後ろ)の PRIVATE_DATA に載せる ULP のデータ。
+     * rep_priv_out_len が 0 なら NVMe-oF の nvme_rdma_cm_rep / _req を載せる(従来どおり)。
+     * iSER は iser_cm_hdr(4 バイト)を載せる。 */
+    uint8_t  rep_priv_out[8];
+    uint8_t  rep_priv_out_len;
+    /* active 側の REQ で名乗る経路 MTU(IB の符号 1=256 .. 5=4096。0 = 従来どおり 1024)。
+     * 確立した QP もこの値で動く。 */
+    uint8_t  req_path_mtu;
+    /* passive 側で受け付ける REQ の SERVICE_ID のポート(0 = 問わない。従来どおり)。 */
+    uint16_t listen_port;
 } rdma_cm_ctx_t;
 
 /* 確立済みの接続を CM の DREQ で畳み、DREP を待つ(同期、GSI を直接回す)。

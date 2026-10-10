@@ -22,7 +22,8 @@ PLATFORM_OBJS := console hal_timer hal_smp hal_dma vfio main
 CORE_OBJS := crc32c crypto crypto_dh crypto_aes crypto_aes_x86 crypto_x25519 tls13 timer mlx5 mlx5_qp timestamp netif net_buf \
              job rdma_cm nvme_rdma nvmet_rdma rdma_short \
              mlx5_net tcp ip ipv6 ipfrag udp arp icmp pmtu \
-             nvmet nvme_auth nvmet_auth nvmet_tls nvme nvmet_tcp nvme_tcp
+             nvmet nvme_auth nvmet_auth nvmet_tls nvme nvmet_tcp nvme_tcp \
+             iscsi_text iscsi_pdu iscsit scsi iscsi_init iscsi_chap iscsit_iser iscsi_iser_init
 
 OBJS := $(addprefix $(BUILD_DIR)/,$(addsuffix .o,$(PLATFORM_OBJS) $(CORE_OBJS)))
 

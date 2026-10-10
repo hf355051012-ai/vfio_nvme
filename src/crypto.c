@@ -115,35 +115,152 @@ static void sha512_block(uint64_t h[8], const uint8_t *p) {
     h[0] += a; h[1] += b; h[2] += c; h[3] += d; h[4] += e; h[5] += f; h[6] += g; h[7] += hh;
 }
 
+/* ---- MD5(RFC 1321)。iSCSI の CHAP_A=5 のためだけ。---- */
+static uint32_t ld32le(const uint8_t *p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+static void md5_block(uint32_t h[4], const uint8_t *p) {
+    static const uint32_t K[64] = {
+        0xd76aa478, 0xe8c7b756, 0x242070db, 0xc1bdceee, 0xf57c0faf, 0x4787c62a, 0xa8304613, 0xfd469501,
+        0x698098d8, 0x8b44f7af, 0xffff5bb1, 0x895cd7be, 0x6b901122, 0xfd987193, 0xa679438e, 0x49b40821,
+        0xf61e2562, 0xc040b340, 0x265e5a51, 0xe9b6c7aa, 0xd62f105d, 0x02441453, 0xd8a1e681, 0xe7d3fbc8,
+        0x21e1cde6, 0xc33707d6, 0xf4d50d87, 0x455a14ed, 0xa9e3e905, 0xfcefa3f8, 0x676f02d9, 0x8d2a4c8a,
+        0xfffa3942, 0x8771f681, 0x6d9d6122, 0xfde5380c, 0xa4beea44, 0x4bdecfa9, 0xf6bb4b60, 0xbebfbc70,
+        0x289b7ec6, 0xeaa127fa, 0xd4ef3085, 0x04881d05, 0xd9d4d039, 0xe6db99e5, 0x1fa27cf8, 0xc4ac5665,
+        0xf4292244, 0x432aff97, 0xab9423a7, 0xfc93a039, 0x655b59c3, 0x8f0ccc92, 0xffeff47d, 0x85845dd1,
+        0x6fa87e4f, 0xfe2ce6e0, 0xa3014314, 0x4e0811a1, 0xf7537e82, 0xbd3af235, 0x2ad7d2bb, 0xeb86d391,
+    };
+    static const uint8_t S[64] = {
+        7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22,
+        5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20,
+        4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23,
+        6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21,
+    };
+    uint32_t m[16];
+    for (unsigned i = 0; i < 16; i++) m[i] = ld32le(p + 4u * i);
+    uint32_t a = h[0], b = h[1], c = h[2], d = h[3];
+    for (unsigned i = 0; i < 64; i++) {
+        uint32_t f;
+        unsigned g;
+        if (i < 16)      { f = (b & c) | (~b & d); g = i; }
+        else if (i < 32) { f = (d & b) | (~d & c); g = (5u * i + 1u) & 15u; }
+        else if (i < 48) { f = b ^ c ^ d;          g = (3u * i + 5u) & 15u; }
+        else             { f = c ^ (b | ~d);       g = (7u * i) & 15u; }
+        const uint32_t t = d;
+        d = c;
+        c = b;
+        const uint32_t x = a + f + K[i] + m[g];
+        b = b + ((x << S[i]) | (x >> (32u - S[i])));
+        a = t;
+    }
+    h[0] += a; h[1] += b; h[2] += c; h[3] += d;
+}
+
+/* ---- SHA-1(FIPS 180-4)。iSCSI の CHAP_A=6 のためだけ。---- */
+static void sha1_block(uint32_t h[5], const uint8_t *p) {
+    uint32_t w[80];
+    for (unsigned i = 0; i < 16; i++) w[i] = ld32be(p + 4u * i);
+    for (unsigned i = 16; i < 80; i++) w[i] = ror32(w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16], 31);
+    uint32_t a = h[0], b = h[1], c = h[2], d = h[3], e = h[4];
+    for (unsigned i = 0; i < 80; i++) {
+        uint32_t f, k;
+        if (i < 20)      { f = (b & c) | (~b & d);          k = 0x5a827999; }
+        else if (i < 40) { f = b ^ c ^ d;                   k = 0x6ed9eba1; }
+        else if (i < 60) { f = (b & c) | (b & d) | (c & d); k = 0x8f1bbcdc; }
+        else             { f = b ^ c ^ d;                   k = 0xca62c1d6; }
+        const uint32_t t = ror32(a, 27) + f + e + k + w[i];
+        e = d; d = c; c = ror32(b, 2); b = a; a = t;
+    }
+    h[0] += a; h[1] += b; h[2] += c; h[3] += d; h[4] += e;
+}
+
+/* ---- SHA3-256(FIPS 202)。Keccak-f[1600]、rate 136 バイト。iSCSI の CHAP_A=8 のためだけ。---- */
+static void keccak_f(uint64_t s[25]) {
+    static const uint64_t RC[24] = {
+        0x0000000000000001ull, 0x0000000000008082ull, 0x800000000000808aull, 0x8000000080008000ull,
+        0x000000000000808bull, 0x0000000080000001ull, 0x8000000080008081ull, 0x8000000000008009ull,
+        0x000000000000008aull, 0x0000000000000088ull, 0x0000000080008009ull, 0x000000008000000aull,
+        0x000000008000808bull, 0x800000000000008bull, 0x8000000000008089ull, 0x8000000000008003ull,
+        0x8000000000008002ull, 0x8000000000000080ull, 0x000000000000800aull, 0x800000008000000aull,
+        0x8000000080008081ull, 0x8000000000008080ull, 0x0000000080000001ull, 0x8000000080008008ull,
+    };
+    static const uint8_t ROT[25] = { 0, 1, 62, 28, 27, 36, 44, 6, 55, 20, 3, 10, 43, 25, 39,
+                                     41, 45, 15, 21, 8, 18, 2, 61, 56, 14 };
+    for (unsigned r = 0; r < 24; r++) {
+        uint64_t C[5], D[5], B[25];
+        for (unsigned x = 0; x < 5; x++) C[x] = s[x] ^ s[x + 5] ^ s[x + 10] ^ s[x + 15] ^ s[x + 20];
+        for (unsigned x = 0; x < 5; x++) D[x] = C[(x + 4) % 5] ^ ((C[(x + 1) % 5] << 1) | (C[(x + 1) % 5] >> 63));
+        for (unsigned i = 0; i < 25; i++) s[i] ^= D[i % 5];
+        /* ρ と π: B[y, 2x+3y] = rot(A[x, y], r[x, y])(添字は x + 5y)*/
+        for (unsigned x = 0; x < 5; x++) {
+            for (unsigned y = 0; y < 5; y++) {
+                const unsigned i = x + 5u * y;
+                const uint64_t v = s[i];
+                const unsigned n = ROT[i];
+                B[y + 5u * ((2u * x + 3u * y) % 5u)] = n ? (v << n) | (v >> (64u - n)) : v;
+            }
+        }
+        for (unsigned y = 0; y < 5; y++)
+            for (unsigned x = 0; x < 5; x++)
+                s[x + 5u * y] = B[x + 5u * y] ^ (~B[(x + 1) % 5 + 5u * y] & B[(x + 2) % 5 + 5u * y]);
+        s[0] ^= RC[r];
+    }
+}
+
+static void sha3_block(uint64_t s[25], const uint8_t *p) {
+    for (unsigned i = 0; i < 136u / 8u; i++) {
+        uint64_t v = 0;
+        for (unsigned k = 0; k < 8; k++) v |= (uint64_t)p[8u * i + k] << (8u * k);   /* レーンはリトルエンディアン */
+        s[i] ^= v;
+    }
+    keccak_f(s);
+}
+
 size_t crypto_hash_len(crypto_hash_id_t id) {
     switch (id) {
     case CRYPTO_SHA256: return 32u;
     case CRYPTO_SHA384: return 48u;
     case CRYPTO_SHA512: return 64u;
+    case CRYPTO_MD5: return 16u;
+    case CRYPTO_SHA1: return 20u;
+    case CRYPTO_SHA3_256: return 32u;
     default: return 0u;
     }
 }
 
 size_t crypto_hash_block(crypto_hash_id_t id) {
-    return (id == CRYPTO_SHA256) ? 64u : (crypto_hash_len(id) ? 128u : 0u);
+    switch (id) {
+    case CRYPTO_SHA256: case CRYPTO_MD5: case CRYPTO_SHA1: return 64u;
+    case CRYPTO_SHA384: case CRYPTO_SHA512: return 128u;
+    case CRYPTO_SHA3_256: return 136u;
+    default: return 0u;
+    }
 }
 
 int crypto_hash_init(crypto_hash_ctx_t *c, crypto_hash_id_t id) {
+    static const uint32_t IVMD5[4] = { 0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476 };
+    static const uint32_t IVSHA1[5] = { 0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476, 0xc3d2e1f0 };
     memset(c, 0, sizeof(*c));
     c->id = id;
     switch (id) {
     case CRYPTO_SHA256: memcpy(c->st.s32, IV256, sizeof(IV256)); return 0;
     case CRYPTO_SHA384: memcpy(c->st.s64, IV384, sizeof(IV384)); return 0;
     case CRYPTO_SHA512: memcpy(c->st.s64, IV512, sizeof(IV512)); return 0;
+    case CRYPTO_MD5: memcpy(c->st.s32, IVMD5, sizeof(IVMD5)); return 0;
+    case CRYPTO_SHA1: memcpy(c->st.s32, IVSHA1, sizeof(IVSHA1)); return 0;
+    case CRYPTO_SHA3_256: return 0;   /* 状態は 0 から */
     default: return -1;
     }
 }
 
 static void hash_compress(crypto_hash_ctx_t *c, const uint8_t *blk) {
-    if (c->id == CRYPTO_SHA256) {
-        sha256_block(c->st.s32, blk);
-    } else {
-        sha512_block(c->st.s64, blk);
+    switch (c->id) {
+    case CRYPTO_SHA256: sha256_block(c->st.s32, blk); break;
+    case CRYPTO_MD5: md5_block(c->st.s32, blk); break;
+    case CRYPTO_SHA1: sha1_block(c->st.s32, blk); break;
+    case CRYPTO_SHA3_256: sha3_block(c->st.s64, blk); break;
+    default: sha512_block(c->st.s64, blk); break;
     }
 }
 
@@ -175,6 +292,17 @@ void crypto_hash_update(crypto_hash_ctx_t *c, const void *data, size_t len) {
 
 void crypto_hash_final(crypto_hash_ctx_t *c, uint8_t *out) {
     const size_t bs = crypto_hash_block(c->id);
+    if (bs == 0) return;   /* 知らない種類(init で -1 を返している)*/
+    if (c->id == CRYPTO_SHA3_256) {
+        /* SHA3 の詰め物: 0x06 ... 0x80(長さ欄は無い)。 */
+        memset(c->buf + c->fill, 0, bs - c->fill);
+        c->buf[c->fill] ^= 0x06;
+        c->buf[bs - 1u] ^= 0x80;
+        sha3_block(c->st.s64, c->buf);
+        for (unsigned i = 0; i < 32u; i++) out[i] = (uint8_t)(c->st.s64[i / 8u] >> (8u * (i % 8u)));
+        crypto_wipe(c, sizeof(*c));
+        return;
+    }
     const size_t lenfield = (bs == 64u) ? 8u : 16u;   /* 長さ欄は 64 / 128 ビット */
     const uint64_t bits = c->total << 3;
     const uint64_t bits_hi = c->total >> 61;
@@ -185,6 +313,14 @@ void crypto_hash_final(crypto_hash_ctx_t *c, uint8_t *out) {
         c->fill = 0;
     }
     memset(c->buf + c->fill, 0, bs - c->fill);
+    if (c->id == CRYPTO_MD5) {
+        /* MD5 だけ長さ欄も出力もリトルエンディアン。 */
+        for (unsigned i = 0; i < 8; i++) c->buf[bs - 8u + i] = (uint8_t)(bits >> (8u * i));
+        hash_compress(c, c->buf);
+        for (unsigned i = 0; i < 16; i++) out[i] = (uint8_t)(c->st.s32[i / 4u] >> (8u * (i % 4u)));
+        crypto_wipe(c, sizeof(*c));
+        return;
+    }
     if (lenfield == 16u) st64be(c->buf + bs - 16u, bits_hi);
     st64be(c->buf + bs - 8u, bits);
     hash_compress(c, c->buf);
@@ -192,6 +328,8 @@ void crypto_hash_final(crypto_hash_ctx_t *c, uint8_t *out) {
     const size_t n = crypto_hash_len(c->id);
     if (c->id == CRYPTO_SHA256) {
         for (unsigned i = 0; i < 8; i++) st32be(out + 4u * i, c->st.s32[i]);
+    } else if (c->id == CRYPTO_SHA1) {
+        for (unsigned i = 0; i < 5; i++) st32be(out + 4u * i, c->st.s32[i]);
     } else {
         uint8_t tmp[64];
         for (unsigned i = 0; i < 8; i++) st64be(tmp + 8u * i, c->st.s64[i]);

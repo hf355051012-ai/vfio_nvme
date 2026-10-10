@@ -3088,6 +3088,11 @@ int tcp_connect_poll(tcp_conn_t *conn)
                 tcp_rtt_update(priv, timer_now() - priv->connect_sent_at);
             }
             conn->snd_seq = priv->expected_ack;  /* SYNは1バイト分のシーケンス番号を消費する */
+            /* **未確認の先頭もここで揃える。** 以前は最初の送信を同期の tcp_send() で
+             * 送る前提で(NVMe/TCP の ICReq)、そこで初めて snd_una が入っていた。
+             * 最初から非同期の短経路で送ると(iSCSI の Login、2026-10-10 に踏んだ)、
+             * 未確認 = snd_seq - 0 が約 38 億に見えてウィンドウが空くのを永久に待つ。 */
+            priv->snd_una = conn->snd_seq;
             tcp_cwnd_init(conn, priv);
             uart_printf("[TCP] connect: ESTABLISHED (peer MSS=%u, 初期cwnd=%u)\n",
                         conn->snd_mss, priv->cwnd);

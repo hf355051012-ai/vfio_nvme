@@ -139,7 +139,7 @@ static void rdma_cm_build_req(rdma_cm_ctx_t *ctx) {
     p[47] = (uint8_t)((20u << 3) | 7u); // LOCAL_CM_RESPONSE_TIMEOUT(pos0-4)=20、RETRY_COUNT(pos5-7)=7
     p[48] = 0xFF;
     p[49] = 0xFF; // PARTITION_KEY(pkey、フル権限0xFFFF)
-    p[50] = (uint8_t)((3u << 4) | 7u); // PATH_PACKET_PAYLOAD_MTU(pos0-3)=IB_MTU_1024(3)、
+    p[50] = (uint8_t)(((ctx->req_path_mtu ? ctx->req_path_mtu : 3u) << 4) | 7u); // PATH_PACKET_PAYLOAD_MTU(pos0-3)=既定 IB_MTU_1024(3)、
                                         // RDC_EXISTS(pos4)=0、RNR_RETRY_COUNT(pos5-7)=7
     p[51] = (uint8_t)(3u << 4); // MAX_CM_RETRIES(pos0-3)=3、SRQ(pos4)=0、EXTENDED_TRANSPORT_TYPE(pos5-7)=0(RC)
     for (unsigned i = 0; i < 16; i++) {
@@ -159,6 +159,11 @@ static void rdma_cm_build_req(rdma_cm_ctx_t *ctx) {
     wr32be_ib(&priv[16], ctx->own_ip);
     // priv[20..35] = dst_addr(16B)。
     wr32be_ib(&priv[32], ctx->peer_ip);
+    if (ctx->rep_priv_out_len) {   /* NVMe-oF 以外(iSER の iser_cm_hdr)*/
+        for (unsigned i = 0; i < ctx->rep_priv_out_len && i < sizeof(ctx->rep_priv_out); i++)
+            priv[36 + i] = ctx->rep_priv_out[i];
+        return;
+    }
     wr16le(&priv[36], 0); // recfmt = NVME_RDMA_CM_FMT_1_0
     wr16le(&priv[38], ctx->nvme_qid); // qid
     wr16le(&priv[40], ctx->hrqsize); // hrqsize(1's based)
@@ -218,6 +223,11 @@ static void rdma_cm_build_rep(rdma_cm_ctx_t *ctx) {
 
     // PRIVATE_DATA(p[36..231]、196バイト) = nvme_rdma_cm_rep(32B)+padding。
     volatile uint8_t *priv = &p[36];
+    if (ctx->rep_priv_out_len) {
+        for (unsigned i = 0; i < ctx->rep_priv_out_len && i < sizeof(ctx->rep_priv_out); i++)
+            priv[i] = ctx->rep_priv_out[i];
+        return;
+    }
     wr16le(&priv[0], 0); // recfmt
     wr16le(&priv[2], 32); // crqsize(プレースホルダ)
 }
@@ -442,8 +452,10 @@ static int cm_want_rep_or_rej(const rdma_cm_ctx_t *ctx, uint16_t attr, const uin
 }
 
 static int cm_want_req(const rdma_cm_ctx_t *ctx, uint16_t attr, const uint8_t *pl) {
-    (void)ctx; (void)pl;
-    return attr == CM_REQ_ATTR_ID;
+    if (attr != CM_REQ_ATTR_ID) return 0;
+    if (ctx->listen_port == 0) return 1;
+    /* SERVICE_ID(REQ の 8〜15 バイト)= (RDMA_PS_TCP << 16) + ポート。下位 16 ビットだけ見る。 */
+    return (uint16_t)(((uint16_t)pl[14] << 8) | pl[15]) == ctx->listen_port;
 }
 
 static int cm_want_rtu(const rdma_cm_ctx_t *ctx, uint16_t attr, const uint8_t *pl) {
@@ -669,6 +681,7 @@ job_result_t rdma_cm_job_step(job_t *self) {
     }
 
     case RDMA_CM_ST_ACTIVE_MODIFY_QP: {
+        if (ctx->req_path_mtu) ctx->rc_qp.path_mtu = ctx->req_path_mtu;
         if (mlx5_qp_modify_init2rtr(ctx->dev, &ctx->rc_qp, ctx->peer_rc_qpn, ctx->peer_gid,
                                      ctx->peer_mac, ctx->peer_starting_psn) != 0 ||
             mlx5_qp_modify_rtr2rts(ctx->dev, &ctx->rc_qp) != 0) {
@@ -694,6 +707,7 @@ job_result_t rdma_cm_job_step(job_t *self) {
         }
         uart_printf("rdma_cm: RTU sent -- RC QP established (active)\n");
         if (ctx->skip_ping) {
+            ctx->rtu_phase_done = 1;   /* 能動側も「RTU まで済んだ」を見られるように(iSER のイニシエータ)*/
             self->state = RDMA_CM_ST_DONE_OK;
             return JOB_DONE;
         }

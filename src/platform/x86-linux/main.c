@@ -22,6 +22,13 @@
 #include "nvme.h"
 #include "nvmet.h"
 #include "nvmet_rdma.h"
+#include "iscsi.h"
+#include "iscsit.h"
+#include "iscsit_iser.h"
+#include "iscsi_iser_init.h"
+#include "iscsi_init.h"
+#include "iscsi_pdu.h"
+#include "scsi.h"
 
 #include <stdint.h>
 #include <string.h>
@@ -4979,6 +4986,214 @@ static void shell_tcpbench(char *args)
     bench_summary(transport, nvme_io_qdepth(), pl.runtime_ms, res, nr);
 }
 
+/* ---- iSCSI イニシエータ(PLAN_iscsi.md 段階 D)---- */
+static struct {
+    int      set;
+    uint32_t ip;
+    uint16_t port;
+    char     iqn[224];
+} s_iscsi_remote;
+
+static void shell_iscsitarget(char *args)
+{
+    while (*args == ' ') args++;
+    if (*args == 0) {
+        if (!s_iscsi_remote.set) { uart_printf("iscsitarget: 未設定\n"); return; }
+        uart_printf("iscsitarget: %u.%u.%u.%u:%u %s\n", (unsigned)(s_iscsi_remote.ip >> 24),
+                    (unsigned)((s_iscsi_remote.ip >> 16) & 0xFFu), (unsigned)((s_iscsi_remote.ip >> 8) & 0xFFu),
+                    (unsigned)(s_iscsi_remote.ip & 0xFFu), s_iscsi_remote.port,
+                    s_iscsi_remote.iqn[0] ? s_iscsi_remote.iqn : "(Discovery の最初)");
+        iscsi_ini_status();
+        return;
+    }
+    iscsi_ini_close();
+    if (strncmp(args, "off", 3) == 0) { s_iscsi_remote.set = 0; uart_printf("iscsitarget: 解除\n"); return; }
+    char *tok[3];
+    unsigned nt = shell_tokenize(args, tok, 3);
+    unsigned o[4] = {0};
+    const char *q = tok[0];
+    for (unsigned i = 0; i < 4; i++) {
+        while (*q >= '0' && *q <= '9') { o[i] = o[i] * 10u + (unsigned)(*q - '0'); q++; }
+        if (*q == '.') q++;
+    }
+    s_iscsi_remote.ip = ip_from_octets((uint8_t)o[0], (uint8_t)o[1], (uint8_t)o[2], (uint8_t)o[3]);
+    s_iscsi_remote.port = (nt >= 2 && atoi(tok[1]) > 0) ? (uint16_t)atoi(tok[1]) : 3260u;
+    s_iscsi_remote.iqn[0] = 0;
+    if (nt >= 3) strncpy(s_iscsi_remote.iqn, tok[2], sizeof(s_iscsi_remote.iqn) - 1u);
+    s_iscsi_remote.set = 1;
+    uart_printf("iscsitarget: 設定した(次の iscsibench で繋ぐ)\n");
+}
+
+/* `iscsitchap` / `iscsichap` の引数: <user> <secret> [<muser> <msecret>] | off。
+ * 秘密は文字列のまま使う(LIO / open-iscsi と同じ)。戻り値 1 = 設定 / 0 = 解除 / -1 = 誤り。 */
+static int shell_chap_parse(char *args, iscsi_chap_cfg_t *cfg)
+{
+    memset(cfg, 0, sizeof(*cfg));
+    char *tok[4];
+    const unsigned nt = shell_tokenize(args, tok, 4);
+    if (nt == 1 && strcmp(tok[0], "off") == 0) return 0;
+    if (nt != 2 && nt != 4) return -1;
+    for (unsigned i = 0; i < nt; i++)
+        if (strlen(tok[i]) >= ISCSI_CHAP_NAME_MAX) return -1;
+    cfg->set = 1;
+    memcpy(cfg->user, tok[0], strlen(tok[0]) + 1u);
+    cfg->slen = (uint32_t)strlen(tok[1]);
+    memcpy(cfg->secret, tok[1], cfg->slen);
+    if (nt == 4) {
+        cfg->mutual = 1;
+        memcpy(cfg->muser, tok[2], strlen(tok[2]) + 1u);
+        cfg->mlen = (uint32_t)strlen(tok[3]);
+        memcpy(cfg->msecret, tok[3], cfg->mlen);
+    }
+    return 1;
+}
+
+static void shell_iscsi_chap(char *args, int target)
+{
+    const char *name = target ? "iscsitchap" : "iscsichap";
+    while (*args == ' ') args++;
+    if (*args == 0) {
+        if (target) iscsit_status(); else iscsi_ini_status();
+        return;
+    }
+    iscsi_chap_cfg_t cfg;
+    const int r = shell_chap_parse(args, &cfg);
+    if (r < 0) { uart_printf("%s: <user> <secret> [<muser> <msecret>] | off\n", name); return; }
+    if (target) iscsit_set_chap(r ? &cfg : NULL);
+    else { iscsi_ini_close(); iscsi_ini_set_chap(r ? &cfg : NULL); }   /* 認証はログインで 1 回だけなので張り直させる */
+    uart_printf("%s: %s\n", name, r ? (cfg.mutual ? "CHAP(双方向)" : "CHAP(片方向)") : "解除");
+}
+
+/* iSER イニシエータの接続先(`isertarget <ip> <mac> [iqn]`)。PLAN_iscsi.md 段階 I。 */
+static struct { int set; uint32_t ip; uint8_t mac[6]; char iqn[224]; } s_iser_remote;
+
+static void shell_isertarget(char *args)
+{
+    while (*args == ' ') args++;
+    if (*args == 0) { iscsi_iser_status(); return; }
+    iscsi_iser_close();
+    if (strncmp(args, "off", 3) == 0) { s_iser_remote.set = 0; uart_printf("isertarget: 解除\n"); return; }
+    char *tok[3];
+    const unsigned nt = shell_tokenize(args, tok, 3);
+    if (nt < 2) { uart_printf("isertarget: <ip> <相手の MAC> [iqn]\n"); return; }
+    unsigned o[4] = {0};
+    const char *q = tok[0];
+    for (unsigned i = 0; i < 4; i++) {
+        while (*q >= '0' && *q <= '9') { o[i] = o[i] * 10u + (unsigned)(*q - '0'); q++; }
+        if (*q == '.') q++;
+    }
+    s_iser_remote.ip = ip_from_octets((uint8_t)o[0], (uint8_t)o[1], (uint8_t)o[2], (uint8_t)o[3]);
+    q = tok[1];
+    for (unsigned i = 0; i < 6; i++) {
+        unsigned v = 0;
+        for (unsigned k = 0; k < 2; k++) {
+            const char ch = *q;
+            const int d = (ch >= '0' && ch <= '9') ? ch - '0' : (ch >= 'a' && ch <= 'f') ? ch - 'a' + 10
+                        : (ch >= 'A' && ch <= 'F') ? ch - 'A' + 10 : -1;
+            if (d < 0) break;
+            v = (v << 4) | (unsigned)d;
+            q++;
+        }
+        s_iser_remote.mac[i] = (uint8_t)v;
+        if (*q == ':' || *q == '-') q++;
+    }
+    const char *iqn = nt >= 3 ? tok[2] : "iqn.2026-10.local.precision:ram0";
+    const size_t l = strlen(iqn) < sizeof(s_iser_remote.iqn) - 1u ? strlen(iqn) : sizeof(s_iser_remote.iqn) - 1u;
+    memcpy(s_iser_remote.iqn, iqn, l);
+    s_iser_remote.iqn[l] = 0;
+    s_iser_remote.set = 1;
+    uart_printf("isertarget: 設定した(次の iserbench で繋ぐ)\n");
+}
+
+static void shell_iserbench(char *args)
+{
+    if (!s_iser_remote.set) { uart_printf("iserbench: 先に isertarget <ip> <mac> [iqn]\n"); return; }
+    bench_plan_t pl; bench_plan_parse(args, &pl);
+    if (!iscsi_iser_connected() &&
+        iscsi_iser_connect(&s_dev0, s_iser_remote.ip, s_iser_remote.mac, s_iser_remote.iqn) < 0) {
+        uart_printf("iserbench: 接続に失敗\n");
+        return;
+    }
+    bench_res_t res[2u * BENCH_MAX_CHUNKS]; unsigned nr = 0;
+    for (unsigned c = 0; c < pl.nchunks; c++) {
+        for (int is_read = 0; is_read < 2; is_read++) {
+            if (!(is_read ? pl.do_r : pl.do_w)) continue;
+            bench_res_t *e = &res[nr++];
+            e->chunk = pl.chunks[c];
+            e->is_read = is_read;
+            uint32_t mis = 0;
+            if (iscsi_iser_bench(is_read, pl.chunks[c], pl.qd, pl.runtime_ms, &e->bytes, &e->count,
+                                 &e->elapsed_ms, &mis) < 0) {
+                e->count = 0;
+                e->elapsed_ms = 0;
+            }
+            if (is_read)
+                uart_printf("[iser] chunk=%u read : %u 回, %u ms, 照合の不一致 %u\n", pl.chunks[c], e->count,
+                            e->elapsed_ms, mis);
+            if (!iscsi_iser_connected()) break;
+        }
+    }
+    bench_summary("iser", pl.qd, pl.runtime_ms, res, nr);
+}
+
+static void shell_iscsidiscover(void)
+{
+    if (!s_iscsi_remote.set) { uart_printf("iscsidiscover: 先に iscsitarget <ip>\n"); return; }
+    netaddr_t a = netaddr_v4(s_iscsi_remote.ip);
+    if (iscsi_ini_discover(&a, s_iscsi_remote.port, NULL, 0) < 0) uart_printf("iscsidiscover: 失敗\n");
+}
+
+/*=================================================================
+ * シェルの `iscsibench`。書式は tcpbench と同じ "[KB[,KB...]] [r|w|rw] [qd] [hdgst|ddgst|digest] [t秒]"。
+ * ダイジェストはログインで合意するので、指定が変われば張り直す。読み出しは抜き取りで
+ * 書き込みと同じ模様かを照合する(書き込みを先に流すこと)。
+ * ===============================================================*/
+static void shell_iscsibench(char *args)
+{
+    if (!s_iscsi_remote.set) { uart_printf("iscsibench: 先に iscsitarget <ip> [port] [iqn]\n"); return; }
+    bench_plan_t pl; bench_plan_parse(args, &pl);
+    int hd = 0, dd = 0;
+    if (iscsi_ini_digest(&hd, &dd) && (hd != pl.hdgst || dd != pl.ddgst)) {
+        uart_printf("iscsibench: ダイジェストの指定が変わったので張り直す\n");
+        iscsi_ini_close();
+    }
+    if (!iscsi_ini_connected()) {
+        netaddr_t a = netaddr_v4(s_iscsi_remote.ip);
+        if (iscsi_ini_connect(&a, s_iscsi_remote.port, s_iscsi_remote.iqn, pl.hdgst, pl.ddgst) < 0) {
+            uart_printf("iscsibench: 接続に失敗\n");
+            return;
+        }
+        iscsi_ini_digest(&hd, &dd);
+        if (hd != pl.hdgst || dd != pl.ddgst)
+            uart_printf("[!] iscsibench: ダイジェストの合意が要求と違う(要求 %u/%u、合意 %u/%u)\n",
+                        pl.hdgst, pl.ddgst, hd, dd);
+    }
+    bench_res_t res[2u * BENCH_MAX_CHUNKS]; unsigned nr = 0;
+    for (unsigned c = 0; c < pl.nchunks; c++) {
+        for (int is_read = 0; is_read < 2; is_read++) {
+            if (!(is_read ? pl.do_r : pl.do_w)) continue;
+            bench_res_t *e = &res[nr++];
+            e->chunk = pl.chunks[c];
+            e->is_read = is_read;
+            uint32_t mis = 0;
+            if (iscsi_ini_bench(is_read, pl.chunks[c], pl.qd, pl.runtime_ms, &e->bytes, &e->count,
+                                &e->elapsed_ms, &mis) < 0) {
+                e->count = 0;
+                e->elapsed_ms = 0;
+            }
+            if (is_read)
+                uart_printf("[iscsi] chunk=%u read : %u 回, %u ms, 照合の不一致 %u\n", pl.chunks[c], e->count,
+                            e->elapsed_ms, mis);
+            else
+                uart_printf("[iscsi] chunk=%u write: %u 回, %u ms\n", pl.chunks[c], e->count, e->elapsed_ms);
+            if (!iscsi_ini_connected()) break;
+        }
+    }
+    iscsi_ini_digest(&hd, &dd);
+    bench_summary(hd && dd ? "iscsi+hdgst+ddgst" : hd ? "iscsi+hdgst" : dd ? "iscsi+ddgst" : "iscsi",
+                  pl.qd, pl.runtime_ms, res, nr);
+}
+
 /*=================================================================
  * シェルの `bench`。NVMe-oF RDMA のスループットを指定 chunk × read/write ×
  * qdepth で測って表を出す。
@@ -5697,6 +5912,136 @@ static void shell_dispatch(char *line, int s0, int s1)
          * 鍵は Linux の `nvme gen-tls-key` で作ったもの。段階 D は握手と最初の
          * 暗号文(ICReq)の復号まで。 */
         nvmet_tls_shell(line + 8);
+    } else if (strncmp(line, "iscsitarget", 11) == 0) {
+        /* iscsitarget                       -- 設定を表示
+         * iscsitarget <ip> [port] [iqn]     -- iSCSI イニシエータの接続先(既定 3260、iqn 省略で Discovery の最初)
+         * iscsitarget off                   -- 解除(セッションも閉じる)
+         * PLAN_iscsi.md 段階 D。PF0 から繋ぐ(`tcptarget` と同じ)。 */
+        shell_iscsitarget(line + 11);
+    } else if (strncmp(line, "iscsidiscover", 13) == 0) {
+        shell_iscsidiscover();
+    } else if (strncmp(line, "iscsidisconnect", 15) == 0) {
+        iscsi_ini_close();
+        uart_printf("iscsi-ini: 閉じた\n");
+    } else if (strncmp(line, "iscsizc", 7) == 0) {
+        /* iscsizc [on|off] -- 大きい PDU の本体をゼロコピーの長経路(LSO)で送るか(off = 短経路で刻む)*/
+        const char *p = line + 7;
+        while (*p == ' ') p++;
+        if (strncmp(p, "on", 2) == 0) g_iscsi_pdu_zerocopy = 1;
+        else if (strncmp(p, "off", 3) == 0) g_iscsi_pdu_zerocopy = 0;
+        uart_printf("iscsizc: %s\n", g_iscsi_pdu_zerocopy ? "on(本体はゼロコピーの長経路)" : "off(短経路で刻む)");
+    } else if (strncmp(line, "iscsibench", 10) == 0) {
+        shell_iscsibench(line + 10);
+    } else if (strncmp(line, "iscsitchap", 10) == 0) {
+        /* iscsitchap <user> <secret> [<muser> <msecret>] | off -- ターゲットが通常セッションに CHAP を求める */
+        shell_iscsi_chap(line + 10, 1);
+    } else if (strncmp(line, "isertarget", 10) == 0) {
+        /* isertarget <ip> <相手の MAC> [iqn] -- iSER イニシエータの接続先(PF0。iqn 既定は Precision の LIO)*/
+        shell_isertarget(line + 10);
+    } else if (strncmp(line, "iserbench", 9) == 0) {
+        /* iserbench <bs,..> <r|w|rw> <qd> [t秒] -- iSER のスループット(`iscsibench` と同じ要約表)*/
+        shell_iserbench(line + 9);
+    } else if (strncmp(line, "iserdisconnect", 14) == 0) {
+        iscsi_iser_close();
+        uart_printf("iser-ini: 閉じた\n");
+    } else if (strncmp(line, "iscsitiser", 10) == 0) {
+        /* iscsitiser <相手の MAC> -- iSER ターゲットを PF1 で起動(RDMA CM、ポート 3260)
+         * iscsitiser stat / clear -- 状態と統計。PLAN_iscsi.md 段階 I。 */
+        const char *p = line + 10;
+        while (*p == ' ') p++;
+        if (*p == 0 || strncmp(p, "stat", 4) == 0) {
+            iscsit_iser_status();
+        } else if (strncmp(p, "clear", 5) == 0) {
+            iscsit_iser_stats_clear();
+        } else {
+            uint8_t mac[6] = {0};
+            unsigned got = 0;
+            for (unsigned i = 0; i < 6 && *p; i++) {
+                unsigned v = 0, nd = 0;
+                while (nd < 2) {
+                    const char ch = *p;
+                    const int d = (ch >= '0' && ch <= '9') ? ch - '0' : (ch >= 'a' && ch <= 'f') ? ch - 'a' + 10
+                                : (ch >= 'A' && ch <= 'F') ? ch - 'A' + 10 : -1;
+                    if (d < 0) break;
+                    v = (v << 4) | (unsigned)d;
+                    p++;
+                    nd++;
+                }
+                if (nd == 0) break;
+                mac[i] = (uint8_t)v;
+                got++;
+                if (*p == ':' || *p == '-') p++;
+            }
+            if (got != 6) { uart_printf("iscsitiser: <相手の MAC>(例 b8:ce:f6:73:bf:7e)\n"); return; }
+            netif_t *nc = netif_find("mlx5-pf1");
+            if (!nc) { uart_printf("iscsitiser: mlx5-pf1 未登録\n"); return; }
+            netif_activate(nc);
+            /* 記憶域は TCP のターゲット(`iscsit`)と同じ LUN(NVMe の RAM ディスク)。 */
+            scsi_set_lun(0, s_x86_nvmet.ram_disk, NVMET_NS1_LBA_COUNT, "vfionvme-lun0");
+            scsi_set_lun(1, s_x86_nvmet.ram_disk2, NVMET_NS2_LBA_COUNT, "vfionvme-lun1");
+            (void)iscsit_iser_start(&s_dev1, "mlx5-pf1", mac);
+        }
+    } else if (strncmp(line, "iscsichap", 9) == 0) {
+        /* iscsichap <user> <secret> [<muser> <msecret>] | off -- イニシエータが CHAP で答える */
+        shell_iscsi_chap(line + 9, 0);
+    } else if (strncmp(line, "iscsit", 6) == 0) {
+        /* iscsit [port]   -- iSCSI ターゲットを常駐起動(pf1、既定 3260)。起動済みなら状態を表示
+         * iscsit stat     -- 状態と統計 / iscsit clear -- 統計を 0 に
+         * PLAN_iscsi.md 段階 A: Login / Discovery / Text / NOP / Logout。SCSI は段階 B まで
+         * CHECK CONDITION を返す。NVMe/TCP ターゲット(`nvmet`)と同時に動かせる。 */
+        const char *p = line + 6;
+        while (*p == ' ') p++;
+        if (strncmp(p, "stat", 4) == 0 || (*p == 0 && iscsit_started())) {
+            iscsit_status();
+        } else if (strncmp(p, "clear", 5) == 0) {
+            iscsit_stats_clear();
+            uart_printf("iscsit: 統計を 0 にした\n");
+        } else if (strncmp(p, "nopin", 5) == 0) {
+            /* iscsit nopin <秒> [待つ秒] -- 生存確認の NOP-In(0 = 打たない。既定 15 / 15)*/
+            char *tk[3];
+            char tmp[64];
+            strncpy(tmp, p + 5, sizeof(tmp) - 1u);
+            tmp[sizeof(tmp) - 1u] = 0;
+            const unsigned n = shell_tokenize(tmp, tk, 3);
+            if (n >= 1) g_iscsit_nopin_ms = (uint32_t)atoi(tk[0]) * 1000u;
+            if (n >= 2) g_iscsit_nopin_wait_ms = (uint32_t)atoi(tk[1]) * 1000u;
+            uart_printf("iscsit: NOP-In は無通信 %u 秒で打ち、%u 秒待つ\n", g_iscsit_nopin_ms / 1000u,
+                        g_iscsit_nopin_wait_ms / 1000u);
+        } else if (strncmp(p, "ackpiggy", 8) == 0) {
+            /* iscsit ackpiggy [on|off] -- 受信の ACK を応答へ相乗りさせる(次の接続から。既定 off)*/
+            const char *q = p + 8;
+            while (*q == ' ') q++;
+            if (strncmp(q, "on", 2) == 0) g_iscsit_ackpiggy = 1;
+            else if (strncmp(q, "off", 3) == 0) g_iscsit_ackpiggy = 0;
+            uart_printf("iscsit: ackpiggy %s(次の接続から)\n", g_iscsit_ackpiggy ? "on" : "off");
+        } else if (strncmp(p, "logout", 6) == 0) {
+            /* iscsit logout <接続番号> -- Async Message でログアウトを求める */
+            iscsit_request_logout((unsigned)atoi(p + 6));
+        } else if (strncmp(p, "corrupt", 7) == 0) {
+            /* iscsit corrupt h|d [N] -- 次に送る N 個(既定 1)のヘッダ / データダイジェストを壊す */
+            const char *q = p + 7;
+            while (*q == ' ') q++;
+            const char kind = *q;
+            if (*q) q++;
+            while (*q == ' ') q++;
+            const uint32_t n = (*q >= '0' && *q <= '9') ? (uint32_t)atoi(q) : 1u;
+            if (kind == 'h') g_iscsit_corrupt_hdgst = n;
+            else if (kind == 'd') g_iscsit_corrupt_ddgst = n;
+            uart_printf("iscsit: 次に送るダイジェストを壊す ヘッダ %u / データ %u\n",
+                        g_iscsit_corrupt_hdgst, g_iscsit_corrupt_ddgst);
+        } else {
+            uint16_t port = ISCSI_PORT;
+            if (*p >= '0' && *p <= '9') port = (uint16_t)atoi(p);
+            netif_t *ctx1 = netif_find("mlx5-pf1");
+            if (!ctx1) { uart_printf("iscsit: mlx5-pf1 未登録\n"); return; }
+            if (smp_boot_core1() == 0) netif_set_owner_core(ctx1, 1u);
+            /* 記憶域は NVMe の RAM ディスクを共有する(LUN 0 = nsid 1、LUN 1 = nsid 2)。
+             * iSCSI で書いて NVMe/TCP で読む照合ができる。 */
+            scsi_set_lun(0, s_x86_nvmet.ram_disk, NVMET_NS1_LBA_COUNT, "vfionvme-lun0");
+            scsi_set_lun(1, s_x86_nvmet.ram_disk2, NVMET_NS2_LBA_COUNT, "vfionvme-lun1");
+            if (iscsit_start(port, ctx1) == 0)
+                uart_printf("iscsit: iSCSI ターゲット常駐起動(pf1, port %u, %s)\n", port, ISCSIT_DEFAULT_IQN);
+        }
     } else if (strncmp(line, "nvmetauth", 9) == 0) {
         /* nvmetauth                                      -- 設定を表示
          * nvmetauth <hostnqn> <DHHC-1:..:..:> [sha256|sha384|sha512]
@@ -6391,6 +6736,7 @@ static void shell_dispatch(char *line, int s0, int s1)
                     "  例: bench 8,64,256 rw 8 / tcpbench 64,256 w digest / ts core 1 num 40\n");
     } else if (strncmp(line, "quit", 4) == 0 || strncmp(line, "exit", 4) == 0) {
         nvme_rdma_shutdown();   /* 相手に接続を残さない(CM の DREQ)*/
+        iscsi_iser_close();     /* 同上(iSER のイニシエータ)*/
         uart_printf("bye\n");
         exit(0);
     } else {

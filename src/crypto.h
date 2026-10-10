@@ -25,10 +25,15 @@ typedef enum {
     CRYPTO_SHA256 = 1,
     CRYPTO_SHA384 = 2,
     CRYPTO_SHA512 = 3,
+    /* iSCSI の CHAP(RFC 7143 12.1.3、CHAP_A = 5 / 6 / 7 / 8)。MD5 と SHA-1 は
+     * 古いが、open-iscsi と LIO が今も既定の候補に入れている。 */
+    CRYPTO_MD5 = 4,
+    CRYPTO_SHA1 = 5,
+    CRYPTO_SHA3_256 = 6,
 } crypto_hash_id_t;
 
 #define CRYPTO_HASH_MAX   64u    /* 最長の出力(SHA-512)*/
-#define CRYPTO_BLOCK_MAX  128u   /* 最長のブロック(SHA-384 / 512)*/
+#define CRYPTO_BLOCK_MAX  144u   /* 最長のブロック(SHA3-256 の rate 136。SHA-384 / 512 は 128)*/
 
 typedef struct {
     crypto_hash_id_t id;
@@ -36,7 +41,7 @@ typedef struct {
     uint32_t fill;               /* buf に溜まっているバイト数 */
     union {
         uint32_t s32[8];
-        uint64_t s64[8];
+        uint64_t s64[25];        /* SHA3 は 25 レーン(200 バイト)*/
     } st;
     uint8_t buf[CRYPTO_BLOCK_MAX];
 } crypto_hash_ctx_t;
