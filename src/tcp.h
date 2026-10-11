@@ -231,6 +231,8 @@ uint32_t tcp_unacked_bytes(const tcp_conn_t *conn);
 /* いま送れるバイト数(相手の受信窓と cwnd の小さいほう - 未確認)。足りないと長経路の送信は
  * その場で窓が空くのを待つ。 */
 uint32_t tcp_send_room(const tcp_conn_t *conn, uint32_t *usable_out);
+/* 短経路(tcp_send_async2/3)の再送用の枠の空きの数と、枠の数(`tcpasync` の実効本数)。 */
+unsigned tcp_send_short_free(const tcp_conn_t *conn, unsigned *cap_out);
 
 /* 借りている ACK を返す / 借りているかを見る(相乗りの後始末)。 */
 int tcp_ack_flush(tcp_conn_t *conn);

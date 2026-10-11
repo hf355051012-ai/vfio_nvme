@@ -2915,6 +2915,8 @@ static void tcp_priv_init(tcp_priv_t *priv, unsigned core)
     priv->ooo_count        = 0;
     priv->unacked_full_segments = 0;
     priv->unacked_consumed_bytes = 0;
+    priv->ack_deferred = 0;
+    priv->ack_piggy_ok = 0;   /* 前にこの枠を使った接続の設定を持ち越さない */
     priv->last_ack_sent = 0;
     priv->last_win_sent = 0;
     for (unsigned i = 0; i < TCP_OOO_SLOTS; i++) {
@@ -3972,6 +3974,33 @@ uint32_t tcp_send_room(const tcp_conn_t *conn, uint32_t *usable_out)
     if (usable_out) *usable_out = usable;
     const uint32_t outstanding = conn->snd_seq - priv->snd_una;
     return (usable > outstanding) ? (usable - outstanding) : 0u;
+}
+
+/*=================================================================
+ * 短経路の再送用の枠の空きの数を返す(ACK 済みの枠はここで返す)。
+ *
+ * 引数:
+ *   conn    - 対象コネクション
+ *   cap_out - 枠の数(NULL 可)
+ * コール元:
+ *   iscsit_conn_step()(`iscsit txyield short`)
+ * ===============================================================*/
+unsigned tcp_send_short_free(const tcp_conn_t *conn, unsigned *cap_out)
+{
+    tcp_priv_t *priv = tcp_priv_for((tcp_conn_t *)conn);
+    const unsigned cap = g_tcp_async_short_cap;
+    if (cap_out) *cap_out = cap;
+    if (!priv) return 0u;
+    /* ACK 済みの枠を返す(返すのは普段 tcp_poll_once_ex() の tcp_async_short_poll() だけで、
+     * net_poll_all_and_dispatch() で ACK を拾っても枠の数は減らない。これをしないと、譲った側が
+     * 枠の空きを待ち続けて止まりかけた)。 */
+    while (priv->async_short_count > 0) {
+        const tcp_async_short_slot_t *sl = &priv->async_short_slots[priv->async_short_head];
+        if (tcp_seq_lt(priv->snd_una, sl->seq + sl->len)) break;
+        priv->async_short_head = (priv->async_short_head + 1u) % g_tcp_async_short_cap;
+        priv->async_short_count--;
+    }
+    return priv->async_short_count < cap ? cap - priv->async_short_count : 0u;
 }
 
 int tcp_send_async2(tcp_conn_t *conn, const void *buf1, uint16_t len1,
@@ -5136,11 +5165,12 @@ void tcp_input_addr(const uint8_t *pkt, uint16_t len,
                     tcp_send_segment(conn, priv, TCP_FLAG_ACK, NULL, 0);
                     priv->unacked_full_segments = 0;
                 }
-            } else if (g_tcp_ack_piggyback && priv->ack_piggy_ok &&
-                       priv->recv_upcall != NULL) {
-                /* **応答へ相乗りさせる。** upcall を持つ = 受け取ったものに
-                 * 対して必ず応答を出すコネクション(nvmet の IO キュー)なので、
-                 * ここで裸の ACK を出すと 1 コマンドが 2 パケットになる。
+            } else if (g_tcp_ack_piggyback && priv->ack_piggy_ok) {
+                /* **応答へ相乗りさせる。** 相乗りを頼んだコネクション(nvmet の IO
+                 * キュー、`iscsit ackpiggy on`)は受け取ったものに対して必ず応答を
+                 * 出すので、ここで裸の ACK を出すと 1 コマンドが 2 パケットになる。
+                 * 以前は upcall を持つことも条件にしていて、**受信を pull で読む
+                 * iSCSI ターゲットでは一度も効いていなかった**(SPEC 17.14)。
                  * 応答は同じ tick のうちに出て ACK を運ぶので、**遅延は
                  * 増えない**。応答が出なかったときは呼び出し側が
                  * `tcp_ack_flush()` で必ず吐き出す(下の nvmet の排出ループ)。 */

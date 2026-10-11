@@ -97,6 +97,7 @@ typedef struct {
     uint64_t      bytes_read, bytes_written;
     /* ---- Login / セッション ---- */
     uint8_t       ffp;             /* Full Feature Phase */
+    uint8_t       ackpiggy;        /* tcp_set_ack_piggyback() に渡した値 */
     uint8_t       login_started;
     uint8_t       isid[6];
     uint16_t      tsih;
@@ -141,7 +142,7 @@ static iscsit_ctx_t s_t;
  * 相手(open-iscsi)が壊れたダイジェストを見つけて接続を張り直すことの確認に使う。 */
 volatile uint32_t g_iscsit_corrupt_hdgst;
 volatile uint32_t g_iscsit_corrupt_ddgst;
-/* 受信の ACK を応答の PDU へ相乗りさせる(NVMe/TCP の `ackpiggy` と同じ仕組み)。次の接続から効く。 */
+/* 受信の ACK を応答の PDU へ相乗りさせる(NVMe/TCP の `ackpiggy` と同じ仕組み)。張ったままの接続にも効く。 */
 volatile uint32_t g_iscsit_ackpiggy;
 /* 送信キューの空きがこれ未満なら、受信した PDU の処理を次の周回へ回す(下の CS_RX 参照)。
  * NVMe/TCP ターゲットの NVMET_TX_ROOM_MIN と同じ(送信キューは 8 枠、SPEC 27.15)。 */
@@ -151,8 +152,8 @@ volatile uint32_t g_iscsit_ackpiggy;
  * 小さいときは窓の半分まで下げる** -- 確立直後の cwnd は数 KB なので、256KiB を待つと一度も送れず
  * cwnd も育たない(実際にそれで止まった)。 */
 #define ISCSIT_TX_WIN_MIN  262144u
-/* `iscsit txyield off|on|win`。0 = off(直す前の挙動、陰性対照)/ 1 = on(送信キューの空きだけ見る)/
- * 2 = win(既定。TCP の窓も見る)。 */
+/* `iscsit txyield off|on|win|short`。0 = off(直す前の挙動、陰性対照)/ 1 = on(送信キューの空きだけ見る)/
+ * 2 = win(既定。TCP の窓も見る)/ 3 = short(win に加えて、短経路の再送用の枠が半分を切っても譲る)。 */
 volatile uint32_t g_iscsit_tx_yield = 2u;
 
 /* ---------------------------------------------------------------- 送信 */
@@ -1232,7 +1233,8 @@ static job_result_t iscsit_conn_step(job_t *self)
                       ? netif_find_by_ip(netaddr_v4_host((const netaddr_t *)&c->tcp.local_ip)) : NULL;
             c->t_accept = timer_now();
             c->st = CS_RX;
-            tcp_set_ack_piggyback(&c->tcp, g_iscsit_ackpiggy ? 1 : 0);
+            c->ackpiggy = g_iscsit_ackpiggy ? 1u : 0u;
+            tcp_set_ack_piggyback(&c->tcp, c->ackpiggy);
             uart_printf("[iscsit] 接続%u 確立(core%u)\n", c->idx, c->tcp.owner_core);
         }
         return JOB_WAITING;
@@ -1242,6 +1244,11 @@ static job_result_t iscsit_conn_step(job_t *self)
         if (!c->ffp && timeout_ms(c->t_accept, ISCSIT_LOGIN_TIMEOUT_MS)) {
             conn_close(c, "Login が終わらない");
             return JOB_WAITING;
+        }
+        /* `iscsit ackpiggy` を張ったままの接続にも効かせる(同じ接続で交互に測るため)。 */
+        if (c->ackpiggy != (g_iscsit_ackpiggy ? 1u : 0u)) {
+            c->ackpiggy = g_iscsit_ackpiggy ? 1u : 0u;
+            tcp_set_ack_piggyback(&c->tcp, c->ackpiggy);
         }
         for (int i = 0; i < 8; i++) {
             /* **送信キューの空きが半分を切ったら、続きは次の周回へ回す。** 送信キューが満杯だと
@@ -1266,6 +1273,19 @@ static job_result_t iscsit_conn_step(job_t *self)
                     if (room < want) {
                         (void)net_poll_all_and_dispatch();
                         if (tcp_send_room(&c->tcp, NULL) < want) {
+                            c->tx_win_yield++;
+                            break;
+                        }
+                    }
+                }
+                /* **短経路の再送用の枠が半分を切ったときも譲る(short)。** ESP の相手には大きい Data-In も
+                 * 短経路で刻んで送る(iscsi_pdu.c の auto)ので、枠が埋まると送信はその場で ACK を待ち、
+                 * 1 コアで 2 本の接続を回すと、もう片方の接続が回らない(窓の場合と同じ形)。 */
+                if (g_iscsit_tx_yield >= 3u) {
+                    unsigned cap;
+                    if (tcp_send_short_free(&c->tcp, &cap) < cap / 2u) {
+                        (void)net_poll_all_and_dispatch();
+                        if (tcp_send_short_free(&c->tcp, NULL) < cap / 2u) {
                             c->tx_win_yield++;
                             break;
                         }

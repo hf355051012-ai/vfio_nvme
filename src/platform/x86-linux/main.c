@@ -6030,12 +6030,15 @@ static void shell_dispatch(char *line, int s0, int s1)
         iscsi_ini_close();
         uart_printf("iscsi-ini: 閉じた\n");
     } else if (strncmp(line, "iscsizc", 7) == 0) {
-        /* iscsizc [on|off] -- 大きい PDU の本体をゼロコピーの長経路(LSO)で送るか(off = 短経路で刻む)*/
+        /* iscsizc [on|off|auto] -- 大きい PDU の本体をゼロコピーの長経路(LSO)で送るか(off = 短経路で刻む、
+         * auto = ESP で包む相手だけ短経路。既定 auto)*/
         const char *p = line + 7;
         while (*p == ' ') p++;
-        if (strncmp(p, "on", 2) == 0) g_iscsi_pdu_zerocopy = 1;
+        if (strncmp(p, "auto", 4) == 0) g_iscsi_pdu_zerocopy = ISCSI_PDU_ZC_AUTO;
+        else if (strncmp(p, "on", 2) == 0) g_iscsi_pdu_zerocopy = 1;
         else if (strncmp(p, "off", 3) == 0) g_iscsi_pdu_zerocopy = 0;
-        uart_printf("iscsizc: %s\n", g_iscsi_pdu_zerocopy ? "on(本体はゼロコピーの長経路)" : "off(短経路で刻む)");
+        uart_printf("iscsizc: %s\n", g_iscsi_pdu_zerocopy == ISCSI_PDU_ZC_AUTO ? "auto(ESP の相手だけ短経路で刻む)"
+                    : g_iscsi_pdu_zerocopy ? "on(本体はゼロコピーの長経路)" : "off(短経路で刻む)");
     } else if (strncmp(line, "iscsibench", 10) == 0) {
         shell_iscsibench(line + 10);
     } else if (strncmp(line, "iscsitchap", 10) == 0) {
@@ -6119,21 +6122,24 @@ static void shell_dispatch(char *line, int s0, int s1)
             uart_printf("iscsit: NOP-In は無通信 %u 秒で打ち、%u 秒待つ\n", g_iscsit_nopin_ms / 1000u,
                         g_iscsit_nopin_wait_ms / 1000u);
         } else if (strncmp(p, "ackpiggy", 8) == 0) {
-            /* iscsit ackpiggy [on|off] -- 受信の ACK を応答へ相乗りさせる(次の接続から。既定 off)*/
+            /* iscsit ackpiggy [on|off] -- 受信の ACK を応答へ相乗りさせる(張ったままの接続にも効く。既定 off)*/
             const char *q = p + 8;
             while (*q == ' ') q++;
             if (strncmp(q, "on", 2) == 0) g_iscsit_ackpiggy = 1;
             else if (strncmp(q, "off", 3) == 0) g_iscsit_ackpiggy = 0;
-            uart_printf("iscsit: ackpiggy %s(次の接続から)\n", g_iscsit_ackpiggy ? "on" : "off");
+            uart_printf("iscsit: ackpiggy %s\n", g_iscsit_ackpiggy ? "on" : "off");
         } else if (strncmp(p, "txyield", 7) == 0) {
-            /* iscsit txyield [off|on|win] -- 送信キューの空きが半分を切ったら(win は TCP の窓が足りなくても)
+            /* iscsit txyield [off|on|win|short] -- 送信キューの空きが半分を切ったら(win は TCP の窓が足りなくても、
+             * short はさらに短経路の再送用の枠が半分を切っても)
              * 順番を譲る(既定 win。off が直す前)*/
             const char *q = p + 7;
             while (*q == ' ') q++;
-            if (strncmp(q, "win", 3) == 0) g_iscsit_tx_yield = 2;
+            if (strncmp(q, "short", 5) == 0) g_iscsit_tx_yield = 3;
+            else if (strncmp(q, "win", 3) == 0) g_iscsit_tx_yield = 2;
             else if (strncmp(q, "on", 2) == 0) g_iscsit_tx_yield = 1;
             else if (strncmp(q, "off", 3) == 0) g_iscsit_tx_yield = 0;
-            uart_printf("iscsit: txyield %s\n", g_iscsit_tx_yield >= 2u ? "win(送信キュー + TCP の窓)"
+            uart_printf("iscsit: txyield %s\n", g_iscsit_tx_yield >= 3u ? "short(送信キュー + TCP の窓 + 短経路の枠)"
+                        : g_iscsit_tx_yield >= 2u ? "win(送信キュー + TCP の窓)"
                         : g_iscsit_tx_yield ? "on(送信キュー)" : "off");
         } else if (strncmp(p, "logout", 6) == 0) {
             /* iscsit logout <接続番号> -- Async Message でログアウトを求める */

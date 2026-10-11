@@ -2,9 +2,17 @@
 #include "iscsi_pdu.h"
 #include "iscsi.h"
 #include "crc32c.h"
+#include "ipsec.h"
 #include <string.h>
 
-volatile uint32_t g_iscsi_pdu_zerocopy = 1;
+volatile uint32_t g_iscsi_pdu_zerocopy = ISCSI_PDU_ZC_AUTO;
+
+/* 相手との通信を ESP で包むか(ipsec.c の方針がある相手)。 */
+static int via_esp(const tcp_conn_t *tcp)
+{
+    return g_ipsec_npol && tcp->remote_ip.family == NETADDR_V4 &&
+           ipsec_policy_match(netaddr_v4_host((const netaddr_t *)&tcp->remote_ip));
+}
 
 static void put_le32(uint8_t *p, uint32_t v)
 {
@@ -47,7 +55,15 @@ int iscsi_pdu_send(tcp_conn_t *tcp, int hd, int dd, uint8_t *bhs, const uint8_t 
     if (cap > TCP_ASYNC_SHORT_SLOT_BYTES) cap = TCP_ASYNC_SHORT_SLOT_BYTES;
     if (hl + dlen + tl <= cap)
         return tcp_send_async3(tcp, hdr, (uint16_t)hl, data, (uint16_t)dlen, tail, (uint16_t)tl) < 0 ? -1 : 0;
-    if (g_iscsi_pdu_zerocopy) {
+    /* **ESP で包む相手には長経路を使わない(auto)。** 長経路はヘッダ 48 バイトを 1 セグメント、本体を
+     * 32KiB ずつの LSO で送るので、ESP の送信(ipsec_out_lso)が MSS で刻むとヘッダと 32KiB ごとの端が
+     * 小さいパケットになる(64KiB の Data-In 1 個が 9.6 個。刻めば 8.4 個)。それ以上に、長経路は窓が開くと
+     * まとめて送るので、相手の Linux(SA ごとに 1 つの CPU で復号して写す)のほうで 1 バイトあたりの費用が
+     * 4 割ほど高くなった(MSS に揃えて長経路で送っても同じだった)。短経路は再送用の枠が空くたびに 1 つずつ
+     * 送るので、ACK に合わせてならされる。どのみち ESP で暗号化するときに写すので、ゼロコピーの得も無い
+     * (読み出し +27〜37%、SPEC 17.14)。 */
+    const int zc = g_iscsi_pdu_zerocopy == ISCSI_PDU_ZC_AUTO ? !via_esp(tcp) : (int)g_iscsi_pdu_zerocopy;
+    if (zc) {
         /* **大きい PDU は本体をゼロコピーの長経路(LSO)で送る。** NVMe/TCP ターゲットの
          * C2HData と同じ形(ヘッダは短経路、本体は tcp_send_async_ref で 32KiB ずつ、
          * ダイジェストは短経路)。9KiB ずつ短経路で刻むと 1 セグメントごとに再送用の

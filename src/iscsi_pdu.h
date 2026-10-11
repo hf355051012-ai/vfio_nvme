@@ -16,8 +16,10 @@
 int iscsi_pdu_send(tcp_conn_t *tcp, int hd, int dd, uint8_t *bhs, const uint8_t *data, uint32_t dlen,
                    unsigned corrupt);
 
-/* 1 セグメントに収まらない PDU の本体をゼロコピーの長経路(LSO)で送るか(`iscsizc on|off`)。
- * **0 が「短経路で刻む」従来の送り方 = 陰性対照。** */
+/* 1 セグメントに収まらない PDU の本体をゼロコピーの長経路(LSO)で送るか(`iscsizc on|off|auto`)。
+ * **0 が「短経路で刻む」従来の送り方 = 陰性対照。** 2(auto、既定)は ESP で包む相手にだけ短経路で刻む
+ * (相手の Linux の負担を減らすため。SPEC 17.14)。 */
+#define ISCSI_PDU_ZC_AUTO 2u
 extern volatile uint32_t g_iscsi_pdu_zerocopy;
 
 /* ダイジェスト(CRC32C、最後に反転)はワイヤ上で**リトルエンディアン**。 */
