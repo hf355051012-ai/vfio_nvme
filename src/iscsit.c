@@ -87,6 +87,9 @@ typedef struct {
     uint32_t      seen_rx;        /* 前に見たときの pdu_rx(進んでいれば相手は生きている)*/
     uint64_t      idle_since;
     uint32_t      ticks;
+    netif_t      *tx_nif;         /* 送るポート(accept したときに決める)。送信キューの空きを見る */
+    uint64_t      tx_yield;       /* 送信キューの空きが無くて順番を譲った回数 */
+    uint64_t      tx_win_yield;   /* TCP の窓が足りなくて順番を譲った回数 */
     volatile int  async_req;      /* `iscsit logout <n>` が立てる(送るのはこの接続のジョブ)*/
     uint16_t      task_gen;
     iscsit_task_t task[ISCSIT_MAX_TASKS];
@@ -140,6 +143,17 @@ volatile uint32_t g_iscsit_corrupt_hdgst;
 volatile uint32_t g_iscsit_corrupt_ddgst;
 /* 受信の ACK を応答の PDU へ相乗りさせる(NVMe/TCP の `ackpiggy` と同じ仕組み)。次の接続から効く。 */
 volatile uint32_t g_iscsit_ackpiggy;
+/* 送信キューの空きがこれ未満なら、受信した PDU の処理を次の周回へ回す(下の CS_RX 参照)。
+ * NVMe/TCP ターゲットの NVMET_TX_ROOM_MIN と同じ(送信キューは 8 枠、SPEC 27.15)。 */
+#define ISCSIT_TX_ROOM_MIN 4u
+/* TCP の送れる量(相手の受信窓・cwnd の残り)がこれ未満でも同じく譲る。読み出し 1 個(256KiB)を
+ * 送り切れないと、送信は途中で窓が空くのをその場で待つ。**窓(相手の窓と cwnd の小さいほう)が
+ * 小さいときは窓の半分まで下げる** -- 確立直後の cwnd は数 KB なので、256KiB を待つと一度も送れず
+ * cwnd も育たない(実際にそれで止まった)。 */
+#define ISCSIT_TX_WIN_MIN  262144u
+/* `iscsit txyield off|on|win`。0 = off(直す前の挙動、陰性対照)/ 1 = on(送信キューの空きだけ見る)/
+ * 2 = win(既定。TCP の窓も見る)。 */
+volatile uint32_t g_iscsit_tx_yield = 2u;
 
 /* ---------------------------------------------------------------- 送信 */
 
@@ -189,6 +203,8 @@ static void conn_reset(iscsit_conn_t *c)
     c->kill = 0;
     c->pdu_rx = c->pdu_tx = c->scsi_cmds = 0;
     c->bytes_read = c->bytes_written = 0;
+    c->tx_nif = NULL;
+    c->tx_yield = c->tx_win_yield = 0;
     c->data_dst = c->data;
     c->cur_task = NULL;
     c->dataout_stale = 0;
@@ -1212,6 +1228,8 @@ static job_result_t iscsit_conn_step(job_t *self)
         if (tcp_accept_ready_poll(t->listener)) {
             t->arm_owner = -1;   /* 受け皿を次のジョブへ譲る */
             job_pin_to_core(self, c->tcp.owner_core);
+            c->tx_nif = (c->tcp.local_ip.family == NETADDR_V4)
+                      ? netif_find_by_ip(netaddr_v4_host((const netaddr_t *)&c->tcp.local_ip)) : NULL;
             c->t_accept = timer_now();
             c->st = CS_RX;
             tcp_set_ack_piggyback(&c->tcp, g_iscsit_ackpiggy ? 1 : 0);
@@ -1226,6 +1244,34 @@ static job_result_t iscsit_conn_step(job_t *self)
             return JOB_WAITING;
         }
         for (int i = 0; i < 8; i++) {
+            /* **送信キューの空きが半分を切ったら、続きは次の周回へ回す。** 送信キューが満杯だと
+             * 送信はその場で空きを待つので、1 つのコアが 2 つのポートを扱うとき、片方の接続が
+             * 受けた読み出しを出し切るまでもう片方の接続が回らず、そちらの線が遊んでいた
+             * (1 コアの 256KiB 読み出しが約 2,400 MiB/s で頭打ち、perf の半分が空き待ち。SPEC 27.14)。
+             * ここで返せばスケジューラが同じコアのほかのジョブを回す。NVMe/TCP と同じ手当て(27.15)。 */
+            if (c->ffp && c->tx_nif && g_iscsit_tx_yield) {
+                if (eth_tx_room_of(c->tx_nif) < ISCSIT_TX_ROOM_MIN) {
+                    c->tx_yield++;
+                    break;
+                }
+                /* **TCP の窓が足りないときも譲る。** 相手(Linux)の受信窓は 1 接続 80 万バイト前後で、
+                 * 256KiB の読み出しを 3 個積むと埋まる。窓待ちはその場で回るので、1 コアでは
+                 * もう片方の接続が回らない。譲る前に受信を 1 回見て ACK を拾う(全部の接続が
+                 * 譲り合うと誰も ACK を拾わず止まる)。 */
+                if (g_iscsit_tx_yield >= 2u) {
+                    uint32_t usable;
+                    const uint32_t room = tcp_send_room(&c->tcp, &usable);
+                    uint32_t want = usable / 2u;
+                    if (want > ISCSIT_TX_WIN_MIN) want = ISCSIT_TX_WIN_MIN;
+                    if (room < want) {
+                        (void)net_poll_all_and_dispatch();
+                        if (tcp_send_room(&c->tcp, NULL) < want) {
+                            c->tx_win_yield++;
+                            break;
+                        }
+                    }
+                }
+            }
             const int r = rx_step(c);
             if (r <= 0) break;
         }
@@ -1354,11 +1400,12 @@ void iscsit_status(void)
             continue;
         }
         uart_printf("  接続%u: %s %s %s tsih=%u ExpCmdSN=%u StatSN=%u PDU 受%u/送%u SCSI %u digest=%s/%s "
-                    "読 %llu / 書 %llu バイト\n",
+                    "読 %llu / 書 %llu バイト / 譲った 送信キュー %llu 回・窓 %llu 回\n",
                     i, CS_NAME[c->st], c->ffp ? (c->neg.p.discovery ? "Discovery" : "Normal") : "login",
                     c->neg.initiator_name[0] ? c->neg.initiator_name : "-", c->tsih, c->exp_cmd_sn,
                     c->stat_sn, c->pdu_rx, c->pdu_tx, c->scsi_cmds, c->hd ? "CRC32C" : "None",
                     c->dd ? "CRC32C" : "None", (unsigned long long)c->bytes_read,
-                    (unsigned long long)c->bytes_written);
+                    (unsigned long long)c->bytes_written, (unsigned long long)c->tx_yield,
+                    (unsigned long long)c->tx_win_yield);
     }
 }

@@ -83,6 +83,8 @@ extern volatile uint64_t g_tcp_async_short_winwait;
 extern volatile uint32_t g_tcp_win_last_usable;
 extern volatile uint32_t g_tcp_win_last_outstanding;
 extern volatile uint32_t g_tcp_win_last_cwnd;
+extern volatile uint64_t g_tcp_async_long_winwait, g_tcp_async_long_cwndlim, g_tcp_async_long_full;
+extern volatile uint32_t g_tcp_long_last_outstanding, g_tcp_long_last_cwnd, g_tcp_long_last_sndwin;
 extern volatile uint32_t g_tcp_win_last_sndwin;
 #define TCP_ASYNC_SHORT_CAP_MAX 64u
 extern volatile uint32_t g_tcp_keepalive_drop_count;   /* 応答が無くて畳んだ数 */
@@ -226,6 +228,9 @@ int      tcp_send_async_commit(tcp_conn_t *conn, uint16_t len);
 
 /* まだ ACK されていない送信済みバイト数(Nagle 的な溜め込みの判定用)。 */
 uint32_t tcp_unacked_bytes(const tcp_conn_t *conn);
+/* いま送れるバイト数(相手の受信窓と cwnd の小さいほう - 未確認)。足りないと長経路の送信は
+ * その場で窓が空くのを待つ。 */
+uint32_t tcp_send_room(const tcp_conn_t *conn, uint32_t *usable_out);
 
 /* 借りている ACK を返す / 借りているかを見る(相乗りの後始末)。 */
 int tcp_ack_flush(tcp_conn_t *conn);

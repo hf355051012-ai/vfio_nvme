@@ -29,6 +29,9 @@ extern volatile uint32_t g_iscsit_corrupt_hdgst;
 extern volatile uint32_t g_iscsit_corrupt_ddgst;
 /* 受信の ACK を応答へ相乗りさせる(`iscsit ackpiggy on|off`、次の接続から)。 */
 extern volatile uint32_t g_iscsit_ackpiggy;
+/* 送信キューの空きが半分を切った / TCP の窓が足りないとき受信の処理を次の周回へ回す
+ * (`iscsit txyield off|on|win`、既定 win = 2)。 */
+extern volatile uint32_t g_iscsit_tx_yield;
 
 /* 生存確認(NOP-In)。無通信がこれだけ続いたら打ち、応答をこれだけ待つ(ms、0 = 打たない)。 */
 extern volatile uint32_t g_iscsit_nopin_ms;

@@ -6125,6 +6125,16 @@ static void shell_dispatch(char *line, int s0, int s1)
             if (strncmp(q, "on", 2) == 0) g_iscsit_ackpiggy = 1;
             else if (strncmp(q, "off", 3) == 0) g_iscsit_ackpiggy = 0;
             uart_printf("iscsit: ackpiggy %s(次の接続から)\n", g_iscsit_ackpiggy ? "on" : "off");
+        } else if (strncmp(p, "txyield", 7) == 0) {
+            /* iscsit txyield [off|on|win] -- 送信キューの空きが半分を切ったら(win は TCP の窓が足りなくても)
+             * 順番を譲る(既定 win。off が直す前)*/
+            const char *q = p + 7;
+            while (*q == ' ') q++;
+            if (strncmp(q, "win", 3) == 0) g_iscsit_tx_yield = 2;
+            else if (strncmp(q, "on", 2) == 0) g_iscsit_tx_yield = 1;
+            else if (strncmp(q, "off", 3) == 0) g_iscsit_tx_yield = 0;
+            uart_printf("iscsit: txyield %s\n", g_iscsit_tx_yield >= 2u ? "win(送信キュー + TCP の窓)"
+                        : g_iscsit_tx_yield ? "on(送信キュー)" : "off");
         } else if (strncmp(p, "logout", 6) == 0) {
             /* iscsit logout <接続番号> -- Async Message でログアウトを求める */
             iscsit_request_logout((unsigned)atoi(p + 6));
@@ -6500,6 +6510,7 @@ static void shell_dispatch(char *line, int s0, int s1)
             g_tcp_async_short_stalls = 0;
             g_tcp_async_short_winwait = 0;
             g_tcp_win_over[0] = g_tcp_win_over[1] = 0;
+            g_tcp_async_long_winwait = g_tcp_async_long_cwndlim = g_tcp_async_long_full = 0;
         } else if (*p != '\0') {
             int n = atoi(p);
             if (n < 1 || n > (int)TCP_ASYNC_SHORT_CAP_MAX) {
@@ -6517,6 +6528,11 @@ static void shell_dispatch(char *line, int s0, int s1)
                     (unsigned long long)g_tcp_async_short_winwait,
                     g_tcp_win_last_usable, g_tcp_win_last_outstanding,
                     g_tcp_win_last_cwnd, g_tcp_win_last_sndwin);
+        uart_printf("  長経路: 窓待ち %llu 回(うち cwnd < 相手の窓 %llu 回、最後: outstanding=%u cwnd=%u snd_win=%u)"
+                    "  再送スロット満杯待ち %llu 回\n",
+                    (unsigned long long)g_tcp_async_long_winwait, (unsigned long long)g_tcp_async_long_cwndlim,
+                    g_tcp_long_last_outstanding, g_tcp_long_last_cwnd, g_tcp_long_last_sndwin,
+                    (unsigned long long)g_tcp_async_long_full);
         uart_printf("  受信ウィンドウ超えの送信 通常 %llu 回 / LSO %llu 回 (最後: 未確認から %u バイト先に %u バイト、窓 %u)"
                     "  窓の確認 %llu 回\n",
                     (unsigned long long)g_tcp_win_over[0], (unsigned long long)g_tcp_win_over[1],

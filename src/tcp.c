@@ -150,6 +150,14 @@ volatile uint32_t g_tcp_win_last_usable;
 volatile uint32_t g_tcp_win_last_outstanding;
 volatile uint32_t g_tcp_win_last_cwnd;
 volatile uint32_t g_tcp_win_last_sndwin;
+/* 長経路(tcp_send_async / _ref)で待った回数。窓が空くのを待ち始めた回数(うち自分の cwnd が
+ * 相手の窓より小さかった回数)と、再送スロットが満杯で待った回数。最後の値も控える。 */
+volatile uint64_t g_tcp_async_long_winwait;
+volatile uint64_t g_tcp_async_long_cwndlim;
+volatile uint64_t g_tcp_async_long_full;
+volatile uint32_t g_tcp_long_last_outstanding;
+volatile uint32_t g_tcp_long_last_cwnd;
+volatile uint32_t g_tcp_long_last_sndwin;
 
 volatile uint32_t g_tcp_retransmit_count[SMP_MAX_CORES];
 
@@ -2479,7 +2487,10 @@ static void tcp_poll_once_ex(int check_ctrl_c)
 {
     unsigned core = smp_core_index();
 
-    if (check_ctrl_c && uart_check_ctrl_c()) {
+    /* Ctrl-C を見るのはシェルのコア(core0)だけ。ほかのコアのジョブ(ターゲットの送信窓待ちなど)が
+     * ここを通ると、1 回ごとに標準入力の read(システムコール)を払い、しかもシェルへ送った
+     * コマンドの文字を読んで捨てていた(1 コアの iSCSI の読み出しで core1 の約 3 割。SPEC 27.14)。 */
+    if (check_ctrl_c && core == 0u && uart_check_ctrl_c()) {
         s_abort_requested = 1;
     }
 
@@ -3834,6 +3845,7 @@ static int tcp_send_async_ex(tcp_conn_t *conn, const void *buf, uint16_t len, in
     while (sent_total < (uint32_t)len) {
         if (priv->async_count >= priv->async_cap) {
             /* キュー満杯 -- 最低1件空くまで待ってから続ける。 */
+            g_tcp_async_long_full++;
             tcp_async_flush_until_room(conn, priv);
         }
 
@@ -3846,6 +3858,13 @@ static int tcp_send_async_ex(tcp_conn_t *conn, const void *buf, uint16_t len, in
         }
         uint32_t room = (usable_window > outstanding) ? (usable_window - outstanding) : 0u;
         uint64_t probe_since = 0;
+        if (room == 0) {
+            g_tcp_async_long_winwait++;
+            if (priv->cwnd + tcp_sacked_bytes(priv) < conn->snd_win) g_tcp_async_long_cwndlim++;
+            g_tcp_long_last_outstanding = outstanding;
+            g_tcp_long_last_cwnd        = priv->cwnd;
+            g_tcp_long_last_sndwin      = conn->snd_win;
+        }
         while (room == 0) {
             /* 窓が 0 の間は送らずに待つ(以前は 1 とみなして 1 バイト送り、
              * Linux に捨てられて再送タイムアウトを待っていた)。 */
@@ -3938,6 +3957,21 @@ uint32_t tcp_unacked_bytes(const tcp_conn_t *conn)
     tcp_priv_t *priv = tcp_priv_for((tcp_conn_t *)conn);
     if (!priv) return 0u;
     return conn->snd_seq - priv->snd_una;
+}
+
+/* いま送れるバイト数(相手の受信窓と自分の cwnd の小さいほうから未確認を引いた残り)。
+ * tcp_send_async_ex() が「窓が空くまでその場で待つ」かどうかの判定と同じ式。 */
+uint32_t tcp_send_room(const tcp_conn_t *conn, uint32_t *usable_out)
+{
+    tcp_priv_t *priv = tcp_priv_for((tcp_conn_t *)conn);
+    if (usable_out) *usable_out = 0u;
+    if (!priv) return 0u;
+    uint32_t usable = conn->snd_win;
+    const uint32_t cw = priv->cwnd + tcp_sacked_bytes(priv);
+    if (cw < usable) usable = cw;
+    if (usable_out) *usable_out = usable;
+    const uint32_t outstanding = conn->snd_seq - priv->snd_una;
+    return (usable > outstanding) ? (usable - outstanding) : 0u;
 }
 
 int tcp_send_async2(tcp_conn_t *conn, const void *buf1, uint16_t len1,
