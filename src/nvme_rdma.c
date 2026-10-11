@@ -889,6 +889,7 @@ job_result_t nvme_rdma_connect_job_step(job_t *self)
         ctx->io_cm.hsqsize      = NVME_RDMA_QSIZE - 1u;
         ctx->io_cm.cntlid       = ctx->cntlid;   /* IO キューでは実値を載せる */
         ctx->io_cm.nvme_qid     = 1u;
+        ctx->io_cm.req_path_mtu = ctx->cm.req_path_mtu;
         {
             job_t *cmjob = job_spawn(rdma_cm_job_step, &ctx->io_cm, "nvme-rdma-io-cm");
             if (!cmjob) return nvmer_fail(ctx, "IOキュー用CMジョブ生成失敗");
@@ -1332,6 +1333,22 @@ void nvme_rdma_force_reconnect(void)
     s_init_ctx.reusable = 0;
 }
 
+/* CM REQ で名乗る経路 MTU(IB の符号 1=256 .. 5=4096)。admin / IO キューの両方に入れ、
+ * 確立した RC QP もこの値で動く。既定は 4096(Linux / SPDK も netdev の MTU 9000 から 4096 を使う)。
+ * rdma_cm の従来値 1024 のままだと、深い qd の 4KiB 以上がフレームのヘッダの割合(約 8%)で
+ * 2,750 MiB/s 前後に頭打ちになる。4096 で 2,900〜2,917(25GbE の線速)。代わりに qd1 の
+ * 4KiB / 64KiB は 1 パケットが大きいぶん 3〜8% 遅くなる(`rdmamtu 1024` で戻せる)。 */
+#define NVMER_PATH_MTU_DEFAULT 5u
+static uint8_t s_path_mtu = NVMER_PATH_MTU_DEFAULT;
+
+void nvme_rdma_set_path_mtu(uint8_t code)
+{
+    s_path_mtu = code ? code : NVMER_PATH_MTU_DEFAULT;
+    s_init_ctx.reusable = 0;
+}
+
+uint8_t nvme_rdma_path_mtu(void) { return s_path_mtu; }
+
 /*=================================================================
  * プロセスを終える前に、イニシエータの接続を CM の DREQ で畳む。
  * 送らずに終えると相手に前の接続が残り、次に起動して繋ぐと
@@ -1460,6 +1477,7 @@ void nvme_rdma_run_bench(mlx5_dev_t *dev0, mlx5_dev_t *dev1, uint32_t duration_m
             rdma_cm_fill_addr(&s_init_ctx.cm, dev0, "mlx5-pf0", "mlx5-pf1", ip0_fallback, ip1_fallback,
                               mac0_fallback, mac1_fallback);
         }
+        s_init_ctx.cm.req_path_mtu = s_path_mtu;
         s_init_ctx.bench_enabled = 1;
         s_init_ctx.bench_is_read = is_read ? 1 : 0;
         s_init_ctx.bench_chunk_bytes = chunk_bytes;

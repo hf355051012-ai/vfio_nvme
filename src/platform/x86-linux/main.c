@@ -5732,6 +5732,22 @@ static void shell_dispatch(char *line, int s0, int s1)
                             lb, (unsigned)nz);
             }
         }
+    } else if (strncmp(line, "rdmamtu", 7) == 0) {
+        /* rdmamtu [256|512|1024|2048|4096|0]
+         *
+         * NVMe-oF RDMA イニシエータが CM REQ で名乗る経路 MTU(確立した RC QP も
+         * この値で動く)。既定(0)は 4096。1024 が rdma_cm の従来値で、**交互に測って
+         * 確かめるための切り替え**。値を変えると次の bench で接続を張り直す。 */
+        char *arg = line + 7;
+        while (*arg == ' ') arg++;
+        if (*arg) {
+            int v = atoi(arg);
+            uint8_t code = v == 256 ? 1u : v == 512 ? 2u : v == 1024 ? 3u :
+                           v == 2048 ? 4u : v == 4096 ? 5u : 0u;
+            nvme_rdma_set_path_mtu(code);
+        }
+        uint8_t c = nvme_rdma_path_mtu();
+        uart_printf("rdmamtu: %u%s\n", 128u << c, c == 5u ? " (既定)" : "");
     } else if (strncmp(line, "rdmarra", 7) == 0) {
         /* rdmarra [N]
          *

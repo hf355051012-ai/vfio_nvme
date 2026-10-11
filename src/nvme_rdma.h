@@ -148,6 +148,8 @@ const nvme_rdma_remote_t *nvme_rdma_remote_target(void);
 void nvme_rdma_set_ns_override(uint32_t lba_size, uint64_t nsze);
 /* 次の bench で RDMA の接続を張り直させる(CM のパラメータを変えたとき用)。 */
 void nvme_rdma_force_reconnect(void);
+void nvme_rdma_set_path_mtu(uint8_t code);
+uint8_t nvme_rdma_path_mtu(void);
 /* プロセスを終える前に、イニシエータの接続を CM の DREQ で畳む。 */
 void nvme_rdma_shutdown(void);
 void nvme_rdma_get_ns_override(uint32_t *lba_size, uint64_t *nsze);
