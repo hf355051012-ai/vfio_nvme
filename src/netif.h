@@ -36,6 +36,11 @@ int eth_send_lso_async(const void *hdr, uint16_t hdr_len,
 
 unsigned eth_tx_wait_free_slot(void);
 
+/* ESP(ipsec.c)を通らない素の送信と、受信のチェックサム検証済みの印の書き換え。 */
+int eth_send_frags_raw(const eth_frag_t *frags, unsigned frag_count);
+int eth_send_frags_async_raw(const eth_frag_t *frags, unsigned frag_count);
+void eth_rx_set_hw_csum_ok(int v);
+
 typedef void (*eth_handler_t)(const uint8_t *payload, size_t len, const uint8_t *src_mac);
 
 /* EtherType に対するハンドラを登録する(再登録は上書き、NULL で解除)。 */

@@ -221,6 +221,19 @@ static inline uint32_t checksum_accumulate(uint32_t sum, const volatile void *da
             sum += (be >> 16) & 0xFFFFu;
             sum += be & 0xFFFFu;
         }
+    } else {
+        /* 4 バイト境界にも揃っていない(ESP を外した中身の TCP は 50 バイト目から始まる)。
+         * x86 は揃っていない読み出しも速いので、ここも 8 バイトずつ読む。1 バイトずつの
+         * ループに落ちると 9KB のセグメントで数 us かかり、IPsec の受信の律速になった。 */
+        for (; i + 8 <= len; i += 8) {
+            uint64_t v;
+            __builtin_memcpy(&v, (const void *)(uintptr_t)(p + i), 8);
+            const uint64_t be = __builtin_bswap64(v);
+            sum += (uint32_t)((be >> 48) & 0xFFFFu);
+            sum += (uint32_t)((be >> 32) & 0xFFFFu);
+            sum += (uint32_t)((be >> 16) & 0xFFFFu);
+            sum += (uint32_t)(be & 0xFFFFu);
+        }
     }
 
     for (; i + 1 < len; i += 2)

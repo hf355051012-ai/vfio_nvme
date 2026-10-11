@@ -1,3 +1,4 @@
+#include "ipsec.h"
 #include <stddef.h>
 #include "tcp.h"
 #include "ip.h"
@@ -2655,6 +2656,15 @@ static void tcp_parse_syn_options(tcp_conn_t *conn, tcp_priv_t *priv,
      * オプションの並び順に依存しないよう、走査を終えてから引く。 */
     if (priv->ts_enabled && conn->snd_mss > TCP_TS_OPT_LEN * 4u) {
         conn->snd_mss = (uint16_t)(conn->snd_mss - TCP_TS_OPT_LEN);
+    }
+    /* **IPsec(ESP)で包む相手には、ESP で増えるぶんも送信側で引く。** 相手が広告する
+     * MSS は相手のリンク MTU だけから決まっていて、ESP の分を含まない(Linux も
+     * 送る側で xfrm のヘッダ長を引く)。引かないとフルサイズのセグメントだけが
+     * 相手の MTU を超えて落ちる。 */
+    if (g_ipsec_npol && conn->remote_ip.family == NETADDR_V4 &&
+        ipsec_policy_match(netaddr_v4_host((const netaddr_t *)&conn->remote_ip)) &&
+        conn->snd_mss > IPSEC_ESP_OVERHEAD * 4u) {
+        conn->snd_mss = (uint16_t)(conn->snd_mss - IPSEC_ESP_OVERHEAD);
     }
 }
 

@@ -39,6 +39,8 @@
 #include <stdio.h>    /* setvbuf(raw モードで1文字ずつ即時エコーするため無バッファ化) */
 #include "timestamp.h" /* ts コマンド(ts_log ダンプ) */
 #include "tcp.h"       /* ackthresh コマンド(g_tcp_ack_threshold) */
+#include "ipsec.h"     /* ipsec コマンド */
+#include "ike.h"
 
 /*=================================================================
  * CRC32C を 2 段階で確認する。
@@ -2041,6 +2043,51 @@ static int shell_parse_ipv4(const char *s, uint32_t *out)
     if (*s != '\0') return -1;
     *out = v;
     return 0;
+}
+
+/* ipsec psk <相手> <事前共有鍵> [pf0|pf1] / up <相手> / down <相手> / del <相手> / stat / clear */
+static void shell_ipsec(const char *args)
+{
+    char tok[4][160];
+    unsigned n = 0;
+    while (*args && n < 4u) {
+        while (*args == ' ') args++;
+        if (!*args) break;
+        unsigned k = 0;
+        while (*args && *args != ' ' && k + 1u < sizeof(tok[0])) tok[n][k++] = *args++;
+        tok[n][k] = 0;
+        while (*args && *args != ' ') args++;
+        n++;
+    }
+    uint32_t ip = 0;
+    if (n == 0 || strcmp(tok[0], "stat") == 0) {
+        ike_status();
+        return;
+    }
+    if (strcmp(tok[0], "clear") == 0) {
+        ipsec_stats_clear();
+        return;
+    }
+    if (n < 2 || shell_parse_ipv4(tok[1], &ip) != 0) {
+        uart_printf("使い方: ipsec psk <相手> <鍵> [pf0|pf1] | up <相手> | down <相手> | del <相手> | stat | clear\n");
+        return;
+    }
+    if (strcmp(tok[0], "psk") == 0 && n >= 3) {
+        netif_t *nif = netif_find((n >= 4 && strcmp(tok[3], "pf0") == 0) ? "mlx5-pf0" : "mlx5-pf1");
+        if (ike_peer_add(ip, tok[2], nif, NULL) != 0) uart_printf("ipsec: 登録できない\n");
+        else uart_printf("ipsec: %s を %s 経由の IPsec の相手にした(以後この相手とは ESP だけ)\n", tok[1],
+                         nif ? nif->name : "?");
+    } else if (strcmp(tok[0], "up") == 0) {
+        uart_printf("ipsec: %s\n", ike_up(ip) == 0 ? "確立した" : "失敗");
+    } else if (strcmp(tok[0], "down") == 0) {
+        ike_down(ip);
+    } else if (strcmp(tok[0], "del") == 0) {
+        ike_down(ip);
+        ike_peer_del(ip);
+        uart_printf("ipsec: %s を外した(平文に戻る)\n", tok[1]);
+    } else {
+        uart_printf("ipsec: 知らない操作 %s\n", tok[0]);
+    }
 }
 
 /*=================================================================
@@ -5928,6 +5975,10 @@ static void shell_dispatch(char *line, int s0, int s1)
          * 鍵は Linux の `nvme gen-tls-key` で作ったもの。段階 D は握手と最初の
          * 暗号文(ICReq)の復号まで。 */
         nvmet_tls_shell(line + 8);
+    } else if (strncmp(line, "ipsec", 5) == 0) {
+        /* ipsec psk <相手> <鍵> [pf0|pf1] / up / down / del / stat / clear
+         * iSCSI の IPsec(ESP AES-GCM-16-128 トランスポート + IKEv2 事前共有鍵)。 */
+        shell_ipsec(line + 5);
     } else if (strncmp(line, "iscsitarget", 11) == 0) {
         /* iscsitarget                       -- 設定を表示
          * iscsitarget <ip> [port] [iqn]     -- iSCSI イニシエータの接続先(既定 3260、iqn 省略で Discovery の最初)

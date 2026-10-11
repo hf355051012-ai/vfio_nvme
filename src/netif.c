@@ -1,3 +1,4 @@
+#include "ipsec.h"
 #include "netif.h"
 #include <stddef.h>
 #include "timestamp.h"   /* 同上 */
@@ -173,6 +174,13 @@ int eth_rx_hw_csum_ok(void)
     return s_rx_hw_csum_ok[smp_core_index()];
 }
 
+/* ESP を復号した中身をもう一度 ip_handle_frame() へ入れるとき、NIC の検証結果
+ * (外側の ESP に対するもの)を使わせないために 0 にする(ipsec.c)。 */
+void eth_rx_set_hw_csum_ok(int v)
+{
+    s_rx_hw_csum_ok[smp_core_index()] = v;
+}
+
 /*=================================================================
  * 受信フレームの EtherType を見て、登録済みハンドラへペイロードを渡す。
  * ハンドラ実行中だけ nb->hw_csum_ok を per-core スロットへ公開する
@@ -233,6 +241,14 @@ void eth_get_mac(uint8_t mac[ETH_ALEN])
  * ===============================================================*/
 int eth_send_frags(const eth_frag_t *frags, unsigned frag_count)
 {
+    int rc;
+    if (g_ipsec_npol && ipsec_out_frags(frags, frag_count, 0, &rc)) return rc;   /* ESP で包む相手 */
+    return eth_send_frags_raw(frags, frag_count);
+}
+
+/* ESP を通らない素の送信(ipsec.c が包んだフレームを送るのに使う)。 */
+int eth_send_frags_raw(const eth_frag_t *frags, unsigned frag_count)
+{
     if (!g_active_ctx) {
         uart_printf("[eth] eth_send_frags: アクティブなインターフェースが無い\n");
         return -1;
@@ -252,6 +268,13 @@ int eth_send_frags(const eth_frag_t *frags, unsigned frag_count)
  *   tcp_send_segment(), tcp_send_bare_ack()
  * ===============================================================*/
 int eth_send_frags_async(const eth_frag_t *frags, unsigned frag_count)
+{
+    int rc;
+    if (g_ipsec_npol && ipsec_out_frags(frags, frag_count, 1, &rc)) return rc;
+    return eth_send_frags_async_raw(frags, frag_count);
+}
+
+int eth_send_frags_async_raw(const eth_frag_t *frags, unsigned frag_count)
 {
     if (!g_active_ctx) return -1;
     return g_active_ctx->nic->send_frags_async(g_active_ctx->nic_priv, frags, frag_count); // -> mlx5_net_send_frags_async
@@ -273,6 +296,8 @@ int eth_send_frags_async(const eth_frag_t *frags, unsigned frag_count)
 int eth_send_lso_async(const void *hdr, uint16_t hdr_len,
                        const void *payload, uint32_t payload_len, uint16_t mss)
 {
+    int rc;
+    if (g_ipsec_npol && ipsec_out_lso(hdr, hdr_len, payload, payload_len, mss, &rc)) return rc;
     if (!g_active_ctx || !g_active_ctx->nic->send_lso) return -1;
     return g_active_ctx->nic->send_lso(g_active_ctx->nic_priv, hdr, hdr_len, payload, payload_len, mss); // -> mlx5_net_send_lso_async
 }

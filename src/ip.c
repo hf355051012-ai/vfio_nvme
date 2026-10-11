@@ -1,3 +1,4 @@
+#include "ipsec.h"
 #include <stddef.h>
 #include "ip.h"
 #include "icmp.h"
@@ -158,6 +159,16 @@ void ip_handle_frame(const uint8_t *payload, size_t len, const uint8_t *src_mac)
         }
         ip_payload     = whole;
         ip_payload_len = whole_len;
+    }
+
+    if (g_ipsec_npol) {
+        const uint32_t sip = ip_from_octets(src_ip[0], src_ip[1], src_ip[2], src_ip[3]);
+        if (protocol == IP_PROTO_ESP) {
+            ipsec_esp_input(payload, total_len, src_mac);
+            return;
+        }
+        /* IPsec の方針を持つ相手からの平文(IKE 以外)は捨てる。 */
+        if (ipsec_rx_drop_plain(sip, protocol, ip_payload, ip_payload_len)) return;
     }
 
     if (protocol == IP_PROTO_ICMP) {
