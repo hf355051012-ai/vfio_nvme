@@ -6,7 +6,7 @@
 /* nvmet が admin 1 + IO キュー NVMET_IO_QUEUES(4)= 5 枠使うので、RDMA 側や
  * 内蔵イニシエータと同時に立てても足りるだけの余裕を持たせてある。 */
 /* nvmet の admin 1 + IO 16、nvmet-rdma の standalone 1 + IO 4 + CM 1 で 23。 */
-#define JOB_MAX 32u
+#define JOB_MAX 48u   /* nvmet は 1 実体で 17 本使う。2 ポート(2 実体)+ iSCSI / RDMA に足りるように */
 
 /* 眠っている(park した)ジョブを念のため step する周期。job_scheduler_tick()
  * の呼び出し回数で数える。**2 の冪であること**(マスクで判定する)。

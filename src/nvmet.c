@@ -208,9 +208,10 @@ static void nvmet_build_id_ctrl(nvmet_ctx_t *ctx)
 
     wr32le(&ctx->id_ctrl[80], NVME_VS_1_3_0);     /* VER: VS レジスタと同じ値を名乗る */
 
-    wr16le(&ctx->id_ctrl[78], 1);                /* CNTLID = 1 (ctx->ctrlr_idと一致させる) */
+    wr16le(&ctx->id_ctrl[78], ctx->cntlid_cfg ? ctx->cntlid_cfg : 1u);   /* CNTLID(ctx->ctrlr_id と一致させる)*/
 
     ctx->id_ctrl[111] = 1;                      /* CNTRLTYPE = 1 (I/O controller) */
+    if (g_nvmet_multi_ctrl) ctx->id_ctrl[76] |= 0x02u;   /* CMIC: 複数コントローラ(2 ポートのとき)*/
 
     wr16le(&ctx->id_ctrl[320], 2);               /* KAS = 2 (200ms単位、値自体は非0であれば可) */
 
@@ -425,6 +426,7 @@ static void nvmet_build_id_ns(nvmet_ctx_t *ctx, uint32_t nsid)
      * ゼロ埋めする実装と整合させる(ここが 0 だと「読み出し値は不定」の
      * 意味になり、ホストは discard 後の内容を信用しない)。 */
     p[NVME_ID_NS_OFF_DLFEAT] = 0x01u;
+    if (g_nvmet_multi_ctrl) p[30] |= 0x01u;   /* NMIC: 複数コントローラから共有(2 ポートのとき)*/
 
     /* **CNS=0x03(記述子リスト)と同じ値をここにも入れる。** 片方だけに
      * 入れるとホストが「識別子が食い違う名前空間」と見なす。
@@ -913,7 +915,7 @@ static int nvmet_admin_dispatch(nvmet_ctx_t *ctx, const nvme_sqe_t *sqe,
                 } else {
                     nvmet_auth_reset(&ctx->auth);   /* Discovery は認証しない(Linux も同じ)*/
                 }
-                ctx->ctrlr_id = 1;
+                ctx->ctrlr_id = ctx->cntlid_cfg ? ctx->cntlid_cfg : 1u;
                 /* Connect のデータは struct nvmf_connect_data(1024 バイト)で、
                  * offset 256 から subsysnqn[256]。ここが Discovery NQN なら
                  * このセッションは Discovery コントローラになる。 */
@@ -943,9 +945,10 @@ static int nvmet_admin_dispatch(nvmet_ctx_t *ctx, const nvme_sqe_t *sqe,
                  * TLS で張り直す**。ここで立てると、admin がその切断で畳まず、張り直しの
                  * SYN を IO 側の受け皿が受け取ってしまう。通常のホストは必ず CC.EN を
                  * 立ててから IO キューを張る。 */
-                nvmet_build_cqe(ctx, &cqe, ctx->admin.last_cid, 1u | atr, 0);
-                uart_printf("[nvmet:%s] Fabrics Connect (qid=0, admin) 受理 (ctrlr_id=1%s%s)\n",
-                            ctx->label, ctx->is_discovery ? ", Discovery コントローラ" : "",
+                /* 応答の dw0 の下位 16 ビットが cntlid(2 ポートのときは実体ごとに違う)。 */
+                nvmet_build_cqe(ctx, &cqe, ctx->admin.last_cid, (uint32_t)ctx->ctrlr_id | atr, 0);
+                uart_printf("[nvmet:%s] Fabrics Connect (qid=0, admin) 受理 (ctrlr_id=%u%s%s)\n",
+                            ctx->label, (unsigned)ctx->ctrlr_id, ctx->is_discovery ? ", Discovery コントローラ" : "",
                             atr ? "、認証を要求" : "");
             } else {
                 uart_printf("[!] nvmet: adminキューで想定外のqid=%u\n", qid);
@@ -1383,8 +1386,16 @@ typedef enum {
 
 /* TLS の接続状態。admin は同時に 1 本、IO はキューの番号ごと。
  * **Linux のホストは admin と IO キューの全部の接続で握手してくる。** */
-static nvmet_tls_conn_t s_admin_tls;
-static nvmet_tls_conn_t s_io_tls[NVMET_IO_QUEUES];
+volatile int g_nvmet_multi_ctrl;
+
+/* 送信キューの空きがこれ未満なら、IO ジョブはコマンドの処理を次の周回へ回す(上の push-run 参照)。
+ * 送信キューは 8 枠(MLX5_SQ_WQE_COUNT)で、256KiB の読み出し 1 個がヘッダと LSO(64KiB)で約 5 枠使う。 */
+#define NVMET_TX_ROOM_MIN 4u
+/* `nvmettxyield on|off`。off が直す前の挙動(陰性対照)。 */
+volatile uint32_t g_nvmet_tx_yield = 1u;
+
+static nvmet_tls_conn_t s_admin_tls[NVMET_MAX_INSTANCES];
+static nvmet_tls_conn_t s_io_tls[NVMET_MAX_INSTANCES][NVMET_IO_QUEUES];
 
 #define NADM_STATE_NAME_COUNT (sizeof(NADM_STATE_NAMES) / sizeof(NADM_STATE_NAMES[0]))
 
@@ -1582,7 +1593,7 @@ static job_result_t nvmet_admin_job_step(job_t *self)
             jc->wait_started_ticks = timer_now();
             if (nvmet_tls_enabled()) {
                 /* **ICReq より前に TLS の握手**(NVMe/TCP の決まり)。 */
-                nvmet_tls_start(&s_admin_tls);
+                nvmet_tls_start(&s_admin_tls[ctx->inst]);
                 self->state = NADM_ST_TLS_HS;
                 return JOB_WAITING;
             }
@@ -1600,22 +1611,22 @@ static job_result_t nvmet_admin_job_step(job_t *self)
         return JOB_WAITING;
 
     case NADM_ST_TLS_HS: {
-        const int r = nvmet_tls_poll(&s_admin_tls, &ctx->admin.tcp);
+        const int r = nvmet_tls_poll(&s_admin_tls[ctx->inst], &ctx->admin.tcp);
         if (r < 0) {
-            crypto_wipe(&s_admin_tls.t, sizeof(s_admin_tls.t));
+            crypto_wipe(&s_admin_tls[ctx->inst].t, sizeof(s_admin_tls[ctx->inst].t));
             return nvmet_admin_job_setup_fail(self, ctx);
         }
         if (r == 0) {
             if (timeout_ms(jc->wait_started_ticks, NVMET_ACCEPT_TIMEOUT_MS)) {
                 uart_printf("[!] nvmet-tls: 握手の待ちがタイムアウト\n");
-                crypto_wipe(&s_admin_tls.t, sizeof(s_admin_tls.t));
+                crypto_wipe(&s_admin_tls[ctx->inst].t, sizeof(s_admin_tls[ctx->inst].t));
                 return nvmet_admin_job_setup_fail(self, ctx);
             }
             return JOB_WAITING;
         }
         /* **握手が済んだら、以後の送受信は全部レコード層を通る**(段階 E)。
          * ICReq はもう平文の待ち行列に入っているかもしれない。 */
-        ctx->admin.tls = &s_admin_tls;
+        ctx->admin.tls = &s_admin_tls[ctx->inst];
         self->state = NADM_ST_ICREQ_RECV;
         return JOB_WAITING;
     }
@@ -1626,10 +1637,10 @@ static job_result_t nvmet_admin_job_step(job_t *self)
          * 最初のバイトで見分ける**: 0x16 = TLS の握手、0x00 = 平文の ICReq。 */
         if (r >= 0 && !ctx->admin.tls && jc->xfer.got > 0 && jc->icreq_buf[0] == 0x16 &&
             nvmet_tls_possible()) {
-            nvmet_tls_start(&s_admin_tls);
-            const int t = nvmet_tls_preload(&s_admin_tls, &ctx->admin.tcp, jc->icreq_buf, jc->xfer.got);
+            nvmet_tls_start(&s_admin_tls[ctx->inst]);
+            const int t = nvmet_tls_preload(&s_admin_tls[ctx->inst], &ctx->admin.tcp, jc->icreq_buf, jc->xfer.got);
             if (t < 0) {
-                crypto_wipe(&s_admin_tls.t, sizeof(s_admin_tls.t));
+                crypto_wipe(&s_admin_tls[ctx->inst].t, sizeof(s_admin_tls[ctx->inst].t));
                 return nvmet_admin_job_setup_fail(self, ctx);
             }
             nvmet_tcp_xfer_reset(&jc->xfer, jc->icreq_buf, NVME_TCP_ICREQ_LEN);
@@ -2077,12 +2088,16 @@ typedef struct {
     nvmet_ready_t     ready[NVMET_READY_RING];
     volatile uint32_t ready_head;            /* upcallが積む(生産) */
     volatile uint32_t ready_tail;            /* jobが取り出す(消費) */
+    /* この接続を受けたインターフェース(送信キューの空きを見るため。accept で決める。
+     * IPv6 などで引けなければ NULL = 見ない)。 */
+    netif_t          *tx_nif;
     /* Dataset Management の範囲リスト。**ready-ring のスロットと 1 対 1** で
      * 割り当てるので、DSM が続けて届いても互いを踏まない。ring 側に持たせると
      * スロットの間隔が 4KB 開いて **hot path(通常の read/write)の TLB を
      * 荒らす**ので、こちらへ置いてある。**キューごとに要る**(ready-ring が
      * キューごとに独立しているため)。 */
     uint8_t           dsm_stage[NVMET_READY_RING][NVMET_DSM_STAGE_BYTES] __attribute__((aligned(64)));
+    uint64_t          tx_yield_count;        /* 送信キューの空きが無くて順番を譲った回数(`nvmetqueues`)*/
 } nvmet_io_job_ctx_t;
 
 static nvmet_io_job_ctx_t s_io_job_pool[NVMET_MAX_INSTANCES][NVMET_IO_QUEUES];
@@ -3022,6 +3037,8 @@ static job_result_t nvmet_io_job_step_impl(job_t *self)
              * そのまま担当コア**なので、ジョブをそこへ移せば揃う。
              * 単一コアのときは今のコアと同じなので何も起きない。 */
             job_pin_to_core(self, jc->io.tcp.owner_core);
+            jc->tx_nif = (jc->io.tcp.local_ip.family == NETADDR_V4)
+                       ? netif_find_by_ip(netaddr_v4_host((const netaddr_t *)&jc->io.tcp.local_ip)) : NULL;
             jc->connected = 1;
             (void)__atomic_add_fetch(&ctx->io_open, 1u, __ATOMIC_ACQ_REL);
             /* **ACK の相乗りはキューが多いときだけ得。** 相手に余裕が
@@ -3039,7 +3056,7 @@ static job_result_t nvmet_io_job_step_impl(job_t *self)
              * 残り時間がほとんど無くなる。 */
             jc->wait_started_ticks = timer_now();
             if (nvmet_tls_enabled()) {
-                nvmet_tls_start(&s_io_tls[jc->qidx]);
+                nvmet_tls_start(&s_io_tls[jc->ctx->inst][jc->qidx]);
                 self->state = NIO_ST_TLS_HS;
                 return JOB_WAITING;
             }
@@ -3063,7 +3080,7 @@ static job_result_t nvmet_io_job_step_impl(job_t *self)
         return JOB_WAITING;
 
     case NIO_ST_TLS_HS: {
-        const int r = nvmet_tls_poll(&s_io_tls[jc->qidx], &jc->io.tcp);
+        const int r = nvmet_tls_poll(&s_io_tls[jc->ctx->inst][jc->qidx], &jc->io.tcp);
         if (r < 0) return nvmet_io_job_end(self, jc, 1, "IO の TLS 握手に失敗");
         if (r == 0) {
             if (timeout_ms(jc->wait_started_ticks, NVMET_ACCEPT_TIMEOUT_MS)) {
@@ -3072,7 +3089,7 @@ static job_result_t nvmet_io_job_step_impl(job_t *self)
             }
             return JOB_WAITING;
         }
-        jc->io.tls = &s_io_tls[jc->qidx];
+        jc->io.tls = &s_io_tls[jc->ctx->inst][jc->qidx];
         self->state = NIO_ST_ICREQ_RECV;
         return JOB_WAITING;
     }
@@ -3080,8 +3097,8 @@ static job_result_t nvmet_io_job_step_impl(job_t *self)
     case NIO_ST_ICREQ_RECV: {
         int r = nvmet_tcp_recv_poll(&jc->io, &jc->xfer);
         if (r >= 0 && !jc->io.tls && jc->xfer.got > 0 && jc->icreq_buf[0] == 0x16 && nvmet_tls_possible()) {
-            nvmet_tls_start(&s_io_tls[jc->qidx]);
-            if (nvmet_tls_preload(&s_io_tls[jc->qidx], &jc->io.tcp, jc->icreq_buf, jc->xfer.got) < 0)
+            nvmet_tls_start(&s_io_tls[jc->ctx->inst][jc->qidx]);
+            if (nvmet_tls_preload(&s_io_tls[jc->ctx->inst][jc->qidx], &jc->io.tcp, jc->icreq_buf, jc->xfer.got) < 0)
                 return nvmet_io_job_end(self, jc, 1, "IO の TLS 握手に失敗");
             nvmet_tcp_xfer_reset(&jc->xfer, jc->icreq_buf, NVME_TCP_ICREQ_LEN);
             self->state = NIO_ST_TLS_HS;
@@ -3159,6 +3176,17 @@ static job_result_t nvmet_io_job_step_impl(job_t *self)
          * park すると応答が止まる)。 */
         nvmet_tcp_tx_batch_begin(&jc->io);
         while (jc->ready_tail != jc->ready_head) {
+            /* **送信キューの空きが半分を切ったら、残りのコマンドは次の周回へ回す。**
+             * 送信キューが満杯だと送信はその場で空きを待つ。1 つのコアが 2 つのポートを扱うとき、
+             * 片方のジョブが受けたコマンドを全部(256KiB x 32 = 8MB、約 2.7ms ぶん)出し終えるまで
+             * もう片方のジョブが回らず、そちらの線が遊んでいた(1 コアの読み出しが 1 ポートぶんで
+             * 頭打ち。SPEC 27.15)。ここで返せばスケジューラが同じコアのほかのジョブを回す。
+             * 眠らせない(ready-ring が空でないので下の park にも行かない)。 */
+            if (jc->tx_nif && g_nvmet_tx_yield &&
+                eth_tx_room_of(jc->tx_nif) < NVMET_TX_ROOM_MIN) {
+                jc->tx_yield_count++;
+                break;
+            }
             nvmet_ready_t *rd = &jc->ready[jc->ready_tail % NVMET_READY_RING];
             uint64_t dsp0 = timer_now();
             if (rd->kind == NVMET_READY_CMD) {
@@ -3500,6 +3528,7 @@ int nvmet_job_start(nvmet_ctx_t *ctx, uint16_t port, netif_t *bound_ctx, const c
     ctx->stop_requested = 0;
     ctx->listener        = listener;
     ctx->bound_ctx        = bound_ctx;
+    ctx->inst             = (uint8_t)slot;
     ctx->label            = label;
 
     /* SMART / Error Information の統計。**ここでしか 0 に戻さない**
@@ -3513,10 +3542,10 @@ int nvmet_job_start(nvmet_ctx_t *ctx, uint16_t port, netif_t *bound_ctx, const c
      * で後から生やす(D6 の AER をそこで発火させる)。 */
     ctx->ns[0].active    = 1;
     ctx->ns[0].lba_count = NVMET_NS1_LBA_COUNT;
-    ctx->ns[0].disk      = ctx->ram_disk;
+    ctx->ns[0].disk      = ctx->share_disk ? ctx->share_disk : ctx->ram_disk;
     ctx->ns[1].active    = 0;
     ctx->ns[1].lba_count = NVMET_NS2_LBA_COUNT;
-    ctx->ns[1].disk      = ctx->ram_disk2;
+    ctx->ns[1].disk      = ctx->share_disk2 ? ctx->share_disk2 : ctx->ram_disk2;
 
     ctx->aer_pending        = 0;
     ctx->aer_notify_ns      = 0;
@@ -3690,10 +3719,10 @@ void nvmet_io_queues_show(const nvmet_ctx_t *ctx)
         if (s_instance_owner[i] != ctx) continue;
         for (unsigned q = 0; q < NVMET_IO_QUEUES; q++) {
             const nvmet_io_job_ctx_t *jc = &s_io_job_pool[i][q];
-            uart_printf("  キュー%u: %s (tcp state=%u) コマンド %llu 件%s\n", q + 1u,
+            uart_printf("  キュー%u: %s (tcp state=%u) コマンド %llu 件、送信キュー待ちで譲った %llu 回%s\n", q + 1u,
                         jc->connected ? "接続中" : "未接続",
                         (unsigned)jc->io.tcp.state,
-                        (unsigned long long)jc->stat_cmds,
+                        (unsigned long long)jc->stat_cmds, (unsigned long long)jc->tx_yield_count,
                         jc->ctx && jc->ctx->io_arm_owner == (int)q ? " [accept待ち]" : "");
         }
     }

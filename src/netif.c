@@ -176,6 +176,12 @@ int eth_rx_hw_csum_ok(void)
 
 /* ESP を復号した中身をもう一度 ip_handle_frame() へ入れるとき、NIC の検証結果
  * (外側の ESP に対するもの)を使わせないために 0 にする(ipsec.c)。 */
+unsigned eth_tx_room_of(netif_t *nif)
+{
+    if (!nif || !nif->nic || !nif->nic->tx_room) return 0xFFFFFFFFu;
+    return nif->nic->tx_room(nif->nic_priv);
+}
+
 void eth_rx_set_hw_csum_ok(int v)
 {
     s_rx_hw_csum_ok[smp_core_index()] = v;
@@ -366,6 +372,14 @@ void netif_register(netif_t *ctx)
     if (s_registered_count < NETIF_MAX_TOTAL) {
         ctx->owner_core = smp_core_index();
         ctx->is_poll_owner = 1;
+        /* 送信キューの番号: 同じ nic_priv の先客がいればその番号、いなければ次の番号。 */
+        unsigned nq = 0;
+        int found = 0;
+        for (unsigned i = 0; i < s_registered_count; i++) {
+            if (s_registered[i]->nic_priv == ctx->nic_priv) { ctx->txq_index = s_registered[i]->txq_index; found = 1; break; }
+            if (s_registered[i]->txq_index + 1u > nq) nq = s_registered[i]->txq_index + 1u;
+        }
+        if (!found) ctx->txq_index = nq;
         s_registered[s_registered_count++] = ctx;
     }
     smp_spin_unlock(&s_registered_lock);

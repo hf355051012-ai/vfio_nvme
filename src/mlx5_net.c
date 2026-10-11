@@ -643,6 +643,7 @@ static int mlx5_net_sq_wait_room(int pf_index, unsigned q, mlx5_dev_t *dev, mlx5
     }
 
     uint64_t start = timer_now();
+    unsigned spins = 0;
     while ((st->sq_pc[q] - st->sq_cc[q]) >= MLX5_SQ_WQE_COUNT) {
         int r = mlx5_net_sq_reap_one(pf_index, q, dev, st);
         if (r < 0) {
@@ -651,6 +652,9 @@ static int mlx5_net_sq_wait_room(int pf_index, unsigned q, mlx5_dev_t *dev, mlx5
         if (r != 0) {
             continue; // 刈り取れた(または復帰でpc/ccが0/0にリセットされ、条件は自然に満たされる) -- 直ちに再確認
         }
+        /* **時刻は 1024 回に 1 回だけ読む。** この環境の timer_now() はシステムコールになることがあり、
+         * 毎回読むと待ちの時間の大半がその費用になっていた(perf で約 4 割。SPEC 27.15)。 */
+        if ((++spins & 1023u) != 0u) continue;
         if (timeout_ms(start, 1000u)) { // 1秒(eth.cのeth_tx_wait_slot()と同じ)
             TS_HOT(TS_MK(TS_FILE_MLX5_NET, TS_FUNC_mlx5_net_sq_wait_room, 0),
                    ((uint32_t)(st->sq_pc[q] & 0xFFFFu) << 16) | (uint32_t)(st->sq_cc[q] & 0xFFFFu));
@@ -974,6 +978,21 @@ static int mlx5_net_try_recover(int pf_index, unsigned q, mlx5_dev_t *dev, mlx5_
  * コール元:
  *   eth_tx_wait_free_slot() から nic_ops_t 経由
  * ===============================================================*/
+/* nic_ops_t.tx_room() の実体。終わった送信を待たずに刈り取ってから、このコアの送信キューの空き枠を数える。 */
+static unsigned mlx5_net_tx_room(void *priv)
+{
+    mlx5_net_state_t *st = (mlx5_net_state_t *)priv;
+    mlx5_dev_t *dev = st->dev;
+    int pf_index = mlx5_net_pf_index(st);
+    unsigned q = mlx5_net_txq_index();
+    if (s_sq_halted[pf_index][q]) return MLX5_SQ_WQE_COUNT;
+    for (unsigned k = 0; k < MLX5_SQ_WQE_COUNT; k++) {
+        if (mlx5_net_sq_reap_one(pf_index, q, dev, st) <= 0) break;
+    }
+    const uint32_t used = st->sq_pc[q] - st->sq_cc[q];
+    return used >= MLX5_SQ_WQE_COUNT ? 0u : MLX5_SQ_WQE_COUNT - used;
+}
+
 static unsigned mlx5_net_tx_wait_free_slot(void *priv)
 {
     mlx5_net_state_t *st = (mlx5_net_state_t *)priv;
@@ -1110,6 +1129,7 @@ static const nic_ops_t s_mlx5_net_ops = {
     .send_frags_async  = mlx5_net_send_frags_async,
     .send_lso          = mlx5_net_send_lso_async, // 2026-08-10、LSO対応(RP1側はNULLのまま)
     .tx_wait_free_slot = mlx5_net_tx_wait_free_slot,
+    .tx_room           = mlx5_net_tx_room,
     .poll_recv         = mlx5_net_poll_recv,
 };
 

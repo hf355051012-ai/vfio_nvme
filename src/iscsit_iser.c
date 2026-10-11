@@ -104,7 +104,13 @@ typedef struct {
     uint8_t       rx[ISERT_RX_SLOTS][ISERT_RX_BYTES] __attribute__((aligned(64)));
 } isert_t;
 
-static isert_t s_i;
+/* PF ごとに 1 つ(2 ポートで受けるとき両方を使う)。関数はどれも「いま扱っている実体」
+ * s_cur を通して触る(`s_i` はその参照)。**s_cur はスレッド(= コア)ごと**なので、
+ * 2 つの PF を別々のコアで同時に回しても混ざらない。ジョブの入口と公開関数で差し替える。 */
+#define ISERT_INSTANCES 2u
+static isert_t s_iser[ISERT_INSTANCES];
+static __thread isert_t *s_cur = &s_iser[0];
+#define s_i (*s_cur)
 
 /* ---------------------------------------------------------------- 送信 */
 
@@ -571,7 +577,7 @@ static int check_dreq(void)
 
 static job_result_t isert_step(job_t *self)
 {
-    (void)self;
+    s_cur = (isert_t *)self->ctx;
     switch (s_i.st) {
     case ST_CM_WAIT:
         if (s_i.cm.failed) { conn_down("CM の確立に失敗"); return JOB_WAITING; }
@@ -656,12 +662,15 @@ static job_result_t isert_step(job_t *self)
 
 /* ---------------------------------------------------------------- 公開 */
 
-int iscsit_iser_started(void) { return s_i.started; }
+int iscsit_iser_started(void) { return s_iser[0].started || s_iser[1].started; }
 
-int iscsit_iser_start(mlx5_dev_t *dev, const char *self_label, const uint8_t peer_mac[6])
+int iscsit_iser_start(mlx5_dev_t *dev, const char *self_label, const uint8_t peer_mac[6], unsigned inst,
+                      unsigned core)
 {
+    if (inst >= ISERT_INSTANCES) return -1;
+    s_cur = &s_iser[inst];
     if (s_i.started) {
-        uart_printf("iser: 既に起動済み\n");
+        uart_printf("iser: %s では既に起動済み\n", self_label);
         return -1;
     }
     s_i.dev = dev;
@@ -689,7 +698,8 @@ int iscsit_iser_start(mlx5_dev_t *dev, const char *self_label, const uint8_t pee
         uart_printf("iser: ジョブを作れない\n");
         return -1;
     }
-    if (smp_boot_core1() == 0) job_pin_to_core(s_i.job, 1u);
+    /* 受け持つコアに固定する(pf1 は core1、2 ポートのときの pf0 は core2)。 */
+    if (core == 1u ? smp_boot_core1() == 0 : core == 2u ? smp_boot_core2() == 0 : 0) job_pin_to_core(s_i.job, core);
     s_i.started = 1;
     uart_printf("[iser] %s で iSER ターゲットを開始(%s、ポート %u)\n", self_label, ISCSIT_DEFAULT_IQN,
                 ISCSIT_ISER_PORT);
@@ -698,17 +708,23 @@ int iscsit_iser_start(mlx5_dev_t *dev, const char *self_label, const uint8_t pee
 
 void iscsit_iser_stats_clear(void)
 {
+    for (unsigned k = 0; k < ISERT_INSTANCES; k++) {
+    s_cur = &s_iser[k];
     s_i.logins = s_i.logouts = s_i.rejects = s_i.check_cond = s_i.tmf = s_i.nop = s_i.cqe_err = s_i.disconnects = 0;
     s_i.cmds = s_i.reads = s_i.writes = s_i.bytes_read = s_i.bytes_written = 0;
+    }
 }
 
 void iscsit_iser_status(void)
 {
-    if (!s_i.started) {
+    if (!iscsit_iser_started()) {
         uart_printf("iser: 未起動(`iscsitiser <相手の MAC>`)\n");
         return;
     }
-    uart_printf("iser: %s  状態 %s  qpn=%u  RDMA_READ 同時 %u 本\n", ISCSIT_DEFAULT_IQN,
+    for (unsigned k = 0; k < ISERT_INSTANCES; k++) {
+    s_cur = &s_iser[k];
+    if (!s_i.started) continue;
+    uart_printf("iser: %s(%s)  状態 %s  qpn=%u  RDMA_READ 同時 %u 本\n", ISCSIT_DEFAULT_IQN, s_i.self_label,
                 s_i.st == ST_RUN ? (s_i.ffp ? "Full Feature" : "login") : "接続待ち",
                 s_i.cm.rc_qp.qpn, s_i.rra_max);
     uart_printf("  ログイン %u、ログアウト %u、切断 %u、Reject %u、CHECK CONDITION %u、TMF %u、NOP %u、CQE エラー %u\n",
@@ -716,4 +732,5 @@ void iscsit_iser_status(void)
     uart_printf("  SCSI %llu(読み %llu / 書き %llu)、読 %llu / 書 %llu バイト\n",
                 (unsigned long long)s_i.cmds, (unsigned long long)s_i.reads, (unsigned long long)s_i.writes,
                 (unsigned long long)s_i.bytes_read, (unsigned long long)s_i.bytes_written);
+    }
 }

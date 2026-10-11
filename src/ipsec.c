@@ -22,7 +22,9 @@ void eth_rx_set_hw_csum_ok(int v);
 #define ESP_ICV_LEN   16u
 #define IKE_PORT      500u
 #define IKE_NATT_PORT 4500u
-#define OUT_SLOTS     16u
+/* NIC の送信スロット 1 つにつき 1 つ(送信はゼロコピーで、NIC が読み終えるまで書き換えられない。
+ * 以前は 16 個を slot % 16 で使い回していて、17 個以上が同時に載ると読み終える前に上書きした)。 */
+#define OUT_SLOTS     ETH_TX_RING_SIZE
 #define OUT_BYTES     10240u
 
 typedef struct {
@@ -45,7 +47,8 @@ static ipsec_peer_t s_peer[IPSEC_MAX_PEERS];
 static volatile uint32_t s_rx_unknown_spi;
 static int s_via_esp[SMP_MAX_CORES];
 static uint8_t s_lin[SMP_MAX_CORES][OUT_BYTES] __attribute__((aligned(64)));
-static uint8_t s_out[SMP_MAX_CORES][OUT_SLOTS][OUT_BYTES] __attribute__((aligned(64)));
+/* [コア][送信キュー(PF)][スロット]。送信キューでも分ける(1 コアで 2 つの PF を扱うとき)。 */
+static uint8_t s_out[SMP_MAX_CORES][NETIF_TXQ_MAX][OUT_SLOTS][OUT_BYTES] __attribute__((aligned(64)));
 
 static ipsec_peer_t *peer_find(uint32_t ip)
 {
@@ -200,8 +203,8 @@ static int esp_send_one(ipsec_peer_t *p, uint8_t *frame, uint32_t flen, int asyn
 
     /* 送り先は、NIC の送信スロットに対応させた作業場所(NIC が読み終えるまで書き換えない)。 */
     const unsigned core = smp_core_index();
-    const unsigned slot = eth_tx_wait_free_slot() % OUT_SLOTS;
-    uint8_t *o = s_out[core][slot];
+    const unsigned slot = eth_tx_wait_free_slot();
+    uint8_t *o = s_out[core][netif_active_txq()][slot];
     const uint32_t pad = (4u - ((l4len + 2u) & 3u)) & 3u;
     const uint32_t ptlen = l4len + pad + 2u;
     const uint32_t esplen = ESP_HDR_LEN + ESP_IV_LEN + ptlen + ESP_ICV_LEN;

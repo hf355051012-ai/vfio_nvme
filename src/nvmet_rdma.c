@@ -15,11 +15,46 @@
 #include "platform.h"
 
 extern job_result_t nvme_rdma_connect_job_step(job_t *self);
+extern volatile int g_nvmet_multi_ctrl;   /* nvmet.c(2 ポートで受けるとき 1)*/
 
-static nvmet_rdma_ctx_t  s_standalone_ctx;      /* admin キュー(queue_id=0)*/
-static nvmet_rdma_ctrl_t s_standalone_ctrl;     /* admin/IO 共有のコントローラ状態 */
-static int      s_standalone_resident;
-static uint32_t s_standalone_resident_generation;
+/* **常駐ターゲットの状態は PF ごとに 1 組**(2 ポートで受けるとき両方を使う。0 = pf1、1 = pf0)。
+ * 関数はどれも「いま扱っている組」s_nr を通して触る(下の s_standalone_* はその参照)。
+ * **s_nr はスレッド(= コア)ごと**で、ジョブの入口(nvmet_rdma_job_step())と
+ * nvmet_rdma_run_standalone() で差し替える。コールバック(on_established など)は
+ * その ctx のジョブの中から呼ばれるので、同じ組を指したままである。 */
+#define NVMETR_INSTANCES 2u
+typedef struct {
+    nvmet_rdma_ctx_t  ctx;          /* admin キュー(queue_id=0)*/
+    nvmet_rdma_ctrl_t ctrl;         /* admin/IO 共有のコントローラ状態 */
+    int               resident;
+    uint32_t          resident_generation;
+    nvmet_rdma_ctx_t  io_ctx[NVMET_RDMA_IO_QUEUES];
+    int               io_spawned;   /* 立てた acceptor の本数 */
+    const char       *self_label;
+    uint8_t           peer_mac[6];
+    nvmet_rdma_ctx_t *admin_ctx_for_io;
+} nvmetr_inst_t;
+static nvmetr_inst_t s_nr_inst[NVMETR_INSTANCES];
+static __thread nvmetr_inst_t *s_nr = &s_nr_inst[0];
+#define s_standalone_ctx                 (s_nr->ctx)
+#define s_standalone_ctrl                (s_nr->ctrl)
+#define s_standalone_resident            (s_nr->resident)
+#define s_standalone_resident_generation (s_nr->resident_generation)
+#define s_standalone_io_ctx              (s_nr->io_ctx)
+#define s_standalone_io_spawned          (s_nr->io_spawned)
+#define s_standalone_self_label          (s_nr->self_label)
+#define s_standalone_peer_mac            (s_nr->peer_mac)
+#define s_standalone_admin_ctx_for_io    (s_nr->admin_ctx_for_io)
+
+/* ctx がどの組のものか(admin でも IO キューでも)。どれでもなければ NULL。 */
+static nvmetr_inst_t *nvmetr_inst_of(const nvmet_rdma_ctx_t *ctx)
+{
+    for (unsigned k = 0; k < NVMETR_INSTANCES; k++) {
+        nvmetr_inst_t *in = &s_nr_inst[k];
+        if (ctx == &in->ctx || (ctx >= &in->io_ctx[0] && ctx < &in->io_ctx[NVMET_RDMA_IO_QUEUES])) return in;
+    }
+    return NULL;
+}
 
 /* IO キュー(queue_id=1)。admin の CM 確立を検出した時点で spawn する。
  * self_label / peer_mac はコールバックに渡らないのでここへ控えておく。 */
@@ -27,13 +62,9 @@ static uint32_t s_standalone_resident_generation;
  * 増やすこと。**GSI(QP1)は 1 PF に 1 つしか置けない**ので、CM の受動
  * accept を同時に 2 つ回してはいけない -- **確立するたびに次の 1 本を
  * 立てる**(1 本ずつ順に張ってくる Linux の挙動と合う)。 */
-static nvmet_rdma_ctx_t s_standalone_io_ctx[NVMET_RDMA_IO_QUEUES];
-static int         s_standalone_io_spawned;   /* 立てた acceptor の本数 */
 static void nvmetr_spawn_io_queue(nvmet_rdma_ctx_t *admin_ctx, unsigned idx);
 static void nvmetr_on_io_established(nvmet_rdma_ctx_t *self);
 static void nvmetr_after_auth(nvmet_rdma_ctx_t *ctx);
-static const char *s_standalone_self_label;
-static uint8_t     s_standalone_peer_mac[6];
 
 
 #define CM_DREQ_ATTR_ID 0x0015u
@@ -130,6 +161,7 @@ static void nvmetr_build_id_ctrl(nvmet_rdma_ctx_t *ctx)
     nvmetr_copy_padded(&ctx->ctrl->id_ctrl[24], "RPi5 Bare-Metal NVMe-oF RDMA Target", 40);
     nvmetr_copy_padded(&ctx->ctrl->id_ctrl[64], "1.0", 8);
     ctx->ctrl->id_ctrl[77] = 0;                          /* MDTS = 0 (無制限) */
+    if (g_nvmet_multi_ctrl) ctx->ctrl->id_ctrl[76] |= 0x02u;   /* CMIC: 複数コントローラ(2 ポートのとき)*/
     wr16le(&ctx->ctrl->id_ctrl[78], ctx->ctrl->ctrlr_id);       /* CNTLID */
     ctx->ctrl->id_ctrl[111] = 1;                          /* CNTRLTYPE = 1 (I/O controller) */
     wr16le(&ctx->ctrl->id_ctrl[320], 2);                  /* KAS(fabricsでは非0が必須) */
@@ -174,6 +206,18 @@ static void nvmetr_build_id_ns(nvmet_rdma_ctx_t *ctx)
     wr64le(&ctx->ctrl->id_ns[16], 0);                        /* NUSE */
     ctx->ctrl->id_ns[26]  = 0;                                /* FLBAS: LBA Format Index = 0 */
     ctx->ctrl->id_ns[130] = 9;                                /* LBAF[0].ds = 9 (512B = 2^9) */
+    if (g_nvmet_multi_ctrl) {
+        /* 2 ポートのとき: NMIC の「共有」と、名前空間の識別子(NGUID / EUI-64)。Linux は 2 つの
+         * コントローラから見える名前空間を識別子で同じものと判断する。値は TCP のターゲット
+         * (nvmet.c)と重ならないよう 2 バイト目を 'R' にし、末尾に nsid(1)を置く。 */
+        ctx->ctrl->id_ns[30] |= 0x01u;
+        ctx->ctrl->id_ns[NVME_ID_NS_OFF_NGUID + 0]  = 0x02u;
+        ctx->ctrl->id_ns[NVME_ID_NS_OFF_NGUID + 1]  = 'R';
+        ctx->ctrl->id_ns[NVME_ID_NS_OFF_NGUID + 15] = 1u;
+        ctx->ctrl->id_ns[NVME_ID_NS_OFF_EUI64 + 0]  = 0x02u;
+        ctx->ctrl->id_ns[NVME_ID_NS_OFF_EUI64 + 1]  = 'R';
+        ctx->ctrl->id_ns[NVME_ID_NS_OFF_EUI64 + 7]  = 1u;
+    }
     dcache_clean_range((const void *)(uintptr_t)ctx->ctrl->id_ns, sizeof(ctx->ctrl->id_ns));
 }
 
@@ -539,7 +583,7 @@ static void nvmetr_reset_admin_for_reconnect(nvmet_rdma_ctx_t *ctx, job_t *self)
     ctx->established = 0;
     ctx->failed = 0;
 
-    ctx->ctrl->ctrlr_id = 1;
+    ctx->ctrl->ctrlr_id = ctx->ctrl->cntlid_cfg ? ctx->ctrl->cntlid_cfg : 1u;
     ctx->ctrl->cc = 0;
     ctx->ctrl->cc_en = 0;
     nvmet_auth_reset(&ctx->ctrl->auth);
@@ -773,6 +817,10 @@ static int nvmetr_pl_send_response(nvmet_rdma_ctx_t *ctx, unsigned slot)
 job_result_t nvmet_rdma_job_step(job_t *self)
 {
     nvmet_rdma_ctx_t *ctx = (nvmet_rdma_ctx_t *)self->ctx;
+    {
+        nvmetr_inst_t *in = nvmetr_inst_of(ctx);
+        if (in) s_nr = in;
+    }
 
     if (ctx->stop_requested || self->cancel_requested) {
         if (ctx == &s_standalone_ctx)    s_standalone_resident = 0;
@@ -790,7 +838,7 @@ job_result_t nvmet_rdma_job_step(job_t *self)
         ctx->cm.is_active = 0;
         ctx->cm.skip_ping = 1;
         if (ctx->queue_id == 0) {
-            ctx->ctrl->ctrlr_id = 1;
+            ctx->ctrl->ctrlr_id = ctx->ctrl->cntlid_cfg ? ctx->ctrl->cntlid_cfg : 1u;
             ctx->ctrl->cc = 0;
             ctx->ctrl->cc_en = 0;
             nvmet_auth_reset(&ctx->ctrl->auth);
@@ -1255,7 +1303,6 @@ static volatile uint8_t *nvmetr_ramdisk_slot0(void)
  * ncores 未満なら idx そのもの)ので、1〜3 本のときの退行はありえない。 */
 volatile uint32_t g_nvmet_rdma_cores = 3u;
 
-static nvmet_rdma_ctx_t *s_standalone_admin_ctx_for_io;
 
 /*=================================================================
  * IO キュー idx 番の CM acceptor を立てる。
@@ -1393,8 +1440,11 @@ static void nvmetr_on_admin_disconnected(nvmet_rdma_ctx_t *admin_ctx)
  * コール元:
  *   shell_dispatch()
  * ===============================================================*/
-void nvmet_rdma_run_standalone(mlx5_dev_t *dev, const char *self_label, const uint8_t peer_mac[6])
+void nvmet_rdma_run_standalone(mlx5_dev_t *dev, const char *self_label, const uint8_t peer_mac[6],
+                               unsigned inst, unsigned acore)
 {
+    if (inst >= NVMETR_INSTANCES) return;
+    s_nr = &s_nr_inst[inst];
     if (s_standalone_resident && !s_standalone_ctx.failed &&
         s_standalone_resident_generation == dev->bringup_generation) {
         uart_printf("[nvmet-rdma] 既に%sで稼働中です(接続待ち、または処理中)\n", self_label);
@@ -1435,6 +1485,9 @@ void nvmet_rdma_run_standalone(mlx5_dev_t *dev, const char *self_label, const ui
     rdma_cm_fill_addr(&s_standalone_ctx.cm, dev, self_label, "__no_such_net_ctx__",
                       0u, 0u, dummy_mac, pm);
     s_standalone_ctx.ctrl             = &s_standalone_ctrl;
+    /* **2 つの組は同じサブシステムの別のコントローラ**なので cntlid を分ける(Linux は同じ
+     * サブシステムで cntlid が重なると 2 本目を拒む)。記憶域(RAM ディスク)は共有する。 */
+    s_standalone_ctrl.cntlid_cfg      = (uint16_t)(inst + 1u);
     s_standalone_ctrl.ram_disk        = nvmetr_ramdisk_slot0();
     s_standalone_ctx.pipeline_enabled = 1;
     s_standalone_ctx.enable_io_queue  = 1;
@@ -1449,8 +1502,11 @@ void nvmet_rdma_run_standalone(mlx5_dev_t *dev, const char *self_label, const ui
         return;
     }
     job->state = NVMETR_ST_CM_SPAWN;
-    if (smp_boot_core1() == 0) job_pin_to_core(job, 1u);
-    else uart_printf("[!] nvmet-rdma: core1起動に失敗、core0のまま動作します\n");
+    /* admin は呼ぶ側が決めたコア(その PF の受信を受け持つコア。pf1 は core1、2 ポートの pf0 は
+     * core2、`twoport on 1core` なら pf0 も core1)で回す。 */
+    if (acore < 1u || acore > 2u) acore = 1u;
+    if ((acore == 1u ? smp_boot_core1() : smp_boot_core2()) == 0) job_pin_to_core(job, acore);
+    else uart_printf("[!] nvmet-rdma: core%u起動に失敗、core0のまま動作します\n", acore);
 
     /* **IO キューを散らす先のコアは、キューを立てる前に起こしておく。**
      * 起きていないコアへ pin すると、そのジョブは誰にも回されず黙って

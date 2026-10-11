@@ -133,6 +133,9 @@ typedef struct {
                      const void *payload, uint32_t payload_len, uint16_t mss);
     unsigned (*tx_wait_free_slot)(void *priv);
     net_buf_t *(*poll_recv)(void *priv);
+    /* 送信キュー(このコアのもの)の空き枠の数。終わった送信を**待たずに**刈り取ってから数える。
+     * NULL なら「いつでも空いている」と見なす。 */
+    unsigned (*tx_room)(void *priv);
 } nic_ops_t;
 
 typedef struct netif {
@@ -189,7 +192,18 @@ typedef struct netif {
     uint16_t    hw_lso_max_hdr_bytes;
     unsigned    owner_core;
     int         is_poll_owner;
+    /* 送信キュー(= NIC の実体 nic_priv)の番号(0 起点、登録順)。同じ PF を共有する別名の
+     * インターフェースは同じ番号になる。**送信スロット番号で引く作業領域は、コアだけでなく
+     * この番号でも分けること** -- 1 つのコアが 2 つの PF を扱うと、両方の送信キューから同じ
+     * スロット番号が出て、NIC が読み終える前に互いのフレームを上書きする(2 ポートを 1 コアで
+     * 受けたときに踏んだ。SPEC 27.14)。 */
+    unsigned    txq_index;
 } netif_t;
+
+#define NETIF_TXQ_MAX 2u   /* 送信キュー(PF)の数の上限。作業領域の添字に使う */
+
+/* いま有効なインターフェースの送信キューの番号(NETIF_TXQ_MAX 未満)。 */
+static inline unsigned netif_active_txq(void);
 
 extern netif_t *g_netif_active_slots[SMP_MAX_CORES];
 
@@ -198,6 +212,11 @@ static inline netif_t **netif_active_slot(void)
     return &g_netif_active_slots[smp_core_index()];
 }
 #define g_active_ctx (*netif_active_slot())
+static inline unsigned netif_active_txq(void)
+{
+    const netif_t *c = g_active_ctx;
+    return (c && c->txq_index < NETIF_TXQ_MAX) ? c->txq_index : 0u;
+}
 
 void netif_activate(netif_t *ctx);
 
@@ -209,6 +228,10 @@ void netif_set_owner_core(netif_t *ctx, unsigned core);
 netif_t *netif_find(const char *name);
 
 netif_t *netif_find_by_ip(uint32_t ip);
+/* インターフェース nif の送信キュー(呼んだコアのもの)の空き枠の数。待たない。
+ * **1 つのコアが 2 つのポートを扱うとき、片方の送信キューが埋まったらもう片方の仕事へ回るため**に
+ * 使う(SPEC 27.15)。nic が対応していなければ大きい値を返す。 */
+unsigned eth_tx_room_of(netif_t *nif);
 
 netif_t *netif_find_by_ip6(const uint8_t addr[16]);
 

@@ -198,6 +198,7 @@ static void conn_reset(iscsit_conn_t *c)
     c->ticks = 0;
     c->async_req = 0;
     c->auth_st = 0;
+    if (c->job) job_set_affinity(c->job, c->t);   /* ログインの間は接続どうしで排他する */
     for (unsigned i = 0; i < ISCSIT_MAX_TASKS; i++) c->task[i].in_use = 0;
     iscsi_neg_init(&c->neg);
 }
@@ -436,6 +437,11 @@ static int login_rx(iscsit_conn_t *c)
 
     /* ---- Full Feature Phase へ ---- */
     c->ffp = 1;
+    /* ここから先で共有の状態に触るのは統計の数だけなので、接続どうしの排他を外す
+     * (2 ポートで受けるとき、別々のポートの接続を別々のコアで同時に動かせる)。
+     * ログイン中は TSIH の採番と下の session reinstatement の走査があるので、
+     * 排他したまま(conn_reset() が戻す)。 */
+    job_set_affinity(c->job, NULL);
     c->hd = n->p.hdgst;   /* **応答を送った後から**ダイジェストが付く */
     c->dd = n->p.ddgst;
     c->t->logins_ok++;
@@ -516,7 +522,8 @@ static int build_send_targets(iscsit_conn_t *c, const char *v, uint32_t vl, uint
     if (!all && !is_name && !(vl == 0 && !c->neg.p.discovery)) return -2;
     if (!all && !match && vl != 0) return 0;
     char addr[48];
-    const uint32_t ip = c->t->nif->ip;
+    /* 自分のアドレスは、この接続を受けたポートのもの(2 ポートで受けるとき両方ありうる)。 */
+    const uint32_t ip = netaddr_v4_host((const netaddr_t *)&c->tcp.local_ip);
     unsigned o = 0;
     for (int i = 3; i >= 0; i--) {
         unsigned x = (ip >> (i * 8)) & 0xFFu;
@@ -1289,7 +1296,7 @@ int iscsit_start(uint16_t port, netif_t *nif)
             uart_printf("iscsit: job_spawn 失敗\n");
             return -1;
         }
-        job_set_affinity(c->job, nif);
+        job_set_affinity(c->job, &s_t);
     }
     s_t.started = 1;
     return 0;

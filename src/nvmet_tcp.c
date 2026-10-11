@@ -7,6 +7,7 @@
 #include "timestamp.h"
 #include "crc32c.h"
 #include "nvmet_tls.h"
+#include "smp.h"
 
 #define NVMET_TCP_C2H_CHUNK_MAX 262144u
 
@@ -396,7 +397,11 @@ void nvmet_tcp_accept_arm(nvmet_tcp_conn_t *c, int listener)
 int nvmet_tcp_send_term(nvmet_tcp_conn_t *c, uint16_t fes, uint32_t fei,
                          const uint8_t *pdu, uint32_t pdu_len)
 {
-    static uint8_t s_term_buf[NVME_TCP_TERM_PLEN_MAX] __attribute__((aligned(64)));
+    /* **コアごとに持つ**(2 ポートで受けるとき、別々のコアで動く 2 つの実体が同時に応答を
+     * 組み立てる。1 つを共有すると互いの PDU を書き潰し、ホストに「知らない command_id」と
+     * 言われて接続を張り直された)。 */
+    static uint8_t s_term_bufs[SMP_MAX_CORES][NVME_TCP_TERM_PLEN_MAX] __attribute__((aligned(64)));
+    uint8_t *const s_term_buf = s_term_bufs[smp_core_index()];
     uint32_t total = nvme_tcp_build_term(s_term_buf, NVME_TCP_PDU_C2H_TERM,
                                           fes, fei, pdu, pdu_len);
     g_nvmet_tcp_term_sent++;
@@ -427,7 +432,11 @@ int nvmet_tcp_send_icresp(nvmet_tcp_conn_t *c, const uint8_t icreq_buf[NVME_TCP_
     c->ddgst = (uint8_t)((digest >> 1) & 0x01u);
     c->maxdata = (uint16_t)rd32le(&icreq_buf[12]);  /* initiatorのmaxr2t(参考値) */
 
-    static uint8_t s_icresp_buf[NVME_TCP_ICRESP_LEN] __attribute__((aligned(64)));
+    /* **コアごとに持つ**(2 ポートで受けるとき、別々のコアで動く 2 つの実体が同時に応答を
+     * 組み立てる。1 つを共有すると互いの PDU を書き潰し、ホストに「知らない command_id」と
+     * 言われて接続を張り直された)。 */
+    static uint8_t s_icresp_bufs[SMP_MAX_CORES][NVME_TCP_ICRESP_LEN] __attribute__((aligned(64)));
+    uint8_t *const s_icresp_buf = s_icresp_bufs[smp_core_index()];
     for (uint32_t i = 0; i < NVME_TCP_ICRESP_LEN; i++) s_icresp_buf[i] = 0;
 
     s_icresp_buf[0] = NVME_TCP_PDU_ICRESP;          /* hdr.type */
@@ -481,7 +490,11 @@ int nvmet_tcp_send_icresp(nvmet_tcp_conn_t *c, const uint8_t icreq_buf[NVME_TCP_
 int nvmet_tcp_send_r2t(nvmet_tcp_conn_t *c, uint16_t cid,
                         uint32_t r2to, uint32_t r2tl)
 {
-    static uint8_t s_r2t_buf[NVME_TCP_R2T_PDU_LEN + 4u] __attribute__((aligned(64)));
+    /* **コアごとに持つ**(2 ポートで受けるとき、別々のコアで動く 2 つの実体が同時に応答を
+     * 組み立てる。1 つを共有すると互いの PDU を書き潰し、ホストに「知らない command_id」と
+     * 言われて接続を張り直された)。 */
+    static uint8_t s_r2t_bufs[SMP_MAX_CORES][NVME_TCP_R2T_PDU_LEN + 4u] __attribute__((aligned(64)));
+    uint8_t *const s_r2t_buf = s_r2t_bufs[smp_core_index()];
 
     uint32_t total = NVME_TCP_R2T_PDU_LEN + (c->hdgst ? 4u : 0u);
 
@@ -521,7 +534,11 @@ int nvmet_tcp_send_r2t(nvmet_tcp_conn_t *c, uint16_t cid,
 
 int nvmet_tcp_send_resp(nvmet_tcp_conn_t *c, const nvme_cqe_t *cqe)
 {
-    static uint8_t s_resp_buf[NVME_TCP_RSP_PDU_LEN + 4u] __attribute__((aligned(64)));
+    /* **コアごとに持つ**(2 ポートで受けるとき、別々のコアで動く 2 つの実体が同時に応答を
+     * 組み立てる。1 つを共有すると互いの PDU を書き潰し、ホストに「知らない command_id」と
+     * 言われて接続を張り直された)。 */
+    static uint8_t s_resp_bufs[SMP_MAX_CORES][NVME_TCP_RSP_PDU_LEN + 4u] __attribute__((aligned(64)));
+    uint8_t *const s_resp_buf = s_resp_bufs[smp_core_index()];
 
     uint32_t total = NVME_TCP_RSP_PDU_LEN + (c->hdgst ? 4u : 0u);
 
@@ -573,8 +590,12 @@ int nvmet_tcp_send_c2h(nvmet_tcp_conn_t *c, uint16_t cid, const nvme_cqe_t *cqe,
                        const void *data, uint32_t dlen,
                        int data_success)
 {
-    static uint8_t s_c2h_buf[NVME_TCP_DATA_PDU_LEN + 4u + NVMET_TCP_C2H_CHUNK_MAX + 4u]
+    /* **コアごとに持つ**(2 ポートで受けるとき、別々のコアで動く 2 つの実体が同時に応答を
+     * 組み立てる。1 つを共有すると互いの PDU を書き潰し、ホストに「知らない command_id」と
+     * 言われて接続を張り直された)。 */
+    static uint8_t s_c2h_bufs[SMP_MAX_CORES][NVME_TCP_DATA_PDU_LEN + 4u + NVMET_TCP_C2H_CHUNK_MAX + 4u]
         __attribute__((aligned(64)));
+    uint8_t *const s_c2h_buf = s_c2h_bufs[smp_core_index()];
 
     const uint8_t *src = data;
     uint32_t sent = 0;

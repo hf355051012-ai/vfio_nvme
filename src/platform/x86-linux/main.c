@@ -186,6 +186,10 @@ static int bringup_pf(int slot, mlx5_dev_t *dev, uint8_t pf_index, const char *l
 nvme_ctx_t s_nvme_ctx;
 
 static nvmet_ctx_t s_x86_nvmet; /* .bss(内蔵 RAM ディスク含む、TCP 経路は CPU 側) */
+/* 2 ポートで受けるときの PF0 の実体(`nvmet <port> pf0`)。RAM ディスクは s_x86_nvmet のものを
+ * 共有するので、この構造体の中の RAM ディスクは使わない(触らないので実メモリも食わない)。 */
+static nvmet_ctx_t s_x86_nvmet2;
+static int         s_shell_nvmet2_started;
 
 static uint8_t s_nvmetcp_buf[262144] __attribute__((aligned(4096)));
 
@@ -2042,6 +2046,22 @@ static int shell_parse_ipv4(const char *s, uint32_t *out)
     }
     if (*s != '\0') return -1;
     *out = v;
+    return 0;
+}
+
+/* 2 ポートで受けるとき: core2 を起こし、pf0 の受信を core2 に受け持たせる(pf1 は core1)。
+ * **pf0 は普段、内蔵イニシエータが core0 から使う**ので、ターゲットに `both` / `pf0` を
+ * 指定したときだけ切り替える。 */
+static unsigned s_pf0_core = 2u;   /* `twoport on` = 2、`twoport on 1core` = 1(pf1 と同じ core1)*/
+static int shell_pf0_on_core2(void)
+{
+    netif_t *ctx0 = netif_find("mlx5-pf0");
+    if (!ctx0) { uart_printf("mlx5-pf0 未登録\n"); return -1; }
+    if ((s_pf0_core == 1u ? smp_boot_core1() : smp_boot_core2()) != 0) {
+        uart_printf("core%u を起こせない\n", s_pf0_core);
+        return -1;
+    }
+    netif_set_owner_core(ctx0, s_pf0_core);
     return 0;
 }
 
@@ -5975,6 +5995,25 @@ static void shell_dispatch(char *line, int s0, int s1)
          * 鍵は Linux の `nvme gen-tls-key` で作ったもの。段階 D は握手と最初の
          * 暗号文(ICReq)の復号まで。 */
         nvmet_tls_shell(line + 8);
+    } else if (strncmp(line, "twoport", 7) == 0) {
+        /* twoport [on [1core]|off] -- 2 ポートで受ける準備。**ターゲットを起動する前に打つ。**
+         * on [1core]: pf0 の受信を core2(1core なら core1)に受け持たせ、NVMe のターゲットが「複数コントローラ」(CMIC)と
+         * 「共有の名前空間」(NMIC、RDMA は識別子も)を名乗るようにする。その後
+         * `nvmet <port>` + `nvmet <port> pf0`、`nvmetrdma <mac1>` + `nvmetrdma <mac0> pf0`、
+         * `iscsit both`、`iscsitiser <mac1>` + `iscsitiser <mac0> pf0` で両方の PF に立てる。 */
+        const char *p = line + 7;
+        while (*p == ' ') p++;
+        if (strncmp(p, "on", 2) == 0) {
+            /* 1core: pf0 の受信も core1 に受け持たせ、ターゲットの仕事を全部 core1 に集める
+             * (`rdmacores 1` と組で使う。RDMA の IO キューはそちらで決まる)。 */
+            s_pf0_core = strstr(p, "1core") ? 1u : 2u;
+            if (shell_pf0_on_core2() != 0) return;
+            g_nvmet_multi_ctrl = 1;
+        } else if (strncmp(p, "off", 3) == 0) {
+            g_nvmet_multi_ctrl = 0;
+        }
+        uart_printf("twoport: %s(CMIC / NMIC %s、pf0 の受信 core%u)\n", g_nvmet_multi_ctrl ? "on" : "off",
+                    g_nvmet_multi_ctrl ? "あり" : "なし", netif_find("mlx5-pf0") ? netif_find("mlx5-pf0")->owner_core : 0u);
     } else if (strncmp(line, "ipsec", 5) == 0) {
         /* ipsec psk <相手> <鍵> [pf0|pf1] / up / down / del / stat / clear
          * iSCSI の IPsec(ESP AES-GCM-16-128 トランスポート + IKEv2 事前共有鍵)。 */
@@ -6012,7 +6051,7 @@ static void shell_dispatch(char *line, int s0, int s1)
         iscsi_iser_close();
         uart_printf("iser-ini: 閉じた\n");
     } else if (strncmp(line, "iscsitiser", 10) == 0) {
-        /* iscsitiser <相手の MAC> -- iSER ターゲットを PF1 で起動(RDMA CM、ポート 3260)
+        /* iscsitiser <相手の MAC> [pf0] -- iSER ターゲットを PF1(pf0 なら PF0)で起動(RDMA CM、ポート 3260)
          * iscsitiser stat / clear -- 状態と統計。PLAN_iscsi.md 段階 I。 */
         const char *p = line + 10;
         while (*p == ' ') p++;
@@ -6040,19 +6079,24 @@ static void shell_dispatch(char *line, int s0, int s1)
                 if (*p == ':' || *p == '-') p++;
             }
             if (got != 6) { uart_printf("iscsitiser: <相手の MAC>(例 b8:ce:f6:73:bf:7e)\n"); return; }
-            netif_t *nc = netif_find("mlx5-pf1");
-            if (!nc) { uart_printf("iscsitiser: mlx5-pf1 未登録\n"); return; }
+            /* pf0 を付けると PF0 で起動する(2 ポートで受けるとき。pf0 は core2 が受け持つ)。 */
+            const int pf0 = strstr(p, "pf0") != NULL;
+            netif_t *nc = netif_find(pf0 ? "mlx5-pf0" : "mlx5-pf1");
+            if (!nc) { uart_printf("iscsitiser: %s 未登録\n", pf0 ? "mlx5-pf0" : "mlx5-pf1"); return; }
+            if (pf0 && shell_pf0_on_core2() != 0) return;
             netif_activate(nc);
             /* 記憶域は TCP のターゲット(`iscsit`)と同じ LUN(NVMe の RAM ディスク)。 */
             scsi_set_lun(0, s_x86_nvmet.ram_disk, NVMET_NS1_LBA_COUNT, "vfionvme-lun0");
             scsi_set_lun(1, s_x86_nvmet.ram_disk2, NVMET_NS2_LBA_COUNT, "vfionvme-lun1");
-            (void)iscsit_iser_start(&s_dev1, "mlx5-pf1", mac);
+            if (pf0) (void)iscsit_iser_start(&s_dev0, "mlx5-pf0", mac, 1u, s_pf0_core);
+            else (void)iscsit_iser_start(&s_dev1, "mlx5-pf1", mac, 0u, 1u);
         }
     } else if (strncmp(line, "iscsichap", 9) == 0) {
         /* iscsichap <user> <secret> [<muser> <msecret>] | off -- イニシエータが CHAP で答える */
         shell_iscsi_chap(line + 9, 0);
     } else if (strncmp(line, "iscsit", 6) == 0) {
-        /* iscsit [port]   -- iSCSI ターゲットを常駐起動(pf1、既定 3260)。起動済みなら状態を表示
+        /* iscsit [port] [both] -- iSCSI ターゲットを常駐起動(pf1、既定 3260)。起動済みなら状態を表示
+         *                   both で pf0 にも来た接続を受ける(pf0 は core2 が受け持つ)
          * iscsit stat     -- 状態と統計 / iscsit clear -- 統計を 0 に
          * PLAN_iscsi.md 段階 A: Login / Discovery / Text / NOP / Logout。SCSI は段階 B まで
          * CHECK CONDITION を返す。NVMe/TCP ターゲット(`nvmet`)と同時に動かせる。 */
@@ -6099,15 +6143,19 @@ static void shell_dispatch(char *line, int s0, int s1)
         } else {
             uint16_t port = ISCSI_PORT;
             if (*p >= '0' && *p <= '9') port = (uint16_t)atoi(p);
+            const int both = strstr(p, "both") != NULL;
             netif_t *ctx1 = netif_find("mlx5-pf1");
             if (!ctx1) { uart_printf("iscsit: mlx5-pf1 未登録\n"); return; }
             if (smp_boot_core1() == 0) netif_set_owner_core(ctx1, 1u);
+            if (both && shell_pf0_on_core2() != 0) return;
             /* 記憶域は NVMe の RAM ディスクを共有する(LUN 0 = nsid 1、LUN 1 = nsid 2)。
              * iSCSI で書いて NVMe/TCP で読む照合ができる。 */
             scsi_set_lun(0, s_x86_nvmet.ram_disk, NVMET_NS1_LBA_COUNT, "vfionvme-lun0");
             scsi_set_lun(1, s_x86_nvmet.ram_disk2, NVMET_NS2_LBA_COUNT, "vfionvme-lun1");
-            if (iscsit_start(port, ctx1) == 0)
-                uart_printf("iscsit: iSCSI ターゲット常駐起動(pf1, port %u, %s)\n", port, ISCSIT_DEFAULT_IQN);
+            /* both: どちらのポートに来た接続も受ける(待ち受けを PF に縛らない)。 */
+            if (iscsit_start(port, both ? NULL : ctx1) == 0)
+                uart_printf("iscsit: iSCSI ターゲット常駐起動(%s, port %u, %s)\n", both ? "pf0 + pf1" : "pf1",
+                            port, ISCSIT_DEFAULT_IQN);
         }
     } else if (strncmp(line, "nvmetauth", 9) == 0) {
         /* nvmetauth                                      -- 設定を表示
@@ -6117,6 +6165,15 @@ static void shell_dispatch(char *line, int s0, int s1)
          * NVMe/TCP ターゲットが DH-HMAC-CHAP でホストを確かめる(nvmet_auth.c)。
          * 鍵は `nvme gen-dhchap-key` で作る。**効くのは次の Connect から。** */
         nvmet_auth_shell(line + 9);
+    } else if (strncmp(line, "nvmettxyield", 12) == 0) {
+        /* nvmettxyield [on|off] -- NVMe/TCP の IO ジョブが、送信キューの空きが半分を切ったら残りのコマンドを
+         * 次の周回へ回して同じコアのほかのジョブに順番を譲るか(既定 on)。**off が直す前の挙動**
+         * (陰性対照。1 コアで 2 ポートを受けると読み出しが 1 ポートぶんで頭打ちになる。SPEC 27.15)。 */
+        const char *p = line + 12;
+        while (*p == ' ') p++;
+        if (strncmp(p, "on", 2) == 0) g_nvmet_tx_yield = 1u;
+        else if (strncmp(p, "off", 3) == 0) g_nvmet_tx_yield = 0u;
+        uart_printf("nvmettxyield: %s\n", g_nvmet_tx_yield ? "on" : "off");
     } else if (strncmp(line, "nvmetqueues", 11) == 0) {
         /* nvmetqueues [N]
          *
@@ -6554,8 +6611,10 @@ static void shell_dispatch(char *line, int s0, int s1)
         nvme_set_incapsule_disable(s_incapsule_disable);
         nvme_rdma_set_incapsule_disable(s_incapsule_disable);
     } else if (strncmp(line, "nvmetrdma", 9) == 0) {
-        /* nvmetrdma [<mac>]
+        /* nvmetrdma [<mac>] [pf0]
          *
+         * pf0 を付けると PF0 で 2 つ目の組を起動する(2 ポートで受けるとき。PF1 の組と同じ
+         * サブシステム・同じ RAM ディスクで、cntlid だけ 2 を名乗る)。
          * 外部ホスト(Linux 等)向けの NVMe-oF RDMA ターゲットを PF1 で常駐
          * 起動する。TCP 側の nvmet コマンドの RDMA 版。
          *
@@ -6584,12 +6643,35 @@ static void shell_dispatch(char *line, int s0, int s1)
                 if (*q == ':' || *q == '-') q++;
             }
         }
-        netif_t *ctx1 = netif_find("mlx5-pf1");
-        if (!ctx1) { uart_printf("nvmetrdma: mlx5-pf1 未登録\n"); return; }
+        /* pf0 を付けると PF0 で 2 つ目の組を起動する(2 ポートで受けるとき。cntlid は 2)。 */
+        const int pf0 = strstr(arg, "pf0") != NULL;
+        netif_t *ctx1 = netif_find(pf0 ? "mlx5-pf0" : "mlx5-pf1");
+        if (!ctx1) { uart_printf("nvmetrdma: %s 未登録\n", pf0 ? "mlx5-pf0" : "mlx5-pf1"); return; }
+        if (pf0 && shell_pf0_on_core2() != 0) return;
         netif_activate(ctx1);
-        uart_printf("nvmetrdma: peer mac=%02x:%02x:%02x:%02x:%02x:%02x\n",
+        uart_printf("nvmetrdma: %s peer mac=%02x:%02x:%02x:%02x:%02x:%02x\n", pf0 ? "pf0" : "pf1",
                     mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-        nvmet_rdma_run_standalone(&s_dev1, "mlx5-pf1", mac);
+        if (pf0) nvmet_rdma_run_standalone(&s_dev0, "mlx5-pf0", mac, 1u, s_pf0_core);
+        else nvmet_rdma_run_standalone(&s_dev1, "mlx5-pf1", mac, 0u, 1u);
+    } else if (strncmp(line, "nvmet", 5) == 0 && strstr(line, "pf0")) {
+        /* nvmet [port] pf0 -- 2 ポートで受けるとき、PF0 にも同じサブシステムの 2 つ目の
+         * コントローラを立てる(cntlid 2、RAM ディスクは pf1 の実体と共有、PF0 は core2)。 */
+        if (s_shell_nvmet2_started) { uart_printf("nvmet: pf0 は既に常駐起動済み\n"); return; }
+        uint16_t port = 4421u;
+        const char *p = line + 5;
+        while (*p == ' ') p++;
+        if (*p >= '0' && *p <= '9') port = (uint16_t)atoi(p);
+        netif_t *ctx0 = netif_find("mlx5-pf0");
+        if (!ctx0) { uart_printf("nvmet: mlx5-pf0 未登録\n"); return; }
+        if (shell_pf0_on_core2() != 0) return;
+        s_x86_nvmet2.cntlid_cfg  = 2u;
+        s_x86_nvmet2.share_disk  = s_x86_nvmet.ram_disk;
+        s_x86_nvmet2.share_disk2 = s_x86_nvmet.ram_disk2;
+        if (nvmet_job_start(&s_x86_nvmet2, port, ctx0, "pf0") != 0) {
+            uart_printf("nvmet: nvmet_job_start 失敗(pf0)\n"); return;
+        }
+        s_shell_nvmet2_started = 1;
+        uart_printf("nvmet: ターゲット常駐起動 (pf0, port %u、cntlid 2、RAM ディスクは pf1 と共有) -- 接続待ち\n", port);
     } else if (strncmp(line, "nvmet", 5) == 0) {
         if (s_shell_nvmet_started) {
             uart_printf("nvmet: 既に常駐起動済み\n");

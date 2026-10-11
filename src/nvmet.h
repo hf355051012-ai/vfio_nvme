@@ -83,7 +83,19 @@ _Static_assert(sizeof(nvmet_core_stat_t) == 64, "nvmet_core_stat_t は 1 キャ�
 
 #define NVMET_IOCCSZ_MAX_BYTES 262144u
 
-#define NVMET_MAX_INSTANCES 1u
+/* 2 = PF ごとに 1 つ(2 ポートで受けるとき。同じサブシステムの別のコントローラで、
+ * RAM ディスクは 1 つ目のものを共有する)。 */
+#define NVMET_MAX_INSTANCES 2u
+
+/* **2 ポートで受けるとき 1**(シェルの `twoport on`。ターゲットを起動する前に立てる)。
+ * Identify Controller の CMIC に「複数コントローラ」、Identify Namespace の NMIC に「共有」を
+ * 名乗る。Linux は同じサブシステムに 2 つ目のコントローラが繋がると CMIC を確かめ
+ * (無ければ "Subsystem does not support multiple controllers")、名前空間も NMIC が無いと
+ * "Duplicate unshared namespace" で断る。1 ポートのときに立てるとホストがマルチパスの装置名で
+ * 見せるようになるので、既定は 0。TCP(nvmet.c)と RDMA(nvmet_rdma.c)の両方が見る。 */
+extern volatile int g_nvmet_multi_ctrl;
+/* IO ジョブが送信キューの空きの少ないときに順番を譲るか(既定 1。シェルの `nvmettxyield`)。 */
+extern volatile uint32_t g_nvmet_tx_yield;
 
 /* 1 つのコントローラが同時に持てる IO キュー(= TCP コネクション)の本数の
  * **上限**。実際に何本広告するかは実行時に `g_nvmet_io_queues` で決める
@@ -154,7 +166,13 @@ typedef struct {
 
 typedef struct {
     nvmet_tcp_conn_t admin;
-    uint16_t ctrlr_id;   /* 固定値1 */
+    uint16_t ctrlr_id;   /* cntlid(既定 1)*/
+    /* **2 ポートで受けるときの 2 つ目の実体のための設定**(呼ぶ側が nvmet_job_start() の前に入れる)。
+     * cntlid_cfg = 名乗る cntlid(0 なら 1。Linux は同じサブシステムで cntlid が重なると拒む)。
+     * share_disk / share_disk2 = 名前空間の実体を 1 つ目の実体と共有する(NULL なら自分のもの)。 */
+    uint16_t cntlid_cfg;
+    uint8_t  inst;       /* 実体の番号(nvmet_job_start() が入れる。TLS の状態の添字)*/
+    uint8_t *share_disk, *share_disk2;
     uint32_t cc;         /* CCレジスタ(Property Setで書き込まれる) */
     int      cc_en;      /* cc & NVME_CC_ENが立ったら1 */
     int      shutdown_complete; /* CC.SHNを受けた=CSTS.SHSTに完了(10b)を返す */

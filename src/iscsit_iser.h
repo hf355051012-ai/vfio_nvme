@@ -8,14 +8,16 @@
  * **データは PDU に載せない**: 読み出しはこちらが RDMA_WRITE でイニシエータのメモリへ書き、
  * 書き込みはこちらが RDMA_READ で引く(R2T / Data-In / Data-Out は出ない)。
  * SCSI の実行は TCP のターゲットと同じ `scsi.c`、記憶域も同じ LUN を使う。
- * 1 接続(= 1 セッション)だけを受ける。 */
+ * 1 つの PF で 1 接続(= 1 セッション)を受ける。PF ごとに起動できる(2 ポートで受ける)。 */
 
 #include <stdint.h>
 #include "mlx5.h"
 
 #define ISCSIT_ISER_PORT 3260u
 
-int  iscsit_iser_start(mlx5_dev_t *dev, const char *self_label, const uint8_t peer_mac[6]);
+/* inst = 実体の番号(0 = pf1、1 = pf0)、core = ジョブを固定するコア。 */
+int  iscsit_iser_start(mlx5_dev_t *dev, const char *self_label, const uint8_t peer_mac[6], unsigned inst,
+                       unsigned core);
 int  iscsit_iser_started(void);
 void iscsit_iser_status(void);
 void iscsit_iser_stats_clear(void);

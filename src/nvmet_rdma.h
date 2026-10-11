@@ -69,7 +69,8 @@ typedef enum {
 } nvmet_rdma_state_t;
 
 typedef struct {
-    uint16_t ctrlr_id;   /* 固定値1(nvme_rdma.cのcntlidと一致させる) */
+    uint16_t ctrlr_id;   /* cntlid(既定 1。nvme_rdma.c の cntlid と一致させる) */
+    uint16_t cntlid_cfg; /* この組が名乗る cntlid(0 なら 1)。2 ポートで受けるとき組ごとに変える */
     /* Set Features(Number of Queues)でホストと合意した IO キュー本数。
      * **ホストの要求とこちらの上限の小さいほう。** 0 = まだ合意していない。 */
     volatile uint32_t io_queues_granted;
@@ -192,7 +193,9 @@ struct nvmet_rdma_ctx {
 
 /* 外部ホスト向けの常駐 NVMe-oF RDMA ターゲットを起動する。
  * peer_mac は REP を返すときの宛先 L2 アドレス(CM には含まれないため)。 */
-void nvmet_rdma_run_standalone(mlx5_dev_t *dev, const char *self_label, const uint8_t peer_mac[6]);
+/* inst = 組の番号(0 = pf1、1 = pf0。2 ポートで受けるとき両方起動する)。 */
+void nvmet_rdma_run_standalone(mlx5_dev_t *dev, const char *self_label, const uint8_t peer_mac[6],
+                               unsigned inst, unsigned acore);
 
 job_result_t nvmet_rdma_job_step(job_t *self);
 

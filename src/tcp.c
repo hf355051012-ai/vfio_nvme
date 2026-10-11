@@ -1102,7 +1102,8 @@ static void tcp_rtt_update(tcp_priv_t *priv, uint64_t measured_ticks)
 #define TCP_SEG_BUF_RAW  (TCP_L4_OFFSET_V6 + TCP_HDR_LEN + TCP_OPT_MAX_LEN + TCP_MSS_LOCAL)
 #define TCP_SEG_BUF_SIZE (((TCP_SEG_BUF_RAW) + 63u) & ~63u)
 
-static uint8_t s_seg_bufs[SMP_MAX_CORES][ETH_TX_RING_SIZE][TCP_SEG_BUF_SIZE]
+/* [コア][送信キュー(PF)][スロット]。**送信キューでも分ける**(netif.h の txq_index)。 */
+static uint8_t s_seg_bufs[SMP_MAX_CORES][NETIF_TXQ_MAX][ETH_TX_RING_SIZE][TCP_SEG_BUF_SIZE]
     __attribute__((aligned(64)));
 
 /*=================================================================
@@ -1747,7 +1748,7 @@ static int tcp_send_segment(tcp_conn_t *conn, tcp_priv_t *priv, uint8_t flags,
     if(ts_log_mode()&TS_MODE_HOTPATH) ts_log(TS_MK(TS_FILE_TCP, TS_FUNC_tcp_send_segment, 0), tcp_conn_arg(conn, data_len));
     unsigned slot = eth_tx_wait_free_slot();
     if(ts_log_mode()&TS_MODE_HOTPATH) ts_log(TS_MK(TS_FILE_TCP, TS_FUNC_tcp_send_segment, 1), tcp_conn_arg(conn, data_len));
-    uint8_t *seg_buf = s_seg_bufs[core][slot];
+    uint8_t *seg_buf = s_seg_bufs[core][netif_active_txq()][slot];
 
     unsigned l4_off = tcp_l4_off((const netaddr_t *)&conn->remote_ip);
     tcp_build_l3(seg_buf, (const netaddr_t *)&conn->local_ip,
@@ -1914,7 +1915,7 @@ static int tcp_send_segment_lso(tcp_conn_t *conn, tcp_priv_t *priv,
 
     /* tcp_send_segment()と同じスロット確保規約(コメント参照)。 */
     unsigned slot = eth_tx_wait_free_slot();
-    uint8_t *seg_buf = s_seg_bufs[core][slot];
+    uint8_t *seg_buf = s_seg_bufs[core][netif_active_txq()][slot];
 
     tcp_build_l3(seg_buf, (const netaddr_t *)&conn->local_ip,
                   (const netaddr_t *)&conn->remote_ip, dst_mac, seg_len);
@@ -1994,7 +1995,7 @@ static void tcp_send_bare(const netaddr_t *local_ip, uint16_t local_port,
     }
 
     unsigned slot = eth_tx_wait_free_slot();
-    uint8_t *seg_buf = s_seg_bufs[core][slot];
+    uint8_t *seg_buf = s_seg_bufs[core][netif_active_txq()][slot];
 
     unsigned l4_off = tcp_l4_off(remote_ip);
     tcp_build_l3(seg_buf, local_ip, remote_ip, dst_mac, TCP_HDR_LEN);
