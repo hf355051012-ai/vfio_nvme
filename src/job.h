@@ -6,7 +6,12 @@
 /* nvmet が admin 1 + IO キュー NVMET_IO_QUEUES(4)= 5 枠使うので、RDMA 側や
  * 内蔵イニシエータと同時に立てても足りるだけの余裕を持たせてある。 */
 /* nvmet の admin 1 + IO 16、nvmet-rdma の standalone 1 + IO 4 + CM 1 で 23。 */
-#define JOB_MAX 48u   /* nvmet は 1 実体で 17 本使う。2 ポート(2 実体)+ iSCSI / RDMA に足りるように */
+/* nvmet は 1 実体で 17 本使う。2 ポート(2 実体)+ iSCSI / RDMA に足りるように。
+ * NVMe-oF RDMA は 1 ポートで admin 2 本(本体と CM)+ IO キュー 4 枠 x 2 本(本体と受け皿の CM)まで
+ * 同時に生きる(IO キューだけを切られた枠は受け皿に戻るため)。TCP 34 + RDMA 20 = 54 で、48 だと admin の
+ * 張り直しの CM ジョブが作れなかった(止めたジョブは次の step まで枠を返さない)。
+ * スケジューラは使っている枠の上限(s_job_high)までしか見ないので、上限を上げても費用は増えない。 */
+#define JOB_MAX 64u
 
 /* 眠っている(park した)ジョブを念のため step する周期。job_scheduler_tick()
  * の呼び出し回数で数える。**2 の冪であること**(マスクで判定する)。

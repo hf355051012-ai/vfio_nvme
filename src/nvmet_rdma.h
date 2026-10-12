@@ -66,6 +66,7 @@ typedef enum {
     NVMETR_ST_WAIT_RESP_SENT,
     NVMETR_ST_PIPELINE_SETUP,
     NVMETR_ST_PIPELINE_LOOP,
+    NVMETR_ST_WAIT_IO_GONE,   /* admin の切断の後、IO キューのジョブが全部終わるのを待つ */
 } nvmet_rdma_state_t;
 
 typedef struct {
@@ -74,6 +75,10 @@ typedef struct {
     /* Set Features(Number of Queues)でホストと合意した IO キュー本数。
      * **ホストの要求とこちらの上限の小さいほう。** 0 = まだ合意していない。 */
     volatile uint32_t io_queues_granted;
+    /* Get Features で返す値(TCP の nvmet.c と同じ 4 つ)。KATO は admin の Connect の cdw12、
+     * Async Event の設定は Set Features で受けた値。 */
+    uint32_t kato_ms;
+    uint32_t aen_config;
     uint32_t cc;
     int      cc_en;
 
@@ -177,6 +182,9 @@ struct nvmet_rdma_ctx {
     int      established;
 
     volatile int stop_requested;
+    /* IO キューだけが DREQ で切られたとき admin のジョブが立てる。IO キューのジョブが自分の QP を捨てて
+     * 同じ枠の受け皿(CM_SPAWN)へ戻る(admin を残したまま qpair を作り直すホスト = SPDK の bdev_nvme のため)。 */
+    volatile int requeue;
 
     int pipeline_enabled;
 

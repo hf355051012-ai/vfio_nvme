@@ -103,7 +103,19 @@ typedef struct {
     uint8_t  req_path_mtu;
     /* passive 側で受け付ける REQ の SERVICE_ID のポート(0 = 問わない。従来どおり)。 */
     uint16_t listen_port;
+    /* passive 側で受け付ける REQ を NVMe-oF の qid(private data の nvme_rdma_cm_req.qid)で絞る。
+     * 0 = 問わない(従来どおり)、RDMA_CM_REQ_ADMIN = qid 0 だけ、RDMA_CM_REQ_IO = qid 1 以上だけ。
+     * 共有 GSI で admin と IO キューの受け皿が同時に REQ を待つとき、互いの REQ を取らないため。 */
+    uint8_t  req_qid_class;
+    /* passive 側: 1 の間は REP を送らずに待つ(RC QP は RTS にして established は立てる)。
+     * 持ち主が受信 WQE を投稿し終えたら 0 にする。**REP を受けた相手はすぐに最初の SEND を
+     * 打ってくる**ので、受信が無いと RNR NAK になる(SPDK の IO キューの Connect がそれで
+     * 0.5 秒の時間切れになった)。Linux の nvmet-rdma も受信を投稿してから rdma_accept() する。 */
+    volatile uint8_t hold_rep;
 } rdma_cm_ctx_t;
+
+#define RDMA_CM_REQ_ADMIN 1u
+#define RDMA_CM_REQ_IO    2u
 
 /* 確立済みの接続を CM の DREQ で畳み、DREP を待つ(同期、GSI を直接回す)。
  * **CM ジョブが終わってから呼ぶこと**(GSI の CQ を取り合う)。

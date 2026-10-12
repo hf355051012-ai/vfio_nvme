@@ -1,3 +1,4 @@
+#include "smp.h"
 #include "mlx5_qp.h"
 #include "mmio.h"
 #include "timer.h"
@@ -223,9 +224,27 @@ ring_db:;
  * コール元:
  *   rdma_cm_job_step(), nvmetr_check_gsi_disconnect()
  * ===============================================================*/
+/* **GSI の送信は複数のコアから来る**(rdmacores 2 以上では、IO キューの受け皿の CM ジョブが core2 / core3 で
+ * REP を、admin のジョブが core1 で DREP を送る)。sq_pc と WQE とドアベルを守る物が無く、2 コアで
+ * GSI が壊れて(完了が syndrome 0x05 で返る)そのポートの接続を以後一切受けられなくなった。冷たい経路なので
+ * 全装置で 1 本のロックにする。 */
+static smp_spinlock_t s_ud_send_lock;
+static int mlx5_qp_post_send_ud_locked(mlx5_dev_t *dev, mlx5_qp_t *qp, const void *data, uint32_t len,
+                                       uint32_t remote_qpn, uint32_t remote_qkey,
+                                       const uint8_t remote_gid[16], const uint8_t remote_mac[6]);
+
 int mlx5_qp_post_send_ud(mlx5_dev_t *dev, mlx5_qp_t *qp, const void *data, uint32_t len,
                           uint32_t remote_qpn, uint32_t remote_qkey,
                           const uint8_t remote_gid[16], const uint8_t remote_mac[6]) {
+    smp_spin_lock(&s_ud_send_lock);
+    int rc = mlx5_qp_post_send_ud_locked(dev, qp, data, len, remote_qpn, remote_qkey, remote_gid, remote_mac);
+    smp_spin_unlock(&s_ud_send_lock);
+    return rc;
+}
+
+static int mlx5_qp_post_send_ud_locked(mlx5_dev_t *dev, mlx5_qp_t *qp, const void *data, uint32_t len,
+                                       uint32_t remote_qpn, uint32_t remote_qkey,
+                                       const uint8_t remote_gid[16], const uint8_t remote_mac[6]) {
     uint32_t pc = qp->sq_pc;
     uint32_t idx0 = pc & 63u; // log_sq_size=6 -- 64 WQEBB
     uint32_t idx1 = (idx0 + 1u) & 63u;

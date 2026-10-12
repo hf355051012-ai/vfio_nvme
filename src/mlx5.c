@@ -1,4 +1,5 @@
 #include "mlx5.h"
+#include "smp.h"
 #include "mmio.h"
 #include "timer.h"
 #include "uart.h"
@@ -676,7 +677,20 @@ static int mlx5_cmdq_init(mlx5_dev_t *dev) {
     return 0;
 }
 
+/* **コマンドキューは entry 0 の 1 つだけで、ロックが無かった。** RDMA ターゲットの IO キューを複数のコアへ
+ * 散らすと(rdmacores 2 以上)、受け皿の QP の作成・遷移・破棄が別々のコアから同時に走り、同じ entry と
+ * メールボックスを書き合う。FW コマンドは冷たい経路なので、全装置で 1 本のロックで直列にする。 */
+static smp_spinlock_t s_mlx5_cmd_lock;
+static int mlx5_cmd_exec_locked(mlx5_dev_t *dev, const uint8_t *in_buf, uint32_t in_len, void *out_buf, uint32_t out_len);
+
 static int mlx5_cmd_exec(mlx5_dev_t *dev, const uint8_t *in_buf, uint32_t in_len, void *out_buf, uint32_t out_len) {
+    smp_spin_lock(&s_mlx5_cmd_lock);
+    int rc = mlx5_cmd_exec_locked(dev, in_buf, in_len, out_buf, out_len);
+    smp_spin_unlock(&s_mlx5_cmd_lock);
+    return rc;
+}
+
+static int mlx5_cmd_exec_locked(mlx5_dev_t *dev, const uint8_t *in_buf, uint32_t in_len, void *out_buf, uint32_t out_len) {
     if (out_len > MLX5_CMD_MBOX_CHAIN_MAX) {
         uart_printf("mlx5: cmd_exec: out_len=%u exceeds mailbox chain support (max %u)\n",
                     out_len, MLX5_CMD_MBOX_CHAIN_MAX);

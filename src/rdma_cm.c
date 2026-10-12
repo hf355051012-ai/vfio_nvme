@@ -453,6 +453,12 @@ static int cm_want_rep_or_rej(const rdma_cm_ctx_t *ctx, uint16_t attr, const uin
 
 static int cm_want_req(const rdma_cm_ctx_t *ctx, uint16_t attr, const uint8_t *pl) {
     if (attr != CM_REQ_ATTR_ID) return 0;
+    if (ctx->req_qid_class != 0u) {
+        /* PRIVATE_DATA は REQ の 140 バイト目から。cma_hdr(36 バイト)の後ろが nvme_rdma_cm_req
+         * (recfmt 2 バイト、qid 2 バイト、どちらもリトルエンディアン)。 */
+        const uint16_t qid = (uint16_t)(pl[140 + 38] | ((uint16_t)pl[140 + 39] << 8));
+        if ((ctx->req_qid_class == RDMA_CM_REQ_ADMIN) != (qid == 0u)) return 0;
+    }
     if (ctx->listen_port == 0) return 1;
     /* SERVICE_ID(REQ の 8〜15 バイト)= (RDMA_PS_TCP << 16) + ポート。下位 16 ビットだけ見る。 */
     return (uint16_t)(((uint16_t)pl[14] << 8) | pl[15]) == ctx->listen_port;
@@ -778,8 +784,9 @@ job_result_t rdma_cm_job_step(job_t *self) {
             rdma_cm_parse_req(ctx, ctx->recv_buf);
             ctx->tid = rd64be(&ctx->recv_buf[MLX5_GRH_BYTES + 8]); // MADヘッダのtidをそのまま流用(REP/RTUで踏襲)
             ctx->local_comm_id = (uint32_t)(timer_now() & 0xFFFFFFFFu) ^ 0x5A5A5A5Au;
-            uart_printf("rdma_cm: REQ received (remote_comm_id=0x%08x peer_qpn=%u peer_psn=%u)\n",
-                        ctx->remote_comm_id, ctx->peer_rc_qpn, ctx->peer_starting_psn);
+            uart_printf("rdma_cm: REQ received (remote_comm_id=0x%08x peer_qpn=%u peer_psn=%u rc_qp_index=%u t=%uus)\n",
+                        ctx->remote_comm_id, ctx->peer_rc_qpn, ctx->peer_starting_psn, ctx->rc_qp_index,
+                        (unsigned)(timer_now() / 1000u));
             self->state = RDMA_CM_ST_PASSIVE_MODIFY_QP;
             return JOB_WAITING;
         }
@@ -806,11 +813,18 @@ job_result_t rdma_cm_job_step(job_t *self) {
                 return JOB_DONE;
             }
         }
+        ctx->state_deadline = timer_now();   /* hold_rep の待ちの起点 */
         self->state = RDMA_CM_ST_PASSIVE_SEND_REP;
         return JOB_WAITING;
     }
 
     case RDMA_CM_ST_PASSIVE_SEND_REP: {
+        if (ctx->hold_rep) {
+            /* 持ち主が受信を投稿するまで待つ。持ち主が止まったときのために 1 秒で諦めて送る。 */
+            if (!timeout_ms(ctx->state_deadline, 1000u)) return JOB_WAITING;
+            uart_printf("rdma_cm: 受信の投稿を 1 秒待ったが来ないので REP を送る\n");
+            ctx->hold_rep = 0;
+        }
         rdma_cm_build_rep(ctx);
         dcache_clean_range((const void *)(uintptr_t)ctx->send_buf, sizeof(ctx->send_buf));
         if (mlx5_qp_post_send_ud(ctx->dev, ctx->gsi_qp, (const void *)(uintptr_t)ctx->send_buf,
@@ -820,8 +834,8 @@ job_result_t rdma_cm_job_step(job_t *self) {
             self->state = RDMA_CM_ST_DONE_FAIL;
             return JOB_DONE;
         }
-        uart_printf("rdma_cm: REP sent (local_comm_id=0x%08x local_qpn=%u) -- RC QP already RTS\n",
-                    ctx->local_comm_id, ctx->rc_qp.qpn);
+        uart_printf("rdma_cm: REP sent (local_comm_id=0x%08x local_qpn=%u t=%uus) -- RC QP already RTS\n",
+                    ctx->local_comm_id, ctx->rc_qp.qpn, (unsigned)(timer_now() / 1000u));
         ctx->state_deadline = timer_now();
         self->state = RDMA_CM_ST_PASSIVE_WAIT_RTU;
         return JOB_WAITING;
@@ -830,7 +844,8 @@ job_result_t rdma_cm_job_step(job_t *self) {
     case RDMA_CM_ST_PASSIVE_WAIT_RTU: {
         int rc = cm_gsi_take(ctx, cm_want_rtu, NULL, NULL);
         if (rc == 1) {
-            uart_printf("rdma_cm: RTU received (passive)\n");
+            uart_printf("rdma_cm: RTU received (passive, rc_qp_index=%u t=%uus)\n", ctx->rc_qp_index,
+                        (unsigned)(timer_now() / 1000u));
             if (ctx->skip_ping) {
                 ctx->rtu_phase_done = 1;
                 self->state = RDMA_CM_ST_DONE_OK;

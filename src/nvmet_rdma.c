@@ -59,11 +59,17 @@ static nvmetr_inst_t *nvmetr_inst_of(const nvmet_rdma_ctx_t *ctx)
 /* IO キュー(queue_id=1)。admin の CM 確立を検出した時点で spawn する。
  * self_label / peer_mac はコールバックに渡らないのでここへ控えておく。 */
 /* **IO キューはコネクションごとに 1 個。** 1 個 1MB 強あるので .bss を見て
- * 増やすこと。**GSI(QP1)は 1 PF に 1 つしか置けない**ので、CM の受動
- * accept を同時に 2 つ回してはいけない -- **確立するたびに次の 1 本を
- * 立てる**(1 本ずつ順に張ってくる Linux の挙動と合う)。 */
+ * 増やすこと。**GSI(QP1)は 1 PF に 1 つしか置けない**が、拾った MAD は
+ * rdma_cm.c の待ち行列(cm_gsi_take())に入り、受け皿は REQ を 1 つずつ取り出す
+ * ので、**同時に来た REQ は次の受け皿が立つまで待ち行列で待つ**(3 秒)。
+ * 受け皿は確立するたびに次の 1 本を立てる。admin の受け皿は qid 0 の REQ だけ、
+ * IO の受け皿は qid 1 以上の REQ だけを取る(req_qid_class)。
+ * **SPDK は同じコントローラの IO キューを複数のコアから同時に張りに来て**、REP を
+ * 受けるとすぐ Connect を送るので、受信の投稿が済むまで REP を待たせる(hold_rep)。
+ * IO キューだけが切られた枠は受け皿に戻す(requeue)。 */
 static void nvmetr_spawn_io_queue(nvmet_rdma_ctx_t *admin_ctx, unsigned idx);
 static void nvmetr_on_io_established(nvmet_rdma_ctx_t *self);
+static void nvmetr_requeue_io(nvmet_rdma_ctx_t *ctx, job_t *self);
 static void nvmetr_after_auth(nvmet_rdma_ctx_t *ctx);
 
 
@@ -299,8 +305,11 @@ static void nvmetr_parse_command(nvmet_rdma_ctx_t *ctx, const volatile uint8_t *
     if (p->opcode == NVME_FABRIC_CMD) {
         if (p->fctype == NVME_FABRIC_FCTYPE_CONNECT) {
             p->resp_dw0 = ctx->ctrl->ctrlr_id;
-            uart_printf("[nvmet-rdma] Fabrics Connect受理 (cntlid=%u)\n", ctx->ctrl->ctrlr_id);
+            uart_printf("[nvmet-rdma] Fabrics Connect受理 (cntlid=%u queue_id=%u qid=%u t=%uus)\n",
+                        ctx->ctrl->ctrlr_id, ctx->queue_id, (unsigned)(p->cdw10 >> 16),
+                        (unsigned)(timer_now() / 1000u));
             if (ctx->queue_id == 0) {
+                ctx->ctrl->kato_ms = p->cdw12;   /* Keep Alive Timeout(ms、Get Features で返す)*/
                 /* **admin の Connect はデータ(1024 バイト、hostnqn を含む)を読む。**
                  * 以前は読まずに受理していた。認証では hostnqn が要る。 */
                 nvmetr_parse_ksgl_into(rb, &p->ksgl_addr, &p->ksgl_len, &p->ksgl_key, &p->inval_rkey);
@@ -345,7 +354,11 @@ static void nvmetr_parse_command(nvmet_rdma_ctx_t *ctx, const volatile uint8_t *
                 p->resp_dw0 = 0xFFu | (0x1Eu << 24);
                 p->resp_dw1 = 0x20u;
             } else if (offset == NVME_REG_CSTS) {
-                p->resp_dw0 = ctx->ctrl->cc_en ? NVME_CSTS_RDY : 0;
+                /* **CC.SHN(停止の通知)を受けたら CSTS.SHST = 10b(停止完了)を返す。** 返さないとホストは
+                 * 待ち切るまで待つ(SPDK は 10 秒 `did not shutdown within 10000 milliseconds`、Linux は 5 秒)。
+                 * TCP の nvmet.c は以前に直してあった。RAM ディスクなので、受けた時点で止めてよい。 */
+                p->resp_dw0 = (ctx->ctrl->cc_en ? NVME_CSTS_RDY : 0) |
+                              ((ctx->ctrl->cc & NVME_CC_SHN_MASK) ? NVME_CSTS_SHST_CMPLT : 0u);
             } else if (offset == NVME_REG_CC) {
                 p->resp_dw0 = ctx->ctrl->cc;
             }
@@ -381,6 +394,38 @@ static void nvmetr_parse_command(nvmet_rdma_ctx_t *ctx, const volatile uint8_t *
             p->resp_dw0 = ((give - 1u) << 16) | (give - 1u);
             uart_printf("[nvmet-rdma] Number of Queues: 要求 %u 本 -> %u 本を許諾\n",
                         want, give);
+        } else if ((p->cdw10 & 0xFFu) == NVME_FEAT_ASYNC_EVENT) {
+            ctx->ctrl->aen_config = p->cdw11;
+        } else if ((p->cdw10 & 0xFFu) == NVME_FEAT_KATO) {
+            ctx->ctrl->kato_ms = p->cdw11;
+        }
+    } else if (p->opcode == NVME_ADM_CMD_GET_FEATURES) {
+        /* **SPDK のイニシエータは接続の途中で Keep Alive Timer(FID 0x0F)を Get Features で読み、
+         * 失敗すると接続をやめる**(`Keep alive timeout Get Feature failed`)。Linux のホストは読まないので
+         * 以前は未実装で、未知の opcode として返していた。TCP の nvmet.c(nvmet_feat_current())と同じ
+         * 4 つを返し、それ以外の FID は Invalid Field で返す。 */
+        const uint32_t fid = p->cdw10 & 0xFFu;
+        const uint32_t sel = (p->cdw10 >> 8) & 0x7u;
+        uint32_t v = 0;
+        int ok = 1;
+        if (fid == NVME_FEAT_NUM_QUEUES) {
+            uint32_t n = ctx->ctrl->io_queues_granted ? ctx->ctrl->io_queues_granted : 1u;
+            v = (n - 1u) | ((n - 1u) << 16);
+        } else if (fid == NVME_FEAT_VOLATILE_WC) {
+            v = 0;
+        } else if (fid == NVME_FEAT_ASYNC_EVENT) {
+            v = ctx->ctrl->aen_config;
+        } else if (fid == NVME_FEAT_KATO) {
+            v = ctx->ctrl->kato_ms;
+        } else {
+            ok = 0;
+        }
+        if (!ok || sel == NVME_FEAT_SEL_SAVED) {
+            p->resp_status = 0x8004u;   /* SC=0x02 Invalid Field in Command + DNR(保存値は持たない)*/
+        } else if (sel == NVME_FEAT_SEL_SUPPORTED) {
+            p->resp_dw0 = (fid == NVME_FEAT_ASYNC_EVENT || fid == NVME_FEAT_KATO) ? NVME_FEAT_CAP_CHANGEABLE : 0u;
+        } else {
+            p->resp_dw0 = v;
         }
     } else if (p->opcode == NVME_ADM_CMD_KEEP_ALIVE) {
         /* 応答するだけ(need_data_move=0 のまま成功 CQE を返す)。 */
@@ -563,12 +608,40 @@ static void nvmetr_build_drep(nvmet_rdma_ctx_t *ctx, uint64_t dreq_tid, uint32_t
  * ===============================================================*/
 static void nvmetr_reset_admin_for_reconnect(nvmet_rdma_ctx_t *ctx, job_t *self)
 {
-    nvmetr_destroy_qp_if_valid(ctx->cm.dev, &ctx->cm.rc_qp);
-    nvmetr_destroy_qp_if_valid(ctx->cm.dev, ctx->cm.gsi_qp);
-
+    /* **IO キューのジョブ(と、その受け皿の CM ジョブ)が全部終わってから GSI を作り直す。**
+     * IO キューのジョブは rdmacores 2 以上では別のコアで回っている。以前はここで IO キューの QP を
+     * こちらのコアから壊し、すぐ GSI を作り直していたので、別のコアで受け皿に戻りかけていた IO キューの
+     * ジョブが止め損ねた CM ジョブを残し、古い GSI を触って GSI ごと壊れた(2 コアで 2 回目以降の接続を
+     * 受けられなかった原因)。止める要求だけ出し、NVMETR_ST_WAIT_IO_GONE で待つ。 */
     if (ctx->on_disconnected) {
         ctx->on_disconnected(ctx);   // -> nvmetr_on_admin_disconnected(このファイル)
     }
+    self->state = NVMETR_ST_WAIT_IO_GONE;
+}
+
+/* 同じ組の IO キューのジョブと受け皿の CM ジョブが全部終わったか(終わっていなければ止め直す)。
+ * IO キューの ctx の先頭は cm なので、job_count_by_ctx(&io_ctx[k]) は両方を数える。 */
+static int nvmetr_io_jobs_gone(void)
+{
+    int gone = 1;
+    for (unsigned k = 0; k < NVMET_RDMA_IO_QUEUES; k++) {
+        if (job_count_by_ctx(&s_standalone_io_ctx[k]) != 0) {
+            s_standalone_io_ctx[k].stop_requested = 1;
+            job_cancel_by_ctx(&s_standalone_io_ctx[k]);   /* 後から生まれた CM ジョブも止める */
+            gone = 0;
+        }
+    }
+    return gone;
+}
+
+/* nvmetr_reset_admin_for_reconnect() の続き。IO キューのジョブが全部終わってから呼ぶ。 */
+static void nvmetr_rearm_admin(nvmet_rdma_ctx_t *ctx, job_t *self)
+{
+    for (unsigned k = 0; k < NVMET_RDMA_IO_QUEUES; k++) {   /* 止まる前に CM ジョブが作った QP の残り */
+        nvmetr_destroy_qp_if_valid(s_standalone_io_ctx[k].cm.dev, &s_standalone_io_ctx[k].cm.rc_qp);
+    }
+    nvmetr_destroy_qp_if_valid(ctx->cm.dev, &ctx->cm.rc_qp);
+    nvmetr_destroy_qp_if_valid(ctx->cm.dev, ctx->cm.gsi_qp);
 
     mlx5_dev_t *dev = ctx->cm.dev;
     const char *self_label = ctx->self_label;
@@ -580,6 +653,8 @@ static void nvmetr_reset_admin_for_reconnect(nvmet_rdma_ctx_t *ctx, job_t *self)
                       dummy_mac, peer_mac_fallback);
     ctx->cm.is_active = 0;
     ctx->cm.skip_ping = 1;
+    ctx->cm.req_qid_class = RDMA_CM_REQ_ADMIN;
+    ctx->cm.hold_rep = 1;
     ctx->established = 0;
     ctx->failed = 0;
 
@@ -644,6 +719,7 @@ static int nvmetr_check_gsi_disconnect(nvmet_rdma_ctx_t *ctx, job_t *self)
         who = "既に畳んだ接続";
         for (int k = 0; k < s_standalone_io_spawned; k++) {
             if (s_standalone_io_ctx[k].cm.local_comm_id == dreq_remote_comm_id) {
+                s_standalone_io_ctx[k].requeue = 1;   /* その枠を受け皿に戻す(IO キューのジョブがやる) */
                 who = "IOキュー";
                 break;
             }
@@ -657,7 +733,7 @@ static int nvmetr_check_gsi_disconnect(nvmet_rdma_ctx_t *ctx, job_t *self)
                          RDMA_CM_MAD_SIZE, 1u /* GSI宛は常にQPN=1固定[フェーズd] */,
                          IB_QP1_QKEY, ctx->cm.peer_gid, ctx->cm.peer_mac);
     if (!is_admin) {
-        return 0;   /* IO キューの QP は admin の DREQ で道連れに畳む */
+        return 0;   /* IO キューの QP はそのキューのジョブが捨てて受け皿に戻る(requeue) */
     }
 
     nvmetr_reset_admin_for_reconnect(ctx, self);
@@ -823,6 +899,8 @@ job_result_t nvmet_rdma_job_step(job_t *self)
     }
 
     if (ctx->stop_requested || self->cancel_requested) {
+        /* IO キューの QP は自分のコアで壊す(admin のジョブは別のコアにいることがある)。 */
+        if (ctx->queue_id != 0) nvmetr_destroy_qp_if_valid(ctx->cm.dev, &ctx->cm.rc_qp);
         if (ctx == &s_standalone_ctx)    s_standalone_resident = 0;
         for (unsigned k = 0; k < NVMET_RDMA_IO_QUEUES; k++) {
             if (ctx == &s_standalone_io_ctx[k] && s_standalone_io_spawned > (int)k) {
@@ -831,12 +909,29 @@ job_result_t nvmet_rdma_job_step(job_t *self)
         }
         return JOB_DONE;
     }
+    if (ctx->requeue && ctx->queue_id != 0) {
+        /* IO キューだけが切られた。ctx->cm を作り直すので、CM ジョブが終わる(RTU を受けたか 3 秒で
+         * 諦めた、または失敗した)まで待つ。CM ジョブはこのジョブと同じコアで回る。
+         * **job_cancel_by_ctx(&ctx->cm) は使えない** -- cm は ctx の先頭の要素なので &ctx->cm == ctx で、
+         * このジョブ自身まで止めてしまう(実機で踏んだ。止まった IO キューのジョブが io_spawned を縮め、
+         * admin の切断で畳まれずに次の接続まで残った)。 */
+        if (!ctx->cm.rtu_phase_done && !ctx->cm.failed) {
+            return JOB_WAITING;
+        }
+        ctx->requeue = 0;
+        nvmetr_requeue_io(ctx, self);
+        return JOB_WAITING;
+    }
 
     switch (self->state) {
 
     case NVMETR_ST_CM_SPAWN: {
         ctx->cm.is_active = 0;
         ctx->cm.skip_ping = 1;
+        /* admin の受け皿は qid 0 の REQ だけ、IO キューの受け皿は qid 1 以上の REQ だけを取る
+         * (GSI は共有。取り違えると相手のキューの種類と合わない Connect を断ることになる)。 */
+        ctx->cm.req_qid_class = (ctx->queue_id == 0) ? RDMA_CM_REQ_ADMIN : RDMA_CM_REQ_IO;
+        ctx->cm.hold_rep = 1;   /* 受信を投稿してから REP を送らせる(PIPELINE_SETUP / POST_RECV で外す) */
         if (ctx->queue_id == 0) {
             ctx->ctrl->ctrlr_id = ctx->ctrl->cntlid_cfg ? ctx->ctrl->cntlid_cfg : 1u;
             ctx->ctrl->cc = 0;
@@ -859,6 +954,13 @@ job_result_t nvmet_rdma_job_step(job_t *self)
         return JOB_WAITING;
     }
 
+    case NVMETR_ST_WAIT_IO_GONE: {
+        /* admin の切断の後、IO キューのジョブが全部終わるのを待ってから GSI を作り直す。 */
+        if (!nvmetr_io_jobs_gone()) return JOB_WAITING;
+        nvmetr_rearm_admin(ctx, self);
+        return ctx->failed ? JOB_DONE : JOB_WAITING;
+    }
+
     case NVMETR_ST_CM_WAIT: {
         if (ctx->cm.failed) {
             uart_printf("[!] nvmet-rdma: CM確立失敗\n");
@@ -867,7 +969,8 @@ job_result_t nvmet_rdma_job_step(job_t *self)
         }
         if (!ctx->cm.established) return JOB_WAITING;
         ctx->established = 1;
-        uart_printf("[nvmet-rdma] RC QP確立完了 (qpn=%u queue_id=%u)\n", ctx->cm.rc_qp.qpn, ctx->queue_id);
+        uart_printf("[nvmet-rdma] RC QP確立完了 (qpn=%u queue_id=%u t=%uus)\n", ctx->cm.rc_qp.qpn,
+                    ctx->queue_id, (unsigned)(timer_now() / 1000u));
         if (ctx->on_established) {
             ctx->on_established(ctx);   // -> nvmetr_on_admin_established(このファイル)
         }
@@ -882,6 +985,7 @@ job_result_t nvmet_rdma_job_step(job_t *self)
             ctx->failed = 1;
             return JOB_DONE;
         }
+        ctx->cm.hold_rep = 0;
         self->state = NVMETR_ST_WAIT_CAPSULE;
         return JOB_WAITING;
     }
@@ -1061,7 +1165,9 @@ job_result_t nvmet_rdma_job_step(job_t *self)
                 return JOB_DONE;
             }
         }
-        uart_printf("[nvmet-rdma] パイプライン化ループ開始 (depth=%u)\n", NVMET_RDMA_MAX_PENDING);
+        ctx->cm.hold_rep = 0;   /* 受信を投稿し終えたので REP を送ってよい */
+        uart_printf("[nvmet-rdma] パイプライン化ループ開始 (depth=%u queue_id=%u t=%uus)\n",
+                    NVMET_RDMA_MAX_PENDING, ctx->queue_id, (unsigned)(timer_now() / 1000u));
         self->state = NVMETR_ST_PIPELINE_LOOP;
         return JOB_WAITING;
     }
@@ -1360,11 +1466,35 @@ static void nvmetr_spawn_io_queue(nvmet_rdma_ctx_t *admin_ctx, unsigned idx)
 }
 
 /*=================================================================
+ * IO キューだけが DREQ で切られた枠を、同じ枠の受け皿に戻す(IO キューのジョブ自身が呼ぶ)。
+ * RC QP を捨て、CM コンテキストを作り直して CM_SPAWN からやり直す。ctx を別のジョブから
+ * ゼロにしないこと(動いているジョブの ctx を消すことになる)。
+ * ===============================================================*/
+static void nvmetr_requeue_io(nvmet_rdma_ctx_t *ctx, job_t *self)
+{
+    mlx5_dev_t *dev   = ctx->cm.dev;
+    mlx5_qp_t  *gsi   = ctx->cm.gsi_qp;
+    uint8_t     rcidx = ctx->cm.rc_qp_index;
+    nvmetr_destroy_qp_if_valid(dev, &ctx->cm.rc_qp);
+    static const uint8_t dummy_mac[6] = {0, 0, 0, 0, 0, 0};
+    rdma_cm_fill_addr(&ctx->cm, dev, s_standalone_self_label, "__no_such_net_ctx__", 0u, 0u,
+                      dummy_mac, s_standalone_peer_mac);
+    ctx->cm.gsi_qp      = gsi;
+    ctx->cm.reuse_gsi   = 1;
+    ctx->cm.rc_qp_index = rcidx;
+    ctx->cm.skip_ping   = 1;
+    ctx->cm.is_active   = 0;
+    ctx->established = 0;
+    ctx->failed      = 0;
+    self->state = NVMETR_ST_CM_SPAWN;
+    uart_printf("[nvmet-rdma] IOキュー%u をホストが切ったので、同じ枠の受け皿に戻します\n", ctx->queue_id);
+}
+
+/*=================================================================
  * IO キューが確立したら次の 1 本の acceptor を立てる。
  *
- * **同時に 2 本を arm してはいけない** -- GSI は 1 本しかなく、受信 CQE を
- * どちらが拾うかが決まらない(TCP の listener で受け皿が 1 本しか無いのと
- * 同じ形)。ホストが要求した本数(Set Features で合意)まで立てる。
+ * 確立までの間に来た次の REQ は GSI の待ち行列で待っている(rdma_cm.c の
+ * cm_gsi_take())。ホストが要求した本数(Set Features で合意)まで立てる。
  * ===============================================================*/
 static void nvmetr_on_io_established(nvmet_rdma_ctx_t *self)
 {
@@ -1372,7 +1502,9 @@ static void nvmetr_on_io_established(nvmet_rdma_ctx_t *self)
     unsigned idx = (unsigned)(self - &s_standalone_io_ctx[0]);
     uint32_t granted = self->ctrl ? self->ctrl->io_queues_granted : 1u;
     if (granted == 0u) granted = 1u;
-    if (idx + 1u < granted && idx + 1u < NVMET_RDMA_IO_QUEUES) {
+    /* 作り直した枠(requeue)がもう一度確立したときは、次の枠が既に立っているので立て直さない
+     * (立て直すと使用中の枠の ctx をゼロにする)。 */
+    if (idx + 1u < granted && idx + 1u < NVMET_RDMA_IO_QUEUES && (int)(idx + 1u) >= s_standalone_io_spawned) {
         nvmetr_spawn_io_queue(s_standalone_admin_ctx_for_io, idx + 1u);
     }
 }
@@ -1418,12 +1550,12 @@ static void nvmetr_on_admin_disconnected(nvmet_rdma_ctx_t *admin_ctx)
     (void)admin_ctx;
     if (!s_standalone_io_spawned) return;
     for (int k = 0; k < s_standalone_io_spawned; k++) {
-        /* まだ REQ を待っている IO キューの受け皿(ホストが張る前に切った等)を
-         * 止める。残すと次の接続の admin 宛ての REQ を横取りする。 */
-        job_cancel_by_ctx(&s_standalone_io_ctx[k].cm);
-        nvmetr_destroy_qp_if_valid(s_standalone_io_ctx[k].cm.dev,
-                                   &s_standalone_io_ctx[k].cm.rc_qp);
+        /* まだ REQ を待っている IO キューの受け皿(ホストが張る前に切った等)も止める。残すと
+         * 次の接続の REQ を横取りする。**QP はここで壊さない** -- IO キューのジョブは別のコアで回って
+         * いることがあるので、止まるときに自分で壊す(nvmet_rdma_job_step() の入口)。
+         * cm は ctx の先頭なので、この取り消しで IO キューのジョブと受け皿の CM ジョブの両方が止まる。 */
         s_standalone_io_ctx[k].stop_requested = 1;
+        job_cancel_by_ctx(&s_standalone_io_ctx[k].cm);
     }
     s_standalone_io_spawned = 0;
     uart_printf("[nvmet-rdma] IOキューも道連れに終了させます\n");
