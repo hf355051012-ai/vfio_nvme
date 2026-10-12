@@ -233,6 +233,9 @@ uint32_t tcp_unacked_bytes(const tcp_conn_t *conn);
 uint32_t tcp_send_room(const tcp_conn_t *conn, uint32_t *usable_out);
 /* 短経路(tcp_send_async2/3)の再送用の枠の空きの数と、枠の数(`tcpasync` の実効本数)。 */
 unsigned tcp_send_short_free(const tcp_conn_t *conn, unsigned *cap_out);
+/* 長経路(LSO・ゼロコピー)の再送用の枠の空きの数と、枠の数。足りないと長経路の送信は
+ * その場で ACK を待つ(その間、同じコアのほかのジョブは回らない)。 */
+unsigned tcp_send_long_free(const tcp_conn_t *conn, unsigned *cap_out);
 
 /* 借りている ACK を返す / 借りているかを見る(相乗りの後始末)。 */
 int tcp_ack_flush(tcp_conn_t *conn);
@@ -306,5 +309,6 @@ int tcp_conn_sack_enabled(const tcp_conn_t *conn);
 void tcp_debug_inject_rst(const tcp_conn_t *victim, uint32_t seq);
 
 void tcp_debug_dump_rx(const tcp_conn_t *conn);
+void tcp_conns_show(void);
 
 #endif /* TCP_H */

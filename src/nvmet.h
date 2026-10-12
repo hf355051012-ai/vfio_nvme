@@ -96,6 +96,8 @@ _Static_assert(sizeof(nvmet_core_stat_t) == 64, "nvmet_core_stat_t は 1 キャ�
 extern volatile int g_nvmet_multi_ctrl;
 /* IO ジョブが送信キューの空きの少ないときに順番を譲るか(既定 1。シェルの `nvmettxyield`)。 */
 extern volatile uint32_t g_nvmet_tx_yield;
+/* push-run の 1 回の step で、入った時点の ready-ring の分だけ処理するか(既定 1。シェルの `nvmetfair`)。 */
+extern volatile uint32_t g_nvmet_fair;
 
 /* 1 つのコントローラが同時に持てる IO キュー(= TCP コネクション)の本数の
  * **上限**。実際に何本広告するかは実行時に `g_nvmet_io_queues` で決める

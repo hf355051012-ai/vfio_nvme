@@ -4003,6 +4003,30 @@ unsigned tcp_send_short_free(const tcp_conn_t *conn, unsigned *cap_out)
     return priv->async_short_count < cap ? cap - priv->async_short_count : 0u;
 }
 
+/*=================================================================
+ * 長経路(LSO・ゼロコピー)の再送用の枠の空きの数を返す(ACK 済みの枠はここで返す)。
+ * tcp_send_short_free() の長経路版。**このコネクションを受け持つコアから呼ぶこと。**
+ *
+ * 引数:
+ *   conn    - 対象コネクション
+ *   cap_out - 枠の数(NULL 可)
+ * コール元:
+ *   nvmet_io_job_step_impl()(`nvmettxyield room`)
+ * ===============================================================*/
+unsigned tcp_send_long_free(const tcp_conn_t *conn, unsigned *cap_out)
+{
+    tcp_priv_t *priv = tcp_priv_for((tcp_conn_t *)conn);
+    if (cap_out) *cap_out = priv ? priv->async_cap : 0u;
+    if (!priv) return 0u;
+    while (priv->async_count > 0) {
+        const tcp_async_slot_t *sl = tcp_async_slot_at(priv, conn->owner_core, priv->async_head);
+        if (tcp_seq_lt(priv->snd_una, sl->seq + sl->len)) break;
+        priv->async_head = (priv->async_head + 1u) % priv->async_cap;
+        priv->async_count--;
+    }
+    return priv->async_count < priv->async_cap ? priv->async_cap - priv->async_count : 0u;
+}
+
 int tcp_send_async2(tcp_conn_t *conn, const void *buf1, uint16_t len1,
                     const void *buf2, uint16_t len2)
 {
@@ -4361,6 +4385,31 @@ int tcp_window_scaling_enabled(const tcp_conn_t *conn)
 {
     tcp_priv_t *priv = tcp_priv_for((tcp_conn_t *)conn);
     return priv ? priv->wscale_enabled : 0;
+}
+
+/*=================================================================
+ * 全コアの確立済みコネクションの送信側の状態を 1 行ずつ表示する
+ * (シェルの `tcpconns`。負荷の最中に、どの接続が何で止まっているかを見る)。
+ * 別のコアが更新している最中の値を読むので、表示は目安。
+ *
+ * コール元:
+ *   シェルの tcpconns コマンド
+ * ===============================================================*/
+void tcp_conns_show(void)
+{
+    for (unsigned core = 0; core < SMP_MAX_CORES; core++) {
+        for (unsigned i = 0; i < TCP_MAX_CONNS; i++) {
+            const tcp_conn_t *c = s_conns[core][i];
+            if (!c || c->state != TCP_ESTABLISHED) continue;
+            const tcp_priv_t *pv = &s_priv[core][i];
+            uart_printf("  core%u %u->%u 未確認=%u cwnd=%u ssthresh=%u 相手の窓=%u 長経路の枠=%u/%u 短経路の枠=%u"
+                        " 高速回復=%d rto=%ums snd_seq=%u\n",
+                        core, (unsigned)c->local_port, (unsigned)c->remote_port,
+                        (unsigned)(c->snd_seq - pv->snd_una), pv->cwnd, pv->ssthresh, (unsigned)c->snd_win,
+                        pv->async_count, pv->async_cap, pv->async_short_count,
+                        pv->in_fast_recovery, pv->rto_ms, (unsigned)c->snd_seq);
+        }
+    }
 }
 
 /*=================================================================

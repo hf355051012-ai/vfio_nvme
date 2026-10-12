@@ -1391,15 +1391,35 @@ volatile int g_nvmet_multi_ctrl;
 /* 送信キューの空きがこれ未満なら、IO ジョブはコマンドの処理を次の周回へ回す(上の push-run 参照)。
  * 送信キューは 8 枠(MLX5_SQ_WQE_COUNT)で、256KiB の読み出し 1 個がヘッダと LSO(64KiB)で約 5 枠使う。 */
 #define NVMET_TX_ROOM_MIN 4u
-/* `nvmettxyield off|nic|tls`(0 / 1 / 2)。off が 27.15 より前、nic が TLS の手当て(枠と窓を見る)より
- * 前の挙動(陰性対照)。 */
-volatile uint32_t g_nvmet_tx_yield = 2u;
+/* `nvmettxyield off|nic|tls|room`(0 / 1 / 2 / 3)。off が 27.15 より前、nic が TLS の手当て(枠と窓を見る)より
+ * 前、tls が平文の大きい読み出しの手当て(長経路の枠と窓を見る)より前の挙動(陰性対照)。 */
+volatile uint32_t g_nvmet_tx_yield = 3u;
+/* `nvmetfair on|off`(既定 on)。on なら push-run の 1 回の step で処理するのは、step に入った時点で
+ * ready-ring に積まれていたコマンドまで(下の push-run 参照)。off が直す前の挙動(陰性対照)。 */
+volatile uint32_t g_nvmet_fair = 1u;
 /* TLS で続けて譲るのはここまで(窓の確認と再送は tcp_short_wait() の中でしか回らないため)。 */
 #define NVMET_TLS_YIELD_RUN_MAX 4096u
 /* コアごとの、TLS の IO キューを受け持って動いているジョブの数。**同じコアにもう 1 本居るときだけ譲る**
  * (1 本だけのコアで譲っても回すものが無く、窓が半分空くまで送り始めないぶん遅くなる。2 コア・2 ポートの
  * 256KiB 読み出しで -10% になった)。 */
 static volatile uint32_t s_tls_io_jobs_on_core[SMP_MAX_CORES];
+/* コアごとの、push 型で IO キューを受け持って動いているジョブの数(TLS も平文も)。平文の読み出しで
+ * 譲るのも、同じコアにもう 1 本居るときだけ(理由は上と同じ)。 */
+static volatile uint32_t s_io_jobs_on_core[SMP_MAX_CORES];
+
+/* 平文の C2HData(dlen バイト、長経路)を、その場で待たずに送り始められるか。枠は必要な本数(最大で枠の半分)、
+ * 送れるバイトは dlen(最大で送れる量の半分)。未確認が 0 なら常に送ってよい(TLS の判定と同じ形)。 */
+static int nvmet_tcp_long_room_ok(const tcp_conn_t *tcp, uint32_t dlen)
+{
+    if (tcp_unacked_bytes(tcp) == 0u) return 1;
+    unsigned cap;
+    const unsigned freeslots = tcp_send_long_free(tcp, &cap);
+    const uint32_t need = (dlen + TCP_ASYNC_MAX_LEN - 1u) / TCP_ASYNC_MAX_LEN;
+    if (freeslots < (need < cap / 2u ? need : cap / 2u)) return 0;
+    uint32_t usable;
+    const uint32_t room = tcp_send_room(tcp, &usable);
+    return room >= (dlen < usable / 2u ? dlen : usable / 2u);
+}
 
 static nvmet_tls_conn_t s_admin_tls[NVMET_MAX_INSTANCES];
 static nvmet_tls_conn_t s_io_tls[NVMET_MAX_INSTANCES][NVMET_IO_QUEUES];
@@ -2105,9 +2125,11 @@ typedef struct {
      * キューごとに独立しているため)。 */
     uint8_t           dsm_stage[NVMET_READY_RING][NVMET_DSM_STAGE_BYTES] __attribute__((aligned(64)));
     uint64_t          tx_yield_count;        /* 送信キューの空きが無くて順番を譲った回数(`nvmetqueues`)*/
-    uint64_t          tls_yield_count;       /* TLS: 短経路の枠か送信窓が足りなくて譲った回数 */
-    uint32_t          tls_yield_run;         /* TLS: 続けて譲った回数(上限で譲るのをやめる)*/
+    uint64_t          room_yield_count;       /* TLS: 短経路の枠か送信窓が足りなくて譲った回数 */
+    uint32_t          room_yield_run;         /* TLS: 続けて譲った回数(上限で譲るのをやめる)*/
+    uint32_t          step_cmds_max;         /* 1 回の step で処理したコマンドの最大数(`nvmetqueues`)*/
     int               tls_core;              /* s_tls_io_jobs_on_core[] に数えたコア(-1 = 数えていない)*/
+    int               io_core;               /* s_io_jobs_on_core[] に数えたコア(-1 = 数えていない)*/
 } nvmet_io_job_ctx_t;
 
 static nvmet_io_job_ctx_t s_io_job_pool[NVMET_MAX_INSTANCES][NVMET_IO_QUEUES];
@@ -2229,6 +2251,10 @@ static job_result_t nvmet_io_job_end(job_t *self, nvmet_io_job_ctx_t *jc, int cl
     if (jc->tls_core >= 0) {
         (void)__atomic_sub_fetch(&s_tls_io_jobs_on_core[jc->tls_core], 1u, __ATOMIC_ACQ_REL);
         jc->tls_core = -1;
+    }
+    if (jc->io_core >= 0) {
+        (void)__atomic_sub_fetch(&s_io_jobs_on_core[jc->io_core], 1u, __ATOMIC_ACQ_REL);
+        jc->io_core = -1;
     }
     if (jc->connected) {
         jc->connected = 0;
@@ -3165,6 +3191,10 @@ static job_result_t nvmet_io_job_step_impl(job_t *self)
             } else {
                 tcp_set_recv_upcall(&jc->io.tcp, nvmet_io_rx_upcall, jc);
             }
+            if (jc->io_core < 0 && self->pinned_core >= 0 && self->pinned_core < (int)SMP_MAX_CORES) {
+                jc->io_core = self->pinned_core;
+                (void)__atomic_add_fetch(&s_io_jobs_on_core[jc->io_core], 1u, __ATOMIC_ACQ_REL);
+            }
             self->state = NIO_ST_PUSH_RUN;
             uart_printf("[nvmet:%s] IOキュー%u push型(inline upcall)受信を有効化 (hdgst=%u ddgst=%u)\n",
                         ctx->label, jc->qidx + 1u, jc->io.hdgst, jc->io.ddgst);
@@ -3193,7 +3223,16 @@ static job_result_t nvmet_io_job_step_impl(job_t *self)
          * 4〜6 倍**になっていた。**`_end` を必ず通ること**(溜めたまま
          * park すると応答が止まる)。 */
         nvmet_tcp_tx_batch_begin(&jc->io);
-        while (jc->ready_tail != jc->ready_head) {
+        /* **処理するのは、この step に入った時点で積まれていたコマンドまで(`nvmetfair`、既定 on)。**
+         * 送信が窓や送信キューの空きを待つ間は tcp_poll_once() が受信を回し、その upcall が**同じ接続の
+         * 新しいコマンドをこの ring に積む**。SPDK のイニシエータは完了を受けた瞬間に次を出すので、
+         * 256KiB の読み出し(1 個で長経路の枠 8 本、枠や窓の待ちが毎回入る)では ring が一度も空にならず、1 本の
+         * ジョブがコアを握り続けて、**同じコアのほかの接続のジョブが試験の終わりまで回らなかった**
+         * (4 本のうち 1 本だけが進み、残りは 1 コマンドが最大 5 秒待った。SPEC 27.18)。送信キューの
+         * 空きで譲る判定(下)は、窓待ちの間に送信キューが空くので働かなかった。 */
+        const uint32_t ready_end = g_nvmet_fair ? jc->ready_head : 0u;
+        uint32_t step_cmds = 0;
+        while (jc->ready_tail != (g_nvmet_fair ? ready_end : jc->ready_head)) {
             /* **送信キューの空きが半分を切ったら、残りのコマンドは次の周回へ回す。**
              * 送信キューが満杯だと送信はその場で空きを待つ。1 つのコアが 2 つのポートを扱うとき、
              * 片方のジョブが受けたコマンドを全部(256KiB x 32 = 8MB、約 2.7ms ぶん)出し終えるまで
@@ -3220,13 +3259,36 @@ static job_result_t nvmet_io_job_step_impl(job_t *self)
                 if (!nvmet_tls_send_room_ok(jc->io.tls, &jc->io.tcp, plain)) {
                     (void)net_poll_all_and_dispatch();
                     if (!nvmet_tls_send_room_ok(jc->io.tls, &jc->io.tcp, plain) &&
-                        jc->tls_yield_run < NVMET_TLS_YIELD_RUN_MAX) {
-                        jc->tls_yield_run++;
-                        jc->tls_yield_count++;
+                        jc->room_yield_run < NVMET_TLS_YIELD_RUN_MAX) {
+                        jc->room_yield_run++;
+                        jc->room_yield_count++;
                         break;
                     }
                 }
-                jc->tls_yield_run = 0;
+                jc->room_yield_run = 0;
+            }
+            /* **平文の大きい読み出しは、長経路の枠と送信窓を見て譲る(`nvmettxyield room`、既定)。**
+             * 長経路(LSO)の枠は 1 接続 32 本(1 本 32KiB = 1MiB)で、256KiB の読み出し 1 個が 8 本使う。
+             * 枠が尽きると tcp_send_async_ex() がその場で ACK を待ち、そのあいだ同じコアのほかのジョブは
+             * 回らない。1 コアで 2 ポート x 2 接続を受けて SPDK に 256KiB を読ませると、各ポートで
+             * 1 本の接続が枠を埋めては待つことを繰り返し、もう 1 本は送信キューの空きの判定(上)で
+             * 毎回譲ってほとんど送れなかった(未確認 0・枠 0 のまま、1 コマンドが 0.3〜5 秒待つ。
+             * SPEC 27.18)。譲り方は TLS と同じ(受信を 1 回見てから、続けて譲るのは上限まで)。 */
+            if (!jc->io.tls && g_nvmet_tx_yield >= 3u && rd->kind == NVMET_READY_CMD &&
+                jc->io_core >= 0 && s_io_jobs_on_core[jc->io_core] >= 2u &&
+                (rd->sqe[0] == NVME_IO_CMD_READ)) {
+                const uint32_t dlen = rd32le(&rd->sqe[32]);   /* SGL の長さ(TLS の判定と同じ)*/
+                if (dlen + NVME_TCP_DATA_PDU_LEN > TCP_ASYNC_SHORT_SLOT_BYTES &&
+                    !nvmet_tcp_long_room_ok(&jc->io.tcp, dlen)) {
+                    (void)net_poll_all_and_dispatch();
+                    if (!nvmet_tcp_long_room_ok(&jc->io.tcp, dlen) &&
+                        jc->room_yield_run < NVMET_TLS_YIELD_RUN_MAX) {
+                        jc->room_yield_run++;
+                        jc->room_yield_count++;
+                        break;
+                    }
+                }
+                jc->room_yield_run = 0;
             }
             uint64_t dsp0 = timer_now();
             if (rd->kind == NVMET_READY_CMD) {
@@ -3236,7 +3298,9 @@ static job_result_t nvmet_io_job_step_impl(job_t *self)
             }
             ts_log(TS_MK(TS_FILE_NVMET, TS_FUNC_nvmet_io_job_step_impl, 1), (0x42u << 24) | ((uint32_t)get_ns_from(dsp0) & 0xFFFFFFu));
             jc->ready_tail++;
+            step_cmds++;
         }
+        if (step_cmds > jc->step_cmds_max) jc->step_cmds_max = step_cmds;
         (void)nvmet_tcp_tx_batch_end(&jc->io);
         /* **応答へ相乗りできなかった ACK をここで返す。** 応答を出して
          * いれば何もしない(相乗り済み)。出していないときに返さないと
@@ -3629,6 +3693,7 @@ int nvmet_job_start(nvmet_ctx_t *ctx, uint16_t port, netif_t *bound_ctx, const c
         ijc->connected = 0;
         ijc->stat_cmds = 0;
         ijc->tls_core  = -1;
+        ijc->io_core   = -1;
         for (unsigned i = 0; i < NVMET_MAX_PENDING_WRITES; i++) {
             ijc->pending_writes[i].in_use = 0;
         }
@@ -3759,14 +3824,15 @@ void nvmet_io_queues_show(const nvmet_ctx_t *ctx)
     for (unsigned i = 0; i < NVMET_MAX_INSTANCES; i++) {
         if (s_instance_owner[i] != ctx) continue;
         for (unsigned q = 0; q < NVMET_IO_QUEUES; q++) {
-            const nvmet_io_job_ctx_t *jc = &s_io_job_pool[i][q];
+            nvmet_io_job_ctx_t *jc = &s_io_job_pool[i][q];
             uart_printf("  キュー%u: %s (tcp state=%u) コマンド %llu 件、送信キュー待ちで譲った %llu 回、"
-                        "TLS の枠・窓待ちで譲った %llu 回%s\n", q + 1u,
+                        "枠・窓待ち(TLS / 長経路)で譲った %llu 回、1 回の step で最大 %u 件%s\n", q + 1u,
                         jc->connected ? "接続中" : "未接続",
                         (unsigned)jc->io.tcp.state,
                         (unsigned long long)jc->stat_cmds, (unsigned long long)jc->tx_yield_count,
-                        (unsigned long long)jc->tls_yield_count,
+                        (unsigned long long)jc->room_yield_count, (unsigned)jc->step_cmds_max,
                         jc->ctx && jc->ctx->io_arm_owner == (int)q ? " [accept待ち]" : "");
+            jc->step_cmds_max = 0;   /* 最大は表示のたびに測り直す(交互の A/B で見るため)*/
         }
     }
     uart_printf("  ※ 変更は次のセッションから効きます(Set Features で合意する値のため)\n");
