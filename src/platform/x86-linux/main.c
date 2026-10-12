@@ -6182,14 +6182,16 @@ static void shell_dispatch(char *line, int s0, int s1)
          * 鍵は `nvme gen-dhchap-key` で作る。**効くのは次の Connect から。** */
         nvmet_auth_shell(line + 9);
     } else if (strncmp(line, "nvmettxyield", 12) == 0) {
-        /* nvmettxyield [on|off] -- NVMe/TCP の IO ジョブが、送信キューの空きが半分を切ったら残りのコマンドを
-         * 次の周回へ回して同じコアのほかのジョブに順番を譲るか(既定 on)。**off が直す前の挙動**
-         * (陰性対照。1 コアで 2 ポートを受けると読み出しが 1 ポートぶんで頭打ちになる。SPEC 27.15)。 */
+        /* nvmettxyield [off|nic|tls|on] -- NVMe/TCP の IO ジョブが、送信キューの空きが半分を切ったら残りの
+         * コマンドを次の周回へ回して同じコアのほかのジョブに順番を譲るか(nic、SPEC 27.15)。tls(既定、on と同じ)は
+         * それに加えて、TLS の読み出しの前に短経路の再送用の枠と送信窓を見て、足りなければ譲る(SPEC 27.14)。
+         * **off / nic が直す前の挙動**(陰性対照)。 */
         const char *p = line + 12;
         while (*p == ' ') p++;
-        if (strncmp(p, "on", 2) == 0) g_nvmet_tx_yield = 1u;
+        if (strncmp(p, "on", 2) == 0 || strncmp(p, "tls", 3) == 0) g_nvmet_tx_yield = 2u;
+        else if (strncmp(p, "nic", 3) == 0) g_nvmet_tx_yield = 1u;
         else if (strncmp(p, "off", 3) == 0) g_nvmet_tx_yield = 0u;
-        uart_printf("nvmettxyield: %s\n", g_nvmet_tx_yield ? "on" : "off");
+        uart_printf("nvmettxyield: %s\n", g_nvmet_tx_yield >= 2u ? "tls" : g_nvmet_tx_yield ? "nic" : "off");
     } else if (strncmp(line, "nvmetqueues", 11) == 0) {
         /* nvmetqueues [N]
          *

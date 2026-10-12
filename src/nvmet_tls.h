@@ -65,6 +65,11 @@ int  nvmet_tls_recv(nvmet_tls_conn_t *s, tcp_conn_t *tcp, uint8_t *dst, uint32_t
 /* 1〜2 断片を暗号化して送る。戻り値: 0=成功、-1=失敗。 */
 int  nvmet_tls_send(nvmet_tls_conn_t *s, tcp_conn_t *tcp, const void *p1, uint32_t l1,
                     const void *p2, uint32_t l2);
+/* plain バイトの応答をいま送り始めても、短経路の再送用の枠と送信窓(相手の受信窓・cwnd)で
+ * その場で待たずに済みそうか。1=済む、0=足りない(呼び出し側は順番を譲る)。
+ * 要求は「必要なレコード数(枠の半分まで)」と「暗号文のバイト数(使える窓の半分まで)」。
+ * 未確認のデータが無ければ常に 1(譲ると誰も ACK を待たずに止まる)。 */
+int  nvmet_tls_send_room_ok(const nvmet_tls_conn_t *s, const tcp_conn_t *tcp, uint32_t plain);
 /* push 型: 届いた暗号文を食わせ、検証の通った平文を deliver へ渡す。
  * 戻り値: 0=続行、-1=失敗(相手の alert / 壊れたレコード)。 */
 typedef void (*nvmet_tls_deliver_fn)(void *arg, const volatile uint8_t *data, uint16_t len);

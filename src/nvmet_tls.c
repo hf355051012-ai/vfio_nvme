@@ -269,6 +269,23 @@ void nvmet_tls_drain(nvmet_tls_conn_t *s, nvmet_tls_deliver_fn deliver, void *ar
     s->apphead = s->applen = 0;
 }
 
+int nvmet_tls_send_room_ok(const nvmet_tls_conn_t *s, const tcp_conn_t *tcp, uint32_t plain) {
+    (void)s;
+    if (tcp_unacked_bytes(tcp) == 0u) return 1;
+    uint32_t chunk = seg_cap(tcp) - (5u + 1u + 16u);
+    if (chunk > TLS13_PLAIN_MAX) chunk = TLS13_PLAIN_MAX;
+    const uint32_t recs  = (plain + chunk - 1u) / chunk;
+    const uint32_t bytes = plain + recs * (5u + 1u + 16u);
+    unsigned cap;
+    const unsigned freeslots = tcp_send_short_free(tcp, &cap);
+    const uint32_t want_slots = recs < cap / 2u ? recs : cap / 2u;
+    if (freeslots < want_slots) return 0;
+    uint32_t usable;
+    const uint32_t room = tcp_send_room(tcp, &usable);
+    const uint32_t want = bytes < usable / 2u ? bytes : usable / 2u;
+    return room >= want;
+}
+
 int nvmet_tls_send(nvmet_tls_conn_t *s, tcp_conn_t *tcp, const void *p1, uint32_t l1,
                    const void *p2, uint32_t l2) {
     if (s->failed || s->t.state != TLS13_ST_OPEN) return -1;
