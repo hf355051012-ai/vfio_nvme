@@ -5978,10 +5978,12 @@ static void shell_dispatch(char *line, int s0, int s1)
             nvme_rdma_force_reconnect();
         }
     } else if (strncmp(line, "nvmetls", 7) == 0) {
-        /* nvmetls [<NVMeTLSkey-1:..> [keylog <path>] | off]
+        /* nvmetls [<NVMeTLSkey-1:..> [cnsa|mlkem|x25519] [id0] [keylog <path>] | off]
          *
          * 内蔵イニシエータの TLS 1.3 の鍵(段階 F)。`tcpbench ... tls` で使う。
-         * 身元は自分の hostnqn と接続先の subnqn で決まる。 */
+         * 身元は自分の hostnqn と接続先の subnqn で決まる。鍵が NVMeTLSkey-1:02(SHA-384)なら
+         * TLS_AES_256_GCM_SHA384。cnsa = ML-KEM-1024 だけ(CNSA 2.0、PLAN_cnsa2.md)、
+         * mlkem / x25519 = 鍵共有の群を選ぶ、id0 = 身元の版 0 で名乗る(SPDK のターゲット向け)。 */
         nvme_tls_client_shell(line + 7);
         /* 握手は接続のときだけなので、鍵を変えたら張り直させる(nvmeauth と同じ。
          * 張ったままだと次の tcpbench は古い鍵で確立した接続を使い続け、陰性が素通りする)。 */
@@ -5989,11 +5991,11 @@ static void shell_dispatch(char *line, int s0, int s1)
         while (*a == ' ') a++;
         if (*a != '\0') shell_tcp_session_close("TLS の鍵を変えたのでセッションを張り直します");
     } else if (strncmp(line, "nvmettls", 8) == 0) {
-        /* nvmettls [<hostnqn> <NVMeTLSkey-1:..> [keylog <path>] | off]
+        /* nvmettls [<hostnqn> <NVMeTLSkey-1:..> [cnsa|mlkem|x25519] [keylog <path>] | off]
          *
          * NVMe/TCP ターゲットが ICReq の前に TLS 1.3 の握手を求める(nvmet_tls.c)。
-         * 鍵は Linux の `nvme gen-tls-key` で作ったもの。段階 D は握手と最初の
-         * 暗号文(ICReq)の復号まで。 */
+         * 鍵は Linux の `nvme gen-tls-key` で作ったもの(--hmac=2 なら SHA-384 =
+         * TLS_AES_256_GCM_SHA384)。cnsa = SHA-384 の PSK + ML-KEM-1024 だけを受ける(CNSA 2.0)。 */
         nvmet_tls_shell(line + 8);
     } else if (strncmp(line, "twoport", 7) == 0) {
         /* twoport [on [1core]|off] -- 2 ポートで受ける準備。**ターゲットを起動する前に打つ。**

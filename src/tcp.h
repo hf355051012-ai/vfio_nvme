@@ -231,6 +231,8 @@ uint32_t tcp_unacked_bytes(const tcp_conn_t *conn);
 /* いま送れるバイト数(相手の受信窓と cwnd の小さいほう - 未確認)。足りないと長経路の送信は
  * その場で窓が空くのを待つ。 */
 uint32_t tcp_send_room(const tcp_conn_t *conn, uint32_t *usable_out);
+/* 相手がこれまでに広告した最大の受信窓(0 = まだ分からない)。 */
+uint32_t tcp_peer_win_max(const tcp_conn_t *conn);
 /* 短経路(tcp_send_async2/3)の再送用の枠の空きの数と、枠の数(`tcpasync` の実効本数)。 */
 unsigned tcp_send_short_free(const tcp_conn_t *conn, unsigned *cap_out);
 /* 長経路(LSO・ゼロコピー)の再送用の枠の空きの数と、枠の数。足りないと長経路の送信は

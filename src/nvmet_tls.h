@@ -30,7 +30,8 @@
 /* 接続 1 本ぶん */
 typedef struct nvmet_tls_conn {
     tls13_t  t;
-    uint8_t  pend[2048];           /* 送るべきもの(握手の応答、KeyUpdate、alert)*/
+    uint8_t  pend[4608];           /* 送るべきもの(握手の応答、KeyUpdate、alert)。ML-KEM-1024 の
+                                    * ClientHello は 2KB を超え、HelloRetryRequest の後は CCS も付く */
     size_t   pendlen;
     uint8_t  in[NVMET_TLS_FEED];   /* TCP から読んだ暗号文 */
     uint8_t  app[NVMET_TLS_APP_MAX]; /* 復号した平文(pull 用の待ち行列 / push 用の作業域)*/
@@ -50,7 +51,7 @@ void nvmet_tls_set_generated(const tls13_psk_t *p);
 /* 握手を始める前に TCP から読んでしまったバイト(ICReq のつもりで読んだ ClientHello の頭)を
  * 食わせる。戻り値は nvmet_tls_poll() と同じ。 */
 int  nvmet_tls_preload(nvmet_tls_conn_t *s, tcp_conn_t *tcp, const uint8_t *buf, size_t n);
-/* nvmettls [<hostnqn> <NVMeTLSkey-1:..> [keylog <path>] | off | corrupt <N>] */
+/* nvmettls [<hostnqn> <NVMeTLSkey-1:..> [cnsa|mlkem|x25519] [keylog <path>] | off | corrupt <N>] */
 void nvmet_tls_shell(const char *args);
 
 /* 握手を始める(TCP が確立した直後)。 */
@@ -82,7 +83,7 @@ void nvmet_tls_close(nvmet_tls_conn_t *s, tcp_conn_t *tcp);
 
 /* ---- 段階 F: イニシエータ側(内蔵イニシエータの `tcpbench ... tls`)---- */
 int  nvme_tls_client_enabled(void);
-/* nvmetls [<NVMeTLSkey-1:..> [keylog <path>] | off] */
+/* nvmetls [<NVMeTLSkey-1:..> [cnsa|mlkem|x25519] [id0] [keylog <path>] | off] */
 void nvme_tls_client_shell(const char *args);
 /* ClientHello を送って握手を始める(以後は nvmet_tls_poll() で進める)。0=送った、-1=失敗。 */
 int  nvme_tls_client_start(nvmet_tls_conn_t *s, tcp_conn_t *tcp, const char *hostnqn, const char *subnqn);

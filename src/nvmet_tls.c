@@ -18,8 +18,35 @@ static unsigned    s_npsk;
 static char        s_hostnqn[256];
 static char        s_keylog_path[256];
 static FILE       *s_keylog;
+/* 鍵共有の方針(PLAN_cnsa2.md 段階 2)。0 = 既定(x25519 と ML-KEM-1024 の両方を受ける)、
+ * cnsa = SHA-384 の PSK + ML-KEM-1024 だけ。 */
+static unsigned    s_groups;
+static int         s_cnsa;
 
 volatile uint32_t g_nvmet_tls_corrupt;
+
+/* 引数の中の方針の語(cnsa / mlkem / x25519)を読んで取り除く。残りの語の数を返す。
+ * keylog <path> は呼び出し側が見る。 */
+static unsigned take_policy(char **tok, unsigned nt, unsigned *groups, int *cnsa) {
+    unsigned w = 0;
+    *groups = 0;
+    *cnsa = 0;
+    for (unsigned i = 0; i < nt; i++) {
+        if (!strcmp(tok[i], "cnsa")) *cnsa = 1;
+        else if (!strcmp(tok[i], "mlkem")) *groups |= TLS13_GROUP_MLKEM1024;
+        else if (!strcmp(tok[i], "x25519")) *groups |= TLS13_GROUP_X25519;
+        else tok[w++] = tok[i];
+    }
+    return w;
+}
+
+static const char *policy_name(unsigned groups, int cnsa, int client) {
+    if (cnsa) return "CNSA 2.0 専用(TLS_AES_256_GCM_SHA384 + MLKEM1024)";
+    if (groups == (TLS13_GROUP_X25519 | TLS13_GROUP_MLKEM1024)) return "MLKEM1024 / x25519";
+    if (groups == TLS13_GROUP_MLKEM1024) return "MLKEM1024 だけ";
+    if (groups == TLS13_GROUP_X25519) return "x25519 だけ";
+    return client ? "x25519(既定)" : "MLKEM1024 / x25519(既定)";
+}
 
 /* concatenation で生成した PSK(段階 H)。握手の候補は「設定した 4 本 + 生成した 1 本」。 */
 static tls13_psk_t s_gen;
@@ -56,10 +83,10 @@ void nvmet_tls_shell(const char *args) {
     char buf[512];
     strncpy(buf, args, sizeof(buf) - 1u);
     buf[sizeof(buf) - 1u] = 0;
-    char *tok[4];
+    char *tok[8];
     unsigned nt = 0;
     char *save = 0;
-    for (char *p = strtok_r(buf, " \t\r\n", &save); p && nt < 4u; p = strtok_r(0, " \t\r\n", &save)) tok[nt++] = p;
+    for (char *p = strtok_r(buf, " \t\r\n", &save); p && nt < 8u; p = strtok_r(0, " \t\r\n", &save)) tok[nt++] = p;
 
     if (nt == 2 && !strcmp(tok[0], "corrupt")) {
         g_nvmet_tls_corrupt = (uint32_t)strtoul(tok[1], NULL, 0);
@@ -71,15 +98,25 @@ void nvmet_tls_shell(const char *args) {
         s_npsk = 0;
     } else if (nt >= 2) {
         const char *why = "";
+        unsigned groups;
+        int cnsa;
+        nt = take_policy(tok, nt, &groups, &cnsa);
         tls13_psk_t p[4];
         if (tls13_nvme_psk(&p[0], tok[1], tok[0], NVMET_SUBNQN, &why) < 0 ||
             tls13_nvme_psk(&p[2], tok[1], tok[0], NVMET_DISCOVERY_NQN, &why) < 0) {
             crypto_wipe(p, sizeof(p));
             uart_printf("nvmettls: 鍵が使えない(%s)\n"
-                        "使い方: nvmettls <hostnqn> <NVMeTLSkey-1:01:..:> [keylog <path>] / nvmettls off / "
-                        "nvmettls corrupt <N>\n", why);
+                        "使い方: nvmettls <hostnqn> <NVMeTLSkey-1:01|02:..:> [cnsa|mlkem|x25519] [keylog <path>] / "
+                        "nvmettls off / nvmettls corrupt <N>\n", why);
             return;
         }
+        if (cnsa && p[0].hash != CRYPTO_SHA384) {
+            crypto_wipe(p, sizeof(p));
+            uart_printf("nvmettls: cnsa には SHA-384 の鍵(NVMeTLSkey-1:02:、nvme gen-tls-key --hmac=2)が要る\n");
+            return;
+        }
+        s_groups = groups;
+        s_cnsa = cnsa;
         memcpy(s_psk, p, sizeof(p));
         crypto_wipe(p, sizeof(p));
         s_npsk = 4;
@@ -94,9 +131,10 @@ void nvmet_tls_shell(const char *args) {
     if (!s_npsk) {
         uart_printf("nvmettls: TLS を使わない(次の接続から)\n");
     } else {
-        uart_printf("nvmettls: 次の接続から TLS 1.3 を求める(ホスト %s、TLS_AES_128_GCM_SHA256、PSK + x25519)\n"
+        uart_printf("nvmettls: 次の接続から TLS 1.3 を求める(ホスト %s、%s、PSK + 鍵共有 %s)\n"
                     "  身元(版 1): %s\n  鍵の書き出し: %s\n",
-                    s_hostnqn, s_psk[0].identity, s_keylog_path[0] ? s_keylog_path : "しない");
+                    s_hostnqn, s_psk[0].hash == CRYPTO_SHA384 ? "TLS_AES_256_GCM_SHA384" : "TLS_AES_128_GCM_SHA256",
+                    policy_name(s_groups, s_cnsa, 0), s_psk[0].identity, s_keylog_path[0] ? s_keylog_path : "しない");
     }
 }
 
@@ -105,6 +143,8 @@ void nvmet_tls_start(nvmet_tls_conn_t *s) {
     for (unsigned i = 0; i < s_npsk; i++) s_list[n++] = s_psk[i];
     if (s_gen_valid) s_list[n++] = s_gen;
     tls13_server_init(&s->t, s_list, n);
+    s->t.groups = s_groups;
+    s->t.cnsa = s_cnsa;
     s->t.keylog = keylog_write;
     s->pendlen = 0;
     s->applen = s->apphead = 0;
@@ -122,6 +162,12 @@ void nvmet_tls_start(nvmet_tls_conn_t *s) {
 static uint32_t seg_cap(const tcp_conn_t *tcp) {
     uint32_t cap = tcp->snd_mss ? (uint32_t)tcp->snd_mss : 1400u;
     if (cap > TCP_ASYNC_SHORT_SLOT_BYTES) cap = TCP_ASYNC_SHORT_SLOT_BYTES;
+    /* **相手がこれまでに広告した最大の受信窓の半分でも頭打ちにする**(Linux の tcp_bound_to_half_wnd() と
+     * 同じ考え方)。1 レコード = 1 セグメントは分けて送れないので、窓より大きいレコードを作ると
+     * 「窓に収まるまで待つ」が永久に終わらない。SPDK の ssl ソケットは Window Scale 無しの 4KB しか
+     * 広告せず、Identify の応答(4,142 バイトのレコード)で止まった(PLAN_cnsa2.md 段階 2)。 */
+    const uint32_t half = tcp_peer_win_max(tcp) / 2u;
+    if (half && half < cap) cap = half < 512u ? 512u : half;
     return cap;
 }
 
@@ -194,8 +240,10 @@ int nvmet_tls_poll(nvmet_tls_conn_t *s, tcp_conn_t *tcp) {
         uart_printf("[nvmet-tls] ClientHello を受理(身元 %.60s...)\n", s->t.psks[s->t.psk_index].identity);
     }
     if (before != TLS13_ST_OPEN && s->t.state == TLS13_ST_OPEN) {
-        uart_printf("[%s] 握手が済んだ(TLS 1.3、TLS_AES_128_GCM_SHA256、x25519、身元の版 %d)\n",
-                    s->t.is_client ? "nvme-tls" : "nvmet-tls", s->t.psk_index == 0 ? 1 : 0);
+        uart_printf("[%s] 握手が済んだ(TLS 1.3、%s、%s%s、身元 %.8s)\n",
+                    s->t.is_client ? "nvme-tls" : "nvmet-tls", tls13_suite_name(s->t.suite),
+                    tls13_group_name(s->t.group), s->t.hrr ? "、HelloRetryRequest あり" : "",
+                    s->t.psks[s->t.psk_index].identity);
     }
     return s->t.state == TLS13_ST_OPEN ? 1 : 0;
 }
@@ -350,6 +398,9 @@ int nvmet_tls_send(nvmet_tls_conn_t *s, tcp_conn_t *tcp, const void *p1, uint32_
 static char  s_cli_key[256];
 static char  s_cli_keylog_path[256];
 static FILE *s_cli_keylog;
+static unsigned s_cli_groups;
+static int   s_cli_cnsa;
+static int   s_cli_id0;   /* 身元の版 0(NVMe0Rhh host sub)で名乗る。SPDK のターゲットは版 0 しか引かない */
 
 static void cli_keylog_write(void *arg, const char *line) {
     (void)arg;
@@ -365,10 +416,22 @@ void nvme_tls_client_shell(const char *args) {
     char buf[512];
     strncpy(buf, args, sizeof(buf) - 1u);
     buf[sizeof(buf) - 1u] = 0;
-    char *tok[3];
+    char *tok[8];
     unsigned nt = 0;
     char *save = 0;
-    for (char *p = strtok_r(buf, " \t\r\n", &save); p && nt < 3u; p = strtok_r(0, " \t\r\n", &save)) tok[nt++] = p;
+    for (char *p = strtok_r(buf, " \t\r\n", &save); p && nt < 8u; p = strtok_r(0, " \t\r\n", &save)) tok[nt++] = p;
+    unsigned groups;
+    int cnsa;
+    nt = take_policy(tok, nt, &groups, &cnsa);
+    int id0 = 0;
+    {
+        unsigned w = 0;
+        for (unsigned i = 0; i < nt; i++) {
+            if (!strcmp(tok[i], "id0")) id0 = 1;
+            else tok[w++] = tok[i];
+        }
+        nt = w;
+    }
     if (nt == 1 && !strcmp(tok[0], "off")) {
         crypto_wipe(s_cli_key, sizeof(s_cli_key));
     } else if (nt >= 1) {
@@ -376,10 +439,19 @@ void nvme_tls_client_shell(const char *args) {
         tls13_psk_t p[2];
         const char *why = "";
         if (tls13_nvme_psk(p, tok[0], "nqn.check", "nqn.check", &why) < 0) {
-            uart_printf("nvmetls: 鍵が使えない(%s)\n使い方: nvmetls <NVMeTLSkey-1:01:..:> [keylog <path>] / nvmetls off\n", why);
+            uart_printf("nvmetls: 鍵が使えない(%s)\n"
+                        "使い方: nvmetls <NVMeTLSkey-1:01|02:..:> [cnsa|mlkem|x25519] [id0] [keylog <path>] / nvmetls off\n", why);
+            return;
+        }
+        if (cnsa && p[0].hash != CRYPTO_SHA384) {
+            crypto_wipe(p, sizeof(p));
+            uart_printf("nvmetls: cnsa には SHA-384 の鍵(NVMeTLSkey-1:02:)が要る\n");
             return;
         }
         crypto_wipe(p, sizeof(p));
+        s_cli_groups = groups;
+        s_cli_cnsa = cnsa;
+        s_cli_id0 = id0;
         strncpy(s_cli_key, tok[0], sizeof(s_cli_key) - 1u);
         s_cli_keylog_path[0] = 0;
         if (s_cli_keylog) {
@@ -388,9 +460,12 @@ void nvme_tls_client_shell(const char *args) {
         }
         if (nt >= 3 && !strcmp(tok[1], "keylog")) strncpy(s_cli_keylog_path, tok[2], sizeof(s_cli_keylog_path) - 1u);
     }
-    uart_printf(s_cli_key[0] ? "nvmetls: 内蔵イニシエータは `tcpbench ... tls` で TLS 1.3 を使う(鍵の書き出し: %s)\n"
-                             : "nvmetls: イニシエータの TLS の鍵なし%s\n",
-                s_cli_key[0] ? (s_cli_keylog_path[0] ? s_cli_keylog_path : "しない") : "");
+    if (s_cli_key[0])
+        uart_printf("nvmetls: 内蔵イニシエータは `tcpbench ... tls` で TLS 1.3 を使う(鍵共有 %s、身元の版 %d、鍵の書き出し: %s)\n",
+                    policy_name(s_cli_groups, s_cli_cnsa, 1), s_cli_id0 ? 0 : 1,
+                    s_cli_keylog_path[0] ? s_cli_keylog_path : "しない");
+    else
+        uart_printf("nvmetls: イニシエータの TLS の鍵なし\n");
 }
 
 int nvme_tls_client_start(nvmet_tls_conn_t *s, tcp_conn_t *tcp, const char *hostnqn, const char *subnqn) {
@@ -400,16 +475,21 @@ int nvme_tls_client_start(nvmet_tls_conn_t *s, tcp_conn_t *tcp, const char *host
         uart_printf("[!] nvme-tls: 鍵が無い / 使えない(%s)\n", why);
         return -1;
     }
-    s->cpsk = p[0];   /* 身元の版 1(nvme gen-tls-key --identity=1 と同じ)*/
+    s->cpsk = p[s_cli_id0 ? 1 : 0];   /* 身元の版 1(nvme gen-tls-key --identity=1 と同じ)。id0 なら版 0 */
     crypto_wipe(p, sizeof(p));
     tls13_client_init(&s->t, &s->cpsk);
+    s->t.groups = s_cli_groups;
+    s->t.cnsa = s_cli_cnsa;
     s->t.keylog = cli_keylog_write;
     s->pendlen = 0;
     s->applen = s->apphead = 0;
     s->failed = 0;
     s->rx_records = s->tx_records = s->rx_bytes = s->tx_bytes = 0;
     const size_t n = tls13_client_hello(&s->t, s->pend, sizeof(s->pend));
-    if (!n) return -1;
+    if (!n) {
+        uart_printf("[!] nvme-tls: ClientHello を組めない(%s)\n", s->t.why ? s->t.why : "?");
+        return -1;
+    }
     s->pendlen = n;
     uart_printf("[nvme-tls] ClientHello を送る(身元 %.60s...)\n", s->cpsk.identity);
     return flush_pend(s, tcp, 1);

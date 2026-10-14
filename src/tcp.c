@@ -433,6 +433,10 @@ typedef struct {
 
     int      wscale_enabled;
     uint8_t  snd_wscale;
+    /* 相手がこれまでに広告した最大の受信窓(tcp_peer_win_max())。1 レコード = 1 セグメントで送る
+     * TLS が、窓より大きいレコードを作って永久に待たないための上限に使う(SPDK の ssl ソケットは
+     * Window Scale 無しの 4KB しか広告しない)。 */
+    uint32_t snd_win_max;
 
     /* Timestamps(RFC 7323)。SYN の交換で双方が出したときだけ有効になる。
      * ts_recent は相手へ echo し返す値、ts_last_ack_sent は「どこまで ACK した
@@ -2902,6 +2906,7 @@ static void tcp_priv_init(tcp_priv_t *priv, unsigned core)
     priv->recv_upcall_ctx = NULL;
     priv->wscale_enabled = 0;
     priv->snd_wscale     = 0;
+    priv->snd_win_max    = 0;
     priv->ts_enabled       = 0;
     priv->ts_recent        = 0;
     priv->ts_last_ack_sent = 0;
@@ -3961,6 +3966,13 @@ uint32_t tcp_unacked_bytes(const tcp_conn_t *conn)
     return conn->snd_seq - priv->snd_una;
 }
 
+/* 相手がこれまでに広告した最大の受信窓(Window Scale を掛けた後)。まだ分からなければ 0。 */
+uint32_t tcp_peer_win_max(const tcp_conn_t *conn)
+{
+    tcp_priv_t *priv = tcp_priv_for((tcp_conn_t *)conn);
+    return priv ? priv->snd_win_max : 0u;
+}
+
 /* いま送れるバイト数(相手の受信窓と自分の cwnd の小さいほうから未確認を引いた残り)。
  * tcp_send_async_ex() が「窓が空くまでその場で待つ」かどうかの判定と同じ式。 */
 uint32_t tcp_send_room(const tcp_conn_t *conn, uint32_t *usable_out)
@@ -4839,6 +4851,7 @@ void tcp_input_addr(const uint8_t *pkt, uint16_t len,
                 tcp_parse_syn_options(aconn, apriv, in + TCP_HDR_LEN, (uint8_t)(hdr_len2 - TCP_HDR_LEN));
             }
             aconn->snd_win = rd16be(in + TCP_OFF_WINDOW);
+            apriv->snd_win_max = aconn->snd_win;
 
             uart_printf("[TCP] accept: SYN受信、SYN|ACK送信 (local_port=%u, slot=%d, backlog=%d)\n",
                         dst_port, slot, backlog_index);
@@ -5011,6 +5024,7 @@ void tcp_input_addr(const uint8_t *pkt, uint16_t len,
     } else {
         conn->snd_win = rd16be(in + TCP_OFF_WINDOW);
     }
+    if (conn->snd_win > priv->snd_win_max) priv->snd_win_max = conn->snd_win;
 
     switch (conn->state) {
     case TCP_SYN_RCVD:
