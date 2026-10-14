@@ -61,7 +61,7 @@ enum {
 
 /* 1 方向のレコードの鍵 */
 typedef struct {
-    crypto_aes128gcm_t aead;
+    crypto_aesgcm_t aead;
     uint8_t  iv[12];
     uint64_t seq;
     uint8_t  secret[32];   /* KeyUpdate で次の鍵を作る元 */

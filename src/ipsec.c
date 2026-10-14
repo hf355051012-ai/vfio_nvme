@@ -32,7 +32,7 @@ typedef struct {
     uint32_t peer;                 /* ホストバイトオーダー */
     uint8_t  up;                   /* SA が入っている */
     uint32_t spi_in, spi_out;
-    crypto_aes128gcm_t k_in, k_out;
+    crypto_aesgcm_t k_in, k_out;
     uint8_t  salt_in[4], salt_out[4];
     volatile uint64_t seq_out;     /* 次に送る順序番号 - 1 */
     uint32_t rp_top;               /* 受け取った最大の順序番号 */
@@ -96,8 +96,8 @@ int ipsec_sa_install(uint32_t ip, uint32_t spi_in, const uint8_t key_in[20],
     }
     p->up = 0;
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
-    crypto_aes128gcm_init(&p->k_in, key_in);
-    crypto_aes128gcm_init(&p->k_out, key_out);
+    crypto_aesgcm_init(&p->k_in, key_in, 16u);
+    crypto_aesgcm_init(&p->k_out, key_out, 16u);
     memcpy(p->salt_in, key_in + 16, 4);
     memcpy(p->salt_out, key_out + 16, 4);
     p->spi_in = spi_in;
@@ -231,7 +231,7 @@ static int esp_send_one(ipsec_peer_t *p, uint8_t *frame, uint32_t flen, int asyn
     uint8_t nonce[12];
     memcpy(nonce, p->salt_out, 4);
     memcpy(nonce + 4, iv, 8);
-    crypto_aes128gcm_seal(&p->k_out, nonce, esp, ESP_HDR_LEN, pt, ptlen, pt, pt + ptlen);
+    crypto_aesgcm_seal(&p->k_out, nonce, esp, ESP_HDR_LEN, pt, ptlen, pt, pt + ptlen);
     p->tx_pkts++;
     p->tx_bytes += l4len;
     eth_frag_t f = { o, (uint16_t)olen };
@@ -366,7 +366,7 @@ void ipsec_esp_input(const uint8_t *ipc, size_t len, const uint8_t *src_mac)
     uint8_t nonce[12];
     memcpy(nonce, p->salt_in, 4);
     memcpy(nonce + 4, esp + ESP_HDR_LEN, 8);
-    if (crypto_aes128gcm_open(&p->k_in, nonce, esp, ESP_HDR_LEN, ct, ctlen, ct, ct + ctlen) != 0) {
+    if (crypto_aesgcm_open(&p->k_in, nonce, esp, ESP_HDR_LEN, ct, ctlen, ct, ct + ctlen) != 0) {
         p->rx_auth_fail++;
         return;
     }

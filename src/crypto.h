@@ -30,6 +30,7 @@ typedef enum {
     CRYPTO_MD5 = 4,
     CRYPTO_SHA1 = 5,
     CRYPTO_SHA3_256 = 6,
+    CRYPTO_SHA3_512 = 7,         /* ML-KEM の G(PLAN_cnsa2.md)*/
 } crypto_hash_id_t;
 
 #define CRYPTO_HASH_MAX   64u    /* 最長の出力(SHA-512)*/
@@ -54,6 +55,19 @@ int  crypto_hash_init(crypto_hash_ctx_t *c, crypto_hash_id_t id);
 void crypto_hash_update(crypto_hash_ctx_t *c, const void *data, size_t len);
 void crypto_hash_final(crypto_hash_ctx_t *c, uint8_t *out);
 int  crypto_hash(crypto_hash_id_t id, const void *data, size_t len, uint8_t *out);
+
+/* SHAKE128 / SHAKE256(FIPS 202 の XOF)。absorb を何回か呼んでから squeeze を何回でも。
+ * 最初の squeeze で詰め物をして吸い込みを終える(以後 absorb は呼ばないこと)。 */
+typedef struct {
+    uint64_t s[25];
+    uint32_t rate;               /* 168(SHAKE128)/ 136(SHAKE256)*/
+    uint32_t pos;                /* 今のブロックの中の位置 */
+    int squeezing;
+} crypto_shake_t;
+void crypto_shake_init(crypto_shake_t *x, unsigned bits);   /* bits は 128 / 256 */
+void crypto_shake_absorb(crypto_shake_t *x, const void *data, size_t n);
+void crypto_shake_squeeze(crypto_shake_t *x, void *out, size_t n);
+int  crypto_shake(unsigned bits, const void *in, size_t n, void *out, size_t olen);
 
 typedef struct {
     crypto_hash_ctx_t inner;
@@ -124,34 +138,40 @@ int crypto_ffdhe_shared(unsigned gid, const uint8_t priv[CRYPTO_FFDHE_PRIV_LEN],
 int crypto_modexp(const uint8_t *base, size_t blen, const uint8_t *exp, size_t elen,
                   const uint8_t *mod, size_t mlen, uint8_t *out);
 
-/* ---- AES-128 と GCM(crypto_aes.c、AES-NI + PCLMULQDQ)----
- * TLS 1.3 の TLS_AES_128_GCM_SHA256 用。IV は 12 バイト、タグは 16 バイト固定。 */
+/* ---- AES-128 / AES-256 と GCM(crypto_aes.c、AES-NI + PCLMULQDQ)----
+ * 鍵の長さ(16 / 32)は init で決まり、以後の seal / open は同じ関数で両方を扱う。
+ * AES-256 は CNSA 2.0 用(PLAN_cnsa2.md)。IV は 12 バイト、タグは 16 バイト固定。
+ * **並びは crypto_aes_x86.S(tools/gen_aes_asm.py)が位置で読む**ので、変えたら生成元の
+ * RK / HPOW / HKAR も合わせる。 */
 typedef struct {
-    uint8_t rk[11 * 16];         /* 展開した鍵 */
+    uint8_t rk[15 * 16];         /* 展開した鍵(AES-128 は先頭 11 個、AES-256 は 15 個)*/
     uint8_t hpow[8][16];         /* GHASH の鍵 H = E(K, 0) の 1〜8 乗(バイト順を反転した表現)。
                                   * 8 ブロックをまとめて畳むために先に計算しておく */
     uint8_t hkar[8][16];         /* hpow[i] の上位 64 ビットと下位 64 ビットの XOR(下位 64 ビットに置く)。
                                   * Karatsuba 法で 1 ブロックの掛け算を 3 回にするため */
-} crypto_aes128gcm_t;
+    uint32_t nr;                 /* ラウンド数(10 / 14)*/
+} crypto_aesgcm_t;
 
 /* 8 ブロックのループ本体を手書きのアセンブリ(crypto_aes_x86.S、AVX)で回すか。
  * -1 = CPU が AVX を持てば使う(既定)、0 = 使わない(C の組込み関数の版。陰性対照と比較用)。 */
 extern int crypto_aes_asm;
 
-void crypto_aes128_encrypt_block(const uint8_t key[16], const uint8_t in[16], uint8_t out[16]);
-void crypto_aes128gcm_init(crypto_aes128gcm_t *c, const uint8_t key[16]);
+/* klen は 16 / 32(それ以外は out を 0 にする)。 */
+void crypto_aes_encrypt_block(const uint8_t *key, size_t klen, const uint8_t in[16], uint8_t out[16]);
+/* klen は 16(AES-128)/ 32(AES-256)。それ以外は -1。 */
+int  crypto_aesgcm_init(crypto_aesgcm_t *c, const uint8_t *key, size_t klen);
 /* in と out は同じでもよい。 */
-void crypto_aes128gcm_seal(const crypto_aes128gcm_t *c, const uint8_t iv[12],
+void crypto_aesgcm_seal(const crypto_aesgcm_t *c, const uint8_t iv[12],
                            const void *aad, size_t alen, const void *in, size_t n,
                            void *out, uint8_t tag[16]);
 /* 断片(最大 4 個)を続けた平文を暗号化する(段階 G)。平文をいったん連続した
  * バッファへ写さずに済む。out と断片は重ならないこと。 */
 typedef struct { const void *p; size_t n; } crypto_iov_t;
-void crypto_aes128gcm_seal_iov(const crypto_aes128gcm_t *c, const uint8_t iv[12],
+void crypto_aesgcm_seal_iov(const crypto_aesgcm_t *c, const uint8_t iv[12],
                                const void *aad, size_t alen, const crypto_iov_t *v, int nv,
                                void *out, uint8_t tag[16]);
 /* タグが合わなければ -1(書いた平文は消してから返す)。 */
-int  crypto_aes128gcm_open(const crypto_aes128gcm_t *c, const uint8_t iv[12],
+int  crypto_aesgcm_open(const crypto_aesgcm_t *c, const uint8_t iv[12],
                            const void *aad, size_t alen, const void *in, size_t n,
                            void *out, const uint8_t tag[16]);
 
@@ -159,6 +179,22 @@ int  crypto_aes128gcm_open(const crypto_aes128gcm_t *c, const uint8_t iv[12],
  * 結果が全 0(相手が小位数の点を送ってきた)なら -1。 */
 int crypto_x25519(uint8_t out[32], const uint8_t scalar[32], const uint8_t point[32]);
 int crypto_x25519_keygen(uint8_t priv[32], uint8_t pub[32]);
+
+/* ---- ML-KEM-1024(crypto_mlkem.c、FIPS 203)。CNSA 2.0 の鍵共有(PLAN_cnsa2.md)----
+ * ek = カプセル化鍵(公開)、dk = 復号鍵(秘密)、ct = 暗号文、共有秘密は 32 バイト。 */
+#define CRYPTO_MLKEM1024_EK_LEN  1568u
+#define CRYPTO_MLKEM1024_DK_LEN  3168u
+#define CRYPTO_MLKEM1024_CT_LEN  1568u
+#define CRYPTO_MLKEM_SS_LEN      32u
+/* 種 d / z から鍵を作る(FIPS 203 ML-KEM.KeyGen_internal。検算用)。 */
+int crypto_mlkem1024_keygen_seed(const uint8_t d[32], const uint8_t z[32], uint8_t *ek, uint8_t *dk);
+int crypto_mlkem1024_keygen(uint8_t *ek, uint8_t *dk);
+/* 相手の ek が不正(係数が q 以上)なら -1。m を与える版は検算用(OpenSSL の ikme と同じ)。 */
+int crypto_mlkem1024_encaps_seed(const uint8_t *ek, const uint8_t m[32], uint8_t *ct, uint8_t ss[32]);
+int crypto_mlkem1024_encaps(const uint8_t *ek, uint8_t *ct, uint8_t ss[32]);
+/* dk の中のハッシュが合わなければ -1。暗号文が壊れていても 0 を返し、ss は暗黙の拒否の値になる
+ * (呼び出し側は失敗を知らない。その後の鍵の確認で相手と食い違う)。 */
+int crypto_mlkem1024_decaps(const uint8_t *dk, const uint8_t *ct, uint8_t ss[32]);
 
 /* 既知の値との照合。0=全部一致。err に最初に食い違った項目名を入れる。 */
 int crypto_selftest(char *err, size_t errlen);

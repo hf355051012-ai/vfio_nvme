@@ -66,7 +66,7 @@ static void dir_install(tls13_dir_t *d, const uint8_t secret[HL]) {
     memcpy(d->secret, secret, HL);
     expand_label(secret, "key", NULL, 0, key, 16);
     expand_label(secret, "iv", NULL, 0, d->iv, 12);
-    crypto_aes128gcm_init(&d->aead, key);
+    crypto_aesgcm_init(&d->aead, key, 16u);
     crypto_wipe(key, sizeof(key));
     d->seq = 0;
     d->on = 1;
@@ -122,7 +122,7 @@ static size_t seal_record(tls13_dir_t *d, uint8_t type, const uint8_t *data, siz
     r[5 + n] = type;
     uint8_t iv[12];
     nonce(d, iv);
-    crypto_aes128gcm_seal(&d->aead, iv, r, 5, r + 5, n + 1u, r + 5, r + 5 + n + 1u);
+    crypto_aesgcm_seal(&d->aead, iv, r, 5, r + 5, n + 1u, r + 5, r + 5 + n + 1u);
     d->seq++;
     return 5u + clen;
 }
@@ -711,7 +711,7 @@ static int on_record(tls13_t *t, uint8_t *rec, size_t rlen, obuf_t *o,
          * 受け取り先を渡された場合など)だけその場で復号する。application_data で
          * なかったら(握手 / alert)そこを作業域として使うだけで、applen は進めない。 */
         uint8_t *dst = (*applen + (n - 16u) <= appcap) ? app + *applen : d;
-        if (crypto_aes128gcm_open(&t->rx.aead, iv, rec, 5, d, n - 16u, dst, d + n - 16u) != 0)
+        if (crypto_aesgcm_open(&t->rx.aead, iv, rec, 5, d, n - 16u, dst, d + n - 16u) != 0)
             return fail(t, o, TLS13_ALERT_BAD_RECORD_MAC, "復号できない(タグが合わない)");
         d = dst;
         t->rx.seq++;
@@ -813,7 +813,7 @@ size_t tls13_seal2(tls13_t *t, const void *p1, size_t l1, const void *p2, size_t
     const crypto_iov_t v[3] = { { p1, l1 }, { p2, l2 }, { &type, 1 } };
     uint8_t iv[12];
     nonce(&t->tx, iv);
-    crypto_aes128gcm_seal_iov(&t->tx.aead, iv, out, 5, v, 3, out + 5, out + 5 + n + 1u);
+    crypto_aesgcm_seal_iov(&t->tx.aead, iv, out, 5, v, 3, out + 5, out + 5 + n + 1u);
     t->tx.seq++;
     return 5u + clen;
 }

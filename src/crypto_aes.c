@@ -1,4 +1,9 @@
-/* AES-128 と GCM(TLS 1.3 の TLS_AES_128_GCM_SHA256 用、PLAN_auth_tls.md 段階 0' / G)。
+/* AES-128 / AES-256 と GCM(TLS 1.3 の TLS_AES_128_GCM_SHA256 用、PLAN_auth_tls.md 段階 0' / G。
+ * AES-256 は CNSA 2.0 のため、PLAN_cnsa2.md 段階 1)。
+ *
+ * **ラウンド数(10 / 14)を引数に取る内部関数を always_inline で展開し、公開関数が
+ * c->nr で 2 通りに呼び分ける。** ラウンド数が定数のまま展開されるので、AES-128 の
+ * 経路は AES-256 を足す前と同じ形のコードになる(ループの回数を実行時に読まない)。
  *
  * AES は AES-NI、GHASH は PCLMULQDQ。**段階 G で 8 ブロック単位にした**:
  *   - CTR: 独立な 8 本の AES を 1 ラウンドずつ交互に流す。aesenc は待ち 4 サイクル・
@@ -21,8 +26,12 @@
 #include <immintrin.h>
 
 #define AESFN __attribute__((target("aes,pclmul,ssse3")))
+#define AESINL __attribute__((target("aes,pclmul,ssse3"), always_inline)) inline
 
-/* ---- AES-128 の鍵の展開 ---- */
+/* ---- 鍵の展開(FIPS 197 5.2)----
+ * key_step: 前の鍵 k を 32 ビットずつ累積 XOR し、aeskeygenassist の結果 t の
+ * 1 語(0xFF = RotWord+SubWord+Rcon、0xAA = SubWord だけ)を 4 語全部に足す。
+ * AES-256 は 2 つおきに 0xAA の段(SubWord だけ、Rcon なし)を挟む。 */
 AESFN static __m128i key_step(__m128i k, __m128i t) {
     t = _mm_shuffle_epi32(t, 0xFF);
     k = _mm_xor_si128(k, _mm_slli_si128(k, 4));
@@ -30,25 +39,50 @@ AESFN static __m128i key_step(__m128i k, __m128i t) {
     k = _mm_xor_si128(k, _mm_slli_si128(k, 4));
     return _mm_xor_si128(k, t);
 }
+AESFN static __m128i key_step_sub(__m128i k, __m128i t) {
+    t = _mm_shuffle_epi32(t, 0xAA);
+    k = _mm_xor_si128(k, _mm_slli_si128(k, 4));
+    k = _mm_xor_si128(k, _mm_slli_si128(k, 4));
+    k = _mm_xor_si128(k, _mm_slli_si128(k, 4));
+    return _mm_xor_si128(k, t);
+}
 
 #define KEXP(i, rcon) rk[i] = key_step(rk[(i) - 1], _mm_aeskeygenassist_si128(rk[(i) - 1], rcon))
+/* AES-256: rk[i] は 2 つ前の鍵から(Rcon あり)、rk[i+1] は 2 つ前から SubWord だけで。 */
+#define KEXP256(i, rcon) do {                                                                     \
+        rk[i] = key_step(rk[(i) - 2], _mm_aeskeygenassist_si128(rk[(i) - 1], rcon));             \
+        if ((i) + 1 < 15) rk[(i) + 1] = key_step_sub(rk[(i) - 1], _mm_aeskeygenassist_si128(rk[i], 0)); \
+    } while (0)
 
-AESFN static void aes128_expand(__m128i rk[11], const uint8_t key[16]) {
+/* 鍵を展開してラウンド数(10 / 14)を返す。klen が 16 / 32 以外なら 0。 */
+AESFN static unsigned aes_expand(__m128i rk[15], const uint8_t *key, size_t klen) {
     rk[0] = _mm_loadu_si128((const __m128i *)key);
-    KEXP(1, 0x01); KEXP(2, 0x02); KEXP(3, 0x04); KEXP(4, 0x08); KEXP(5, 0x10);
-    KEXP(6, 0x20); KEXP(7, 0x40); KEXP(8, 0x80); KEXP(9, 0x1B); KEXP(10, 0x36);
+    if (klen == 16u) {
+        KEXP(1, 0x01); KEXP(2, 0x02); KEXP(3, 0x04); KEXP(4, 0x08); KEXP(5, 0x10);
+        KEXP(6, 0x20); KEXP(7, 0x40); KEXP(8, 0x80); KEXP(9, 0x1B); KEXP(10, 0x36);
+        return 10u;
+    }
+    if (klen == 32u) {
+        rk[1] = _mm_loadu_si128((const __m128i *)(key + 16));
+        KEXP256(2, 0x01); KEXP256(4, 0x02); KEXP256(6, 0x04); KEXP256(8, 0x08);
+        KEXP256(10, 0x10); KEXP256(12, 0x20); KEXP256(14, 0x40);
+        return 14u;
+    }
+    return 0u;
 }
 
-AESFN static __m128i aes128_enc(const __m128i rk[11], __m128i b) {
+AESINL static __m128i aes_enc(const __m128i *rk, const unsigned nr, __m128i b) {
     b = _mm_xor_si128(b, rk[0]);
-    for (int i = 1; i < 10; i++) b = _mm_aesenc_si128(b, rk[i]);
-    return _mm_aesenclast_si128(b, rk[10]);
+    for (unsigned i = 1; i < nr; i++) b = _mm_aesenc_si128(b, rk[i]);
+    return _mm_aesenclast_si128(b, rk[nr]);
 }
 
-AESFN void crypto_aes128_encrypt_block(const uint8_t key[16], const uint8_t in[16], uint8_t out[16]) {
-    __m128i rk[11];
-    aes128_expand(rk, key);
-    _mm_storeu_si128((__m128i *)out, aes128_enc(rk, _mm_loadu_si128((const __m128i *)in)));
+AESFN void crypto_aes_encrypt_block(const uint8_t *key, size_t klen, const uint8_t in[16], uint8_t out[16]) {
+    __m128i rk[15];
+    const unsigned nr = aes_expand(rk, key, klen);
+    if (nr == 0u) { memset(out, 0, 16); return; }
+    const __m128i b = _mm_loadu_si128((const __m128i *)in);
+    _mm_storeu_si128((__m128i *)out, nr == 14u ? aes_enc(rk, 14u, b) : aes_enc(rk, 10u, b));
     crypto_wipe(rk, sizeof(rk));
 }
 
@@ -127,7 +161,7 @@ AESFN static inline __m128i kara_fold(__m128i lo, __m128i hi, __m128i mid) {
 }
 
 /* 反転済みの 8 ブロックを H^8..H^1 で畳み、還元を 1 回だけする。 */
-AESFN static inline __m128i ghash8(__m128i x, const crypto_aes128gcm_t *c, const __m128i blk[8]) {
+AESFN static inline __m128i ghash8(__m128i x, const crypto_aesgcm_t *c, const __m128i blk[8]) {
     __m128i lo = _mm_setzero_si128(), hi = _mm_setzero_si128(), mid = _mm_setzero_si128();
     kara_acc(_mm_xor_si128(x, blk[0]), _mm_loadu_si128((const __m128i *)c->hpow[7]),
              _mm_loadu_si128((const __m128i *)c->hkar[7]), &lo, &hi, &mid);
@@ -141,7 +175,7 @@ AESFN static inline __m128i ghash8(__m128i x, const crypto_aes128gcm_t *c, const
 
 /* メモリ上の 8 ブロック(暗号文)を読みながら畳む。レジスタに 8 本を持ち越さない
  * ため(書き終えた出力や入力をそのまま読み直す)。 */
-AESFN static inline __m128i ghash8_mem(__m128i x, const crypto_aes128gcm_t *c, const uint8_t *p) {
+AESFN static inline __m128i ghash8_mem(__m128i x, const crypto_aesgcm_t *c, const uint8_t *p) {
     __m128i lo = _mm_setzero_si128(), hi = _mm_setzero_si128(), mid = _mm_setzero_si128();
     kara_acc(_mm_xor_si128(x, bswap128(_mm_loadu_si128((const __m128i *)p))),
              _mm_loadu_si128((const __m128i *)c->hpow[7]), _mm_loadu_si128((const __m128i *)c->hkar[7]),
@@ -157,7 +191,7 @@ AESFN static inline __m128i ghash8_mem(__m128i x, const crypto_aes128gcm_t *c, c
 
 /* x に data を吸わせる(端数は 0 詰めした 1 ブロックとして扱う)。
  * 128 バイトずつは H^8..H^1 で畳んで還元 1 回、残りは 1 ブロックずつ。 */
-AESFN static __m128i ghash_update(__m128i x, const crypto_aes128gcm_t *c, const uint8_t *p, size_t n) {
+AESFN static __m128i ghash_update(__m128i x, const crypto_aesgcm_t *c, const uint8_t *p, size_t n) {
     const __m128i h = _mm_loadu_si128((const __m128i *)c->hpow[0]);
     while (n >= 128u) {
         __m128i blk[8];
@@ -178,11 +212,15 @@ AESFN static __m128i ghash_update(__m128i x, const crypto_aes128gcm_t *c, const 
     return x;
 }
 
-AESFN void crypto_aes128gcm_init(crypto_aes128gcm_t *c, const uint8_t key[16]) {
-    __m128i rk[11];
-    aes128_expand(rk, key);
-    memcpy(c->rk, rk, sizeof(rk));
-    const __m128i h = bswap128(aes128_enc(rk, _mm_setzero_si128()));
+AESFN int crypto_aesgcm_init(crypto_aesgcm_t *c, const uint8_t *key, size_t klen) {
+    __m128i rk[15];
+    const unsigned nr = aes_expand(rk, key, klen);
+    memset(c, 0, sizeof(*c));
+    if (nr == 0u) return -1;
+    c->nr = nr;
+    memcpy(c->rk, rk, 16u * (nr + 1u));
+    const __m128i z = _mm_setzero_si128();
+    const __m128i h = bswap128(nr == 14u ? aes_enc(rk, 14u, z) : aes_enc(rk, 10u, z));
     __m128i p = h;
     for (int i = 0; i < 8; i++) {   /* H^1..H^8 */
         _mm_storeu_si128((__m128i *)c->hpow[i], p);
@@ -190,6 +228,7 @@ AESFN void crypto_aes128gcm_init(crypto_aes128gcm_t *c, const uint8_t key[16]) {
         p = gfmul(p, h);
     }
     crypto_wipe(rk, sizeof(rk));
+    return 0;
 }
 
 /* ---- 8 ブロック単位の CTR と GHASH(段階 G)----
@@ -205,7 +244,7 @@ AESFN void crypto_aes128gcm_init(crypto_aes128gcm_t *c, const uint8_t key[16]) {
  * バイト順を入れ替え、2〜8 本目は末尾 1 バイトに 1〜7 を足して作る**。足して
  * よいのは 8 本目まで末尾のバイトが桁上がりしないとき(1 本目の末尾が 248 以下)で、
  * それ以外の周回は 8 本とも 32 ビットで足してから入れ替える。 */
-AESFN static inline void aes8(const __m128i rk[11], __m128i cb, __m128i b[8]) {
+AESINL static void aes8(const __m128i *rk, const unsigned nr, __m128i cb, __m128i b[8]) {
     if (((unsigned)_mm_cvtsi128_si32(cb) & 0xffu) <= 248u) {
         const __m128i c0 = bswap128(cb);
 #pragma GCC unroll 8
@@ -217,20 +256,21 @@ AESFN static inline void aes8(const __m128i rk[11], __m128i cb, __m128i b[8]) {
         for (int i = 0; i < 8; i++)
             b[i] = _mm_xor_si128(bswap128(_mm_add_epi32(cb, _mm_set_epi32(0, 0, 0, i))), rk[0]);
     }
-#pragma GCC unroll 9
-    for (int r = 1; r < 10; r++) {
+#pragma GCC unroll 13
+    for (unsigned r = 1; r < nr; r++) {
 #pragma GCC unroll 8
         for (int i = 0; i < 8; i++) b[i] = _mm_aesenc_si128(b[i], rk[r]);
     }
 #pragma GCC unroll 8
-    for (int i = 0; i < 8; i++) b[i] = _mm_aesenclast_si128(b[i], rk[10]);
+    for (int i = 0; i < 8; i++) b[i] = _mm_aesenclast_si128(b[i], rk[nr]);
 }
 
 /* 端数(128 バイト未満)の CTR。1 ブロックずつ。 */
-AESFN static void ctr_tail(const __m128i rk[11], __m128i *cb, const uint8_t *in, uint8_t *out, size_t n) {
+AESINL static void ctr_tail(const __m128i *rk, const unsigned nr, __m128i *cb, const uint8_t *in, uint8_t *out,
+                           size_t n) {
     while (n) {
         uint8_t ks[16];
-        _mm_storeu_si128((__m128i *)ks, aes128_enc(rk, bswap128(*cb)));
+        _mm_storeu_si128((__m128i *)ks, aes_enc(rk, nr, bswap128(*cb)));
         *cb = _mm_add_epi32(*cb, _mm_set_epi32(0, 0, 0, 1));
         const size_t take = n < 16u ? n : 16u;
         for (size_t i = 0; i < take; i++) out[i] = (uint8_t)(in[i] ^ ks[i]);
@@ -239,7 +279,7 @@ AESFN static void ctr_tail(const __m128i rk[11], __m128i *cb, const uint8_t *in,
 }
 
 /* 長さのブロックを吸わせ、E(K, J0) と混ぜてタグにする。 */
-AESFN static void gcm_finish(const crypto_aes128gcm_t *c, const __m128i rk[11], const uint8_t iv[12],
+AESINL static void gcm_finish(const crypto_aesgcm_t *c, const __m128i *rk, const unsigned nr, const uint8_t iv[12],
                              __m128i x, size_t alen, size_t n, uint8_t tag[16]) {
     uint8_t lens[16];
     const uint64_t ab = (uint64_t)alen * 8u, cbits = (uint64_t)n * 8u;
@@ -251,13 +291,15 @@ AESFN static void gcm_finish(const crypto_aes128gcm_t *c, const __m128i rk[11], 
     uint8_t j0[16];
     memcpy(j0, iv, 12);
     j0[12] = 0; j0[13] = 0; j0[14] = 0; j0[15] = 1;
-    const __m128i e = aes128_enc(rk, _mm_loadu_si128((const __m128i *)j0));
+    const __m128i e = aes_enc(rk, nr, _mm_loadu_si128((const __m128i *)j0));
     _mm_storeu_si128((__m128i *)tag, _mm_xor_si128(e, bswap128(x)));
 }
 
-/* ---- 8 ブロックのループ本体のアセンブリ版(crypto_aes_x86.S)---- */
-void crypto_aesgcm8_avx(const uint8_t *in, uint8_t *out, size_t iters, const crypto_aes128gcm_t *c,
+/* ---- 8 ブロックのループ本体のアセンブリ版(crypto_aes_x86.S。10 ラウンドと 14 ラウンドの 2 本)---- */
+void crypto_aesgcm8_avx(const uint8_t *in, uint8_t *out, size_t iters, const crypto_aesgcm_t *c,
                         uint8_t x[16], const uint8_t ctr[16], const uint8_t *gh);
+void crypto_aesgcm8_avx14(const uint8_t *in, uint8_t *out, size_t iters, const crypto_aesgcm_t *c,
+                          uint8_t x[16], const uint8_t ctr[16], const uint8_t *gh);
 
 int crypto_aes_asm = -1;
 
@@ -268,12 +310,13 @@ static int aes_asm_on(void) {
 
 /* k 組(128k バイト)をアセンブリで回す。gh は畳む 8 ブロックの先頭(暗号化では
  * out - 128、復号では in)。cb を 8k 進め、新しい GHASH の値を返す。 */
-AESFN static __m128i gcm8_asm(const crypto_aes128gcm_t *c, const uint8_t *ip, uint8_t *op, size_t k,
-                              __m128i x, __m128i *cb, const uint8_t *gh) {
+AESINL static __m128i gcm8_asm(const crypto_aesgcm_t *c, const unsigned nr, const uint8_t *ip, uint8_t *op,
+                               size_t k, __m128i x, __m128i *cb, const uint8_t *gh) {
     uint8_t xb[16], ctr[16];
     _mm_storeu_si128((__m128i *)xb, x);
     _mm_storeu_si128((__m128i *)ctr, bswap128(*cb));
-    crypto_aesgcm8_avx(ip, op, k, c, xb, ctr, gh);
+    if (nr == 14u) crypto_aesgcm8_avx14(ip, op, k, c, xb, ctr, gh);
+    else crypto_aesgcm8_avx(ip, op, k, c, xb, ctr, gh);
     *cb = _mm_add_epi32(*cb, _mm_set_epi32(0, 0, 0, (int)(8u * k)));
     return _mm_loadu_si128((const __m128i *)xb);
 }
@@ -289,11 +332,11 @@ AESFN static __m128i ctr_start(const uint8_t iv[12]) {
  * (AES と PCLMULQDQ は別の演算器なので重なる。今の 8 ブロックの GHASH は今の
  * AES の結果を待つので、1 周遅らせて依存を切る)。1 つ前の 8 ブロックは
  * レジスタに持ち越さず、書き終えた出力(op - 128)から読み直す。 */
-AESFN void crypto_aes128gcm_seal(const crypto_aes128gcm_t *c, const uint8_t iv[12],
-                                 const void *aad, size_t alen, const void *in, size_t n,
-                                 void *out, uint8_t tag[16]) {
-    __m128i rk[11];
-    memcpy(rk, c->rk, sizeof(rk));
+AESINL static void seal_impl(const crypto_aesgcm_t *c, const unsigned nr, const uint8_t iv[12],
+                             const void *aad, size_t alen, const void *in, size_t n,
+                             void *out, uint8_t tag[16]) {
+    __m128i rk[15];
+    memcpy(rk, c->rk, 16u * (nr + 1u));
     const uint8_t *ip = (const uint8_t *)in;
     uint8_t *op = (uint8_t *)out;
     size_t left = n;
@@ -303,12 +346,12 @@ AESFN void crypto_aes128gcm_seal(const crypto_aes128gcm_t *c, const uint8_t iv[1
     while (left >= 128u) {
         if (have && aes_asm_on()) {   /* 2 組目からはアセンブリで最後まで */
             const size_t k = left / 128u;
-            x = gcm8_asm(c, ip, op, k, x, &cb, op - 128);
+            x = gcm8_asm(c, nr, ip, op, k, x, &cb, op - 128);
             ip += 128u * k; op += 128u * k; left -= 128u * k;
             break;
         }
         __m128i b[8];
-        aes8(rk, cb, b);
+        aes8(rk, nr, cb, b);
         cb = _mm_add_epi32(cb, _mm_set_epi32(0, 0, 0, 8));
         if (have) x = ghash8_mem(x, c, op - 128);
 #pragma GCC unroll 8
@@ -320,10 +363,10 @@ AESFN void crypto_aes128gcm_seal(const crypto_aes128gcm_t *c, const uint8_t iv[1
     }
     if (have) x = ghash8_mem(x, c, op - 128);
     if (left) {
-        ctr_tail(rk, &cb, ip, op, left);
+        ctr_tail(rk, nr, &cb, ip, op, left);
         x = ghash_update(x, c, op, left);
     }
-    gcm_finish(c, rk, iv, x, alen, n, tag);
+    gcm_finish(c, rk, nr, iv, x, alen, n, tag);
 }
 
 /* 断片の列から、次の len バイトの読み出し先を返す。1 つの断片に収まっていれば
@@ -347,13 +390,13 @@ static const uint8_t *iov_take(const crypto_iov_t *v, int nv, int *vi, size_t *v
     return tmp;
 }
 
-/* crypto_aes128gcm_seal() の断片版(段階 G。TLS の送信が PDU のヘッダ・データ・
+/* crypto_aesgcm_seal() の断片版(段階 G。TLS の送信が PDU のヘッダ・データ・
  * 内側の種別 1 バイトを、写さずに直接 TCP の再送スロットへ暗号化するため)。 */
-AESFN void crypto_aes128gcm_seal_iov(const crypto_aes128gcm_t *c, const uint8_t iv[12],
-                                     const void *aad, size_t alen, const crypto_iov_t *v, int nv,
-                                     void *out, uint8_t tag[16]) {
-    __m128i rk[11];
-    memcpy(rk, c->rk, sizeof(rk));
+AESINL static void seal_iov_impl(const crypto_aesgcm_t *c, const unsigned nr, const uint8_t iv[12],
+                                 const void *aad, size_t alen, const crypto_iov_t *v, int nv,
+                                 void *out, uint8_t tag[16]) {
+    __m128i rk[15];
+    memcpy(rk, c->rk, 16u * (nr + 1u));
     size_t n = 0;
     for (int i = 0; i < nv; i++) n += v[i].n;
     uint8_t *op = (uint8_t *)out;
@@ -371,14 +414,14 @@ AESFN void crypto_aes128gcm_seal_iov(const crypto_aes128gcm_t *c, const uint8_t 
             if (run > left) run = left;
             const size_t k = run / 128u;
             if (k) {
-                x = gcm8_asm(c, (const uint8_t *)v[vi].p + vo, op, k, x, &cb, op - 128);
+                x = gcm8_asm(c, nr, (const uint8_t *)v[vi].p + vo, op, k, x, &cb, op - 128);
                 vo += 128u * k; op += 128u * k; left -= 128u * k;
                 continue;
             }
         }
         const uint8_t *ip = iov_take(v, nv, &vi, &vo, 128u, tmp);
         __m128i b[8];
-        aes8(rk, cb, b);
+        aes8(rk, nr, cb, b);
         cb = _mm_add_epi32(cb, _mm_set_epi32(0, 0, 0, 8));
         if (have) x = ghash8_mem(x, c, op - 128);
 #pragma GCC unroll 8
@@ -391,19 +434,19 @@ AESFN void crypto_aes128gcm_seal_iov(const crypto_aes128gcm_t *c, const uint8_t 
     if (have) x = ghash8_mem(x, c, op - 128);
     if (left) {
         const uint8_t *ip = iov_take(v, nv, &vi, &vo, left, tmp);
-        ctr_tail(rk, &cb, ip, op, left);
+        ctr_tail(rk, nr, &cb, ip, op, left);
         x = ghash_update(x, c, op, left);
     }
-    gcm_finish(c, rk, iv, x, alen, n, tag);
+    gcm_finish(c, rk, nr, iv, x, alen, n, tag);
 }
 
 /* 復号。暗号文は最初から分かっているので、同じ 8 ブロックの GHASH と AES を並べる。
  * **タグが合わなければ、書いた平文を消して -1**(in == out でもよい)。 */
-AESFN int crypto_aes128gcm_open(const crypto_aes128gcm_t *c, const uint8_t iv[12],
-                                const void *aad, size_t alen, const void *in, size_t n,
-                                void *out, const uint8_t tag[16]) {
-    __m128i rk[11];
-    memcpy(rk, c->rk, sizeof(rk));
+AESINL static int open_impl(const crypto_aesgcm_t *c, const unsigned nr, const uint8_t iv[12],
+                            const void *aad, size_t alen, const void *in, size_t n,
+                            void *out, const uint8_t tag[16]) {
+    __m128i rk[15];
+    memcpy(rk, c->rk, 16u * (nr + 1u));
     const uint8_t *ip = (const uint8_t *)in;
     uint8_t *op = (uint8_t *)out;
     size_t left = n;
@@ -411,14 +454,14 @@ AESFN int crypto_aes128gcm_open(const crypto_aes128gcm_t *c, const uint8_t iv[12
     __m128i x = ghash_update(_mm_setzero_si128(), c, (const uint8_t *)aad, alen);
     if (left >= 128u && aes_asm_on()) {
         const size_t k = left / 128u;
-        x = gcm8_asm(c, ip, op, k, x, &cb, ip);
+        x = gcm8_asm(c, nr, ip, op, k, x, &cb, ip);
         ip += 128u * k; op += 128u * k; left -= 128u * k;
     }
     while (left >= 128u) {
         /* GHASH は書き込む前に入力から読む(in == out のとき上書きされる)。 */
         __m128i b[8];
         x = ghash8_mem(x, c, ip);
-        aes8(rk, cb, b);
+        aes8(rk, nr, cb, b);
         cb = _mm_add_epi32(cb, _mm_set_epi32(0, 0, 0, 8));
 #pragma GCC unroll 8
         for (int i = 0; i < 8; i++)
@@ -428,13 +471,35 @@ AESFN int crypto_aes128gcm_open(const crypto_aes128gcm_t *c, const uint8_t iv[12
     }
     if (left) {
         x = ghash_update(x, c, ip, left);   /* 復号より先に(in == out のとき上書きされる)*/
-        ctr_tail(rk, &cb, ip, op, left);
+        ctr_tail(rk, nr, &cb, ip, op, left);
     }
     uint8_t want[16];
-    gcm_finish(c, rk, iv, x, alen, n, want);
+    gcm_finish(c, rk, nr, iv, x, alen, n, want);
     if (!crypto_equal(want, tag, 16u)) {
         crypto_wipe(out, n);   /* 検証できなかった平文は残さない */
         return -1;
     }
     return 0;
+}
+
+/* ---- 公開関数: ラウンド数を定数にして内部関数を呼び分ける ---- */
+AESFN void crypto_aesgcm_seal(const crypto_aesgcm_t *c, const uint8_t iv[12],
+                              const void *aad, size_t alen, const void *in, size_t n,
+                              void *out, uint8_t tag[16]) {
+    if (c->nr == 14u) seal_impl(c, 14u, iv, aad, alen, in, n, out, tag);
+    else seal_impl(c, 10u, iv, aad, alen, in, n, out, tag);
+}
+
+AESFN void crypto_aesgcm_seal_iov(const crypto_aesgcm_t *c, const uint8_t iv[12],
+                                  const void *aad, size_t alen, const crypto_iov_t *v, int nv,
+                                  void *out, uint8_t tag[16]) {
+    if (c->nr == 14u) seal_iov_impl(c, 14u, iv, aad, alen, v, nv, out, tag);
+    else seal_iov_impl(c, 10u, iv, aad, alen, v, nv, out, tag);
+}
+
+AESFN int crypto_aesgcm_open(const crypto_aesgcm_t *c, const uint8_t iv[12],
+                             const void *aad, size_t alen, const void *in, size_t n,
+                             void *out, const uint8_t tag[16]) {
+    if (c->nr == 14u) return open_impl(c, 14u, iv, aad, alen, in, n, out, tag);
+    return open_impl(c, 10u, iv, aad, alen, in, n, out, tag);
 }

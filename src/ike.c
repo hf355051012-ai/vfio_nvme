@@ -77,7 +77,7 @@ typedef struct {
     uint8_t  x_priv[32], x_pub[32];
     uint8_t  sk_d[PRF_LEN], sk_pi[PRF_LEN], sk_pr[PRF_LEN];
     uint8_t  salt_i[4], salt_r[4];
-    crypto_aes128gcm_t k_i, k_r;      /* SK_ei / SK_er */
+    crypto_aesgcm_t k_i, k_r;      /* SK_ei / SK_er */
     uint8_t  msg1[MSG_MAX], msg2[MSG_MAX];   /* IKE_SA_INIT の要求と応答(AUTH の計算に使う)*/
     uint32_t msg1_len, msg2_len;
     uint32_t my_msgid;                /* こちらの次の要求の Message ID */
@@ -148,9 +148,9 @@ static int derive_ike_keys(ike_peer_t *p, const uint8_t peer_pub[32])
     uint8_t km[PRF_LEN + 2 * KEY_LEN + 2 * PRF_LEN];
     prf_plus(seed, PRF_LEN, s, p->ni_len + p->nr_len + 16, km, sizeof(km));
     memcpy(p->sk_d, km, PRF_LEN);
-    crypto_aes128gcm_init(&p->k_i, km + PRF_LEN);
+    crypto_aesgcm_init(&p->k_i, km + PRF_LEN, 16u);
     memcpy(p->salt_i, km + PRF_LEN + 16, 4);
-    crypto_aes128gcm_init(&p->k_r, km + PRF_LEN + KEY_LEN);
+    crypto_aesgcm_init(&p->k_r, km + PRF_LEN + KEY_LEN, 16u);
     memcpy(p->salt_r, km + PRF_LEN + KEY_LEN + 16, 4);
     memcpy(p->sk_pi, km + PRF_LEN + 2 * KEY_LEN, PRF_LEN);
     memcpy(p->sk_pr, km + PRF_LEN + 2 * KEY_LEN + PRF_LEN, PRF_LEN);
@@ -353,7 +353,7 @@ static int seal_sk(wbuf_t *w, const ike_peer_t *p, int as_initiator, uint8_t fir
     uint8_t nonce[12];
     memcpy(nonce, as_initiator ? p->salt_i : p->salt_r, 4);
     memcpy(nonce + 4, iv, 8);
-    crypto_aes128gcm_seal(as_initiator ? &p->k_i : &p->k_r, nonce, w->b, (size_t)(h + 4 - w->b),
+    crypto_aesgcm_seal(as_initiator ? &p->k_i : &p->k_r, nonce, w->b, (size_t)(h + 4 - w->b),
                           ct, ctlen, ct, ct + ctlen);
     return 0;
 }
@@ -508,7 +508,7 @@ static int open_sk(const ike_peer_t *p, int from_initiator, uint8_t *msg, const 
     uint8_t nonce[12];
     memcpy(nonce, from_initiator ? p->salt_i : p->salt_r, 4);
     memcpy(nonce + 4, iv, 8);
-    if (crypto_aes128gcm_open(from_initiator ? &p->k_i : &p->k_r, nonce, msg, (size_t)(sk - msg),
+    if (crypto_aesgcm_open(from_initiator ? &p->k_i : &p->k_r, nonce, msg, (size_t)(sk - msg),
                               ct, ctlen, ct, ct + ctlen) != 0)
         return -1;
     const uint8_t padlen = ct[ctlen - 1];

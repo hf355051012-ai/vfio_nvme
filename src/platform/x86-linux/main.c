@@ -7211,10 +7211,12 @@ int main(int argc, char **argv)
     rc |= crc32c_selftest();
     {
         /* 認証 / TLS 用の暗号部品(crypto.c)。期待値は OpenSSL で作り直した
-         * FIPS 180-4 / RFC 4231 / RFC 5869 / RFC 8448 の値。 */
+         * FIPS 180-4 / RFC 4231 / RFC 5869 / RFC 8448 の値と、CNSA 2.0 用の
+         * SHA-3 / SHAKE / AES-256-GCM / ML-KEM-1024(PLAN_cnsa2.md)。 */
         char err[64];
         const int crc = crypto_selftest(err, sizeof(err));
-        uart_printf("[selftest] crypto(SHA-256/384/512, HMAC, HKDF, Expand-Label, base64, CRC-32, ffdhe, AES-GCM, X25519) -> %s%s%s\n",
+        uart_printf("[selftest] crypto(SHA-2, SHA-3/SHAKE, HMAC, HKDF, Expand-Label, base64, CRC-32, ffdhe, "
+                    "AES-128/256-GCM, X25519, ML-KEM-1024) -> %s%s%s\n",
                     crc == 0 ? "OK" : "NG(", crc == 0 ? "" : err, crc == 0 ? "" : ")");
         rc |= crc;
         const int trc = tls13_selftest(err, sizeof(err));

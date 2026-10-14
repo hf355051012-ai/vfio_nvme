@@ -175,7 +175,9 @@ static void sha1_block(uint32_t h[5], const uint8_t *p) {
     h[0] += a; h[1] += b; h[2] += c; h[3] += d; h[4] += e;
 }
 
-/* ---- SHA3-256(FIPS 202)。Keccak-f[1600]、rate 136 バイト。iSCSI の CHAP_A=8 のためだけ。---- */
+/* ---- SHA-3 と SHAKE(FIPS 202)。Keccak-f[1600]。
+ * SHA3-256(rate 136)は iSCSI の CHAP_A=8、SHA3-512(rate 72)と SHAKE128 / 256(rate 168 / 136)は
+ * ML-KEM(FIPS 203 の H / G / J / PRF / XOF、PLAN_cnsa2.md 段階 1)。---- */
 static void keccak_f(uint64_t s[25]) {
     static const uint64_t RC[24] = {
         0x0000000000000001ull, 0x0000000000008082ull, 0x800000000000808aull, 0x8000000080008000ull,
@@ -208,13 +210,60 @@ static void keccak_f(uint64_t s[25]) {
     }
 }
 
-static void sha3_block(uint64_t s[25], const uint8_t *p) {
-    for (unsigned i = 0; i < 136u / 8u; i++) {
+static void sha3_block(uint64_t s[25], const uint8_t *p, size_t rate) {
+    for (unsigned i = 0; i < rate / 8u; i++) {
         uint64_t v = 0;
         for (unsigned k = 0; k < 8; k++) v |= (uint64_t)p[8u * i + k] << (8u * k);   /* レーンはリトルエンディアン */
         s[i] ^= v;
     }
     keccak_f(s);
+}
+
+/* SHAKE128 / 256。1 バイトずつ状態のレーンへ XOR する(ML-KEM の使い方では長くても数 KB)。 */
+void crypto_shake_init(crypto_shake_t *x, unsigned bits) {
+    memset(x, 0, sizeof(*x));
+    x->rate = (bits == 128u) ? 168u : 136u;
+}
+
+void crypto_shake_absorb(crypto_shake_t *x, const void *data, size_t n) {
+    const uint8_t *p = (const uint8_t *)data;
+    for (size_t i = 0; i < n; i++) {
+        x->s[x->pos / 8u] ^= (uint64_t)p[i] << (8u * (x->pos % 8u));
+        if (++x->pos == x->rate) {
+            keccak_f(x->s);
+            x->pos = 0;
+        }
+    }
+}
+
+void crypto_shake_squeeze(crypto_shake_t *x, void *out, size_t n) {
+    uint8_t *o = (uint8_t *)out;
+    if (!x->squeezing) {
+        /* 詰め物: SHAKE の区切り 1111 + pad10*1 = 0x1F ... 0x80 */
+        x->s[x->pos / 8u] ^= (uint64_t)0x1Fu << (8u * (x->pos % 8u));
+        x->s[(x->rate - 1u) / 8u] ^= (uint64_t)0x80u << (8u * ((x->rate - 1u) % 8u));
+        keccak_f(x->s);
+        x->pos = 0;
+        x->squeezing = 1;
+    }
+    for (size_t i = 0; i < n; i++) {
+        if (x->pos == x->rate) {
+            keccak_f(x->s);
+            x->pos = 0;
+        }
+        o[i] = (uint8_t)(x->s[x->pos / 8u] >> (8u * (x->pos % 8u)));
+        x->pos++;
+    }
+}
+
+int crypto_shake(unsigned bits, const void *in, size_t n, void *out, size_t olen) {
+    if (bits != 128u && bits != 256u) return -1;
+    crypto_shake_t x;
+    crypto_shake_init(&x, bits);
+    crypto_shake_absorb(&x, in, n);
+    crypto_shake_squeeze(&x, out, olen);
+    crypto_wipe(&x, sizeof(x));
+    return 0;
 }
 
 size_t crypto_hash_len(crypto_hash_id_t id) {
@@ -225,6 +274,7 @@ size_t crypto_hash_len(crypto_hash_id_t id) {
     case CRYPTO_MD5: return 16u;
     case CRYPTO_SHA1: return 20u;
     case CRYPTO_SHA3_256: return 32u;
+    case CRYPTO_SHA3_512: return 64u;
     default: return 0u;
     }
 }
@@ -234,6 +284,7 @@ size_t crypto_hash_block(crypto_hash_id_t id) {
     case CRYPTO_SHA256: case CRYPTO_MD5: case CRYPTO_SHA1: return 64u;
     case CRYPTO_SHA384: case CRYPTO_SHA512: return 128u;
     case CRYPTO_SHA3_256: return 136u;
+    case CRYPTO_SHA3_512: return 72u;
     default: return 0u;
     }
 }
@@ -249,7 +300,7 @@ int crypto_hash_init(crypto_hash_ctx_t *c, crypto_hash_id_t id) {
     case CRYPTO_SHA512: memcpy(c->st.s64, IV512, sizeof(IV512)); return 0;
     case CRYPTO_MD5: memcpy(c->st.s32, IVMD5, sizeof(IVMD5)); return 0;
     case CRYPTO_SHA1: memcpy(c->st.s32, IVSHA1, sizeof(IVSHA1)); return 0;
-    case CRYPTO_SHA3_256: return 0;   /* 状態は 0 から */
+    case CRYPTO_SHA3_256: case CRYPTO_SHA3_512: return 0;   /* 状態は 0 から */
     default: return -1;
     }
 }
@@ -259,7 +310,8 @@ static void hash_compress(crypto_hash_ctx_t *c, const uint8_t *blk) {
     case CRYPTO_SHA256: sha256_block(c->st.s32, blk); break;
     case CRYPTO_MD5: md5_block(c->st.s32, blk); break;
     case CRYPTO_SHA1: sha1_block(c->st.s32, blk); break;
-    case CRYPTO_SHA3_256: sha3_block(c->st.s64, blk); break;
+    case CRYPTO_SHA3_256: sha3_block(c->st.s64, blk, 136u); break;
+    case CRYPTO_SHA3_512: sha3_block(c->st.s64, blk, 72u); break;
     default: sha512_block(c->st.s64, blk); break;
     }
 }
@@ -293,13 +345,14 @@ void crypto_hash_update(crypto_hash_ctx_t *c, const void *data, size_t len) {
 void crypto_hash_final(crypto_hash_ctx_t *c, uint8_t *out) {
     const size_t bs = crypto_hash_block(c->id);
     if (bs == 0) return;   /* 知らない種類(init で -1 を返している)*/
-    if (c->id == CRYPTO_SHA3_256) {
-        /* SHA3 の詰め物: 0x06 ... 0x80(長さ欄は無い)。 */
+    if (c->id == CRYPTO_SHA3_256 || c->id == CRYPTO_SHA3_512) {
+        /* SHA3 の詰め物: 0x06 ... 0x80(長さ欄は無い)。出力は rate より短いので 1 回で足りる。 */
         memset(c->buf + c->fill, 0, bs - c->fill);
         c->buf[c->fill] ^= 0x06;
         c->buf[bs - 1u] ^= 0x80;
-        sha3_block(c->st.s64, c->buf);
-        for (unsigned i = 0; i < 32u; i++) out[i] = (uint8_t)(c->st.s64[i / 8u] >> (8u * (i % 8u)));
+        sha3_block(c->st.s64, c->buf, bs);
+        const size_t ol = crypto_hash_len(c->id);
+        for (unsigned i = 0; i < ol; i++) out[i] = (uint8_t)(c->st.s64[i / 8u] >> (8u * (i % 8u)));
         crypto_wipe(c, sizeof(*c));
         return;
     }
@@ -747,7 +800,7 @@ int crypto_selftest(char *err, size_t errlen) {
         static const uint8_t k0[16] = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 };
         static const uint8_t p0[16] = { 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
                                         0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF };
-        crypto_aes128_encrypt_block(k0, p0, out);
+        crypto_aes_encrypt_block(k0, 16u, p0, out);
         if (!hexeq(out, "69c4e0d86a7b0430d8cdb78070b4c55a", 16)) return fail(err, errlen, "AES-128");
 
         uint8_t key[16], iv[12], aad[20], pt[60], ct[60], tag[16], back[60];
@@ -756,22 +809,103 @@ int crypto_selftest(char *err, size_t errlen) {
         unhex("feedfacedeadbeeffeedfacedeadbeefabaddad2", aad, 20);
         unhex("d9313225f88406e5a55909c5aff5269a86a7a9531534f7da2e4c303d8a318a72"
               "1c3c0c95956809532fcf0e2449a6b525b16aedf5aa0de657ba637b39", pt, 60);
-        crypto_aes128gcm_t g;
-        crypto_aes128gcm_init(&g, key);
-        crypto_aes128gcm_seal(&g, iv, aad, 20, pt, 60, ct, tag);
+        crypto_aesgcm_t g;
+        crypto_aesgcm_init(&g, key, 16u);
+        crypto_aesgcm_seal(&g, iv, aad, 20, pt, 60, ct, tag);
         if (!hexeq(ct, "42831ec2217774244b7221b784d0d49ce3aa212f2c02a4e035c17e2329aca12e"
                        "21d514b25466931c7d8f6a5aac84aa051ba30b396a0aac973d58e091", 60))
             return fail(err, errlen, "AES-GCM 暗号文");
         if (!hexeq(tag, "5bc94fbc3221a5db94fae95ae7121a47", 16)) return fail(err, errlen, "AES-GCM タグ");
-        if (crypto_aes128gcm_open(&g, iv, aad, 20, ct, 60, back, tag) != 0 || memcmp(back, pt, 60) != 0)
+        if (crypto_aesgcm_open(&g, iv, aad, 20, ct, 60, back, tag) != 0 || memcmp(back, pt, 60) != 0)
             return fail(err, errlen, "AES-GCM 復号");
         /* 陰性対照: 暗号文・AAD・タグのどれを 1 ビット変えても開かない */
         ct[59] ^= 1;
-        if (crypto_aes128gcm_open(&g, iv, aad, 20, ct, 60, back, tag) == 0) return fail(err, errlen, "AES-GCM 改ざん(暗号文)");
+        if (crypto_aesgcm_open(&g, iv, aad, 20, ct, 60, back, tag) == 0) return fail(err, errlen, "AES-GCM 改ざん(暗号文)");
         ct[59] ^= 1; aad[0] ^= 1;
-        if (crypto_aes128gcm_open(&g, iv, aad, 20, ct, 60, back, tag) == 0) return fail(err, errlen, "AES-GCM 改ざん(AAD)");
+        if (crypto_aesgcm_open(&g, iv, aad, 20, ct, 60, back, tag) == 0) return fail(err, errlen, "AES-GCM 改ざん(AAD)");
         aad[0] ^= 1; tag[15] ^= 0x80;
-        if (crypto_aes128gcm_open(&g, iv, aad, 20, ct, 60, back, tag) == 0) return fail(err, errlen, "AES-GCM 改ざん(タグ)");
+        if (crypto_aesgcm_open(&g, iv, aad, 20, ct, 60, back, tag) == 0) return fail(err, errlen, "AES-GCM 改ざん(タグ)");
+    }
+
+    /* ---- CNSA 2.0 の部品(PLAN_cnsa2.md 段階 1)。期待値は OpenSSL 3.5 で作ったもの ----
+     * SHA3-512 / SHAKE128 / SHAKE256 */
+    crypto_hash(CRYPTO_SHA3_512, "abc", 3, out);
+    if (!hexeq(out, "b751850b1a57168a5693cd924b6b096e08f621827444f70d884f5d0240d2712e"
+                    "10e116e9192af3c91a7ec57647e3934057340b4cf408d5a56592f8274eec53f0", 64))
+        return fail(err, errlen, "SHA3-512");
+    crypto_shake(128, "", 0, out, 32);
+    if (!hexeq(out, "7f9c2ba4e88f827d616045507605853ed73b8093f6efbc88eb1a6eacfa66ef26", 32))
+        return fail(err, errlen, "SHAKE128");
+    crypto_shake(256, "abc", 3, out, 64);
+    if (!hexeq(out, "483366601360a8771c6863080cc4114d8db44530f8f1e1ee4f94ea37e78b5739"
+                    "d5a15bef186a5386c75744c0527e1faa9f8726e462a12a4feb06bd8801e751e4", 64))
+        return fail(err, errlen, "SHAKE256");
+
+    /* AES-256(FIPS-197 付録 C.3)と GCM(McGrew & Viega の Test Case 16 = TC4 の鍵を 2 回並べた 32 バイト)、
+     * それに 512 バイト(14 ラウンドのアセンブリを通る長さ。暗号文 + タグの SHA3-256 で比べる)。 */
+    {
+        uint8_t k[32], p0[16], key[32], iv[12], aad[20], pt[60], ct[60], tag[16], back[60];
+        for (unsigned i = 0; i < 32; i++) k[i] = (uint8_t)i;
+        unhex("00112233445566778899aabbccddeeff", p0, 16);
+        crypto_aes_encrypt_block(k, 32u, p0, out);
+        if (!hexeq(out, "8ea2b7ca516745bfeafc49904b496089", 16)) return fail(err, errlen, "AES-256");
+        unhex("feffe9928665731c6d6a8f9467308308feffe9928665731c6d6a8f9467308308", key, 32);
+        unhex("cafebabefacedbaddecaf888", iv, 12);
+        unhex("feedfacedeadbeeffeedfacedeadbeefabaddad2", aad, 20);
+        unhex("d9313225f88406e5a55909c5aff5269a86a7a9531534f7da2e4c303d8a318a72"
+              "1c3c0c95956809532fcf0e2449a6b525b16aedf5aa0de657ba637b39", pt, 60);
+        crypto_aesgcm_t g;
+        if (crypto_aesgcm_init(&g, key, 32u) != 0) return fail(err, errlen, "AES-256-GCM init");
+        crypto_aesgcm_seal(&g, iv, aad, 20, pt, 60, ct, tag);
+        if (!hexeq(ct, "522dc1f099567d07f47f37a32a84427d643a8cdcbfe5c0c97598a2bd2555d1aa"
+                       "8cb08e48590dbb3da7b08b1056828838c5f61e6393ba7a0abcc9f662", 60) ||
+            !hexeq(tag, "76fc6ece0f4e1768cddf8853bb2d551b", 16))
+            return fail(err, errlen, "AES-256-GCM");
+        if (crypto_aesgcm_open(&g, iv, aad, 20, ct, 60, back, tag) != 0 || memcmp(back, pt, 60) != 0)
+            return fail(err, errlen, "AES-256-GCM 復号");
+        static uint8_t big[512 + 16], bk[512];
+        uint8_t biv[12], baad[13];
+        for (unsigned i = 0; i < 12; i++) biv[i] = (uint8_t)(0xA0u + i);
+        for (unsigned i = 0; i < 13; i++) baad[i] = (uint8_t)(0xC0u + i);
+        for (unsigned i = 0; i < 512; i++) bk[i] = (uint8_t)(i * 7u);
+        crypto_aesgcm_init(&g, k, 32u);
+        crypto_aesgcm_seal(&g, biv, baad, 13, bk, 512, big, big + 512);
+        crypto_hash(CRYPTO_SHA3_256, big, sizeof(big), out);
+        if (!hexeq(out, "742298e449e9a3b3c3947d288fbfde28d455507ec2ebfe0d9cf62a9f129a74b4", 32))
+            return fail(err, errlen, "AES-256-GCM 512 バイト");
+        if (crypto_aesgcm_open(&g, biv, baad, 13, big, 512, big, big + 512) != 0 || memcmp(big, bk, 512) != 0)
+            return fail(err, errlen, "AES-256-GCM 512 バイトの復号");
+        if (crypto_aesgcm_init(&g, k, 24u) != -1) return fail(err, errlen, "AES-192 の鍵を受け付けた");
+    }
+
+    /* ML-KEM-1024: d = 00..1f、z = 20..3f の鍵、m = 40..5f のカプセル化、復号、壊した暗号文の暗黙の拒否 */
+    {
+        static uint8_t ek[CRYPTO_MLKEM1024_EK_LEN], dk[CRYPTO_MLKEM1024_DK_LEN], kc[CRYPTO_MLKEM1024_CT_LEN];
+        uint8_t dz[64], m[32], ss[32];
+        for (unsigned i = 0; i < 64; i++) dz[i] = (uint8_t)i;
+        for (unsigned i = 0; i < 32; i++) m[i] = (uint8_t)(0x40u + i);
+        crypto_mlkem1024_keygen_seed(dz, dz + 32, ek, dk);
+        crypto_hash(CRYPTO_SHA3_256, ek, sizeof(ek), out);
+        if (!hexeq(out, "61349e5c131a7e116a0463861d7d18663c5627c38c7147ddaadfd48acd7a4535", 32))
+            return fail(err, errlen, "ML-KEM ek");
+        crypto_hash(CRYPTO_SHA3_256, dk, sizeof(dk), out);
+        if (!hexeq(out, "f0db5d938027fcd9bad87847d52c14cf0c4abcf0703b749793f212111ffb303b", 32))
+            return fail(err, errlen, "ML-KEM dk");
+        if (crypto_mlkem1024_encaps_seed(ek, m, kc, ss) != 0) return fail(err, errlen, "ML-KEM encaps");
+        crypto_hash(CRYPTO_SHA3_256, kc, sizeof(kc), out);
+        if (!hexeq(out, "c1579fa02c614f3762b2a799b51e41cebb8f820f34fa736af02c56de2460ce3c", 32) ||
+            !hexeq(ss, "0ad8d1ea1b8dd788979b4379581218df9321bdce5567eca42ae6be7d395f1a54", 32))
+            return fail(err, errlen, "ML-KEM 暗号文 / 共有秘密");
+        memset(ss, 0, 32);
+        if (crypto_mlkem1024_decaps(dk, kc, ss) != 0 ||
+            !hexeq(ss, "0ad8d1ea1b8dd788979b4379581218df9321bdce5567eca42ae6be7d395f1a54", 32))
+            return fail(err, errlen, "ML-KEM 復号");
+        kc[0] ^= 1;
+        crypto_mlkem1024_decaps(dk, kc, ss);
+        if (!hexeq(ss, "8f2c880890996c587aa500cf8b6da03372de706a9f96075744bb0956ea6fbaac", 32))
+            return fail(err, errlen, "ML-KEM 暗黙の拒否");
+        ek[0] = 0xFF; ek[1] |= 0x0F;   /* 陰性対照: 係数 4095 >= q の ek は断る */
+        if (crypto_mlkem1024_encaps_seed(ek, m, kc, ss) != -1) return fail(err, errlen, "ML-KEM 不正な ek を受け付けた");
     }
 
     /* X25519(RFC 7748 5.2 の 1 本目と 6.1 の鍵交換)*/
