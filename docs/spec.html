@@ -3294,12 +3294,33 @@ const blocks = Array.from(document.querySelectorAll('pre.mermaid'));
 blocks.forEach(function(el){ el.dataset.src = el.textContent; });
 function v(name){ return getComputedStyle(document.documentElement).getPropertyValue(name).trim(); }
 // 図は 60 個あり、まとめて描くと十数秒かかるので、画面に近づいたものから描く。
+// 図は描くと背が伸びるので、リンクで飛んだ直後に上の図が描かれると飛び先が画面から外れる。
+// 飛んだ先を覚えておき、図を描くたびにそこへ合わせ直す(利用者が自分で動かしたらやめる)。
+let pin = null, pinUntil = 0;
+function pinTo(id){
+  const t = id && document.getElementById(id);
+  if (!t) return;
+  pin = t; pinUntil = Date.now() + 10000;
+  t.scrollIntoView({ behavior: 'instant' });
+}
+function keepPin(){
+  if (pin && Date.now() < pinUntil) pin.scrollIntoView({ behavior: 'instant' }); else pin = null;
+}
+['wheel', 'touchstart', 'keydown'].forEach(function(e){
+  window.addEventListener(e, function(){ pin = null; }, { passive: true });
+});
+window.addEventListener('hashchange', function(){ pinTo(decodeURIComponent(location.hash.slice(1))); });
+document.addEventListener('click', function(ev){
+  const a = ev.target.closest && ev.target.closest('a[href^="#"]');
+  if (a) setTimeout(function(){ pinTo(decodeURIComponent(a.getAttribute('href').slice(1))); }, 0);
+});
 let queue = Promise.resolve();
 function render(el){
   queue = queue.then(async function(){
     if (el.hasAttribute('data-processed')) return;
     el.innerHTML = ''; el.textContent = el.dataset.src;
     try { await mermaid.run({ nodes: [el], suppressErrors: true }); } catch (e) { console.error(e); }
+    keepPin();
   });
   return queue;
 }
@@ -3372,6 +3393,7 @@ function redraw(){
 // 自己検査用: すべて描き終えるまで待つ(window.__drawAll())
 window.__drawAll = function(){ blocks.forEach(render); return queue; };
 redraw();
+if (location.hash) pinTo(decodeURIComponent(location.hash.slice(1)));
 window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', redraw);
 new MutationObserver(redraw).observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
 </script>
