@@ -31,9 +31,10 @@ int  ipsec_policy_add(uint32_t peer_ip);
 void ipsec_policy_del(uint32_t peer_ip);
 int  ipsec_policy_match(uint32_t ip);
 
-/* SA を入れる(同じ相手の既存の SA は置き換える)。key は 20 バイト(鍵 16 + salt 4)。 */
-int  ipsec_sa_install(uint32_t peer_ip, uint32_t spi_in, const uint8_t key_in[20],
-                      uint32_t spi_out, const uint8_t key_out[20]);
+/* SA を入れる(同じ相手の既存の SA は置き換える)。key は aes_klen + 4 バイト
+ * (AES の鍵 16 / 32 + salt 4。RFC 4106 の KEYMAT の並び)。aes_klen が 16 / 32 以外なら -1。 */
+int  ipsec_sa_install(uint32_t peer_ip, uint32_t spi_in, const uint8_t *key_in,
+                      uint32_t spi_out, const uint8_t *key_out, size_t aes_klen);
 void ipsec_sa_del(uint32_t peer_ip);
 int  ipsec_sa_up(uint32_t peer_ip);
 /* 受信用 SPI から相手を引く(ike.c の DELETE 処理用)。0 = 無い。 */

@@ -2068,9 +2068,9 @@ static int shell_pf0_on_core2(void)
 /* ipsec psk <相手> <事前共有鍵> [pf0|pf1] / up <相手> / down <相手> / del <相手> / stat / clear */
 static void shell_ipsec(const char *args)
 {
-    char tok[4][160];
+    char tok[5][160];
     unsigned n = 0;
-    while (*args && n < 4u) {
+    while (*args && n < 5u) {
         while (*args == ' ') args++;
         if (!*args) break;
         unsigned k = 0;
@@ -2089,14 +2089,22 @@ static void shell_ipsec(const char *args)
         return;
     }
     if (n < 2 || shell_parse_ipv4(tok[1], &ip) != 0) {
-        uart_printf("使い方: ipsec psk <相手> <鍵> [pf0|pf1] | up <相手> | down <相手> | del <相手> | stat | clear\n");
+        uart_printf("使い方: ipsec psk <相手> <鍵> [pf0|pf1] [cnsa] | up <相手> | down <相手> | del <相手> | stat | clear\n"
+                    "  cnsa = CNSA 2.0 の組(IKE aes256gcm16-prfsha384-mlkem1024、ESP aes256gcm16)\n");
         return;
     }
     if (strcmp(tok[0], "psk") == 0 && n >= 3) {
-        netif_t *nif = netif_find((n >= 4 && strcmp(tok[3], "pf0") == 0) ? "mlx5-pf0" : "mlx5-pf1");
-        if (ike_peer_add(ip, tok[2], nif, NULL) != 0) uart_printf("ipsec: 登録できない\n");
-        else uart_printf("ipsec: %s を %s 経由の IPsec の相手にした(以後この相手とは ESP だけ)\n", tok[1],
-                         nif ? nif->name : "?");
+        int pf0 = 0, cnsa = 0;
+        for (unsigned i = 3; i < n; i++) {
+            if (strcmp(tok[i], "pf0") == 0) pf0 = 1;
+            else if (strcmp(tok[i], "cnsa") == 0) cnsa = 1;
+        }
+        netif_t *nif = netif_find(pf0 ? "mlx5-pf0" : "mlx5-pf1");
+        if (ike_peer_add(ip, tok[2], nif, NULL, cnsa) != 0) uart_printf("ipsec: 登録できない\n");
+        else uart_printf("ipsec: %s を %s 経由の IPsec の相手にした(以後この相手とは ESP だけ、%s)\n", tok[1],
+                         nif ? nif->name : "?",
+                         cnsa ? "CNSA 2.0: IKE aes256gcm16-prfsha384-mlkem1024 / ESP aes256gcm16"
+                              : "IKE aes128gcm16-prfsha256-x25519 / ESP aes128gcm16");
     } else if (strcmp(tok[0], "up") == 0) {
         uart_printf("ipsec: %s\n", ike_up(ip) == 0 ? "確立した" : "失敗");
     } else if (strcmp(tok[0], "down") == 0) {

@@ -46,6 +46,9 @@ static struct {
     nvme_auth_key_t ctrl;      /* コントローラの鍵(双方向のときホストに示す鍵)。len=0 なら無し */
     uint8_t    hash_pref; /* 優先するハッシュ(Linux の dhchap_hash、既定 SHA-256)*/
     uint8_t    dhgid;     /* 使う DH 群(Linux の dhchap_dhgroup、既定 NULL)*/
+    /* CNSA 2.0 専用(PLAN_cnsa2.md 段階 2): ハッシュは SHA-384 / 512 だけ、DH 群は NULL だけ
+     * (ffdhe は CNSA 2.0 の鍵共有に入らない)。DH が要る secure channel concatenation は断る。 */
+    int        cnsa;
 } s_cfg = { .hash_pref = CRYPTO_SHA256 };
 
 static inline uint16_t rd16le(const uint8_t *p) { return (uint16_t)(p[0] | (p[1] << 8)); }
@@ -180,16 +183,22 @@ static void on_negotiate(nvmet_auth_sess_t *s, const uint8_t *d, uint32_t len) {
     }
     const uint8_t halen = pd[2], dhlen = pd[3];
     const uint8_t *ids = pd + 4;
+    if (s_cfg.cnsa && s->concat) {
+        fail(s, FAIL_CONCAT_MISMATCH, "CNSA 2.0 専用: secure channel concatenation は DH(ffdhe)が要るので使えない");
+        return;
+    }
     uint8_t pick = 0, fallback = 0;
     for (unsigned i = 0; i < halen && i < 30u; i++) {
         const uint8_t h = ids[i];
         if (h < 1 || h > 3) continue;
+        if (s_cfg.cnsa && h == CRYPTO_SHA256) continue;   /* SHA-384 / 512 だけ */
         if (!fallback) fallback = h;
         if (h == s_cfg.hash_pref) pick = h;
     }
     if (!pick) pick = fallback;
     if (!pick) {
-        fail(s, FAIL_HASH_UNUSABLE, "使えるハッシュが無い");
+        fail(s, FAIL_HASH_UNUSABLE, s_cfg.cnsa ? "CNSA 2.0 専用: ホストが SHA-384 / 512 を出していない"
+                                               : "使えるハッシュが無い");
         return;
     }
     /* DH 群は設定したものだけを使う(ホストの候補に入っていること)。
@@ -421,8 +430,9 @@ uint16_t nvmet_auth_receive(nvmet_auth_sess_t *s, uint32_t cdw10, uint32_t cdw11
 void nvmet_auth_shell(const char *args) {
     static const char usage[] =
         "使い方: nvmetauth <hostnqn> <ホストの鍵 DHHC-1:..> [sha256|sha384|sha512]\n"
-        "                  [null|ffdhe2048|ffdhe3072|ffdhe4096|ffdhe6144|ffdhe8192] [ctrl=<DHHC-1:..>]\n"
-        "        nvmetauth off\n";
+        "                  [null|ffdhe2048|ffdhe3072|ffdhe4096|ffdhe6144|ffdhe8192] [ctrl=<DHHC-1:..>] [cnsa]\n"
+        "        nvmetauth off\n"
+        "  cnsa = CNSA 2.0 専用(SHA-384 / 512 だけ、DH 群は null だけ、concatenation は断る)\n";
     char buf[600];
     strncpy(buf, args ? args : "", sizeof(buf) - 1u);
     buf[sizeof(buf) - 1u] = 0;
@@ -443,8 +453,10 @@ void nvmet_auth_shell(const char *args) {
         memset(&ctrl, 0, sizeof(ctrl));
         int r = nvme_auth_parse_secret(tok[1], &host);
         uint8_t pref = CRYPTO_SHA256, dh = 0;
+        int cnsa = 0;
         for (unsigned i = 2; i < nt && r == 0; i++) {
-            if (!strcmp(tok[i], "sha256")) pref = CRYPTO_SHA256;
+            if (!strcmp(tok[i], "cnsa")) cnsa = 1;
+            else if (!strcmp(tok[i], "sha256")) pref = CRYPTO_SHA256;
             else if (!strcmp(tok[i], "sha384")) pref = CRYPTO_SHA384;
             else if (!strcmp(tok[i], "sha512")) pref = CRYPTO_SHA512;
             else if (!strncmp(tok[i], "ctrl=", 5)) r = nvme_auth_parse_secret(tok[i] + 5, &ctrl);
@@ -466,12 +478,22 @@ void nvmet_auth_shell(const char *args) {
             crypto_wipe(&ctrl, sizeof(ctrl));
             return;
         }
+        if (cnsa && (pref == CRYPTO_SHA256 || dh != 0)) {
+            if (dh != 0) {
+                uart_printf("nvmetauth: cnsa では DH 群は null だけ(ffdhe は CNSA 2.0 に入らない)\n");
+                crypto_wipe(&host, sizeof(host));
+                crypto_wipe(&ctrl, sizeof(ctrl));
+                return;
+            }
+            pref = CRYPTO_SHA384;   /* 優先ハッシュの既定を SHA-384 にする */
+        }
         strncpy(s_cfg.hostnqn, tok[0], NVMET_AUTH_NQN_MAX);
         s_cfg.hostnqn[NVMET_AUTH_NQN_MAX] = 0;
         s_cfg.host = host;
         s_cfg.ctrl = ctrl;
         s_cfg.hash_pref = pref;
         s_cfg.dhgid = dh;
+        s_cfg.cnsa = cnsa;
         s_cfg.enabled = 1;
         crypto_wipe(&host, sizeof(host));
         crypto_wipe(&ctrl, sizeof(ctrl));
@@ -484,9 +506,10 @@ void nvmet_auth_shell(const char *args) {
     } else {
         /* 鍵そのものは表示しない。 */
         uart_printf("nvmetauth: ホスト %s に DH-HMAC-CHAP を求める(ホストの鍵 %u バイト・変換 %u、"
-                    "コントローラの鍵 %s、優先ハッシュ SHA-%u、DH 群 %s)。次の Connect から\n",
+                    "コントローラの鍵 %s、優先ハッシュ SHA-%u、DH 群 %s%s)。次の Connect から\n",
                     s_cfg.hostnqn, s_cfg.host.len, s_cfg.host.hash,
                     s_cfg.ctrl.len ? "あり(双方向に応じる)" : "なし(片方向のみ)",
-                    hash_bits(s_cfg.hash_pref), nvme_auth_dh_name(s_cfg.dhgid));
+                    hash_bits(s_cfg.hash_pref), nvme_auth_dh_name(s_cfg.dhgid),
+                    s_cfg.cnsa ? "、CNSA 2.0 専用" : "");
     }
 }

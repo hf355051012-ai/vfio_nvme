@@ -125,6 +125,16 @@ void nvme_auth_ctrl_response(const nvme_auth_key_t *ctrlkey, uint8_t hashid, con
 /* ホスト側                                                            */
 /* ------------------------------------------------------------------ */
 
+/* CNSA 2.0 専用(`nvmeauth ... cnsa`、PLAN_cnsa2.md 段階 2): SHA-384 / 512 と DH 群 NULL だけを出し、
+ * 相手がそれ以外を選んだら断る(ffdhe は CNSA 2.0 の鍵共有に入らない)。 */
+static int s_host_cnsa;
+/* Linux の nvmet(6.18 / 7.0 の nvmet_auth_negotiate())は、ホストが出した DH 群のうち
+ * 「設定と違うもの」を見つけたときだけ成功する(比較が逆)。設定と同じ null だけを出すと
+ * kpp の無い null で fallback も作れず DHGROUP_UNUSABLE(理由 5)で断る。ctrl->dh_gid は
+ * どのみち設定のまま使われるので、`cnsa lnxdh` では null の後ろに ffdhe2048 を詰め物として
+ * 並べる(選ばれたら Reply の時点で断るので、ffdhe で鍵を共有することは無い)。 */
+static int s_host_lnxdh;
+
 uint32_t nvme_auth_host_negotiate(nvme_auth_host_t *h, uint8_t *out) {
     /* struct nvmf_auth_dhchap_negotiate_data + protocol descriptor 1 個 = 72 バイト
      * (Linux の nvme_auth_set_dhchap_negotiate_data())。 */
@@ -138,6 +148,18 @@ uint32_t nvme_auth_host_negotiate(nvme_auth_host_t *h, uint8_t *out) {
     out[6] = 0;                    /* SC_C: secure channel concatenation なし */
     out[7] = 1;                    /* napd */
     out[8] = NVME_AUTH_ID_DHCHAP;
+    if (s_host_cnsa) {
+        out[10] = 2;               /* halen: SHA-384 / SHA-512 */
+        out[11] = 1;               /* dhlen: NULL だけ */
+        out[12] = CRYPTO_SHA384;
+        out[13] = CRYPTO_SHA512;
+        out[12 + 30] = 0;
+        if (s_host_lnxdh) {
+            out[11] = 2;
+            out[12 + 30 + 1] = 1;  /* ffdhe2048(詰め物。選ばれたら断る)*/
+        }
+        return 72u;
+    }
     out[10] = 3;                   /* halen */
     out[11] = 6;                   /* dhlen */
     out[12] = CRYPTO_SHA256;
@@ -164,6 +186,10 @@ uint32_t nvme_auth_host_reply(nvme_auth_host_t *h, const uint8_t *in, uint32_t i
     const uint32_t s1 = rd32(in + 12);
     if (hashid < 1 || hashid > 3 || hl != crypto_hash_len((crypto_hash_id_t)hashid)) {
         *why = "ハッシュが分からない";
+        return 0;
+    }
+    if (s_host_cnsa && (hashid == CRYPTO_SHA256 || dhgid != 0)) {
+        *why = "CNSA 2.0 専用: コントローラが SHA-256 か ffdhe を選んだ(出していない)";
         return 0;
     }
     const size_t plen = dhgid ? crypto_ffdhe_len(dhgid) : 0u;
@@ -277,15 +303,20 @@ void nvme_auth_host_shell(const char *args) {
     char buf[600];
     strncpy(buf, args ? args : "", sizeof(buf) - 1u);
     buf[sizeof(buf) - 1u] = 0;
-    char *tok[3];
+    char *tok[4];
     unsigned nt = 0;
     char *save = 0;
-    for (char *p = strtok_r(buf, " \t\r\n", &save); p && nt < 3u; p = strtok_r(0, " \t\r\n", &save)) {
-        tok[nt++] = p;
+    int cnsa = 0, lnxdh = 0;
+    for (char *p = strtok_r(buf, " \t\r\n", &save); p && nt < 4u; p = strtok_r(0, " \t\r\n", &save)) {
+        if (!strcmp(p, "cnsa")) cnsa = 1;
+        else if (!strcmp(p, "lnxdh")) lnxdh = 1;
+        else tok[nt++] = p;
     }
     if (nt == 1 && !strcmp(tok[0], "off")) {
         crypto_wipe(&s_host_key, sizeof(s_host_key));
         crypto_wipe(&s_ctrl_key, sizeof(s_ctrl_key));
+        s_host_cnsa = 0;
+        s_host_lnxdh = 0;
     } else if (nt >= 1) {
         nvme_auth_key_t hk, ck;
         memset(&ck, 0, sizeof(ck));
@@ -295,10 +326,13 @@ void nvme_auth_host_shell(const char *args) {
         }
         if (r != 0) {
             uart_printf("nvmeauth: 鍵の形式が正しくない(%s)\n"
-                        "使い方: nvmeauth <ホストの鍵 DHHC-1:..> [ctrl=<コントローラの鍵>] / nvmeauth off\n",
+                        "使い方: nvmeauth <ホストの鍵 DHHC-1:..> [ctrl=<コントローラの鍵>] [cnsa [lnxdh]] / nvmeauth off\n"
+                        "  lnxdh = Linux の nvmet 向けに null の後ろへ ffdhe2048 を詰め物として並べる(選ばれたら断る)\n",
                         nvme_auth_parse_error(r));
             return;
         }
+        s_host_cnsa = cnsa;
+        s_host_lnxdh = cnsa && lnxdh;
         s_host_key = hk;
         s_ctrl_key = ck;
         crypto_wipe(&hk, sizeof(hk));
@@ -307,8 +341,10 @@ void nvme_auth_host_shell(const char *args) {
     if (s_host_key.len == 0) {
         uart_printf("nvmeauth: イニシエータの鍵なし(相手が認証を求めたら接続に失敗する)\n");
     } else {
-        uart_printf("nvmeauth: 相手が認証を求めたら DH-HMAC-CHAP で答える(ホストの鍵 %u バイト・変換 %u、%s)\n",
+        uart_printf("nvmeauth: 相手が認証を求めたら DH-HMAC-CHAP で答える(ホストの鍵 %u バイト・変換 %u、%s%s)\n",
                     s_host_key.len, s_host_key.hash,
-                    s_ctrl_key.len ? "コントローラの鍵あり = 双方向を求める" : "片方向");
+                    s_ctrl_key.len ? "コントローラの鍵あり = 双方向を求める" : "片方向",
+                    s_host_cnsa ? (s_host_lnxdh ? "、CNSA 2.0 専用 = SHA-384 / 512 と DH 群 null だけ(ffdhe2048 を詰め物に並べる)"
+                                                : "、CNSA 2.0 専用 = SHA-384 / 512 と DH 群 null だけ") : "");
     }
 }

@@ -3,9 +3,15 @@
 
 /* IKEv2(RFC 7296)。ESP(ipsec.c)の鍵を作る。iSCSI の IPsec(RFC 7143 8 章)用。
  *
- *   - 交わす組は 1 つに絞る: IKE SA は AES-GCM-16 / 128(RFC 5282)+ PRF HMAC-SHA2-256 +
- *     CURVE_25519(DH 群 31)、子 SA は ESP の AES-GCM-16 / 128、ESN 無し、トランスポートモード。
- *     strongSwan の proposals = aes128gcm16-prfsha256-x25519 / esp_proposals = aes128gcm16。
+ *   - 交わす組は相手ごとに 1 つに絞る:
+ *       既定: IKE SA は AES-GCM-16 / 128(RFC 5282)+ PRF HMAC-SHA2-256 + CURVE_25519(DH 群 31)、
+ *             子 SA は ESP の AES-GCM-16 / 128。strongSwan の proposals = aes128gcm16-prfsha256-x25519 /
+ *             esp_proposals = aes128gcm16。
+ *       CNSA 2.0(`ipsec psk ... cnsa`、PLAN_cnsa2.md 段階 3): IKE SA は AES-GCM-16 / 256 + PRF HMAC-SHA2-384 +
+ *             ML-KEM-1024(変換 ID 37、draft-ietf-ipsecme-ikev2-mlkem。IKE_SA_INIT の KE に直接載せる)、
+ *             子 SA は ESP の AES-GCM-16 / 256。strongSwan の proposals = aes256gcm16-prfsha384-mlkem1024 /
+ *             esp_proposals = aes256gcm16。
+ *     どちらも ESN 無し、トランスポートモード。
  *   - 認証は事前共有鍵(AUTH 方式 2)。身元は互いの IPv4 アドレス(ID_IPV4_ADDR)。
  *   - 交換は IKE_SA_INIT と IKE_AUTH(子 SA を 1 つ作る)、INFORMATIONAL(DELETE と生存確認)。
  *     始める側(`ipsec up`)と受ける側(相手から来たら答える)の両方。
@@ -17,8 +23,9 @@
 #define IKE_PORT 500u
 
 int  ike_init(void);
-/* 相手と事前共有鍵を登録する(IPsec の方針も入る)。nif は相手へ出るインターフェース。 */
-int  ike_peer_add(uint32_t peer_ip, const char *psk, netif_t *nif, const uint8_t peer_mac[6]);
+/* 相手と事前共有鍵を登録する(IPsec の方針も入る)。nif は相手へ出るインターフェース。
+ * cnsa が 0 でなければ CNSA 2.0 の組だけを使う / 受ける。 */
+int  ike_peer_add(uint32_t peer_ip, const char *psk, netif_t *nif, const uint8_t peer_mac[6], int cnsa);
 void ike_peer_del(uint32_t peer_ip);
 /* こちらから IKE SA と子 SA を作る(同期。終わるまで待つ)。0 = 成功。 */
 int  ike_up(uint32_t peer_ip);

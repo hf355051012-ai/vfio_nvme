@@ -86,9 +86,10 @@ int ipsec_policy_match(uint32_t ip)
     return g_ipsec_npol && peer_find(ip) != NULL;
 }
 
-int ipsec_sa_install(uint32_t ip, uint32_t spi_in, const uint8_t key_in[20],
-                     uint32_t spi_out, const uint8_t key_out[20])
+int ipsec_sa_install(uint32_t ip, uint32_t spi_in, const uint8_t *key_in,
+                     uint32_t spi_out, const uint8_t *key_out, size_t aes_klen)
 {
+    if (aes_klen != 16u && aes_klen != 32u) return -1;
     ipsec_peer_t *p = peer_find(ip);
     if (!p) {
         if (ipsec_policy_add(ip) < 0) return -1;
@@ -96,10 +97,10 @@ int ipsec_sa_install(uint32_t ip, uint32_t spi_in, const uint8_t key_in[20],
     }
     p->up = 0;
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
-    crypto_aesgcm_init(&p->k_in, key_in, 16u);
-    crypto_aesgcm_init(&p->k_out, key_out, 16u);
-    memcpy(p->salt_in, key_in + 16, 4);
-    memcpy(p->salt_out, key_out + 16, 4);
+    crypto_aesgcm_init(&p->k_in, key_in, aes_klen);
+    crypto_aesgcm_init(&p->k_out, key_out, aes_klen);
+    memcpy(p->salt_in, key_in + aes_klen, 4);
+    memcpy(p->salt_out, key_out + aes_klen, 4);
     p->spi_in = spi_in;
     p->spi_out = spi_out;
     p->seq_out = 0;

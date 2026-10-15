@@ -41,11 +41,14 @@
 #define TR_ESN  5u
 #define ENCR_AES_GCM_16   20u
 #define PRF_HMAC_SHA2_256 5u
+#define PRF_HMAC_SHA2_384 6u
 #define DH_CURVE25519     31u
+#define KE_MLKEM1024      37u     /* draft-ietf-ipsecme-ikev2-mlkem(IANA: 35/36/37 = ML-KEM-512/768/1024)*/
 #define PROTO_IKE 1u
 #define PROTO_ESP 3u
 /* 通知 */
 #define N_NO_PROPOSAL_CHOSEN   14u
+#define N_INVALID_SYNTAX        7u
 #define N_INVALID_KE_PAYLOAD   17u
 #define N_AUTH_FAILED          24u
 #define N_TS_UNACCEPTABLE      38u
@@ -54,10 +57,23 @@
 
 #define HDR_LEN   28u
 #define NONCE_LEN 32u
-#define PRF_LEN   32u
-#define KEY_LEN   20u      /* AES-128 の鍵 16 + salt 4 */
-#define MSG_MAX   2048u
+#define PRF_MAX   48u      /* SHA-384 */
+#define KEY_MAX   36u      /* AES-256 の鍵 32 + salt 4 */
+#define KE_MAX    CRYPTO_MLKEM1024_CT_LEN   /* ML-KEM-1024 のカプセル化鍵 / 暗号文(どちらも 1568)*/
+#define MSG_MAX   4096u    /* ML-KEM の KE(1568)を載せた IKE_SA_INIT が 1.7KB 前後になる */
 #define IKE_PEERS 4u
+
+/* 交わす組(相手ごと。`ipsec psk ... cnsa` で CNSA 2.0 の組)。
+ *   既定:     IKE aes128gcm16-prfsha256-x25519、ESP aes128gcm16
+ *   CNSA 2.0: IKE aes256gcm16-prfsha384-mlkem1024、ESP aes256gcm16(PLAN_cnsa2.md 段階 3) */
+typedef struct {
+    uint16_t encr_bits;   /* AES-GCM の鍵長(IKE / ESP 共通)*/
+    uint16_t prf_id;      /* PRF の変換 ID */
+    uint16_t ke_id;       /* 鍵交換の変換 ID(DH 群 / ML-KEM)*/
+    crypto_hash_id_t hid; /* PRF のハッシュ */
+} ike_suite_t;
+static const ike_suite_t SUITE_DEFAULT = { 128u, PRF_HMAC_SHA2_256, DH_CURVE25519, CRYPTO_SHA256 };
+static const ike_suite_t SUITE_CNSA    = { 256u, PRF_HMAC_SHA2_384, KE_MLKEM1024, CRYPTO_SHA384 };
 
 enum { ST_NONE = 0, ST_I_INIT, ST_I_AUTH, ST_ESTABLISHED, ST_R_INIT, ST_DELETING };
 
@@ -69,13 +85,19 @@ typedef struct {
     uint8_t  mac_known;
     char     psk[128];
     uint32_t psklen;
+    ike_suite_t suite;
+    uint32_t prf_len;                 /* PRF の出力長(32 / 48)*/
+    uint32_t key_len;                 /* AES の鍵長 + salt 4(20 / 36)*/
     /* IKE SA */
     uint8_t  state, initiator;
     uint8_t  spi_i[8], spi_r[8];
     uint8_t  ni[256], nr[256];
     uint32_t ni_len, nr_len;
-    uint8_t  x_priv[32], x_pub[32];
-    uint8_t  sk_d[PRF_LEN], sk_pi[PRF_LEN], sk_pr[PRF_LEN];
+    uint8_t  x_priv[32];
+    uint8_t  ke_mine[KE_MAX];         /* こちらの KE の中身(X25519 の公開値 / ML-KEM のカプセル化鍵か暗号文)*/
+    uint32_t ke_mine_len;
+    uint8_t  ml_dk[CRYPTO_MLKEM1024_DK_LEN];   /* 始めた側の ML-KEM の復号鍵(応答を受けるまで)*/
+    uint8_t  sk_d[PRF_MAX], sk_pi[PRF_MAX], sk_pr[PRF_MAX];
     uint8_t  salt_i[4], salt_r[4];
     crypto_aesgcm_t k_i, k_r;      /* SK_ei / SK_er */
     uint8_t  msg1[MSG_MAX], msg2[MSG_MAX];   /* IKE_SA_INIT の要求と応答(AUTH の計算に使う)*/
@@ -105,84 +127,142 @@ static ike_peer_t *find_peer(uint32_t ip)
 
 /* ---------------------------------------------------------------- 鍵 */
 
-static void prf(const void *k, size_t kl, const void *m, size_t ml, uint8_t out[PRF_LEN])
+static void set_suite(ike_peer_t *p, const ike_suite_t *s)
 {
-    crypto_hmac(CRYPTO_SHA256, k, kl, m, ml, out);
+    p->suite = *s;
+    p->prf_len = (uint32_t)crypto_hash_len(s->hid);
+    p->key_len = s->encr_bits / 8u + 4u;
+}
+
+static void prf(const ike_peer_t *p, const void *k, size_t kl, const void *m, size_t ml, uint8_t *out)
+{
+    crypto_hmac(p->suite.hid, k, kl, m, ml, out);
 }
 
 /* prf+(RFC 7296 2.13)。T1 = prf(K, S | 0x01)、Tn = prf(K, Tn-1 | S | n)。 */
-static void prf_plus(const void *k, size_t kl, const uint8_t *s, size_t sl, uint8_t *out, size_t olen)
+static void prf_plus(const ike_peer_t *p, const void *k, size_t kl, const uint8_t *s, size_t sl,
+                     uint8_t *out, size_t olen)
 {
-    uint8_t t[PRF_LEN];
+    uint8_t t[PRF_MAX];
     size_t tl = 0, done = 0;
     for (uint8_t n = 1; done < olen; n++) {
         crypto_hmac_ctx_t c;
-        crypto_hmac_init(&c, CRYPTO_SHA256, k, kl);
+        crypto_hmac_init(&c, p->suite.hid, k, kl);
         crypto_hmac_update(&c, t, tl);
         crypto_hmac_update(&c, s, sl);
         crypto_hmac_update(&c, &n, 1);
         crypto_hmac_final(&c, t);
-        tl = PRF_LEN;
-        const size_t take = (olen - done < PRF_LEN) ? olen - done : PRF_LEN;
+        tl = p->prf_len;
+        const size_t take = (olen - done < tl) ? olen - done : tl;
         memcpy(out + done, t, take);
         done += take;
     }
     crypto_wipe(t, sizeof(t));
 }
 
+/* ---- 鍵交換(X25519 か ML-KEM-1024)----
+ * ML-KEM は KEM なので向きで中身が違う(draft-ietf-ipsecme-ikev2-mlkem): 始めた側の KE がカプセル化鍵、
+ * 受けた側の KE がそれでカプセル化した暗号文。共有秘密はどちらも 32 バイトで、g^ir の代わりに使う。 */
+
+/* 始めた側: こちらの KE を作る。 */
+static int ke_initiator_make(ike_peer_t *p)
+{
+    if (p->suite.ke_id == KE_MLKEM1024) {
+        p->ke_mine_len = CRYPTO_MLKEM1024_EK_LEN;
+        return crypto_mlkem1024_keygen(p->ke_mine, p->ml_dk);
+    }
+    p->ke_mine_len = 32u;
+    return crypto_x25519_keygen(p->x_priv, p->ke_mine);
+}
+
+/* 受けた側: 相手の KE から共有秘密とこちらの KE を作る。相手の KE が不正なら -1。 */
+static int ke_responder(ike_peer_t *p, const uint8_t *peer, uint32_t len, uint8_t shared[32])
+{
+    if (p->suite.ke_id == KE_MLKEM1024) {
+        if (len != CRYPTO_MLKEM1024_EK_LEN) return -1;
+        p->ke_mine_len = CRYPTO_MLKEM1024_CT_LEN;
+        return crypto_mlkem1024_encaps(peer, p->ke_mine, shared);   /* 係数が q 以上の ek は -1 */
+    }
+    if (len != 32u) return -1;
+    p->ke_mine_len = 32u;
+    crypto_x25519_keygen(p->x_priv, p->ke_mine);
+    const int r = crypto_x25519(shared, p->x_priv, peer);
+    crypto_wipe(p->x_priv, sizeof(p->x_priv));
+    return r;
+}
+
+/* 始めた側: 相手の KE から共有秘密を作る。ML-KEM の暗号文が壊れていても失敗は返らず(暗黙の拒否)、
+ * 違う鍵になって相手の AUTH / SK が開けない形で出る。 */
+static int ke_initiator_finish(ike_peer_t *p, const uint8_t *peer, uint32_t len, uint8_t shared[32])
+{
+    int r;
+    if (p->suite.ke_id == KE_MLKEM1024) {
+        r = (len == CRYPTO_MLKEM1024_CT_LEN) ? crypto_mlkem1024_decaps(p->ml_dk, peer, shared) : -1;
+        crypto_wipe(p->ml_dk, sizeof(p->ml_dk));
+    } else {
+        r = (len == 32u) ? crypto_x25519(shared, p->x_priv, peer) : -1;
+        crypto_wipe(p->x_priv, sizeof(p->x_priv));
+    }
+    return r;
+}
+
+/* 相手の KE の中身の長さ(向きで決まる)。 */
+static uint32_t ke_peer_len(const ike_peer_t *p, int from_initiator)
+{
+    if (p->suite.ke_id != KE_MLKEM1024) return 32u;
+    return from_initiator ? CRYPTO_MLKEM1024_EK_LEN : CRYPTO_MLKEM1024_CT_LEN;
+}
+
 /* IKE SA の鍵(2.14): SKEYSEED = prf(Ni | Nr, g^ir)、
  * SK_d | SK_ai | SK_ar | SK_ei | SK_er | SK_pi | SK_pr = prf+(SKEYSEED, Ni | Nr | SPIi | SPIr)。
- * AEAD なので SK_ai / SK_ar は 0 バイト。 */
-static int derive_ike_keys(ike_peer_t *p, const uint8_t peer_pub[32])
+ * AEAD なので SK_ai / SK_ar は 0 バイト。SK_d / SK_pi / SK_pr は PRF の長さ、SK_e は鍵 + salt 4。 */
+static void derive_ike_keys(ike_peer_t *p, const uint8_t shared[32])
 {
-    uint8_t shared[32], seed[PRF_LEN];
-    if (crypto_x25519(shared, p->x_priv, peer_pub) != 0) return -1;
+    const uint32_t pl = p->prf_len, kl = p->key_len, ak = kl - 4u;
+    uint8_t seed[PRF_MAX];
     uint8_t nn[512];
     memcpy(nn, p->ni, p->ni_len);
     memcpy(nn + p->ni_len, p->nr, p->nr_len);
-    prf(nn, p->ni_len + p->nr_len, shared, 32, seed);
+    prf(p, nn, p->ni_len + p->nr_len, shared, 32, seed);
     uint8_t s[512 + 16];
     memcpy(s, nn, p->ni_len + p->nr_len);
     memcpy(s + p->ni_len + p->nr_len, p->spi_i, 8);
     memcpy(s + p->ni_len + p->nr_len + 8, p->spi_r, 8);
-    uint8_t km[PRF_LEN + 2 * KEY_LEN + 2 * PRF_LEN];
-    prf_plus(seed, PRF_LEN, s, p->ni_len + p->nr_len + 16, km, sizeof(km));
-    memcpy(p->sk_d, km, PRF_LEN);
-    crypto_aesgcm_init(&p->k_i, km + PRF_LEN, 16u);
-    memcpy(p->salt_i, km + PRF_LEN + 16, 4);
-    crypto_aesgcm_init(&p->k_r, km + PRF_LEN + KEY_LEN, 16u);
-    memcpy(p->salt_r, km + PRF_LEN + KEY_LEN + 16, 4);
-    memcpy(p->sk_pi, km + PRF_LEN + 2 * KEY_LEN, PRF_LEN);
-    memcpy(p->sk_pr, km + PRF_LEN + 2 * KEY_LEN + PRF_LEN, PRF_LEN);
-    crypto_wipe(shared, sizeof(shared));
+    uint8_t km[PRF_MAX + 2 * KEY_MAX + 2 * PRF_MAX];
+    prf_plus(p, seed, pl, s, p->ni_len + p->nr_len + 16, km, pl + 2u * kl + 2u * pl);
+    memcpy(p->sk_d, km, pl);
+    crypto_aesgcm_init(&p->k_i, km + pl, ak);
+    memcpy(p->salt_i, km + pl + ak, 4);
+    crypto_aesgcm_init(&p->k_r, km + pl + kl, ak);
+    memcpy(p->salt_r, km + pl + kl + ak, 4);
+    memcpy(p->sk_pi, km + pl + 2u * kl, pl);
+    memcpy(p->sk_pr, km + pl + 2u * kl + pl, pl);
     crypto_wipe(seed, sizeof(seed));
     crypto_wipe(km, sizeof(km));
-    crypto_wipe(p->x_priv, sizeof(p->x_priv));
-    return 0;
 }
 
 /* 子 SA の鍵(2.17): KEYMAT = prf+(SK_d, Ni | Nr)。始めた側から受けた側への向きの鍵が先。 */
-static void derive_child_keys(ike_peer_t *p, uint8_t k_i2r[KEY_LEN], uint8_t k_r2i[KEY_LEN])
+static void derive_child_keys(ike_peer_t *p, uint8_t *k_i2r, uint8_t *k_r2i)
 {
-    uint8_t nn[512], km[2 * KEY_LEN];
+    uint8_t nn[512], km[2 * KEY_MAX];
     memcpy(nn, p->ni, p->ni_len);
     memcpy(nn + p->ni_len, p->nr, p->nr_len);
-    prf_plus(p->sk_d, PRF_LEN, nn, p->ni_len + p->nr_len, km, sizeof(km));
-    memcpy(k_i2r, km, KEY_LEN);
-    memcpy(k_r2i, km + KEY_LEN, KEY_LEN);
+    prf_plus(p, p->sk_d, p->prf_len, nn, p->ni_len + p->nr_len, km, 2u * p->key_len);
+    memcpy(k_i2r, km, p->key_len);
+    memcpy(k_r2i, km + p->key_len, p->key_len);
     crypto_wipe(km, sizeof(km));
 }
 
 /* AUTH(2.15、事前共有鍵): prf(prf(鍵, "Key Pad for IKEv2"), 署名する並び)。
  * 署名する並び = 自分の IKE_SA_INIT のメッセージ | 相手の Nonce | prf(SK_p, ID の本体)。 */
 static void compute_auth(const ike_peer_t *p, int of_initiator, const uint8_t *id_body, uint32_t id_len,
-                         uint8_t out[PRF_LEN])
+                         uint8_t *out)
 {
-    uint8_t kpad[PRF_LEN], mid[PRF_LEN];
-    prf(p->psk, p->psklen, "Key Pad for IKEv2", 17, kpad);
-    prf(of_initiator ? p->sk_pi : p->sk_pr, PRF_LEN, id_body, id_len, mid);
+    uint8_t kpad[PRF_MAX], mid[PRF_MAX];
+    prf(p, p->psk, p->psklen, "Key Pad for IKEv2", 17, kpad);
+    prf(p, of_initiator ? p->sk_pi : p->sk_pr, p->prf_len, id_body, id_len, mid);
     crypto_hmac_ctx_t c;
-    crypto_hmac_init(&c, CRYPTO_SHA256, kpad, PRF_LEN);
+    crypto_hmac_init(&c, p->suite.hid, kpad, p->prf_len);
     if (of_initiator) {
         crypto_hmac_update(&c, p->msg1, p->msg1_len);
         crypto_hmac_update(&c, p->nr, p->nr_len);
@@ -190,7 +270,7 @@ static void compute_auth(const ike_peer_t *p, int of_initiator, const uint8_t *i
         crypto_hmac_update(&c, p->msg2, p->msg2_len);
         crypto_hmac_update(&c, p->ni, p->ni_len);
     }
-    crypto_hmac_update(&c, mid, PRF_LEN);
+    crypto_hmac_update(&c, mid, p->prf_len);
     crypto_hmac_final(&c, out);
     crypto_wipe(kpad, sizeof(kpad));
 }
@@ -265,8 +345,9 @@ static void put_transform(wbuf_t *w, int last, uint8_t type, uint16_t id, uint16
     if (keylen) { put16(w, 0x800E); put16(w, keylen); }
 }
 
-/* SA ペイロード(提案 1 つ)。IKE なら ENCR / PRF / DH、ESP なら ENCR / ESN と SPI 4 バイト。 */
-static void put_sa(wbuf_t *w, uint8_t propnum, uint8_t proto, uint32_t esp_spi)
+/* SA ペイロード(提案 1 つ)。IKE なら ENCR / PRF / KE(DH 群 / ML-KEM)、ESP なら ENCR / ESN と SPI 4 バイト。
+ * 組は相手ごとの p->suite。 */
+static void put_sa(wbuf_t *w, const ike_peer_t *p, uint8_t propnum, uint8_t proto, uint32_t esp_spi)
 {
     uint8_t *h = pl_begin(w, PL_SA);
     uint8_t *ph = w->b + w->len;
@@ -278,14 +359,14 @@ static void put_sa(wbuf_t *w, uint8_t propnum, uint8_t proto, uint32_t esp_spi)
     if (proto == PROTO_IKE) {
         put8(w, 0);       /* SPI の長さ */
         put8(w, 3);
-        put_transform(w, 0, TR_ENCR, ENCR_AES_GCM_16, 128);
-        put_transform(w, 0, TR_PRF, PRF_HMAC_SHA2_256, 0);
-        put_transform(w, 1, TR_DH, DH_CURVE25519, 0);
+        put_transform(w, 0, TR_ENCR, ENCR_AES_GCM_16, p->suite.encr_bits);
+        put_transform(w, 0, TR_PRF, p->suite.prf_id, 0);
+        put_transform(w, 1, TR_DH, p->suite.ke_id, 0);
     } else {
         put8(w, 4);
         put8(w, 2);
         put32(w, esp_spi);
-        put_transform(w, 0, TR_ENCR, ENCR_AES_GCM_16, 128);
+        put_transform(w, 0, TR_ENCR, ENCR_AES_GCM_16, p->suite.encr_bits);
         put_transform(w, 1, TR_ESN, 0, 0);
     }
     wr16be(ph + 2, (uint16_t)(w->b + w->len - ph));
@@ -448,9 +529,9 @@ static int parse_payloads(uint8_t first, const uint8_t *b, uint32_t len, parsed_
     return 0;
 }
 
-/* SA ペイロードから、こちらの組(proto により IKE / ESP)を含む提案を探す。
+/* SA ペイロードから、こちらの組(p->suite。proto により IKE / ESP)を含む提案を探す。
  * 見つかれば提案番号(ESP なら相手の SPI も)を返す。0 = 無い。 */
-static uint8_t pick_proposal(const uint8_t *sa, uint32_t len, uint8_t proto, uint32_t *spi)
+static uint8_t pick_proposal(const ike_peer_t *p, const uint8_t *sa, uint32_t len, uint8_t proto, uint32_t *spi)
 {
     uint32_t off = 0;
     while (off + 8u <= len) {
@@ -476,9 +557,9 @@ static uint8_t pick_proposal(const uint8_t *sa, uint32_t len, uint8_t proto, uin
                     a += 4u + rd16be(t + toff + a + 2);
                 }
             }
-            if (type == TR_ENCR && id == ENCR_AES_GCM_16 && keylen == 128) encr = 1;
-            else if (type == TR_PRF && id == PRF_HMAC_SHA2_256) prfok = 1;
-            else if (type == TR_DH) { dh_any = 1; if (id == DH_CURVE25519) dh = 1; else if (id == 0) dh = dh ? dh : 2; }
+            if (type == TR_ENCR && id == ENCR_AES_GCM_16 && keylen == p->suite.encr_bits) encr = 1;
+            else if (type == TR_PRF && id == p->suite.prf_id) prfok = 1;
+            else if (type == TR_DH) { dh_any = 1; if (id == p->suite.ke_id) dh = 1; else if (id == 0) dh = dh ? dh : 2; }
             else if (type == TR_ESN) { esn_any = 1; if (id == 0) esn_no = 1; }
             else if (type == TR_INTEG && id != 0) integ = 1;
             toff += tl;
@@ -520,17 +601,21 @@ static int open_sk(const ike_peer_t *p, int from_initiator, uint8_t *msg, const 
 
 static void install_child(ike_peer_t *p)
 {
-    uint8_t k_i2r[KEY_LEN], k_r2i[KEY_LEN];
+    uint8_t k_i2r[KEY_MAX], k_r2i[KEY_MAX];
+    const size_t ak = p->key_len - 4u;
     derive_child_keys(p, k_i2r, k_r2i);
-    if (p->initiator) ipsec_sa_install(p->peer, p->esp_spi_in, k_r2i, p->esp_spi_out, k_i2r);
-    else ipsec_sa_install(p->peer, p->esp_spi_in, k_i2r, p->esp_spi_out, k_r2i);
+    if (p->initiator) ipsec_sa_install(p->peer, p->esp_spi_in, k_r2i, p->esp_spi_out, k_i2r, ak);
+    else ipsec_sa_install(p->peer, p->esp_spi_in, k_i2r, p->esp_spi_out, k_r2i, ak);
     crypto_wipe(k_i2r, sizeof(k_i2r));
     crypto_wipe(k_r2i, sizeof(k_r2i));
     p->state = ST_ESTABLISHED;
     p->n_up++;
-    uart_printf("[ike] %u.%u.%u.%u と SA を確立(%s、ESP SPI 受 0x%08x / 送 0x%08x)\n", p->peer >> 24,
+    uart_printf("[ike] %u.%u.%u.%u と SA を確立(%s、IKE aes%ugcm16-prfsha%u-%s、ESP aes%ugcm16、"
+                "SPI 受 0x%08x / 送 0x%08x)\n", p->peer >> 24,
                 (p->peer >> 16) & 255u, (p->peer >> 8) & 255u, p->peer & 255u,
-                p->initiator ? "こちらから" : "相手から", p->esp_spi_in, p->esp_spi_out);
+                p->initiator ? "こちらから" : "相手から", p->suite.encr_bits, p->prf_len * 8u,
+                p->suite.ke_id == KE_MLKEM1024 ? "mlkem1024" : "x25519", p->suite.encr_bits,
+                p->esp_spi_in, p->esp_spi_out);
 }
 
 static uint32_t self_ip(const ike_peer_t *p)
@@ -557,7 +642,7 @@ static void r_sa_init(ike_peer_t *p, uint8_t *m, uint32_t len, const parsed_t *q
 {
     static uint8_t out[MSG_MAX];
     uint32_t dummy;
-    const uint8_t num = q->sa ? pick_proposal(q->sa, q->sa_len, PROTO_IKE, &dummy) : 0;
+    const uint8_t num = q->sa ? pick_proposal(p, q->sa, q->sa_len, PROTO_IKE, &dummy) : 0;
     reset_sa(p);
     memcpy(p->spi_i, m, 8);
     crypto_random(p->spi_r, 8);
@@ -568,13 +653,14 @@ static void r_sa_init(ike_peer_t *p, uint8_t *m, uint32_t len, const parsed_t *q
         put_notify(&w, 0, N_NO_PROPOSAL_CHOSEN, NULL, 0);
         hdr_finish(&w);
         send_msg(p, out, w.len);
-        uart_printf("[ike] IKE_SA_INIT: 受けられる提案が無い(AES-GCM-16-128 / PRF-SHA256 / X25519 が要る)\n");
+        uart_printf("[ike] IKE_SA_INIT: 受けられる提案が無い(AES-GCM-16-%u / PRF-SHA%u / %s が要る)\n",
+                    p->suite.encr_bits, p->prf_len * 8u, p->suite.ke_id == KE_MLKEM1024 ? "ML-KEM-1024" : "X25519");
         return;
     }
-    if (q->ke_len != 4u + 32u || rd16be(q->ke) != DH_CURVE25519) {
-        /* 相手の KE が別の群。X25519 で送り直すよう求める(2.7)。 */
+    if (q->ke_len < 4u || rd16be(q->ke) != p->suite.ke_id || q->ke_len != 4u + ke_peer_len(p, 1)) {
+        /* 相手の KE が別の群。こちらの群で送り直すよう求める(2.7)。 */
         uint8_t g[2];
-        wr16be(g, DH_CURVE25519);
+        wr16be(g, p->suite.ke_id);
         memset(p->spi_r, 0, 8);
         hdr_init(&w, out, sizeof(out), p, EX_IKE_SA_INIT, F_RESPONSE, 0);
         put_notify(&w, 0, N_INVALID_KE_PAYLOAD, g, 2);
@@ -582,17 +668,28 @@ static void r_sa_init(ike_peer_t *p, uint8_t *m, uint32_t len, const parsed_t *q
         send_msg(p, out, w.len);
         return;
     }
+    uint8_t shared[32];
+    if (ke_responder(p, q->ke + 4, q->ke_len - 4u, shared) != 0) {
+        /* 相手の X25519 の公開値が小位数の点 / ML-KEM のカプセル化鍵の係数が q 以上 */
+        memset(p->spi_r, 0, 8);
+        hdr_init(&w, out, sizeof(out), p, EX_IKE_SA_INIT, F_RESPONSE, 0);
+        put_notify(&w, 0, N_INVALID_SYNTAX, NULL, 0);
+        hdr_finish(&w);
+        send_msg(p, out, w.len);
+        uart_printf("[ike] IKE_SA_INIT: 相手の KE の値が不正\n");
+        crypto_wipe(shared, sizeof(shared));
+        return;
+    }
     memcpy(p->ni, q->nonce, q->nonce_len);
     p->ni_len = q->nonce_len;
     crypto_random(p->nr, NONCE_LEN);
     p->nr_len = NONCE_LEN;
-    crypto_x25519_keygen(p->x_priv, p->x_pub);
     hdr_init(&w, out, sizeof(out), p, EX_IKE_SA_INIT, F_RESPONSE, 0);
-    put_sa(&w, num, PROTO_IKE, 0);
+    put_sa(&w, p, num, PROTO_IKE, 0);
     uint8_t *h = pl_begin(&w, PL_KE);
-    put16(&w, DH_CURVE25519);
+    put16(&w, p->suite.ke_id);
     put16(&w, 0);
-    put(&w, p->x_pub, 32);
+    put(&w, p->ke_mine, p->ke_mine_len);
     pl_end(&w, h);
     h = pl_begin(&w, PL_NONCE);
     put(&w, p->nr, NONCE_LEN);
@@ -602,7 +699,8 @@ static void r_sa_init(ike_peer_t *p, uint8_t *m, uint32_t len, const parsed_t *q
     p->msg1_len = len;
     memcpy(p->msg2, out, w.len);
     p->msg2_len = w.len;
-    if (derive_ike_keys(p, q->ke + 4) != 0) { reset_sa(p); return; }
+    derive_ike_keys(p, shared);
+    crypto_wipe(shared, sizeof(shared));
     p->initiator = 0;
     p->state = ST_R_INIT;
     p->peer_msgid = 1;
@@ -620,10 +718,10 @@ static void r_auth(ike_peer_t *p, const uint8_t *pt, uint32_t ptlen, uint8_t fir
     uint8_t dummy_np = 0;
     iw.b = inner; iw.cap = sizeof(inner); iw.len = 0; iw.np = &dummy_np;
     int ok = parse_payloads(first, pt, ptlen, &q) == 0 && q.idi && q.auth && q.sa && q.tsi && q.tsr;
-    uint8_t want[PRF_LEN];
+    uint8_t want[PRF_MAX];
     if (ok) {
         compute_auth(p, 1, q.idi, q.idi_len, want);
-        ok = q.auth_len == 4u + PRF_LEN && q.auth[0] == 2 && crypto_equal(q.auth + 4, want, PRF_LEN);
+        ok = q.auth_len == 4u + p->prf_len && q.auth[0] == 2 && crypto_equal(q.auth + 4, want, p->prf_len);
         if (!ok) uart_printf("[ike] IKE_AUTH: 相手の AUTH が合わない(事前共有鍵か身元が違う)\n");
     }
     if (!ok) {
@@ -635,10 +733,10 @@ static void r_auth(ike_peer_t *p, const uint8_t *pt, uint32_t ptlen, uint8_t fir
         return;
     }
     uint32_t peer_spi = 0;
-    const uint8_t num = pick_proposal(q.sa, q.sa_len, PROTO_ESP, &peer_spi);
+    const uint8_t num = pick_proposal(p, q.sa, q.sa_len, PROTO_ESP, &peer_spi);
     if (!num || !q.transport) {
-        uart_printf("[ike] IKE_AUTH: 子 SA を受けられない(ESP AES-GCM-16-128 の提案%s が要る)\n",
-                    q.transport ? "" : "とトランスポートモード");
+        uart_printf("[ike] IKE_AUTH: 子 SA を受けられない(ESP AES-GCM-16-%u の提案%s が要る)\n",
+                    p->suite.encr_bits, q.transport ? "" : "とトランスポートモード");
         put_notify(&iw, 0, N_NO_PROPOSAL_CHOSEN, NULL, 0);
         hdr_init(&w, out, sizeof(out), p, EX_IKE_AUTH, F_RESPONSE, msgid);
         seal_sk(&w, p, 0, PL_NOTIFY, inner, iw.len);
@@ -649,15 +747,15 @@ static void r_auth(ike_peer_t *p, const uint8_t *pt, uint32_t ptlen, uint8_t fir
     p->esp_spi_out = peer_spi;
     crypto_random(&p->esp_spi_in, 4);
     p->esp_spi_in |= 0x100u;
-    uint8_t idr[8], auth[PRF_LEN];
+    uint8_t idr[8], auth[PRF_MAX];
     put_id(&iw, PL_IDR, self_ip(p), idr);
     compute_auth(p, 0, idr, 8, auth);
     uint8_t *h = pl_begin(&iw, PL_AUTH);
     put8(&iw, 2); put8(&iw, 0); put8(&iw, 0); put8(&iw, 0);
-    put(&iw, auth, PRF_LEN);
+    put(&iw, auth, p->prf_len);
     pl_end(&iw, h);
     put_notify(&iw, 0, N_USE_TRANSPORT_MODE, NULL, 0);
-    put_sa(&iw, num, PROTO_ESP, p->esp_spi_in);
+    put_sa(&iw, p, num, PROTO_ESP, p->esp_spi_in);
     put_ts(&iw, PL_TSI, p->peer);
     put_ts(&iw, PL_TSR, self_ip(p));
     hdr_init(&w, out, sizeof(out), p, EX_IKE_AUTH, F_RESPONSE, msgid);
@@ -700,14 +798,14 @@ static int i_send_sa_init(ike_peer_t *p)
     crypto_random(p->spi_i, 8);
     crypto_random(p->ni, NONCE_LEN);
     p->ni_len = NONCE_LEN;
-    crypto_x25519_keygen(p->x_priv, p->x_pub);
+    if (ke_initiator_make(p) != 0) return -1;
     wbuf_t w;
     hdr_init(&w, out, sizeof(out), p, EX_IKE_SA_INIT, F_INITIATOR, 0);
-    put_sa(&w, 1, PROTO_IKE, 0);
+    put_sa(&w, p, 1, PROTO_IKE, 0);
     uint8_t *h = pl_begin(&w, PL_KE);
-    put16(&w, DH_CURVE25519);
+    put16(&w, p->suite.ke_id);
     put16(&w, 0);
-    put(&w, p->x_pub, 32);
+    put(&w, p->ke_mine, p->ke_mine_len);
     pl_end(&w, h);
     h = pl_begin(&w, PL_NONCE);
     put(&w, p->ni, NONCE_LEN);
@@ -729,17 +827,17 @@ static void i_send_auth(ike_peer_t *p)
     wbuf_t w, iw;
     uint8_t dummy_np = 0;
     iw.b = inner; iw.cap = sizeof(inner); iw.len = 0; iw.np = &dummy_np;
-    uint8_t idi[8], auth[PRF_LEN];
+    uint8_t idi[8], auth[PRF_MAX];
     put_id(&iw, PL_IDI, self_ip(p), idi);
     compute_auth(p, 1, idi, 8, auth);
     uint8_t *h = pl_begin(&iw, PL_AUTH);
     put8(&iw, 2); put8(&iw, 0); put8(&iw, 0); put8(&iw, 0);
-    put(&iw, auth, PRF_LEN);
+    put(&iw, auth, p->prf_len);
     pl_end(&iw, h);
     put_notify(&iw, 0, N_USE_TRANSPORT_MODE, NULL, 0);
     crypto_random(&p->esp_spi_in, 4);
     p->esp_spi_in |= 0x100u;
-    put_sa(&iw, 1, PROTO_ESP, p->esp_spi_in);
+    put_sa(&iw, p, 1, PROTO_ESP, p->esp_spi_in);
     put_ts(&iw, PL_TSI, self_ip(p));
     put_ts(&iw, PL_TSR, p->peer);
     hdr_init(&w, out, sizeof(out), p, EX_IKE_AUTH, F_INITIATOR, 1);
@@ -757,9 +855,17 @@ static void i_on_sa_init_resp(ike_peer_t *p, uint8_t *m, uint32_t len, const par
         return;
     }
     uint32_t dummy;
-    if (!q->sa || !pick_proposal(q->sa, q->sa_len, PROTO_IKE, &dummy) || !q->ke || q->ke_len != 36u ||
-        rd16be(q->ke) != DH_CURVE25519 || !q->nonce || q->nonce_len < 16 || q->nonce_len > 256) {
+    if (!q->sa || !pick_proposal(p, q->sa, q->sa_len, PROTO_IKE, &dummy) || !q->ke ||
+        q->ke_len != 4u + ke_peer_len(p, 0) || rd16be(q->ke) != p->suite.ke_id ||
+        !q->nonce || q->nonce_len < 16 || q->nonce_len > 256) {
         uart_printf("[ike] IKE_SA_INIT の応答が受けられない形\n");
+        p->fail = 1;
+        return;
+    }
+    uint8_t shared[32];
+    if (ke_initiator_finish(p, q->ke + 4, q->ke_len - 4u, shared) != 0) {
+        uart_printf("[ike] IKE_SA_INIT: 相手の KE の値が不正\n");
+        crypto_wipe(shared, sizeof(shared));
         p->fail = 1;
         return;
     }
@@ -768,7 +874,8 @@ static void i_on_sa_init_resp(ike_peer_t *p, uint8_t *m, uint32_t len, const par
     p->nr_len = q->nonce_len;
     memcpy(p->msg2, m, len);
     p->msg2_len = len;
-    if (derive_ike_keys(p, q->ke + 4) != 0) { p->fail = 1; return; }
+    derive_ike_keys(p, shared);
+    crypto_wipe(shared, sizeof(shared));
     p->got_resp = 1;
     i_send_auth(p);
 }
@@ -783,16 +890,16 @@ static void i_on_auth_resp(ike_peer_t *p, const uint8_t *pt, uint32_t ptlen, uin
         p->fail = 1;
         return;
     }
-    uint8_t want[PRF_LEN];
+    uint8_t want[PRF_MAX];
     if (!q.idr || !q.auth) { p->fail = 1; return; }
     compute_auth(p, 0, q.idr, q.idr_len, want);
-    if (q.auth_len != 4u + PRF_LEN || q.auth[0] != 2 || !crypto_equal(q.auth + 4, want, PRF_LEN)) {
+    if (q.auth_len != 4u + p->prf_len || q.auth[0] != 2 || !crypto_equal(q.auth + 4, want, p->prf_len)) {
         uart_printf("[ike] IKE_AUTH: 相手の AUTH が合わない\n");
         p->fail = 1;
         return;
     }
     uint32_t spi = 0;
-    if (!q.sa || !pick_proposal(q.sa, q.sa_len, PROTO_ESP, &spi) || !q.transport) {
+    if (!q.sa || !pick_proposal(p, q.sa, q.sa_len, PROTO_ESP, &spi) || !q.transport) {
         uart_printf("[ike] IKE_AUTH: 子 SA の応答が受けられない(トランスポートモード %s)\n", q.transport ? "あり" : "なし");
         p->fail = 1;
         return;
@@ -887,7 +994,7 @@ int ike_init(void)
     return 0;
 }
 
-int ike_peer_add(uint32_t ip, const char *psk, netif_t *nif, const uint8_t mac[6])
+int ike_peer_add(uint32_t ip, const char *psk, netif_t *nif, const uint8_t mac[6], int cnsa)
 {
     if (ike_init() < 0) return -1;
     ike_peer_t *p = find_peer(ip);
@@ -901,6 +1008,7 @@ int ike_peer_add(uint32_t ip, const char *psk, netif_t *nif, const uint8_t mac[6
     if (l == 0 || l >= sizeof(p->psk)) return -1;
     memcpy(p->psk, psk, l + 1);
     p->psklen = (uint32_t)l;
+    set_suite(p, cnsa ? &SUITE_CNSA : &SUITE_DEFAULT);
     p->peer = ip;
     p->nif = nif;
     if (mac) { memcpy(p->peer_mac, mac, 6); p->mac_known = 1; }
