@@ -8,7 +8,7 @@
 
 /* 統計をコアごとに持つときの本数(SMP_MAX_CORES と同じ。smp.h を引くと
  * ヘッダの依存が増えるので、ここで独立に定義して nvmet.c で検算する)。 */
-#define NVMET_STAT_CORES 4u
+#define NVMET_STAT_CORES 9u
 
 /* **1 コアぶんでちょうど 1 キャッシュライン。** 隣のコアの更新で自分の行が
  * 無効化されると、分けた意味が無くなる(false sharing)。 */

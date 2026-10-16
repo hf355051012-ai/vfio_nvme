@@ -82,8 +82,17 @@ uint64_t mlx5_dma_addr(const volatile void *cpu_ptr);
 
 /* **受信キューの本数 = 分散できるコア数。** RSS(CREATE_RQT + Toeplitz の
  * TIR)で 4-tuple ハッシュにより振り分ける。**既定では catch-all の FTE が
- * rxq[0] の直接 TIR を指したまま**で、`netmt N` で RSS TIR へ張り替える。 */
-#define MLX5_NUM_RXQ 4u
+ * rxq[0] の直接 TIR を指したまま**で、`netmt N` で RSS TIR へ張り替える。
+ * core1..core8 が rxq[0..7] を 1 対 1 で見る(core0 はシェルなので持たない)。
+ * 1 本あたり CQ 64KB + 受信データ 256 x ジャンボ枠を DMA プールから取る。 */
+#define MLX5_NUM_RXQ 8u
+
+/* **RSS の振り分け表(RQT)の長さ。** 本数 n の RQT はこの長さの表を
+ * rxq[0..n-1] の繰り返しで埋める。表が本数と同じ 8 だと、3 / 5 / 6 / 7 本の
+ * ときに一部の RQ だけ 2 倍のハッシュ区間を持つ(8 = 3+3+2)。64 にすると偏りは
+ * 最大 1/64 の差に縮む(Linux の mlx5e は 256)。CREATE_RQT の入力は
+ * 272 + 4 x 64 = 528 バイトでメールボックス(2064 バイト)に収まる。 */
+#define MLX5_RSS_TABLE_SIZE 64u
 typedef struct {
     uint32_t  cqn;         // このRQ専用のCQ
     uint32_t  rqn;
@@ -103,7 +112,7 @@ typedef struct {
  * 完了を二重計上して SQ を過剰投稿する競合が残っていた)。
  * **SMP_MAX_CORES と一致させること**(mlx5_net.c に _Static_assert がある)。
  * TIS は全 SQ で共有する(Linux の mlx5e も TC ごとに 1 つを共有する)。 */
-#define MLX5_NUM_TXQ 4u
+#define MLX5_NUM_TXQ 9u
 typedef struct {
     uint32_t  cqn;          // このSQ専用のCQ(旧 dev->sq_cqn)
     uint32_t  sqn;          // 旧 dev->sqn

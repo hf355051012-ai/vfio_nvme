@@ -6264,12 +6264,10 @@ static void shell_dispatch(char *line, int s0, int s1)
                             (unsigned)SMP_MAX_CORES - 1u);
                 return;
             }
-            if (n >= 2 && smp_boot_core2() != 0) {
-                uart_printf("[!] netmt: core2 の起動に失敗\n");
-                return;
-            }
-            if (n >= 3 && smp_boot_core3() != 0) {
-                uart_printf("[!] netmt: core3 の起動に失敗\n");
+            /* **受信キューを持たせるコアは先に起こす。** 起きていないコアの RQ は
+             * 誰も見ないので、そこへハッシュされたコネクションが黙って止まる。 */
+            if (smp_boot_cores_upto((unsigned)n) != 0) {
+                uart_printf("[!] netmt: core1..core%d の起動に失敗\n", n);
                 return;
             }
             /* **NIC 側の RSS を先に切り替える。** ここを忘れると、コアだけ
@@ -6369,19 +6367,15 @@ static void shell_dispatch(char *line, int s0, int s1)
          * `txdrop` と同じ恒久デバッグ機能。 */
         const char *p = line + 9;
         while (*p == 32) p++;
-        if (*p >= 49 && *p <= 51) {
-            int n = *p - 48;
-            if (n >= 2 && smp_boot_core2() != 0) {
-                uart_printf("[!] rdmacores: core2 の起動に失敗\n");
-                return;
-            }
-            if (n >= 3 && smp_boot_core3() != 0) {
-                uart_printf("[!] rdmacores: core3 の起動に失敗\n");
+        int n = (*p != 0) ? atoi(p) : 0;
+        if (n >= 1 && n <= (int)SMP_MAX_CORES - 1) {
+            if (smp_boot_cores_upto((unsigned)n) != 0) {
+                uart_printf("[!] rdmacores: core1..core%d の起動に失敗\n", n);
                 return;
             }
             g_nvmet_rdma_cores = (uint32_t)n;
         } else if (*p != 0) {
-            uart_printf("usage: rdmacores [1|2|3]\n");
+            uart_printf("usage: rdmacores [1..%u]\n", (unsigned)SMP_MAX_CORES - 1u);
             return;
         }
         uart_printf("rdmacores: %u コアへ round-robin (1=従来。次のセッションから)\n",

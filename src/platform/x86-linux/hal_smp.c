@@ -6,6 +6,7 @@
 #include <pthread.h>
 #include <sched.h>
 #include <stdint.h>
+#include <unistd.h>
 
 static __thread unsigned t_core_index = 0u;
 
@@ -70,6 +71,12 @@ typedef struct {
  * ===============================================================*/
 static void set_affinity(unsigned cpu)
 {
+    /* **コア番号が論理 CPU の数を超えたら折り返す。** OptiPlex(4 CPU)で
+     * core4..core8 を起こしたとき、存在しない CPU へ pin しようとして失敗し
+     * どこへでも流れるより、決まった CPU に載るほうが測定が再現する
+     * (ただし core0..core3 と同じ CPU を分け合うので速くはならない)。 */
+    long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+    if (ncpu > 0 && cpu >= (unsigned)ncpu) cpu %= (unsigned)ncpu;
     cpu_set_t set;
     CPU_ZERO(&set);
     CPU_SET(cpu, &set);
@@ -104,17 +111,94 @@ static void *worker_main(void *argp)
     return 0; /* 到達しない */
 }
 
-/* PF ごとに 1 度だけ起動する(二重起動しても実害は無いが再起動しない)。 */
-static worker_arg_t s_core1_arg;
-static worker_arg_t s_core2_arg;
-static worker_arg_t s_core3_arg;
-static pthread_t    s_core1_thr;
-static pthread_t    s_core2_thr;
-static pthread_t    s_core3_thr;
+/* コアごとに 1 度だけ起動する(二重起動しても実害は無いが再起動しない)。
+ * core1..core3 のハートビートと生存フラグは従来の大域変数(smpstat などが読む)、
+ * core4 以降はこの配列に持つ。 */
+static worker_arg_t      s_core_arg[SMP_MAX_CORES];
+static pthread_t         s_core_thr[SMP_MAX_CORES];
+static volatile uint64_t s_core_hb[SMP_MAX_CORES];
+static volatile int      s_core_alive[SMP_MAX_CORES];
 
 /*=================================================================
- * core1 ワーカスレッドを起動する(既に起動済みなら何もしない冪等関数)。
- * 起動後、ハートビートが進み始めるまで待つ。
+ * コア番号からハートビートと生存フラグの置き場を引く。
+ *
+ * 引数:
+ *   core      - 1..SMP_MAX_CORES-1
+ *   hb/alive  - 置き場の格納先
+ * コール元:
+ *   smp_boot_core()
+ * ===============================================================*/
+static void core_slots(unsigned core, volatile uint64_t **hb, volatile int **alive)
+{
+    switch (core) {
+    case 1u: *hb = &g_core1_heartbeat; *alive = &g_core1_alive; break;
+    case 2u: *hb = &g_core2_heartbeat; *alive = &g_core2_alive; break;
+    case 3u: *hb = &g_core3_heartbeat; *alive = &g_core3_alive; break;
+    default: *hb = &s_core_hb[core];   *alive = &s_core_alive[core]; break;
+    }
+}
+
+/*=================================================================
+ * 指定コアのワーカスレッドを起動する(既に起動済みなら何もしない冪等関数)。
+ * 起動後、生存フラグが立つまで最大 2 秒待つ(RPi5 の smp_boot_core1 と同じ規約)。
+ *
+ * 引数:
+ *   core - 1..SMP_MAX_CORES-1(0 はシェル自身なので起こさない)
+ * 戻り値:
+ *   0=起動済み/成功、-1=範囲外 / pthread 作成失敗 / 起動待ちのタイムアウト
+ * コール元:
+ *   smp_boot_core1/2/3(), smp_boot_cores_upto()
+ * ===============================================================*/
+int smp_boot_core(unsigned core)
+{
+    if (core == 0u || core >= SMP_MAX_CORES) {
+        return -1;
+    }
+    volatile uint64_t *hb;
+    volatile int *alive;
+    core_slots(core, &hb, &alive);
+    if (*alive) {
+        return 0; /* 既に起動済み */
+    }
+    s_core_arg[core].core_index = core;
+    s_core_arg[core].hb    = hb;
+    s_core_arg[core].alive = alive;
+    if (pthread_create(&s_core_thr[core], 0, worker_main, &s_core_arg[core]) != 0) {
+        return -1;
+    }
+    uint64_t start = timer_now();
+    while (!*alive) {
+        if (timeout_sec(start, 2u)) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+/*=================================================================
+ * core1..coreN のワーカをまとめて起こす(`netmt N` / `rdmacores N` 用)。
+ * **散らす先のコアは、その上にジョブや受信キューを載せる前に起こしておくこと**
+ * (起きていないコアへ pin したジョブは誰にも回されず黙って止まる)。
+ *
+ * 引数:
+ *   n - 最後に起こすコア番号(0 / 1 なら core1 だけ)
+ * 戻り値:
+ *   0=全部成功、-1=どれかが失敗
+ * コール元:
+ *   shell_dispatch() の netmt / rdmacores、nvmet_rdma_run_standalone()
+ * ===============================================================*/
+int smp_boot_cores_upto(unsigned n)
+{
+    if (n < 1u) n = 1u;
+    if (n >= SMP_MAX_CORES) return -1;
+    for (unsigned c = 1u; c <= n; c++) {
+        if (smp_boot_core(c) != 0) return -1;
+    }
+    return 0;
+}
+
+/*=================================================================
+ * core1 ワーカスレッドを起動する(smp_boot_core(1) の別名)。
  *
  * 戻り値:
  *   0=起動済み/成功、-1=pthread 作成失敗
@@ -124,85 +208,34 @@ static pthread_t    s_core3_thr;
  * ===============================================================*/
 int smp_boot_core1(void)
 {
-    if (g_core1_alive) {
-        return 0; /* 既に起動済み */
-    }
-    s_core1_arg.core_index = 1u;
-    s_core1_arg.hb    = &g_core1_heartbeat;
-    s_core1_arg.alive = &g_core1_alive;
-    if (pthread_create(&s_core1_thr, 0, worker_main, &s_core1_arg) != 0) {
-        return -1;
-    }
-    /* g_core1_alive が立つまで最大 2 秒待つ(RPi5 の smp_boot_core1 と同じ規約)。 */
-    uint64_t start = timer_now();
-    while (!g_core1_alive) {
-        if (timeout_sec(start, 2u)) {
-            return -1;
-        }
-    }
-    return 0;
+    return smp_boot_core(1u);
 }
 
 /*=================================================================
- * core2 ワーカスレッドを起動する(smp_boot_core1() と同じ冪等関数)。
- *
- * 【現時点で呼び出し元は無い】複数コネクションの受信を複数コアへ振り分ける
- * scale-out(フローステアリングで RQ を分け、per-RQ でポーリングする段階)で
- * 使う予定の部品として意図的に残してある。bench / tcpbench は core0(initiator)
- * と core1(target)の 2 コアだけで動くため、こちらは呼ばれない。
+ * core2 ワーカスレッドを起動する(smp_boot_core(2) の別名)。
  * **未使用に見えても削除しないこと** -- 一度、未到達関数の一括削除で消して
- * しまい復活させた経緯がある。
+ * しまい復活させた経緯がある(いまは 2 ポート / iSER / RDMA が呼ぶ)。
  *
  * 戻り値:
  *   0=起動済み/成功、-1=pthread 作成失敗
  * コール元:
- *   (未配線。複数コネクション scale-out の実装時に配線する)
+ *   nvmet_rdma_run_standalone(), iscsit_iser の起動、2 ポートの起動
  * ===============================================================*/
 int smp_boot_core2(void)
 {
-    if (g_core2_alive) {
-        return 0;
-    }
-    s_core2_arg.core_index = 2u;
-    s_core2_arg.hb    = &g_core2_heartbeat;
-    s_core2_arg.alive = &g_core2_alive;
-    if (pthread_create(&s_core2_thr, 0, worker_main, &s_core2_arg) != 0) {
-        return -1;
-    }
-    uint64_t start = timer_now();
-    while (!g_core2_alive) {
-        if (timeout_sec(start, 2u)) {
-            return -1;
-        }
-    }
-    return 0;
+    return smp_boot_core(2u);
 }
 
 /*=================================================================
- * core3 ワーカスレッドを起動する(smp_boot_core2() と同じ、未配線)。
+ * core3 ワーカスレッドを起動する(smp_boot_core(3) の別名)。
  * 削除しない理由は smp_boot_core2() のコメント参照。
  *
  * 戻り値:
  *   0=起動済み/成功、-1=pthread 作成失敗
  * コール元:
- *   (未配線。複数コネクション scale-out の実装時に配線する)
+ *   (いまは直接の呼び出し元は無い。smp_boot_cores_upto() 経由で起きる)
  * ===============================================================*/
 int smp_boot_core3(void)
 {
-    if (g_core3_alive) {
-        return 0;
-    }
-    s_core3_arg.core_index = 3u;
-    s_core3_arg.hb    = &g_core3_heartbeat;
-    s_core3_arg.alive = &g_core3_alive;
-    if (pthread_create(&s_core3_thr, 0, worker_main, &s_core3_arg) != 0) {
-        return -1;
-    }
-    uint64_t start = timer_now();
-    while (!g_core3_alive) {
-        if (timeout_sec(start, 2u)) {
-            return -1;
-        }
-    }
-    return 0;
+    return smp_boot_core(3u);
 }

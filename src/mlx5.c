@@ -443,12 +443,12 @@ int mlx5_hca_bringup(mlx5_dev_t *dev, const char *label, int monitor_only) {
      * `netmt N` で mlx5_set_rss_enable() が張り替える。
      * **失敗しても致命的にしない** -- RSS が使えないだけで単一コアでは動く。 */
     for (unsigned n = 2u; n <= MLX5_NUM_RXQ; n++) {
-        uint32_t rqns[MLX5_NUM_RXQ];
+        uint32_t rqns[MLX5_RSS_TABLE_SIZE];
         /* **rxq[0..n-1] を繰り返して表を埋める。** 表の大きさは固定の
-         * MLX5_NUM_RXQ(2 の冪)にしておき、中身の繰り返しで「散らす本数」を
+         * MLX5_RSS_TABLE_SIZE(2 の冪)にしておき、中身の繰り返しで「散らす本数」を
          * 決める。こうすると RQT を作り直さずに本数を変えられる。 */
-        for (unsigned i = 0; i < MLX5_NUM_RXQ; i++) rqns[i] = dev->rxq[i % n].rqn;
-        if (mlx5_create_rqt(dev, rqns, MLX5_NUM_RXQ, &dev->rqtn[n]) != 0) {
+        for (unsigned i = 0; i < MLX5_RSS_TABLE_SIZE; i++) rqns[i] = dev->rxq[i % n].rqn;
+        if (mlx5_create_rqt(dev, rqns, MLX5_RSS_TABLE_SIZE, &dev->rqtn[n]) != 0) {
             uart_printf("mlx5: CREATE_RQT(%u本) failed -- RSS はこの本数では使えない\n", n);
             dev->rqtn[n] = 0;
         } else if (mlx5_create_tir_rss(dev, dev->rqtn[n], tdn, &dev->rss_tirn[n]) != 0) {
@@ -1877,7 +1877,7 @@ static int mlx5_create_tir(mlx5_dev_t *dev, uint32_t rqn, uint32_t tdn, uint32_t
  * 引数:
  *   dev       - 対象 HCA
  *   rqns      - 束ねる RQ 番号の配列
- *   n         - その本数(2 の冪であること)
+ *   n         - 表の長さ(2 の冪、MLX5_RSS_TABLE_SIZE 以下であること)
  *   out_rqtn  - RQT 番号の格納先
  * 戻り値:
  *   0=成功、-1=コマンド失敗
@@ -1885,7 +1885,8 @@ static int mlx5_create_tir(mlx5_dev_t *dev, uint32_t rqn, uint32_t tdn, uint32_t
  *   mlx5_hca_bringup()
  * ===============================================================*/
 static int mlx5_create_rqt(mlx5_dev_t *dev, const uint32_t *rqns, unsigned n, uint32_t *out_rqtn) {
-    uint8_t in[272 + 4u * MLX5_NUM_RXQ];
+    if (n > MLX5_RSS_TABLE_SIZE) return -1;
+    uint8_t in[272 + 4u * MLX5_RSS_TABLE_SIZE];
     for (unsigned i = 0; i < sizeof(in); i++) {
         in[i] = 0;
     }

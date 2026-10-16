@@ -25,8 +25,18 @@ extern volatile int      g_core3_alive;
 int smp_boot_core2(void);
 int smp_boot_core3(void);
 
+/* 任意のコア(1..SMP_MAX_CORES-1)のワーカを起こす。smp_boot_core1/2/3 はこれの
+ * 薄いラッパ。0=起動済み/成功、-1=失敗(範囲外を含む)。 */
+int smp_boot_core(unsigned core);
+/* core1..coreN をまとめて起こす(N=0/1 なら core1 だけ)。0=全部成功。 */
+int smp_boot_cores_upto(unsigned n);
+
 #if defined(__x86_64__)
-#define SMP_MAX_CORES 4u
+/* **core0(シェル)+ RSS で受信を配る core1..core8 の 9 本。**
+ * `netmt` / `rdmacores` が最大 8 コアまで散らせる。**1 コア増やすと .bss が
+ * 約 135MB 増える**(大半は tcp.c の s_priv[コア][TCP_MAX_CONNS])。.bss は
+ * 起動時に VFIO が丸ごとピン留めするので、その分だけ常駐する。 */
+#define SMP_MAX_CORES 9u
 #else
 #define SMP_MAX_CORES 2u
 #endif

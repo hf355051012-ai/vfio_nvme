@@ -1644,13 +1644,10 @@ void nvmet_rdma_run_standalone(mlx5_dev_t *dev, const char *self_label, const ui
      * 起きていないコアへ pin すると、そのジョブは誰にも回されず黙って
      * 止まる(接続はするが 1 コマンドも進まない、という形で出る)。
      * 起動に失敗したら分散数をそのぶん下げる。 */
-    while (g_nvmet_rdma_cores >= 3u && smp_boot_core3() != 0) {
-        uart_printf("[!] nvmet-rdma: core3起動に失敗、分散を2コアへ下げます\n");
-        g_nvmet_rdma_cores = 2u;
-    }
-    while (g_nvmet_rdma_cores >= 2u && smp_boot_core2() != 0) {
-        uart_printf("[!] nvmet-rdma: core2起動に失敗、分散を1コアへ下げます\n");
-        g_nvmet_rdma_cores = 1u;
+    while (g_nvmet_rdma_cores >= 2u && smp_boot_cores_upto(g_nvmet_rdma_cores) != 0) {
+        uart_printf("[!] nvmet-rdma: core1..core%u の起動に失敗、分散を %u コアへ下げます\n",
+                    (unsigned)g_nvmet_rdma_cores, (unsigned)g_nvmet_rdma_cores - 1u);
+        g_nvmet_rdma_cores--;
     }
 
     s_standalone_resident            = 1;
