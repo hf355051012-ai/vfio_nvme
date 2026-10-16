@@ -2065,6 +2065,136 @@ static int shell_pf0_on_core2(void)
     return 0;
 }
 
+/* ---- nicstat: NIC とデータ経路の統計(性能の分析用) -----------------------------
+ * 「線が止められていた(PAUSE)」「NIC が捨てた」「送信キューの空きを待った」を、
+ * 前回の `nicstat clear` からの差分で出す。カウンタは NIC(PPCNT / Q カウンタ)と
+ * mlx5_net の累計で、ここでは基準を覚えて引くだけ。 */
+static mlx5_port_stats_t   s_nic_base[2];
+static mlx5_net_sw_stats_t s_nic_sw_base[2][MLX5_NUM_TXQ];
+#define NICSTAT_TCP_N 9u
+static uint64_t            s_nic_tcp_base[NICSTAT_TCP_N];   /* 再送 / 高速再送 / 重複 ACK / 受信側の 6 つ */
+static uint64_t            s_nic_base_t;
+static int                 s_nic_base_set;
+
+static void nicstat_tcp_now(uint64_t v[NICSTAT_TCP_N])
+{
+    for (unsigned i = 0; i < NICSTAT_TCP_N; i++) v[i] = 0;
+    for (unsigned c = 0; c < SMP_MAX_CORES; c++) {
+        v[0] += g_tcp_retransmit_count[c];
+        v[1] += g_tcp_fast_retransmit_count[c];
+        v[2] += g_tcp_dup_ack_count[c];
+        v[3] += g_tcp_rx_ooo[c];
+        v[4] += g_tcp_rx_ooo_drop[c];
+        v[5] += g_tcp_rx_dup[c];
+        v[6] += g_tcp_rx_nospace[c];
+        v[7] += g_tcp_rx_csum_drop[c];
+        v[8] += g_tcp_rx_paws_drop[c];
+    }
+}
+
+static void nicstat_take_base(void)
+{
+    mlx5_dev_t *devs[2] = { &s_dev0, &s_dev1 };
+    for (int pf = 0; pf < 2; pf++) {
+        (void)mlx5_port_stats_read(devs[pf], &s_nic_base[pf]);
+        for (unsigned q = 0; q < MLX5_NUM_TXQ; q++) mlx5_net_sw_stats_get(pf, q, &s_nic_sw_base[pf][q]);
+    }
+    nicstat_tcp_now(s_nic_tcp_base);
+    s_nic_base_t   = timer_now();
+    s_nic_base_set = 1;
+}
+
+/*=================================================================
+ * nicstat [clear]
+ *   clear: 今の値を基準にする。引数なし: 基準からの差分を表示する(基準が無ければ取るだけ)。
+ *
+ * 読み方:
+ *   - **PAUSE 受信**が増えて**送信キューの空き待ち**も増えていれば、相手が受け切れずに
+ *     こちらの送信を止めている(相手の受信が律速)。時間の割合は「止められていた時間 / 経過」。
+ *   - **PAUSE 送信 / 物理層の捨て / 受信バッファ満杯**は、こちらのポートのバッファが
+ *     あふれかけた(またはあふれた)こと。
+ *   - **out_of_buffer** は受信キューの WQE が尽きて捨てた数(キュー N = core N+1 が受け持つ)。
+ *     受信を処理するコアが追いつかないと増える。相手には再送として見える。
+ * コール元:
+ *   shell_dispatch()
+ * ===============================================================*/
+static void shell_nicstat(const char *args)
+{
+    while (*args == ' ') args++;
+    if (strncmp(args, "clear", 5) == 0 || !s_nic_base_set) {
+        nicstat_take_base();
+        uart_printf("nicstat: 基準を取った(以後 `nicstat` で差分を出す)\n");
+        return;
+    }
+    mlx5_dev_t *devs[2] = { &s_dev0, &s_dev1 };
+    const uint64_t dt_ns = timer_now() - s_nic_base_t;
+    const uint64_t dt_us = dt_ns / 1000u ? dt_ns / 1000u : 1u;
+    uart_printf("nicstat: 基準から %llu.%03llu 秒\n", (unsigned long long)(dt_us / 1000000u),
+                (unsigned long long)(dt_us / 1000u % 1000u));
+    for (int pf = 0; pf < 2; pf++) {
+        mlx5_port_stats_t now;
+        if (mlx5_port_stats_read(devs[pf], &now) != 0 && !now.ok) {
+            uart_printf("  pf%d: 読めない(bring-up していない?)\n", pf);
+            continue;
+        }
+        const mlx5_port_stats_t *b = &s_nic_base[pf];
+        const uint64_t rxo = now.rx_octets - b->rx_octets, txo = now.tx_octets - b->tx_octets;
+        uart_printf("  pf%d: 受信 %llu フレーム %llu MB/s / 送信 %llu フレーム %llu MB/s\n", pf,
+                    (unsigned long long)(now.rx_frames - b->rx_frames), (unsigned long long)(rxo / dt_us),
+                    (unsigned long long)(now.tx_frames - b->tx_frames), (unsigned long long)(txo / dt_us));
+        const uint64_t rpu = now.rx_pause_us - b->rx_pause_us, tpu = now.tx_pause_us - b->tx_pause_us;
+        uart_printf("       PAUSE 受信 %llu 回 %llu.%03llu ms(経過の %llu.%llu%%)/ 送信 %llu 回 %llu.%03llu ms(%llu.%llu%%)\n",
+                    (unsigned long long)(now.rx_pause - b->rx_pause),
+                    (unsigned long long)(rpu / 1000u), (unsigned long long)(rpu % 1000u),
+                    (unsigned long long)(rpu * 100u / dt_us), (unsigned long long)(rpu * 1000u / dt_us % 10u),
+                    (unsigned long long)(now.tx_pause - b->tx_pause),
+                    (unsigned long long)(tpu / 1000u), (unsigned long long)(tpu % 1000u),
+                    (unsigned long long)(tpu * 100u / dt_us), (unsigned long long)(tpu * 1000u / dt_us % 10u));
+        uart_printf("       捨て: 物理層 受信 %llu / 送信 %llu、受信バッファ ほぼ満杯 %llu / 満杯 %llu\n",
+                    (unsigned long long)(now.rx_discards_phy - b->rx_discards_phy),
+                    (unsigned long long)(now.tx_discards_phy - b->tx_discards_phy),
+                    (unsigned long long)(now.rx_buf_almost_full - b->rx_buf_almost_full),
+                    (unsigned long long)(now.rx_buf_full - b->rx_buf_full));
+        uart_printf("       受信キューの WQE 切れ(out_of_buffer):");
+        uint64_t oob_sum = 0;
+        int any = 0;
+        for (unsigned q = 0; q < MLX5_NUM_RXQ; q++) {
+            if (!now.oob_valid[q]) continue;
+            const uint32_t d = now.out_of_buffer[q] - b->out_of_buffer[q];
+            oob_sum += d;
+            any = 1;
+            if (d) uart_printf(" q%u=%u", q, d);
+        }
+        if (any) uart_printf(" 合計 %llu\n", (unsigned long long)oob_sum);
+        else     uart_printf(" (Q カウンタが無い)\n");
+        uart_printf("       送信キューの空き待ち:");
+        int shown = 0;
+        for (unsigned q = 0; q < MLX5_NUM_TXQ; q++) {
+            mlx5_net_sw_stats_t s;
+            mlx5_net_sw_stats_get(pf, q, &s);
+            const mlx5_net_sw_stats_t *sb = &s_nic_sw_base[pf][q];
+            const uint64_t w = s.sq_full_waits - sb->sq_full_waits;
+            const uint64_t ns = s.sq_full_wait_ns - sb->sq_full_wait_ns;
+            const uint64_t nb = s.rx_nobuf - sb->rx_nobuf, bc = s.rx_bad_cqe - sb->rx_bad_cqe;
+            if (!w && !nb && !bc) continue;
+            uart_printf(" core%u %llu 回 %llu ms(経過の %llu%%)", q, (unsigned long long)w,
+                        (unsigned long long)(ns / 1000000u), (unsigned long long)(ns / 10u / dt_us));
+            if (nb || bc) uart_printf(" [net_buf 切れ %llu、想定外の CQE %llu]", (unsigned long long)nb, (unsigned long long)bc);
+            shown = 1;
+        }
+        uart_printf(shown ? "\n" : " なし\n");
+    }
+    uint64_t t[NICSTAT_TCP_N];
+    nicstat_tcp_now(t);
+    for (unsigned i = 0; i < NICSTAT_TCP_N; i++) t[i] -= s_nic_tcp_base[i];
+    uart_printf("  TCP 送信側: 再送 %llu(うち高速再送 %llu)、受けた重複 ACK %llu\n",
+                (unsigned long long)t[0], (unsigned long long)t[1], (unsigned long long)t[2]);
+    uart_printf("  TCP 受信側: 順序の飛び %llu(先読み満杯で捨て %llu)、受け取り済みの再送 %llu、"
+                "バッファ不足 %llu、チェックサム不正 %llu、PAWS %llu\n",
+                (unsigned long long)t[3], (unsigned long long)t[4], (unsigned long long)t[5],
+                (unsigned long long)t[6], (unsigned long long)t[7], (unsigned long long)t[8]);
+}
+
 /* ipsec psk <相手> <事前共有鍵> [pf0|pf1] / up <相手> / down <相手> / del <相手> / stat / clear */
 static void shell_ipsec(const char *args)
 {
@@ -6005,6 +6135,10 @@ static void shell_dispatch(char *line, int s0, int s1)
          * 鍵は Linux の `nvme gen-tls-key` で作ったもの(--hmac=2 なら SHA-384 =
          * TLS_AES_256_GCM_SHA384)。cnsa = SHA-384 の PSK + ML-KEM-1024 だけを受ける(CNSA 2.0)。 */
         nvmet_tls_shell(line + 8);
+    } else if (strncmp(line, "nicstat", 7) == 0) {
+        /* nicstat [clear] -- PAUSE・NIC の捨て・受信キューの WQE 切れ・送信キューの空き待ち・TCP の再送
+         * (前回の clear からの差分)。性能が落ちたときに「線が止められていたか / どこで捨てたか」を見る */
+        shell_nicstat(line + 7);
     } else if (strncmp(line, "twoport", 7) == 0) {
         /* twoport [on [1core]|off] -- 2 ポートで受ける準備。**ターゲットを起動する前に打つ。**
          * on [1core]: pf0 の受信を core2(1core なら core1)に受け持たせ、NVMe のターゲットが「複数コントローラ」(CMIC)と

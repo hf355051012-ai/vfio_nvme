@@ -112,6 +112,27 @@ static inline unsigned mlx5_net_rxq_index(void)
 
 static volatile int s_sq_halted[2][MLX5_NUM_TXQ];
 
+/* **送受信の経路の統計(`nicstat`)。** [PF][コア] ごとに 1 キャッシュラインで持つ
+ * (書くのはそのコアだけ。隣のコアの更新で行が無効化されないように)。 */
+typedef struct {
+    volatile uint64_t sq_full_waits;    /* 送信キューが満杯で空きを待った回数 */
+    volatile uint64_t sq_full_wait_ns;  /* その待ちの合計時間 */
+    volatile uint64_t rx_nobuf;         /* net_buf が尽きて受信フレームを捨てた数 */
+    volatile uint64_t rx_bad_cqe;       /* 想定外の受信 CQE */
+    uint64_t pad[4];
+} __attribute__((aligned(64))) mlx5_net_swstat_slot_t;
+static mlx5_net_swstat_slot_t s_swstat[2][MLX5_NUM_TXQ];
+
+void mlx5_net_sw_stats_get(int pf, unsigned q, mlx5_net_sw_stats_t *out)
+{
+    if (pf < 0 || pf > 1 || q >= MLX5_NUM_TXQ) { out->sq_full_waits = out->sq_full_wait_ns = out->rx_nobuf = out->rx_bad_cqe = 0; return; }
+    const mlx5_net_swstat_slot_t *s = &s_swstat[pf][q];
+    out->sq_full_waits   = s->sq_full_waits;
+    out->sq_full_wait_ns = s->sq_full_wait_ns;
+    out->rx_nobuf        = s->rx_nobuf;
+    out->rx_bad_cqe      = s->rx_bad_cqe;
+}
+
 _Static_assert(MLX5_NUM_TXQ == SMP_MAX_CORES,
                "TX キューの添字は smp_core_index() そのものなので本数を合わせること");
 
@@ -644,6 +665,7 @@ static int mlx5_net_sq_wait_room(int pf_index, unsigned q, mlx5_dev_t *dev, mlx5
 
     uint64_t start = timer_now();
     unsigned spins = 0;
+    const int full = (st->sq_pc[q] - st->sq_cc[q]) >= MLX5_SQ_WQE_COUNT;
     while ((st->sq_pc[q] - st->sq_cc[q]) >= MLX5_SQ_WQE_COUNT) {
         int r = mlx5_net_sq_reap_one(pf_index, q, dev, st);
         if (r < 0) {
@@ -663,6 +685,11 @@ static int mlx5_net_sq_wait_room(int pf_index, unsigned q, mlx5_dev_t *dev, mlx5
             mlx5_net_try_recover(pf_index, q, dev, st);
             return -1;
         }
+    }
+    /* 満杯で待ったときだけ数える(待たなかった呼び出しに時刻の読み出しを足さない)。 */
+    if (full && pf_index >= 0 && pf_index <= 1 && q < MLX5_NUM_TXQ) {
+        s_swstat[pf_index][q].sq_full_waits++;
+        s_swstat[pf_index][q].sq_full_wait_ns += timer_now() - start;
     }
     return 0;
 }
@@ -1104,8 +1131,14 @@ static net_buf_t *mlx5_net_poll_recv(void *priv)
             TS_HOT(TS_MK(TS_FILE_MLX5_NET, TS_FUNC_mlx5_net_poll_recv, 3), byte_cnt);
         } else {
             uart_printf("[mlx5net] poll: net_bufプール枯渇、フレーム破棄\n");
+            unsigned c = smp_core_index();
+            if (c < MLX5_NUM_TXQ) s_swstat[mlx5_net_pf_index(st) & 1][c].rx_nobuf++;
         }
     } else if (opcode != MLX5_CQE_OP_INVALID) {
+        {
+            unsigned c = smp_core_index();
+            if (c < MLX5_NUM_TXQ) s_swstat[mlx5_net_pf_index(st) & 1][c].rx_bad_cqe++;
+        }
         uart_printf("[mlx5net] poll: 想定外のCQE (opcode=0x%x byte_cnt=%u wqe_idx=%u) 破棄\n",
                     opcode, byte_cnt, wqe_idx);
     }

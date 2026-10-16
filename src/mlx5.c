@@ -58,6 +58,7 @@ static int mlx5_create_cq(mlx5_dev_t *dev, uint32_t uarn, uint32_t eqn, uint64_t
 static int mlx5_alloc_transport_domain(mlx5_dev_t *dev, uint32_t *out_tdn);
 static int mlx5_create_tis(mlx5_dev_t *dev, uint32_t tdn, uint32_t *out_tisn);
 static int mlx5_create_rq(mlx5_dev_t *dev, unsigned rxq_idx, uint32_t cqn, uint32_t pdn, uint32_t uarn, uint32_t mkey, uint32_t *out_rqn);
+static int mlx5_alloc_q_counter(mlx5_dev_t *dev, uint8_t *out_id);
 static int mlx5_modify_rq_to_rdy(mlx5_dev_t *dev, uint32_t rqn);
 static int mlx5_create_tir(mlx5_dev_t *dev, uint32_t rqn, uint32_t tdn, uint32_t *out_tirn);
 static int mlx5_create_rqt(mlx5_dev_t *dev, const uint32_t *rqns, unsigned n, uint32_t *out_rqtn);
@@ -409,6 +410,9 @@ int mlx5_hca_bringup(mlx5_dev_t *dev, const char *label, int monitor_only) {
     uart_printf("mlx5: CREATE_TIS ok: tisn=%u\n", tisn);
 
     for (unsigned q = 0; q < MLX5_NUM_RXQ; q++) {
+        /* **受信キューごとに Q カウンタを 1 つ割り当て、RQ に結びつける**(`nicstat` の
+         * out_of_buffer = WQE が尽きて NIC が捨てた数)。失敗しても致命的にしない。 */
+        dev->rxq[q].qcnt_valid = (uint8_t)(mlx5_alloc_q_counter(dev, &dev->rxq[q].qcnt) == 0);
         uint32_t cqn = 0;
         if (mlx5_create_cq(dev, uarn, eqn,
                            (uint64_t)dev->rxq[q].cq_buf_cpu, (uint64_t)dev->rxq[q].cq_dbr_cpu, &cqn) != 0) {
@@ -1730,6 +1734,8 @@ static int mlx5_create_rq(mlx5_dev_t *dev, unsigned rxq_idx, uint32_t cqn, uint3
     in[41] = (uint8_t)(cqn >> 16);
     in[42] = (uint8_t)(cqn >> 8);
     in[43] = (uint8_t)cqn;
+
+    if (dev->rxq[rxq_idx].qcnt_valid) in[32 + 12] = dev->rxq[rxq_idx].qcnt;  /* rqc.counter_set_id */
 
     in[80] = (uint8_t)((MLX5_WQ_TYPE_CYCLIC << 4) | (MLX5_WQ_END_PAD_MODE_ALIGN << 1));
     in[89] = (uint8_t)(pdn >> 16);
@@ -4056,7 +4062,20 @@ static int mlx5_query_port_status(mlx5_dev_t *dev, uint8_t *out_admin_status, ui
  * コール元:
  *   mlx5_dump_ieee802_3(), mlx5_dump_phys_layer(), mlx5_hw_error_flags()
  * ===============================================================*/
+static int mlx5_ppcnt_query_prio(mlx5_dev_t *dev, uint8_t grp, uint8_t prio, uint8_t *counter_set_out);
 static int mlx5_ppcnt_query(mlx5_dev_t *dev, uint8_t grp, uint8_t *counter_set_out) {
+    return mlx5_ppcnt_query_prio(dev, grp, 0u, counter_set_out);
+}
+
+/*=================================================================
+ * mlx5_ppcnt_query() の優先度つき版。優先度ごとのグループ(0x10)は prio_tc
+ * (ppcnt_reg の byte 7 の下位 5 ビット)で優先度を選ぶ。PFC を使わない構成の
+ * 全体の PAUSE は優先度 0 に数えられる(Linux の rx/tx_global_pause と同じ)。
+ *
+ * コール元:
+ *   mlx5_ppcnt_query(), mlx5_port_stats_read()
+ * ===============================================================*/
+static int mlx5_ppcnt_query_prio(mlx5_dev_t *dev, uint8_t grp, uint8_t prio, uint8_t *counter_set_out) {
     uint8_t in[16 + 8 + MLX5_PPCNT_COUNTER_SET_BYTES];
     for (unsigned i = 0; i < sizeof(in); i++) {
         in[i] = 0;
@@ -4068,6 +4087,7 @@ static int mlx5_ppcnt_query(mlx5_dev_t *dev, uint8_t grp, uint8_t *counter_set_o
     in[11] = (uint8_t)(MLX5_REG_PPCNT & 0xffu);
     in[16 + 1] = 0x01u; // local_port=1
     in[16 + 3] = (uint8_t)(grp & 0x3Fu);
+    in[16 + 7] = (uint8_t)(prio & 0x1Fu); // prio_tc
 
     uint8_t out[sizeof(in)];
     int rc = mlx5_cmd_exec(dev, in, sizeof(in), out, sizeof(out));
@@ -4085,6 +4105,90 @@ static int mlx5_ppcnt_query(mlx5_dev_t *dev, uint8_t grp, uint8_t *counter_set_o
         counter_set_out[i] = out[16 + 8 + i];
     }
     return 0;
+}
+
+#define MLX5_CMD_OP_ALLOC_Q_COUNTER 0x771u
+#define MLX5_CMD_OP_QUERY_Q_COUNTER 0x773u
+#define MLX5_PPCNT_GRP_RFC_2863     0x1u
+#define MLX5_PPCNT_GRP_ETH_EXT      0x5u
+#define MLX5_PPCNT_GRP_PER_PRIO     0x10u
+
+/*=================================================================
+ * Q カウンタを 1 つ割り当てる(ALLOC_Q_COUNTER)。RQ の rqc.counter_set_id に
+ * 入れると、その RQ の out_of_buffer(受信 WQE が尽きて捨てた数)などを数える。
+ * 入力は opcode だけの 16 バイト、出力の counter_set_id は byte 11。
+ *
+ * 引数:
+ *   dev    - 対象 HCA
+ *   out_id - 割り当てた番号の格納先
+ * 戻り値:
+ *   0=成功、-1=失敗
+ * コール元:
+ *   mlx5_hca_bringup()
+ * ===============================================================*/
+static int mlx5_alloc_q_counter(mlx5_dev_t *dev, uint8_t *out_id) {
+    uint8_t in[16] = {0};
+    in[0] = (uint8_t)(MLX5_CMD_OP_ALLOC_Q_COUNTER >> 8);
+    in[1] = (uint8_t)(MLX5_CMD_OP_ALLOC_Q_COUNTER & 0xffu);
+    uint8_t out[16];
+    if (mlx5_cmd_exec(dev, in, sizeof(in), out, sizeof(out)) != 0 || out[0] != 0) {
+        uart_printf("mlx5: ALLOC_Q_COUNTER failed (status=0x%02x) -- out_of_buffer は数えない\n", out[0]);
+        return -1;
+    }
+    *out_id = out[11];
+    return 0;
+}
+
+/*=================================================================
+ * Q カウンタの out_of_buffer を読む(QUERY_Q_COUNTER)。入力 32 バイトの byte 31 が
+ * counter_set_id(clear = byte 24 の最上位ビットは立てない)、出力 256 バイトの
+ * byte 48 が out_of_buffer(32 ビット)。
+ *
+ * コール元:
+ *   mlx5_port_stats_read()
+ * ===============================================================*/
+static int mlx5_query_q_out_of_buffer(mlx5_dev_t *dev, uint8_t id, uint32_t *out_val) {
+    uint8_t in[32] = {0};
+    in[0] = (uint8_t)(MLX5_CMD_OP_QUERY_Q_COUNTER >> 8);
+    in[1] = (uint8_t)(MLX5_CMD_OP_QUERY_Q_COUNTER & 0xffu);
+    in[31] = id;
+    uint8_t out[256];
+    if (mlx5_cmd_exec(dev, in, sizeof(in), out, sizeof(out)) != 0 || out[0] != 0) return -1;
+    *out_val = ((uint32_t)out[48] << 24) | ((uint32_t)out[49] << 16) | ((uint32_t)out[50] << 8) | out[51];
+    return 0;
+}
+
+static uint64_t mlx5_cs64(const uint8_t *cs, unsigned off) {
+    uint64_t v = 0;
+    for (unsigned i = 0; i < 8u; i++) v = (v << 8) | cs[off + i];
+    return v;
+}
+
+int mlx5_port_stats_read(mlx5_dev_t *dev, mlx5_port_stats_t *s) {
+    uint8_t cs[MLX5_PPCNT_COUNTER_SET_BYTES];
+    for (unsigned i = 0; i < sizeof(*s); i++) ((uint8_t *)s)[i] = 0;
+    if (!dev) return -1;
+    int ok = 1;
+    if (mlx5_ppcnt_query_prio(dev, MLX5_PPCNT_GRP_IEEE_802_3, 0u, cs) == 0) {
+        s->tx_frames = mlx5_cs64(cs, 0);  s->rx_frames = mlx5_cs64(cs, 8);
+        s->tx_octets = mlx5_cs64(cs, 32); s->rx_octets = mlx5_cs64(cs, 40);
+    } else ok = 0;
+    if (mlx5_ppcnt_query_prio(dev, MLX5_PPCNT_GRP_PER_PRIO, 0u, cs) == 0) {
+        s->rx_pause = mlx5_cs64(cs, 80); s->rx_pause_us = mlx5_cs64(cs, 88);
+        s->tx_pause = mlx5_cs64(cs, 96); s->tx_pause_us = mlx5_cs64(cs, 104);
+    } else ok = 0;
+    if (mlx5_ppcnt_query_prio(dev, MLX5_PPCNT_GRP_RFC_2863, 0u, cs) == 0) {
+        s->rx_discards_phy = mlx5_cs64(cs, 16); s->tx_discards_phy = mlx5_cs64(cs, 56);
+    } else ok = 0;
+    if (mlx5_ppcnt_query_prio(dev, MLX5_PPCNT_GRP_ETH_EXT, 0u, cs) == 0) {
+        s->rx_buf_almost_full = mlx5_cs64(cs, 40); s->rx_buf_full = mlx5_cs64(cs, 48);
+    } else ok = 0;
+    for (unsigned q = 0; q < MLX5_NUM_RXQ; q++) {
+        if (dev->rxq[q].qcnt_valid && mlx5_query_q_out_of_buffer(dev, dev->rxq[q].qcnt, &s->out_of_buffer[q]) == 0)
+            s->oob_valid[q] = 1u;
+    }
+    s->ok = ok;
+    return ok ? 0 : -1;
 }
 
 static void mlx5_print_ctr64(const char *name, const uint8_t *cs, unsigned byte_off) {

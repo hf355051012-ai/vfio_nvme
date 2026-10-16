@@ -102,6 +102,11 @@ typedef struct {
     uintptr_t data_cpu;    // 旧 dev->rq_data_cpu(受信データバッファ)
     uintptr_t wqe_cpu;     // 旧 dev->rq_wqe_cpu(WQEリング)
     uintptr_t dbr_cpu;     // 旧 dev->rq_dbr_cpu(RQドアベル)
+    /* この RQ を結びつけた Q カウンタ(ALLOC_Q_COUNTER の counter_set_id)。
+     * **受信バッファ(WQE)が尽きて NIC が捨てたフレーム数(out_of_buffer)**をこれで数える。
+     * 割り当てに失敗したら qcnt_valid = 0(RQ は既定のカウンタのまま動く)。 */
+    uint8_t   qcnt;
+    uint8_t   qcnt_valid;
 } mlx5_rxq_t;
 
 /* **送信キューの本数 = コアの本数。** 添字は `smp_core_index()` そのもので、
@@ -214,6 +219,30 @@ int mlx5_net_register_dual(mlx5_dev_t *dev0, mlx5_dev_t *dev1);
 /* catch-all の FTE の転送先を直接 TIR / RSS TIR で張り替える(受信の分散)。 */
 int mlx5_set_rss_enable(mlx5_dev_t *dev, unsigned ncores);
 int mlx5_net_set_rss(unsigned ncores);
+
+/* **ポートと受信キューの統計(`nicstat`)。** 性能の分析で「線が止められていた(PAUSE)」
+ * 「NIC が捨てた」を直接数えるためのもの。値は起動からの累計(差分は呼ぶ側で取る)。
+ * 欄の位置は Linux の mlx5_ifc.h(7.0)を userspace でコンパイルして offsetof で出した。 */
+typedef struct {
+    uint64_t tx_frames, rx_frames, tx_octets, rx_octets;   /* PPCNT IEEE 802.3(0x0)*/
+    uint64_t rx_pause, rx_pause_us, tx_pause, tx_pause_us; /* PPCNT 優先度ごと(0x10)の優先度 0 = 全体の PAUSE。長さは µs */
+    uint64_t rx_discards_phy, tx_discards_phy;             /* PPCNT RFC 2863(0x1)の if_in/out_discards(ポートのバッファあふれ等)*/
+    uint64_t rx_buf_almost_full, rx_buf_full;              /* PPCNT 拡張(0x5)。受信バッファがほぼ満杯 / 満杯になった回数 */
+    uint32_t out_of_buffer[MLX5_NUM_RXQ];                  /* Q カウンタ。受信キューの WQE が尽きて捨てた数(キュー N = core N+1)*/
+    uint8_t  oob_valid[MLX5_NUM_RXQ];
+    int      ok;                                           /* PPCNT が読めたか */
+} mlx5_port_stats_t;
+int mlx5_port_stats_read(mlx5_dev_t *dev, mlx5_port_stats_t *s);
+
+/* **送受信の経路のソフトウェアの統計(コアごと = 送信キューごと)。**
+ * sq_full_waits / sq_full_wait_ns: 送信キュー(8 枠)が満杯で空きを待った回数と時間。
+ * PAUSE で線が止められると、まずここが増える。
+ * rx_nobuf: net_buf が尽きて受信フレームを捨てた数、rx_bad_cqe: 想定外の受信 CQE。 */
+typedef struct {
+    uint64_t sq_full_waits, sq_full_wait_ns, rx_nobuf, rx_bad_cqe;
+} mlx5_net_sw_stats_t;
+/* pf = 0 / 1、q = コア番号(0..MLX5_NUM_TXQ-1)。 */
+void mlx5_net_sw_stats_get(int pf, unsigned q, mlx5_net_sw_stats_t *out);
 
 // IPv4-mapped IPv6形式のRoCEv2 GID(::ffff:a.b.c.d)を構築する。
 void mlx5_build_roce_gid_v4(uint32_t ipv4_host_order, uint8_t out_gid[16]);

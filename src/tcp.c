@@ -171,6 +171,14 @@ volatile uint32_t g_tcp_fast_retransmit_count[SMP_MAX_CORES];
  * 効きすぎていないか(1 回のロスに対し何回入り直しているか)が分かる。 */
 volatile uint32_t g_tcp_dup_ack_count[SMP_MAX_CORES];
 
+/* 受信側で使えなかったセグメントの数(tcp.h の説明を参照)。どれも冷たい経路でだけ増える。 */
+volatile uint32_t g_tcp_rx_ooo[SMP_MAX_CORES];
+volatile uint32_t g_tcp_rx_ooo_drop[SMP_MAX_CORES];
+volatile uint32_t g_tcp_rx_dup[SMP_MAX_CORES];
+volatile uint32_t g_tcp_rx_nospace[SMP_MAX_CORES];
+volatile uint32_t g_tcp_rx_csum_drop[SMP_MAX_CORES];
+volatile uint32_t g_tcp_rx_paws_drop[SMP_MAX_CORES];
+
 /* **既定 1(= 受信セグメントごとに ACK)。** 4 にすると相手の ACK 処理は
  * 減るが、**得か損かは相手が飽和しているかで逆になる**:
  *
@@ -5012,6 +5020,7 @@ void tcp_input_addr(const uint8_t *pkt, uint16_t len,
             if(ts_log_mode()&TS_MODE_HOTPATH) ts_log(TS_MK(TS_FILE_TCP, TS_FUNC_tcp_input, 1), tcp_conn_arg(conn, len));
             uart_printf("[TCP] チェックサム不正 (計算結果=0x%04X、0であるべき) セグメント破棄\n",
                         csum_check);
+            g_tcp_rx_csum_drop[core]++;
             return;
         }
     }
@@ -5080,6 +5089,7 @@ void tcp_input_addr(const uint8_t *pkt, uint16_t len,
     uint32_t seg_tsecr = 0;
     if ((priv->ts_enabled || priv->sack_enabled) &&
         !tcp_input_options(conn, priv, in, hdr_len, seq, &seg_tsecr)) {
+        g_tcp_rx_paws_drop[core]++;
         return;  /* PAWS で破棄(ACK は tcp_input_options() が返している) */
     }
 
@@ -5226,6 +5236,7 @@ void tcp_input_addr(const uint8_t *pkt, uint16_t len,
                     if (!spliced) break;
                 }
             } else if (seq == conn->rcv_seq) {
+                g_tcp_rx_nospace[core]++;
                 if(ts_log_mode()&TS_MODE_HOTPATH) ts_log(TS_MK(TS_FILE_TCP, TS_FUNC_tcp_input, 6), tcp_conn_arg(conn, payload_len));
             } else if (tcp_seq_gt(seq, conn->rcv_seq) && payload_len <= TCP_MSS_LOCAL) {
                 int already = 0;
@@ -5247,6 +5258,7 @@ void tcp_input_addr(const uint8_t *pkt, uint16_t len,
                             priv->ooo[i].valid = 1;
                             priv->ooo_count++;
                             if (priv->sack_enabled) tcp_sack_tx_add(priv, seq, payload_len);
+                            g_tcp_rx_ooo[core]++;
                             /* ここは ts_log だけにしてある。以前は 1 セグメントごとに
                              * uart_printf していたが、高速再送(C2)を入れて順序不正の
                              * 到着が「異常」ではなく通常の回復過程になると、受信ホット
@@ -5259,6 +5271,7 @@ void tcp_input_addr(const uint8_t *pkt, uint16_t len,
                         }
                     }
                     if (!stored) {
+                        g_tcp_rx_ooo_drop[core]++;
                         if(ts_log_mode()&TS_MODE_HOTPATH) ts_log(TS_MK(TS_FILE_TCP, TS_FUNC_tcp_input, 8), tcp_conn_arg(conn, payload_len));
                         uart_printf("[!] TCP: 順序不正セグメントを破棄(先読みバッファ満杯 "
                                     "TCP_OOO_SLOTS=%u) (seq=%u rcv_seq=%u len=%u)\n",
@@ -5267,6 +5280,8 @@ void tcp_input_addr(const uint8_t *pkt, uint16_t len,
                 }
             } else if (tcp_seq_gt(seq, conn->rcv_seq)) {
                 if(ts_log_mode()&TS_MODE_HOTPATH) ts_log(TS_MK(TS_FILE_TCP, TS_FUNC_tcp_input, 9), tcp_conn_arg(conn, payload_len));
+            } else {
+                g_tcp_rx_dup[core]++;   /* 既に受け取った範囲(seq < rcv_seq)*/
             }
             /* **「ちょうどフルサイズのときだけ間引く」ではいけない。**
              * NVMe/TCP の PDU は 4120B / 8240B のように MSS(9204)ちょうどには

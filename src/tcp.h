@@ -10,6 +10,18 @@
 extern volatile uint32_t g_tcp_retransmit_count[SMP_MAX_CORES];
 extern volatile uint32_t g_tcp_fast_retransmit_count[SMP_MAX_CORES];
 extern volatile uint32_t g_tcp_dup_ack_count[SMP_MAX_CORES];
+/* **受信側で、届いたセグメントをそのまま使えなかった数(`nicstat`)。** コアごと。
+ *   rx_ooo      : 順序が飛んだセグメントを先読みに入れた(その前が欠けている)
+ *   rx_ooo_drop : 先読み(TCP_OOO_SLOTS)が満杯で捨てた
+ *   rx_dup      : 既に受け取った範囲を含むセグメント(相手の再送が無駄だった印)
+ *   rx_nospace  : 順番どおりだが受信バッファに空きが無く受け取れなかった
+ *   rx_csum_drop / rx_paws_drop : チェックサム不正 / PAWS で捨てた */
+extern volatile uint32_t g_tcp_rx_ooo[SMP_MAX_CORES];
+extern volatile uint32_t g_tcp_rx_ooo_drop[SMP_MAX_CORES];
+extern volatile uint32_t g_tcp_rx_dup[SMP_MAX_CORES];
+extern volatile uint32_t g_tcp_rx_nospace[SMP_MAX_CORES];
+extern volatile uint32_t g_tcp_rx_csum_drop[SMP_MAX_CORES];
+extern volatile uint32_t g_tcp_rx_paws_drop[SMP_MAX_CORES];
 extern volatile uint32_t g_tcp_ack_threshold;
 /* ACK を間引く対象とする受信セグメントの最小長(0 = MSS/8)。`ackminseg`。 */
 extern volatile uint32_t g_tcp_ack_min_seg;
