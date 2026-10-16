@@ -286,9 +286,11 @@ void     tcp_backlog_stats(unsigned *waiting, unsigned *estab);
 unsigned tcp_backlog_capacity(void);
 
 int  tcp_accept_ready_poll(int listener);
+/* 自コアが持ち主の、確立済みの待ち行列エントリを受け皿へ渡す(ポーリングの先頭で呼ぶ)。 */
+void tcp_backlog_service(void);
 
-/* 用意した受け皿を取り下げる。1=取り下げた時点で既に確立していた
- * (呼び出し側が tcp_close() すること)。 */
+/* 用意した受け皿を取り下げる。1=取り下げた時点で既に使われていた(確立済み、
+ * または SYN を直接受理して握手の途中。呼び出し側が tcp_close() すること)。 */
 int  tcp_accept_cancel(int listener, tcp_conn_t *conn);
 
 void tcp_unlisten(int listener);

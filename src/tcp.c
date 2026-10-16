@@ -610,8 +610,15 @@ static void tcp_timewait_reap(void)
 /* リスナ 1 本あたりの待ち行列(listen backlog)の深さ。呼び出し側が
  * tcp_accept_begin() で受け皿を用意していない間に届いた SYN を、ここに
  * 積んで先に確立まで進めておく。積まずに捨てると相手の SYN 再送
- * (Linux の初期値は 1 秒)ぶんだけ接続確立が遅れる。 */
-#define TCP_BACKLOG 4u
+ * (Linux の初期値は 1 秒)ぶんだけ接続確立が遅れる。
+ *
+ * **IO キューの本数(NVMET_IO_QUEUES = 16)に合わせて 16。** 4 本だった頃、
+ * SPDK の spdk_nvme_perf が 16 本の qpair を同時に張りに来ると(-c 0xF -P 4)、
+ * 受け皿は 1 本ずつしか立たないので残りがあふれ、1 コアのときは捨てた SYN の
+ * 再送待ち(1・3・7 秒後)が積み重なって SPDK の接続待ち(10 秒)を超えた。
+ * 待ち行列の接続は引き渡し後も同じ s_priv のスロットを使い続けるので、
+ * TCP_MAX_CONNS の見積もり(admin 1 + IO 16 + 内蔵イニシエータ 2)は変わらない。 */
+#define TCP_BACKLOG 16u
 
 /* 待ち行列に積んだまま確立しない(相手が消えた)エントリを回収するまでの
  * 時間。確立済みで引き渡し待ちのものは対象にしない(Linux も accept 待ちの
@@ -644,6 +651,11 @@ volatile uint32_t g_tcp_backlog_max = TCP_BACKLOG;
 
 /* 待ち行列が満杯で捨てた SYN の数(Linux と同じく RST は返さない)。 */
 volatile uint32_t g_tcp_backlog_overflow_count;
+
+/* **確立して引き渡し待ちの待ち行列エントリの数(持ち主のコアごと)。**
+ * 引き渡しは持ち主のコアだけが行う(tcp_backlog_service())ので、0 のコアは
+ * リスナの走査をまるごと飛ばす。 */
+static volatile uint32_t s_backlog_estab_cnt[SMP_MAX_CORES];
 
 /* 待ち行列を経由して引き渡した accept の数。「受け皿の用意前に届いた SYN を
  * 実際に拾えているか」はこれが増えるかどうかで分かる。 */
@@ -700,6 +712,8 @@ static void tcp_backlog_release(tcp_listener_slot_t *l, unsigned p)
 {
     tcp_conn_t *c = &l->pending[p];
     unsigned    core = c->owner_core;
+    if (l->pending_estab[p] && core < SMP_MAX_CORES)
+        (void)__atomic_sub_fetch(&s_backlog_estab_cnt[core], 1u, __ATOMIC_ACQ_REL);
     if (core < SMP_MAX_CORES) {
         for (unsigned i = 0; i < TCP_MAX_CONNS; i++) {
             if (s_conns[core][i] == c) { s_conns[core][i] = NULL; break; }
@@ -4506,9 +4520,12 @@ void tcp_accept_begin(int listener, tcp_conn_t *conn)
 {
     tcp_listener_slot_t *l = tcp_listener_for(listener);
     if (!l) return;
+    /* SYN の処理(別のコアのこともある)と引き渡しが受け皿をロックの中で見るので揃える。 */
+    smp_spin_lock(&s_listener_lock);
     conn->state    = TCP_CLOSED;
     l->accept_conn  = conn;
     l->accept_ready = 0;
+    smp_spin_unlock(&s_listener_lock);
 }
 
 /*=================================================================
@@ -4537,11 +4554,19 @@ int tcp_accept_cancel(int listener, tcp_conn_t *conn)
 {
     tcp_listener_slot_t *l = tcp_listener_for(listener);
     if (!l) return 0;
-    if (l->accept_conn != conn) return 0;
-    int was_ready = l->accept_ready;
+    smp_spin_lock(&s_listener_lock);
+    if (l->accept_conn != conn) {
+        smp_spin_unlock(&s_listener_lock);
+        return 0;
+    }
+    /* **SYN を受け皿へ直接受理して握手の途中(SYN_RCVD)のものも「使われていた」。**
+     * s_conns[] に登録済みなので、黙って取り下げると呼び出し側の tcp_conn_t を
+     * 指したままの孤児が残る。呼び出し側に閉じさせる(tcp_close() が外す)。 */
+    int was_used = l->accept_ready || conn->state != TCP_CLOSED;
     l->accept_conn  = NULL;
     l->accept_ready = 0;
-    return was_ready ? 1 : 0;
+    smp_spin_unlock(&s_listener_lock);
+    return was_used ? 1 : 0;
 }
 
 /*=================================================================
@@ -4552,50 +4577,85 @@ int tcp_accept_cancel(int listener, tcp_conn_t *conn)
  * 受信済みのデータもスロット側に残ったまま)。
  *
  * 引数:
- *   l - リスナースロット
+ *   l    - リスナースロット
+ *   core - 呼んでいるコア(このコアが持ち主のエントリだけを渡す)
  * 戻り値:
- *   1=引き渡した、0=引き渡せるものが無い
+ *   1=引き渡した(accept_ready を立てた)、0=引き渡せるものが無い
  * コール元:
- *   tcp_accept_ready_poll()
+ *   tcp_accept_ready_poll(), tcp_backlog_service()
  * ===============================================================*/
-static int tcp_backlog_handoff(tcp_listener_slot_t *l)
+static int tcp_backlog_handoff(tcp_listener_slot_t *l, unsigned core)
 {
-    if (l->accept_conn == NULL) return 0;
+    smp_spin_lock(&s_listener_lock);
+    /* **受け皿が未使用のときだけ渡す。** 受け皿には SYN が直接受理されることがあり
+     * (tcp_input_addr() の backlog=-1)、握手の途中(SYN_RCVD)や確立直後
+     * (accept_ready)の受け皿へ複製すると、その接続の中身を上書きして消してしまう。
+     * 以前はこれを見ておらず、SPDK が 16 本を同時に張ると、直接受理した 1〜2 本の
+     * ACK と ICReq が行き場を失い、SPDK の接続待ち(10 秒)が切れた。 */
+    tcp_conn_t *to = l->accept_conn;
+    if (to == NULL || to->state != TCP_CLOSED || l->accept_ready) {
+        smp_spin_unlock(&s_listener_lock);
+        return 0;
+    }
 
-    /* 先に確立したものから渡す(FIFO)。 */
+    /* 先に確立したものから渡す(FIFO)。**自コアが持ち主のものだけ。** 持ち主の
+     * コアは同じ接続の受信を処理している最中かもしれないので、別のコアから
+     * 64 バイトを複製すると壊れた状態を写しうる(RSS で受信を散らしたとき)。 */
     int oldest = -1;
     for (unsigned p = 0; p < TCP_BACKLOG; p++) {
         if (!l->pending_used[p] || !l->pending_estab[p]) continue;
+        if (l->pending[p].owner_core != core) continue;
         if (oldest < 0 || l->pending_since[p] < l->pending_since[oldest]) oldest = (int)p;
     }
-    if (oldest < 0) return 0;
+    if (oldest < 0) {
+        smp_spin_unlock(&s_listener_lock);
+        return 0;
+    }
 
     tcp_conn_t *from = &l->pending[oldest];
-    tcp_conn_t *to   = l->accept_conn;
-    unsigned    pcore = from->owner_core;
-
     *to = *from;  /* 64 バイトの複製 */
 
     int moved = 0;
-    if (pcore < SMP_MAX_CORES) {
-        for (unsigned i = 0; i < TCP_MAX_CONNS; i++) {
-            if (s_conns[pcore][i] == from) { s_conns[pcore][i] = to; moved = 1; break; }
-        }
+    for (unsigned i = 0; i < TCP_MAX_CONNS; i++) {
+        if (s_conns[core][i] == from) { s_conns[core][i] = to; moved = 1; break; }
     }
     if (!moved) {
         /* s_conns[] に居ない = 既に畳まれている。引き渡さずに回収する。 */
         uart_printf("[!] TCP: backlog のエントリが s_conns[] に居ません(引き渡し中止)\n");
         to->state = TCP_CLOSED;
         tcp_backlog_release(l, (unsigned)oldest);
+        smp_spin_unlock(&s_listener_lock);
         return 0;
     }
 
     from->state = TCP_CLOSED;
     l->pending_estab[oldest] = 0;
     l->pending_used[oldest]  = 0;
-    l->accept_conn = NULL;
+    (void)__atomic_sub_fetch(&s_backlog_estab_cnt[core], 1u, __ATOMIC_ACQ_REL);
+    /* **引き取りは呼び出し側の tcp_accept_ready_poll() が見る**(受け皿へ直接受理して
+     * 確立したときと同じ印)。引き渡しは持ち主のコアで、待っているジョブは別の
+     * コアに居てよい。 */
+    l->accept_ready = 1;
     g_tcp_backlog_accept_count++;
+    smp_spin_unlock(&s_listener_lock);
     return 1;
+}
+
+/*=================================================================
+ * 自コアが持ち主の、確立済みの待ち行列エントリを受け皿へ引き渡す。
+ * **ポーリングの先頭で呼ぶ。** 引き渡し待ちが無いコアは数を見るだけで返る。
+ *
+ * コール元:
+ *   net_poll_all_and_dispatch()
+ * ===============================================================*/
+void tcp_backlog_service(void)
+{
+    unsigned core = smp_core_index();
+    if (core >= SMP_MAX_CORES || !s_backlog_estab_cnt[core]) return;
+    for (unsigned li = 0; li < TCP_LISTENER_TOTAL; li++) {
+        tcp_listener_slot_t *l = &s_listeners[li];
+        if (l->in_use && l->accept_conn != NULL) (void)tcp_backlog_handoff(l, core);
+    }
 }
 
 /*=================================================================
@@ -4616,12 +4676,17 @@ int tcp_accept_ready_poll(int listener)
     if (tcp_abort_requested()) {
         return 0;
     }
-    if (l->accept_ready) {
+    /* 同じコアが持ち主のエントリはここで渡す。別のコアのものは、そのコアの
+     * tcp_backlog_service() が渡して accept_ready を立てる。 */
+    (void)tcp_backlog_handoff(l, smp_core_index());
+    smp_spin_lock(&s_listener_lock);
+    int ready = l->accept_ready;
+    if (ready) {
         l->accept_ready = 0;
         l->accept_conn  = NULL;
-        return 1;
     }
-    return tcp_backlog_handoff(l);
+    smp_spin_unlock(&s_listener_lock);
+    return ready;
 }
 
 /*=================================================================
@@ -5043,6 +5108,7 @@ void tcp_input_addr(const uint8_t *pkt, uint16_t len,
                     /* 待ち行列の中で確立した。呼び出し側が受け皿を用意した
                      * 時点で tcp_accept_ready_poll() が引き渡す。 */
                     s_listeners[li].pending_estab[bp] = 1;
+                    (void)__atomic_add_fetch(&s_backlog_estab_cnt[core], 1u, __ATOMIC_ACQ_REL);
                     break;
                 }
             }

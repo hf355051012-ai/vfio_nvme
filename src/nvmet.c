@@ -960,7 +960,11 @@ static int nvmet_admin_dispatch(nvmet_ctx_t *ctx, const nvme_sqe_t *sqe,
             if (offset == NVME_REG_CC) {
                 ctx->cc    = rd32le(&sqe->cdw12);
                 ctx->cc_en = (ctx->cc & NVME_CC_EN) ? 1 : 0;
-                if (ctx->cc_en && !ctx->io_armed && !ctx->is_discovery) {
+                /* **CC.SHN の書き込みでは立てない。** Linux / SPDK は EN を立てたまま
+                 * SHN を書く(CC=0x464001)。最後の IO キューが閉じて io_armed を
+                 * 落とした直後にこれが来ると、IO の受け皿が立ち直り、次のホストの
+                 * admin 接続を横取りした(qid=0 の Connect が IO キューに来る)。 */
+                if (ctx->cc_en && !(ctx->cc & NVME_CC_SHN_MASK) && !ctx->io_armed && !ctx->is_discovery) {
                     ctx->io_armed = 1;
                     /* **arm 権を admin から手放す。** これで IO ジョブの 1 本が
                      * accept の受け皿を用意できるようになる。 */

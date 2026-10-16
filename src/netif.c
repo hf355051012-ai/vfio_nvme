@@ -726,6 +726,9 @@ int net_poll_all_and_dispatch(void)
     /* **前の巡回で応答へ相乗りできなかった ACK をここで返す。**
      * 借りが無ければ何もしない(コアごとの旗 1 個を見るだけ)。 */
     tcp_ack_flush_deferred();
+    /* 待ち行列で確立した接続の引き渡しは持ち主のコアが行う(待っている
+     * ジョブが別のコアに居ても、ここで受け皿へ渡して accept_ready を立てる)。 */
+    tcp_backlog_service();
 
     for (unsigned i = 0; i < s_registered_count; i++) {
         netif_t *ctx = s_registered[i];
