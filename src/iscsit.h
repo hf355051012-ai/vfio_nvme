@@ -11,8 +11,11 @@
 
 /* 同時に受ける接続の数。**1 接続 = 1 セッション**(MaxConnections=1)。
  * open-iscsi は Discovery のあと通常セッションを張り、session reinstatement では
- * 一瞬 2 本並ぶので、最低 2 本は要る。 */
-#define ISCSIT_MAX_CONNS      4u
+ * 一瞬 2 本並ぶので、最低 2 本は要る。
+ * **RSS で 8 コアへ配る(`netmt 8`)には 8 本以上の接続が要る**ので 16(NVMe/TCP の IO キューの
+ * 上限と同じ)。open-iscsi は `node.session.nr_sessions` で同じポータルへ別の ISID のセッションを
+ * 何本でも張れる。1 本あたり約 300KB(s_t.conn[])、ジョブは 1 本 1 つ(JOB_MAX 64 に収まる)。 */
+#define ISCSIT_MAX_CONNS      16u
 /* コマンドの窓(MaxCmdSN = ExpCmdSN + この数 - 1)。LIO は 64。 */
 #define ISCSIT_CMD_WINDOW     128u
 /* 自分が受け取れる 1 PDU のデータ長(MaxRecvDataSegmentLength の宣言)。LIO と同じ。 */
