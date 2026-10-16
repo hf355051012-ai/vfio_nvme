@@ -2715,6 +2715,7 @@ static void tcp_parse_syn_options(tcp_conn_t *conn, tcp_priv_t *priv,
  *   in          - TCP ヘッダ先頭
  *   hdr_len     - オプション込みの TCP ヘッダ長
  *   seq         - このセグメントの先頭 seq
+ *   end_seq     - このセグメントの終わりの seq(seq + ペイロード長、FIN なら + 1)
  *   out_tsecr   - 相手が echo してきた自分の TSval(RTT 計測用)
  * 戻り値:
  *   1=処理を続けてよい、0=PAWS で破棄した
@@ -2723,7 +2724,7 @@ static void tcp_parse_syn_options(tcp_conn_t *conn, tcp_priv_t *priv,
  * ===============================================================*/
 static int tcp_input_options(tcp_conn_t *conn, tcp_priv_t *priv,
                               const volatile uint8_t *in, uint8_t hdr_len,
-                              uint32_t seq, uint32_t *out_tsecr)
+                              uint32_t seq, uint32_t end_seq, uint32_t *out_tsecr)
 {
     if (hdr_len <= TCP_HDR_LEN) return 1;  /* 相手が付けてこなかった */
 
@@ -2782,8 +2783,14 @@ static int tcp_input_options(tcp_conn_t *conn, tcp_priv_t *priv,
     }
 
     /* R3: ACK 済みの範囲に続くセグメントのときだけ TS.Recent を進める
-     * (順序不正のセグメントで進めると、後から届く正しいものを弾いてしまう)。 */
-    if (!tcp_seq_lt(priv->ts_last_ack_sent, seq)) {
+     * (順序不正のセグメントで進めると、後から届く正しいものを弾いてしまう)。
+     *
+     * **範囲全体が受け取り済みの古いセグメントでは進めない**(seq <= Last.ACK.sent <= end_seq。
+     * Linux の tcp_sequence() + tcp_replace_ts_recent() と同じ)。以前は seq だけを見ていたので、
+     * 相手の無駄な再送(新しい TSval が付く)で TS.Recent が進み、その再送より前に送られて遅れて届く
+     * **新しいデータ**(古い TSval)を R1 で捨てていた。相手から見ると新たな穴で、再送の時間切れ
+     * (200 ms)まで待つことになる(256KiB の書き込みで 15 秒に 55〜321 回。SPEC 27.11.2)。 */
+    if (!tcp_seq_lt(priv->ts_last_ack_sent, seq) && !tcp_seq_lt(end_seq, priv->ts_last_ack_sent)) {
         priv->ts_recent = tsval;
     }
 
@@ -5087,8 +5094,10 @@ void tcp_input_addr(const uint8_t *pkt, uint16_t len,
      * PAWS(古いセグメントの検出)はここで行う -- RST より後に置いてあるので
      * RST は PAWS の対象外(相手を切れなくなるのを避ける)。 */
     uint32_t seg_tsecr = 0;
+    const uint32_t seg_end = seq + (uint32_t)(len - hdr_len) +
+                             ((in[TCP_OFF_FLAGS] & TCP_FLAG_FIN) ? 1u : 0u);
     if ((priv->ts_enabled || priv->sack_enabled) &&
-        !tcp_input_options(conn, priv, in, hdr_len, seq, &seg_tsecr)) {
+        !tcp_input_options(conn, priv, in, hdr_len, seq, seg_end, &seg_tsecr)) {
         g_tcp_rx_paws_drop[core]++;
         return;  /* PAWS で破棄(ACK は tcp_input_options() が返している) */
     }
