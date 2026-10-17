@@ -708,8 +708,10 @@ int nvmet_tcp_send_c2h_async(nvmet_tcp_conn_t *c, uint16_t cid,
 
     if (c->tls) {
         /* TLS: 暗号化先が要るのでゼロコピーは使わない。ヘッダと本体を
-         * 同じレコードへ詰め、データダイジェストがあれば続けて送る。 */
-        if (nvmet_tls_send(c->tls, &c->tcp, hdr, (uint32_t)NVME_TCP_DATA_PDU_LEN + hd, src, dlen) != 0) {
+         * 同じレコードへ詰め、データダイジェストがあれば続けて送る。
+         * **本体は RAM ディスクで送り終わるまで変わらない**ので _stable で渡す(相手の窓が足りなければ
+         * 途中で止めて、IO ジョブが次の周回で続きを送る。nvmet_tls_tx_continue())。 */
+        if (nvmet_tls_send_stable(c->tls, &c->tcp, hdr, (uint32_t)NVME_TCP_DATA_PDU_LEN + hd, src, dlen) != 0) {
             uart_printf("[!] NVMe/TCP target: C2HData送信失敗(TLS、cid=%u)\n", cid);
             return -1;
         }

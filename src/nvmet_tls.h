@@ -26,6 +26,8 @@
 
 #define NVMET_TLS_APP_MAX  (2u * TLS13_PLAIN_MAX + 8192u)  /* 平文の溜め */
 #define NVMET_TLS_FEED     8192u                           /* 1 回に食わせる暗号文 */
+#define NVMET_TLS_PQ_N     16u                             /* 送り残しの断片の数 */
+#define NVMET_TLS_PQ_BUF   2048u                           /* 送り残しのうち写して持つ小さい断片の置き場 */
 
 /* 接続 1 本ぶん */
 typedef struct nvmet_tls_conn {
@@ -40,6 +42,17 @@ typedef struct nvmet_tls_conn {
     int      failed;
     uint64_t rx_records, tx_records, rx_bytes, tx_bytes;
     tls13_psk_t cpsk;               /* クライアント: この接続の PSK(身元は host / sub で決まる)*/
+    /* **送り残し(まだ封をしていない平文)の待ち行列。** 大きい応答の途中で相手の窓が足りなくなったら、
+     * 残りをここに置いて呼び出し側へ返し、IO ジョブが次の周回で続きを送る(nvmet_tls_tx_continue())。
+     * 待ち行列が空でない間に来た送信は後ろへ積む(**封をした順にワイヤへ出す**ため。段階 E)。
+     * 大きい断片は呼び出し側の領域(RAM ディスク)を指したまま、小さい断片(ヘッダ・ダイジェスト・応答)は
+     * pq_buf へ写して持つ。 */
+    struct { const uint8_t *p; uint32_t len; } pq[NVMET_TLS_PQ_N];
+    uint8_t  pq_head, pq_n;
+    uint8_t  ptx_allow;             /* 1 = 窓が足りなければ途中で止めてよい(IO ジョブが周回ごとに決める)*/
+    uint16_t pq_buf_used;
+    uint64_t ptx_parts;             /* 途中で止めた回数 */
+    uint8_t  pq_buf[NVMET_TLS_PQ_BUF];
 } nvmet_tls_conn_t;
 
 int  nvmet_tls_enabled(void);   /* TLS を必須にしている(`nvmettls` で鍵を設定した)*/
@@ -63,9 +76,17 @@ int  nvmet_tls_poll(nvmet_tls_conn_t *s, tcp_conn_t *tcp);
 /* ---- 段階 E: レコード層 ---- */
 /* 平文を読む。戻り値: >0=読んだバイト数、0=まだ無い、-1=相手が閉じた / 失敗。 */
 int  nvmet_tls_recv(nvmet_tls_conn_t *s, tcp_conn_t *tcp, uint8_t *dst, uint32_t max);
-/* 1〜2 断片を暗号化して送る。戻り値: 0=成功、-1=失敗。 */
+/* 1〜2 断片を暗号化して送る。戻り値: 0=成功、-1=失敗。送り残しがあれば後ろへ積む(順序を保つ)。 */
 int  nvmet_tls_send(nvmet_tls_conn_t *s, tcp_conn_t *tcp, const void *p1, uint32_t l1,
                     const void *p2, uint32_t l2);
+/* nvmet_tls_send() と同じだが、**p2 は送り終わるまで書き換わらない**(RAM ディスクの読み出し)。
+ * ptx_allow が立っていれば、窓が足りなくなったところで残りを待ち行列に置いて 0 を返す。 */
+int  nvmet_tls_send_stable(nvmet_tls_conn_t *s, tcp_conn_t *tcp, const void *p1, uint32_t l1,
+                           const void *p2, uint32_t l2);
+/* 送り残しがあるか。 */
+static inline int nvmet_tls_tx_pending(const nvmet_tls_conn_t *s) { return s->pq_n != 0u; }
+/* 送り残しの続きを送る。allow=1 なら窓が足りなければ止める。戻り値: 0=送り切った、1=まだ残る、-1=失敗。 */
+int  nvmet_tls_tx_continue(nvmet_tls_conn_t *s, tcp_conn_t *tcp, int allow);
 /* plain バイトの応答をいま送り始めても、短経路の再送用の枠と送信窓(相手の受信窓・cwnd)で
  * その場で待たずに済みそうか。1=済む、0=足りない(呼び出し側は順番を譲る)。
  * 要求は「必要なレコード数(枠の半分まで)」と「暗号文のバイト数(使える窓の半分まで)」。

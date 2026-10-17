@@ -4443,10 +4443,10 @@ void tcp_conns_show(void)
             const tcp_conn_t *c = s_conns[core][i];
             if (!c || c->state != TCP_ESTABLISHED) continue;
             const tcp_priv_t *pv = &s_priv[core][i];
-            uart_printf("  core%u %u->%u 未確認=%u cwnd=%u ssthresh=%u 相手の窓=%u 長経路の枠=%u/%u 短経路の枠=%u"
+            uart_printf("  core%u %u->%u 未確認=%u cwnd=%u ssthresh=%u 相手の窓=%u(最大 %u)長経路の枠=%u/%u 短経路の枠=%u"
                         " 高速回復=%d rto=%ums snd_seq=%u\n",
                         core, (unsigned)c->local_port, (unsigned)c->remote_port,
-                        (unsigned)(c->snd_seq - pv->snd_una), pv->cwnd, pv->ssthresh, (unsigned)c->snd_win,
+                        (unsigned)(c->snd_seq - pv->snd_una), pv->cwnd, pv->ssthresh, (unsigned)c->snd_win, pv->snd_win_max,
                         pv->async_count, pv->async_cap, pv->async_short_count,
                         pv->in_fast_recovery, pv->rto_ms, (unsigned)c->snd_seq);
         }

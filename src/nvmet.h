@@ -98,6 +98,8 @@ extern volatile int g_nvmet_multi_ctrl;
 extern volatile uint32_t g_nvmet_tx_yield;
 /* push-run の 1 回の step で、入った時点の ready-ring の分だけ処理するか(既定 1。シェルの `nvmetfair`)。 */
 extern volatile uint32_t g_nvmet_fair;
+/* `tlssplit on|off`(既定 on)。TLS の大きい応答を、相手の窓が足りなければ途中で止めて次の周回で続きを送る。 */
+extern volatile uint32_t g_nvmet_tls_split;
 
 /* 1 つのコントローラが同時に持てる IO キュー(= TCP コネクション)の本数の
  * **上限**。実際に何本広告するかは実行時に `g_nvmet_io_queues` で決める

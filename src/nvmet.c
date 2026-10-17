@@ -1401,6 +1401,10 @@ volatile uint32_t g_nvmet_tx_yield = 3u;
 /* `nvmetfair on|off`(既定 on)。on なら push-run の 1 回の step で処理するのは、step に入った時点で
  * ready-ring に積まれていたコマンドまで(下の push-run 参照)。off が直す前の挙動(陰性対照)。 */
 volatile uint32_t g_nvmet_fair = 1u;
+/* `tlssplit on|off`(既定 on)。on なら、TLS の大きい応答(C2HData)を送る途中で相手の窓が足りなくなったとき、
+ * 残りを接続の送り残しに置いて次のコマンドへ進まずに順番を譲り、次の周回で続きを送る(下の push-run 参照)。
+ * off が直す前の挙動(陰性対照。応答を送り切るまで tcp_short_wait() で窓を待ち、同じコアのほかの接続が止まる)。 */
+volatile uint32_t g_nvmet_tls_split = 1u;
 /* TLS で続けて譲るのはここまで(窓の確認と再送は tcp_short_wait() の中でしか回らないため)。 */
 #define NVMET_TLS_YIELD_RUN_MAX 4096u
 /* コアごとの、TLS の IO キューを受け持って動いているジョブの数。**同じコアにもう 1 本居るときだけ譲る**
@@ -2131,10 +2135,32 @@ typedef struct {
     uint64_t          tx_yield_count;        /* 送信キューの空きが無くて順番を譲った回数(`nvmetqueues`)*/
     uint64_t          room_yield_count;       /* TLS: 短経路の枠か送信窓が足りなくて譲った回数 */
     uint32_t          room_yield_run;         /* TLS: 続けて譲った回数(上限で譲るのをやめる)*/
+    uint64_t          split_yield_count;      /* TLS: 応答の送り残しの窓待ちで譲った回数(`tlssplit`)*/
     uint32_t          step_cmds_max;         /* 1 回の step で処理したコマンドの最大数(`nvmetqueues`)*/
     int               tls_core;              /* s_tls_io_jobs_on_core[] に数えたコア(-1 = 数えていない)*/
     int               io_core;               /* s_io_jobs_on_core[] に数えたコア(-1 = 数えていない)*/
 } nvmet_io_job_ctx_t;
+
+/* TLS の応答の送り残しの続きを送る。1 = まだ残る(呼び出し側は順番を譲る)、0 = 送り切った / 失敗。
+ * まず続きを試し、窓が足りなければ受信を 1 回見て ACK を拾ってからもう一度試す(全員が譲ると誰も ACK を
+ * 拾わない)。窓の確認や再送は tcp_short_wait() の中でしか回らないので、続けて NVMET_TLS_YIELD_RUN_MAX 回
+ * 譲ったらその場で送り切る。失敗はここでは扱わない(次の送信か受信で接続ごと畳まれる)。 */
+static int nvmet_io_tls_continue(nvmet_io_job_ctx_t *jc)
+{
+    const int allow = jc->io.tls->ptx_allow && jc->room_yield_run < NVMET_TLS_YIELD_RUN_MAX;
+    int r = nvmet_tls_tx_continue(jc->io.tls, &jc->io.tcp, allow);
+    if (r == 1) {
+        (void)net_poll_all_and_dispatch();
+        r = nvmet_tls_tx_continue(jc->io.tls, &jc->io.tcp, allow);
+    }
+    if (r == 1) {
+        jc->room_yield_run++;
+        jc->split_yield_count++;
+        return 1;
+    }
+    jc->room_yield_run = 0;
+    return 0;
+}
 
 static nvmet_io_job_ctx_t s_io_job_pool[NVMET_MAX_INSTANCES][NVMET_IO_QUEUES];
 
@@ -3236,7 +3262,14 @@ static job_result_t nvmet_io_job_step_impl(job_t *self)
          * 空きで譲る判定(下)は、窓待ちの間に送信キューが空くので働かなかった。 */
         const uint32_t ready_end = g_nvmet_fair ? jc->ready_head : 0u;
         uint32_t step_cmds = 0;
-        while (jc->ready_tail != (g_nvmet_fair ? ready_end : jc->ready_head)) {
+        /* **TLS の応答を途中で止めてよいのは、同じコアにもう 1 本 TLS の IO ジョブが居るときだけ**
+         * (`tlssplit`、既定 on)。1 本だけなら譲っても回すものが無い(下の nvmet_tls_send_room_ok() と同じ条件)。 */
+        if (jc->io.tls) {
+            jc->io.tls->ptx_allow = (uint8_t)(g_nvmet_tls_split && g_nvmet_tx_yield >= 2u && jc->tls_core >= 0 &&
+                                              s_tls_io_jobs_on_core[jc->tls_core] >= 2u);
+        }
+        int tls_blocked = 0;
+        while (!tls_blocked && jc->ready_tail != (g_nvmet_fair ? ready_end : jc->ready_head)) {
             /* **送信キューの空きが半分を切ったら、残りのコマンドは次の周回へ回す。**
              * 送信キューが満杯だと送信はその場で空きを待つ。1 つのコアが 2 つのポートを扱うとき、
              * 片方のジョブが受けたコマンドを全部(256KiB x 32 = 8MB、約 2.7ms ぶん)出し終えるまで
@@ -3246,6 +3279,12 @@ static job_result_t nvmet_io_job_step_impl(job_t *self)
             if (jc->tx_nif && g_nvmet_tx_yield &&
                 eth_tx_room_of(jc->tx_nif) < NVMET_TX_ROOM_MIN) {
                 jc->tx_yield_count++;
+                break;
+            }
+            /* **前のコマンドの応答の送り残しがあれば、先にその続きを送る。** 窓がまだ足りなければ、次の
+             * コマンドへ進まずに順番を譲る(同じ接続の応答の順番を崩さないため)。 */
+            if (jc->io.tls && nvmet_tls_tx_pending(jc->io.tls) && nvmet_io_tls_continue(jc)) {
+                tls_blocked = 1;
                 break;
             }
             nvmet_ready_t *rd = &jc->ready[jc->ready_tail % NVMET_READY_RING];
@@ -3304,6 +3343,8 @@ static job_result_t nvmet_io_job_step_impl(job_t *self)
             jc->ready_tail++;
             step_cmds++;
         }
+        /* コマンドが無くても、送り残しがあれば続きを送る(残っているあいだは眠らない)。 */
+        if (!tls_blocked && jc->io.tls && nvmet_tls_tx_pending(jc->io.tls)) tls_blocked = nvmet_io_tls_continue(jc);
         if (step_cmds > jc->step_cmds_max) jc->step_cmds_max = step_cmds;
         (void)nvmet_tcp_tx_batch_end(&jc->io);
         /* **応答へ相乗りできなかった ACK をここで返す。** 応答を出して
@@ -3322,7 +3363,8 @@ static job_result_t nvmet_io_job_step_impl(job_t *self)
          *
          * 上の 3 つ(Ctrl+C / パースエラー / 切断)を見るのが
          * JOB_IDLE_TICK_DIVISOR 周期に落ちるが、いずれも ms を争わない。 */
-        if (jc->ready_tail == jc->ready_head && !tcp_ack_owed(&jc->io.tcp)) {
+        if (jc->ready_tail == jc->ready_head && !tcp_ack_owed(&jc->io.tcp) &&
+            !(jc->io.tls && nvmet_tls_tx_pending(jc->io.tls))) {
             job_park(self, &jc->ready_head, &jc->ready_tail);
         }
         return JOB_WAITING;
@@ -3830,11 +3872,12 @@ void nvmet_io_queues_show(const nvmet_ctx_t *ctx)
         for (unsigned q = 0; q < NVMET_IO_QUEUES; q++) {
             nvmet_io_job_ctx_t *jc = &s_io_job_pool[i][q];
             uart_printf("  キュー%u: %s (tcp state=%u) コマンド %llu 件、送信キュー待ちで譲った %llu 回、"
-                        "枠・窓待ち(TLS / 長経路)で譲った %llu 回、1 回の step で最大 %u 件%s\n", q + 1u,
+                        "枠・窓待ち(TLS / 長経路)で譲った %llu 回、TLS の送り残しで譲った %llu 回、1 回の step で最大 %u 件%s\n", q + 1u,
                         jc->connected ? "接続中" : "未接続",
                         (unsigned)jc->io.tcp.state,
                         (unsigned long long)jc->stat_cmds, (unsigned long long)jc->tx_yield_count,
-                        (unsigned long long)jc->room_yield_count, (unsigned)jc->step_cmds_max,
+                        (unsigned long long)jc->room_yield_count, (unsigned long long)jc->split_yield_count,
+                        (unsigned)jc->step_cmds_max,
                         jc->ctx && jc->ctx->io_arm_owner == (int)q ? " [accept待ち]" : "");
             jc->step_cmds_max = 0;   /* 最大は表示のたびに測り直す(交互の A/B で見るため)*/
         }

@@ -150,6 +150,10 @@ void nvmet_tls_start(nvmet_tls_conn_t *s) {
     s->applen = s->apphead = 0;
     s->failed = 0;
     s->rx_records = s->tx_records = s->rx_bytes = s->tx_bytes = 0;
+    s->pq_head = s->pq_n = 0;
+    s->pq_buf_used = 0;
+    s->ptx_allow = 0;
+    s->ptx_parts = 0;
 }
 
 /* 1 TCP セグメントに収まるレコードの大きさ(TLS のヘッダ・内側の種別・タグで 22 バイト)。
@@ -334,36 +338,58 @@ int nvmet_tls_send_room_ok(const nvmet_tls_conn_t *s, const tcp_conn_t *tcp, uin
     return room >= want;
 }
 
-int nvmet_tls_send(nvmet_tls_conn_t *s, tcp_conn_t *tcp, const void *p1, uint32_t l1,
-                   const void *p2, uint32_t l2) {
-    if (s->failed || s->t.state != TLS13_ST_OPEN) return -1;
-    if (flush_pend(s, tcp, 0) != 0) return -1;   /* **受信中に生まれた送信を先に**(順序を崩さない)*/
-    const uint8_t *f[2] = { (const uint8_t *)p1, (const uint8_t *)p2 };
-    uint32_t fl[2] = { l1, l2 };
-    unsigned fi = 0;
-    uint32_t fo = 0;
-    uint32_t left = l1 + l2;
+/* ---- 送り残しの待ち行列(nvmet_tls_conn_t.pq)---- */
+/* 断片を待ち行列の後ろへ積む。copy=1 なら pq_buf へ写す(呼び出し側の領域がすぐ書き換わる場合)。 */
+static int pq_push(nvmet_tls_conn_t *s, const uint8_t *p, uint32_t len, int copy) {
+    if (len == 0u) return 0;
+    if (s->pq_n >= NVMET_TLS_PQ_N) return -1;
+    if (copy) {
+        if ((uint32_t)s->pq_buf_used + len > NVMET_TLS_PQ_BUF) return -1;
+        memcpy(&s->pq_buf[s->pq_buf_used], p, len);
+        p = &s->pq_buf[s->pq_buf_used];
+        s->pq_buf_used = (uint16_t)(s->pq_buf_used + len);
+    }
+    const unsigned i = (s->pq_head + s->pq_n) % NVMET_TLS_PQ_N;
+    s->pq[i].p = p;
+    s->pq[i].len = len;
+    s->pq_n++;
+    return 0;
+}
+
+/* rl バイトのレコード(= 1 セグメント)を、いま待たずに送れるか。未確認が無ければ常に送る
+ * (送らないと誰も ACK を待たずに止まる。nvmet_tls_send_room_ok() と同じ)。 */
+static int can_send_now(const tcp_conn_t *tcp, uint32_t rl) {
+    if (tcp_unacked_bytes(tcp) == 0u) return 1;
+    if (tcp_send_short_free(tcp, NULL) == 0u) return 0;
+    return tcp_send_room(tcp, NULL) >= rl;
+}
+
+/* 待ち行列の頭から、1 レコード(最大 2 断片)ずつ封をして送る。allow=1 なら、次のレコードが窓に
+ * 収まらないところで止める。戻り値: 0=送り切った、1=まだ残る、-1=失敗。 */
+static int pq_drain(nvmet_tls_conn_t *s, tcp_conn_t *tcp, int allow) {
     uint32_t chunk = seg_cap(tcp) - (5u + 1u + 16u);
     if (chunk > TLS13_PLAIN_MAX) chunk = TLS13_PLAIN_MAX;
-    while (left) {
-        const uint32_t take = left < chunk ? left : chunk;
-        /* このレコードに入る平文の断片(最大 2 個)*/
+    while (s->pq_n) {
+        const unsigned i0 = s->pq_head, i1 = (s->pq_head + 1u) % NVMET_TLS_PQ_N;
         const uint8_t *q[2] = { NULL, NULL };
         uint32_t ql[2] = { 0, 0 };
-        unsigned nq = 0;
-        for (uint32_t got = 0; got < take;) {
-            while (fo == fl[fi]) { fi++; fo = 0; }
-            uint32_t c = fl[fi] - fo;
-            if (c > take - got) c = take - got;
-            q[nq] = f[fi] + fo;
-            ql[nq] = c;
-            nq++;
-            fo += c;
-            got += c;
+        unsigned nq = 1;
+        ql[0] = s->pq[i0].len < chunk ? s->pq[i0].len : chunk;
+        q[0] = s->pq[i0].p;
+        uint32_t take = ql[0];
+        if (ql[0] == s->pq[i0].len && s->pq_n > 1u && take < chunk) {
+            ql[1] = s->pq[i1].len < chunk - take ? s->pq[i1].len : chunk - take;
+            q[1] = s->pq[i1].p;
+            take += ql[1];
+            nq = 2;
+        }
+        const uint16_t rl_want = (uint16_t)(5u + take + 1u + 16u);
+        if (allow && !can_send_now(tcp, rl_want)) {
+            s->ptx_parts++;
+            return 1;
         }
         /* **暗号化の出力を TCP の再送スロットへ直接書く**(段階 G)。平文をレコード用
          * バッファへ写す 1 回と、レコードをスロットへ写す 1 回が無くなる。 */
-        const uint16_t rl_want = (uint16_t)(5u + take + 1u + 16u);
         uint8_t *slot = g_nvmet_tls_corrupt ? NULL : tcp_send_async_reserve(tcp, rl_want);
         if (slot) {
             const size_t rl = tls13_seal2(&s->t, q[0], ql[0], q[1], ql[1], slot);
@@ -371,27 +397,86 @@ int nvmet_tls_send(nvmet_tls_conn_t *s, tcp_conn_t *tcp, const void *p1, uint32_
                 s->failed = 1;
                 return -1;
             }
-            s->tx_records++;
-            s->tx_bytes += take;
-            left -= take;
-            continue;
-        }
-        /* 予約できない(検証用に壊す / 大きすぎる)ときは従来どおりレコード用バッファで */
-        const size_t rl = tls13_seal2(&s->t, q[0], ql[0], q[1], ql[1], s->rec);
-        if (g_nvmet_tls_corrupt) {   /* 検証用: 暗号文を 1 ビット壊す(相手が bad_record_mac で切るか)*/
-            g_nvmet_tls_corrupt--;
-            s->rec[rl - 1] ^= 0x01;
-            uart_printf("[nvmet-tls] 検証用にレコード 1 個の暗号文を壊して送る\n");
-        }
-        if (tcp_send_async2(tcp, s->rec, (uint16_t)rl, NULL, 0) < 0) {
-            s->failed = 1;
-            return -1;
+        } else {
+            /* 予約できない(検証用に壊す / 大きすぎる)ときは従来どおりレコード用バッファで */
+            const size_t rl = tls13_seal2(&s->t, q[0], ql[0], q[1], ql[1], s->rec);
+            if (g_nvmet_tls_corrupt) {   /* 検証用: 暗号文を 1 ビット壊す(相手が bad_record_mac で切るか)*/
+                g_nvmet_tls_corrupt--;
+                s->rec[rl - 1] ^= 0x01;
+                uart_printf("[nvmet-tls] 検証用にレコード 1 個の暗号文を壊して送る\n");
+            }
+            if (tcp_send_async2(tcp, s->rec, (uint16_t)rl, NULL, 0) < 0) {
+                s->failed = 1;
+                return -1;
+            }
         }
         s->tx_records++;
         s->tx_bytes += take;
-        left -= take;
+        for (unsigned k = 0; k < nq; k++) {
+            const unsigned ik = (s->pq_head) % NVMET_TLS_PQ_N;
+            s->pq[ik].p += ql[k];
+            s->pq[ik].len -= ql[k];
+            if (s->pq[ik].len == 0u) {
+                s->pq_head = (uint8_t)((s->pq_head + 1u) % NVMET_TLS_PQ_N);
+                s->pq_n--;
+            }
+        }
+    }
+    s->pq_head = 0;
+    s->pq_buf_used = 0;
+    return 0;
+}
+
+static int tls_send(nvmet_tls_conn_t *s, tcp_conn_t *tcp, const void *p1, uint32_t l1,
+                    const void *p2, uint32_t l2, int stable) {
+    if (s->failed || s->t.state != TLS13_ST_OPEN) return -1;
+    if (flush_pend(s, tcp, 0) != 0) return -1;   /* **受信中に生まれた送信を先に**(順序を崩さない)*/
+    const uint8_t *b1 = (const uint8_t *)p1, *b2 = (const uint8_t *)p2;
+    if (s->pq_n) {
+        /* **送り残しがあれば後ろへ積む**(先に封をしたものから順にワイヤへ出す)。積めなければ
+         * 送り残しをその場で送り切ってから、下の普通の経路で送る。 */
+        const uint8_t n0 = s->pq_n;
+        const uint16_t u0 = s->pq_buf_used;
+        if (pq_push(s, b1, l1, 1) == 0 && pq_push(s, b2, l2, !stable) == 0)
+            return pq_drain(s, tcp, s->ptx_allow) < 0 ? -1 : 0;
+        s->pq_n = n0;                    /* 積みかけを戻す */
+        s->pq_buf_used = u0;
+        if (pq_drain(s, tcp, 0) != 0) return -1;
+    }
+    /* 待ち行列は空。断片は写さずに指したまま積み、送る。 */
+    (void)pq_push(s, b1, l1, 0);
+    (void)pq_push(s, b2, l2, 0);
+    const int r = pq_drain(s, tcp, stable && s->ptx_allow);
+    if (r != 1) return r;
+    /* 途中で止めた。**p1 は呼び出し側の作業域なので、残っていれば写す**(p2 は stable なので指したままでよい)。 */
+    for (unsigned k = 0; k < s->pq_n; k++) {
+        const unsigned ik = (s->pq_head + k) % NVMET_TLS_PQ_N;
+        if (s->pq[ik].p >= b1 && s->pq[ik].p < b1 + l1) {
+            const uint32_t len = s->pq[ik].len;
+            if ((uint32_t)s->pq_buf_used + len > NVMET_TLS_PQ_BUF) return pq_drain(s, tcp, 0);
+            memcpy(&s->pq_buf[s->pq_buf_used], s->pq[ik].p, len);
+            s->pq[ik].p = &s->pq_buf[s->pq_buf_used];
+            s->pq_buf_used = (uint16_t)(s->pq_buf_used + len);
+        }
     }
     return 0;
+}
+
+int nvmet_tls_send(nvmet_tls_conn_t *s, tcp_conn_t *tcp, const void *p1, uint32_t l1,
+                   const void *p2, uint32_t l2) {
+    return tls_send(s, tcp, p1, l1, p2, l2, 0);
+}
+
+int nvmet_tls_send_stable(nvmet_tls_conn_t *s, tcp_conn_t *tcp, const void *p1, uint32_t l1,
+                          const void *p2, uint32_t l2) {
+    return tls_send(s, tcp, p1, l1, p2, l2, 1);
+}
+
+int nvmet_tls_tx_continue(nvmet_tls_conn_t *s, tcp_conn_t *tcp, int allow) {
+    if (!s->pq_n) return 0;
+    if (s->failed || s->t.state != TLS13_ST_OPEN) return -1;
+    if (flush_pend(s, tcp, 0) != 0) return -1;
+    return pq_drain(s, tcp, allow);
 }
 
 /* ---- 段階 F: イニシエータ側 ---- */
@@ -485,6 +570,10 @@ int nvme_tls_client_start(nvmet_tls_conn_t *s, tcp_conn_t *tcp, const char *host
     s->applen = s->apphead = 0;
     s->failed = 0;
     s->rx_records = s->tx_records = s->rx_bytes = s->tx_bytes = 0;
+    s->pq_head = s->pq_n = 0;
+    s->pq_buf_used = 0;
+    s->ptx_allow = 0;
+    s->ptx_parts = 0;
     const size_t n = tls13_client_hello(&s->t, s->pend, sizeof(s->pend));
     if (!n) {
         uart_printf("[!] nvme-tls: ClientHello を組めない(%s)\n", s->t.why ? s->t.why : "?");
@@ -498,6 +587,7 @@ int nvme_tls_client_start(nvmet_tls_conn_t *s, tcp_conn_t *tcp, const char *host
 void nvmet_tls_close(nvmet_tls_conn_t *s, tcp_conn_t *tcp) {
     if (tcp->state == TCP_ESTABLISHED || tcp->state == TCP_CLOSE_WAIT) {
         flush_pend(s, tcp, 0);
+        if (!s->failed && s->t.state == TLS13_ST_OPEN && s->pq_n) (void)pq_drain(s, tcp, 0);
         if (!s->failed && s->t.state == TLS13_ST_OPEN) {
             const size_t n = tls13_close(&s->t, s->rec);
             if (n) send_raw(tcp, s->rec, n);
@@ -505,4 +595,6 @@ void nvmet_tls_close(nvmet_tls_conn_t *s, tcp_conn_t *tcp) {
     }
     crypto_wipe(&s->t, sizeof(s->t));
     s->applen = s->apphead = s->pendlen = 0;
+    s->pq_head = s->pq_n = 0;      /* 送り残しは捨てる(閉じた接続へは送れない)*/
+    s->pq_buf_used = 0;
 }

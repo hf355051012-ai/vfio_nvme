@@ -6349,6 +6349,16 @@ static void shell_dispatch(char *line, int s0, int s1)
         if (strncmp(p, "on", 2) == 0) g_nvmet_fair = 1u;
         else if (strncmp(p, "off", 3) == 0) g_nvmet_fair = 0u;
         uart_printf("nvmetfair: %s\n", g_nvmet_fair ? "on" : "off");
+    } else if (strncmp(line, "tlssplit", 8) == 0) {
+        /* tlssplit [on|off] -- TLS の大きい応答を、相手の窓が足りなければ途中で止めて次の周回で続きを送るか
+         * (既定 on。同じコアに TLS の IO ジョブが 2 本以上のときだけ働く)。**off が直す前の挙動**(陰性対照。
+         * 応答を送り切るまでその場で窓を待ち、受信窓の小さい相手に 1 コアで読み出すとほかの接続が止まった。
+         * SPEC 27.4)。`nvmetqueues` の「TLS の送り残しで譲った」で効き方が見える。 */
+        const char *p = line + 8;
+        while (*p == ' ') p++;
+        if (strncmp(p, "on", 2) == 0) g_nvmet_tls_split = 1u;
+        else if (strncmp(p, "off", 3) == 0) g_nvmet_tls_split = 0u;
+        uart_printf("tlssplit: %s\n", g_nvmet_tls_split ? "on" : "off");
     } else if (strncmp(line, "nvmetqueues", 11) == 0) {
         /* nvmetqueues [N]
          *
