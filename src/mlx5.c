@@ -63,7 +63,7 @@ static int mlx5_modify_rq_to_rdy(mlx5_dev_t *dev, uint32_t rqn);
 static int mlx5_create_tir(mlx5_dev_t *dev, uint32_t rqn, uint32_t tdn, uint32_t *out_tirn);
 static int mlx5_create_rqt(mlx5_dev_t *dev, const uint32_t *rqns, unsigned n, uint32_t *out_rqtn);
 static int mlx5_create_tir_rss(mlx5_dev_t *dev, uint32_t rqtn, uint32_t tdn, uint32_t *out_tirn);
-static int mlx5_nic_vport_enable_allmulti(mlx5_dev_t *dev);
+int mlx5_nic_vport_set_allmulti(mlx5_dev_t *dev, int on);
 static int mlx5_create_flow_table_nic_rx(mlx5_dev_t *dev, uint32_t *out_table_id);
 static int mlx5_set_flow_table_root_nic_rx(mlx5_dev_t *dev, uint32_t table_id);
 static int mlx5_create_flow_group_catchall(mlx5_dev_t *dev, uint32_t table_id, uint32_t *out_group_id);
@@ -560,7 +560,7 @@ int mlx5_hca_bringup(mlx5_dev_t *dev, const char *label, int monitor_only) {
     dev->tisn = tisn;
     // dev->txq[q].{cqn,sqn} は上記のTXキュー生成ループで設定済み。
 
-    (void)mlx5_nic_vport_enable_allmulti(dev);
+    (void)mlx5_nic_vport_set_allmulti(dev, 1);
     mlx5_dump_nic_vport_context(dev, "bring-up 直後");
     uart_printf("mlx5: ===== %s bringup complete =====\n", label);
     return 0;
@@ -2693,7 +2693,7 @@ int mlx5_dump_nic_vport_context(mlx5_dev_t *dev, const char *tag) {
  * コール元:
  *   mlx5_hca_bringup()
  * ===============================================================*/
-static int mlx5_nic_vport_enable_allmulti(mlx5_dev_t *dev) {
+int mlx5_nic_vport_set_allmulti(mlx5_dev_t *dev, int on) {
     uint8_t in[516];
     for (unsigned i = 0; i < sizeof(in); i++) in[i] = 0;
     in[0] = (uint8_t)(MLX5_CMD_OP_MODIFY_NIC_VPORT_CONTEXT >> 8);
@@ -2703,7 +2703,7 @@ static int mlx5_nic_vport_enable_allmulti(mlx5_dev_t *dev) {
     in[15] |= 0x10u;
     /* nic_vport_context.promisc_mc = bit 0x781。context は in[256] からなので
      * 0x780/8 = 240 -> in[496]、bit0x781 は MSB から 1 番目 = 0x40。 */
-    in[496] |= 0x40u;
+    if (on) in[496] |= 0x40u;
 
     uint8_t out[16];
     int rc = mlx5_cmd_exec(dev, in, sizeof(in), out, sizeof(out));
@@ -2714,7 +2714,7 @@ static int mlx5_nic_vport_enable_allmulti(mlx5_dev_t *dev) {
                     "syndrome=0x%08x\n", rc, out[0], syndrome);
         return -1;
     }
-    uart_printf("mlx5: MODIFY_NIC_VPORT_CONTEXT(promisc_mc=1) ok -- マルチキャスト受信を有効化\n");
+    uart_printf("mlx5: MODIFY_NIC_VPORT_CONTEXT(promisc_mc=%d) ok\n", on ? 1 : 0);
     return 0;
 }
 

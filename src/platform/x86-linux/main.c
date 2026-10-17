@@ -184,6 +184,9 @@ static int bringup_pf(int slot, mlx5_dev_t *dev, uint8_t pf_index, const char *l
 }
 
 nvme_ctx_t s_nvme_ctx;
+/* 2 ポートのイニシエータの PF1 側(`tcptarget pf1 ..` + `tcpbench .. 2port`)。PF1 の受信はコア 1 が見るので、
+ * 接続も読み書きもコア 1 で行う。 */
+nvme_ctx_t s_nvme_ctx2;
 
 static nvmet_ctx_t s_x86_nvmet; /* .bss(内蔵 RAM ディスク含む、TCP 経路は CPU 側) */
 /* 2 ポートで受けるときの PF0 の実体(`nvmet <port> pf0`)。RAM ディスクは s_x86_nvmet のものを
@@ -192,6 +195,7 @@ static nvmet_ctx_t s_x86_nvmet2;
 static int         s_shell_nvmet2_started;
 
 static uint8_t s_nvmetcp_buf[262144] __attribute__((aligned(4096)));
+static uint8_t s_nvmetcp_buf2[262144] __attribute__((aligned(4096)));  /* 2 ポートの PF1 側 */
 
 /*=================================================================
  * mlx5_monitor_summary3() へ渡す PCI コンフィグ空間リード関数。
@@ -251,6 +255,68 @@ typedef struct {
     char     subnqn[224];
 } shell_tcp_remote_t;
 static shell_tcp_remote_t s_tcp_remote;
+/* 2 ポートのイニシエータの PF1 側の接続先(`tcptarget pf1 <ip> [port] [subnqn]`)。 */
+static shell_tcp_remote_t s_tcp_remote2;
+static int s_shell_tcp2_connected;
+
+/*=================================================================
+ * 関数を指定のコアで 1 回だけ実行する(そのコアのジョブとして動かす)。
+ * 2 ポートのイニシエータで、PF1 側の接続の後始末や測定をコア 1 で行うために使う。
+ * 実行中は、そのコアで他のジョブは回らない(測定の間はそれでよい)。
+ * ===============================================================*/
+typedef struct {
+    void (*fn)(void *);
+    void *arg;
+    volatile int done;
+} shell_oncore_t;
+
+static job_result_t shell_oncore_step(job_t *self)
+{
+    shell_oncore_t *o = (shell_oncore_t *)self->ctx;
+    /* fn の中で同じコアの別のジョブ(iSER の接続管理など)を回せるようにする。 */
+    job_tick_reenter_begin();
+    o->fn(o->arg);
+    job_tick_reenter_end();
+    __atomic_store_n(&o->done, 1, __ATOMIC_RELEASE);
+    return JOB_DONE;
+}
+
+static int shell_oncore_start(shell_oncore_t *o, unsigned core, void (*fn)(void *), void *arg)
+{
+    o->fn = fn; o->arg = arg; o->done = 0;
+    job_t *j = job_spawn(shell_oncore_step, o, "oncore");
+    if (!j) return -1;
+    job_pin_to_core(j, core);
+    return 0;
+}
+
+static void shell_oncore_wait(shell_oncore_t *o)
+{
+    while (!__atomic_load_n(&o->done, __ATOMIC_ACQUIRE)) {
+        job_scheduler_tick();
+        net_poll_all_and_dispatch();
+    }
+}
+
+static void shell_tcp2_close_fn(void *arg)
+{
+    (void)arg;
+    nvme_tcp_close(&s_nvme_ctx2.io);
+    nvme_tcp_close(&s_nvme_ctx2.admin);
+    uint64_t t0 = timer_now();
+    while (!timeout_ms(t0, 300u)) net_poll_all_and_dispatch();
+}
+
+/* PF1 側のセッションを(コア 1 で)閉じる。 */
+static void shell_tcp2_session_close(const char *reason)
+{
+    if (!s_shell_tcp2_connected) return;
+    if (reason) uart_printf("tcpdisconnect: PF1 側: %s\n", reason);
+    shell_oncore_t o;
+    if (shell_oncore_start(&o, 1u, shell_tcp2_close_fn, NULL) == 0) shell_oncore_wait(&o);
+    s_nvme_ctx2.io_connected = 0;
+    s_shell_tcp2_connected = 0;
+}
 /* `incapsule off` で in-capsule write を止める(A/B 用)。 */
 static int s_incapsule_disable;
 /* 現在張っているセッションがどの相手のものか(設定が変わったら張り直す)。 */
@@ -275,8 +341,10 @@ static uint16_t s_shell_tcp_sess_port;
  * コール元:
  *   shell_ensure_tcp_session(), shell_tcpdisconnect()
  * ===============================================================*/
+static void shell_tcp2_session_close(const char *reason);
 static int shell_tcp_session_close(const char *reason)
 {
+    shell_tcp2_session_close(reason);
     if (!s_shell_tcp_connected) return 0;
     if (reason) uart_printf("tcpdisconnect: %s\n", reason);
     nvme_tcp_close(&s_nvme_ctx.io);
@@ -400,6 +468,51 @@ wait_connect:;
                 s_nvme_ctx.lba_size, want_ipv6 ? "IPv6" : "IPv4",
                 want_tls ? ", TLS 1.3" : "",
                 s_tcp_remote.enabled ? ", 外部ターゲット" : "");
+    return 0;
+}
+
+/*=================================================================
+ * 2 ポートのイニシエータの PF1 側のセッションを張る(`tcptarget pf1 ..` の相手へ)。
+ * **PF1 の受信はコア 1 に見させ、接続ジョブもコア 1 で動かす。** TCP の接続は張ったコアの
+ * 表に載るので、受信を見るコアと同じコアで張る必要がある。
+ *
+ * 戻り値:
+ *   0=確立済み、-1=失敗
+ * コール元:
+ *   shell_tcpbench()(2port)
+ * ===============================================================*/
+static int shell_ensure_tcp_session2(uint8_t want_hdgst, uint8_t want_ddgst, uint8_t want_tls)
+{
+    if (!s_tcp_remote2.enabled) {
+        uart_printf("tcpbench: 2port には先に `tcptarget pf1 <ip> [port] [subnqn]` で PF1 側の相手を指定すること\n");
+        return -1;
+    }
+    if (s_shell_tcp2_connected &&
+        (s_nvme_ctx2.req_hdgst != want_hdgst || s_nvme_ctx2.req_ddgst != want_ddgst ||
+         s_nvme_ctx2.req_tls != want_tls)) {
+        shell_tcp2_session_close("digest/TLS の設定が変わったので張り直します");
+    }
+    if (s_shell_tcp2_connected) return 0;
+    netif_t *ctx1 = netif_find("mlx5-pf1");
+    if (!ctx1) { uart_printf("netif 未登録\n"); return -1; }
+    if (smp_boot_core1() != 0) { uart_printf("tcpbench: コア 1 を起こせない\n"); return -1; }
+    netif_set_owner_core(ctx1, 1u);
+    s_nvme_ctx2.req_hdgst = want_hdgst;
+    s_nvme_ctx2.req_ddgst = want_ddgst;
+    s_nvme_ctx2.req_tls   = want_tls;
+    netaddr_t target = netaddr_v4(s_tcp_remote2.ip);
+    if (nvme_connect_job_start_on(&s_nvme_ctx2, &target, s_tcp_remote2.port,
+                                  s_tcp_remote2.subnqn, ctx1, 1) != 0) return -1;
+    uint64_t t = timer_now();
+    while (s_nvme_ctx2.busy) {
+        job_scheduler_tick();
+        net_poll_all_and_dispatch();
+        if (timeout_ms(t, 15000u)) { uart_printf("tcpbench: PF1 側の connect タイムアウト\n"); return -1; }
+    }
+    if (!s_nvme_ctx2.io_connected) { uart_printf("tcpbench: PF1 側の接続に失敗した\n"); return -1; }
+    s_shell_tcp2_connected = 1;
+    uart_printf("tcpbench: PF1 側の initiator 接続完了 (lba_size=%u%s、コア 1)\n",
+                s_nvme_ctx2.lba_size, want_tls ? ", TLS 1.3" : "");
     return 0;
 }
 
@@ -4922,6 +5035,7 @@ typedef struct {
     uint8_t  ipv6;          /* NVMe/TCP のみ。1=対向のリンクローカルへ IPv6 で繋ぐ */
     uint8_t  tls;           /* NVMe/TCP のみ。1=TLS 1.3 で繋ぐ(鍵は `nvmetls`)*/
     uint32_t runtime_ms;    /* 1 条件あたりの測定時間。`t<秒>` で上書きできる */
+    uint8_t  twoport;       /* 1=2 ポート(PF0 をコア 0、PF1 をコア 1 で同時に回す。qd はポートごと)*/
 } bench_plan_t;
 
 /*=================================================================
@@ -4938,10 +5052,10 @@ typedef struct {
  * ===============================================================*/
 static void bench_plan_parse(char *args, bench_plan_t *pl)
 {
-    char *tok[6];
-    unsigned nt = shell_tokenize(args, tok, 6);
+    char *tok[10];
+    unsigned nt = shell_tokenize(args, tok, 10);
     pl->qd = 8u; pl->do_r = 1; pl->do_w = 1;
-    pl->hdgst = 0; pl->ddgst = 0; pl->ipv6 = 0; pl->tls = 0;
+    pl->hdgst = 0; pl->ddgst = 0; pl->ipv6 = 0; pl->tls = 0; pl->twoport = 0;
     pl->runtime_ms = 3000u;
 
     /* 先に digest キーワードを抜き取り、残りを従来通り位置引数として扱う。 */
@@ -4953,6 +5067,7 @@ static void bench_plan_parse(char *args, bench_plan_t *pl)
         if (strcmp(tok[i], "ipv6") == 0)   { pl->ipv6 = 1; continue; }
         if (strcmp(tok[i], "ipv4") == 0)   { pl->ipv6 = 0; continue; }
         if (strcmp(tok[i], "tls") == 0)    { pl->tls = 1; continue; }
+        if (strcmp(tok[i], "2port") == 0)  { pl->twoport = 1; continue; }
         /* `t<秒>` -- 1 条件あたりの測定時間。**Linux 側(fio / spdk_nvme_perf)と
          * 同じ秒数で測るために要る**。位置引数と紛れないようキーワードにする。 */
         if (tok[i][0] == 't' && tok[i][1] >= '0' && tok[i][1] <= '9') {
@@ -5151,6 +5266,47 @@ static void tcp_measure(uint32_t chunk, int is_read, uint32_t runtime_ms, bench_
     out->elapsed_ms = el;
 }
 
+/* 2 ポートの測定で、PF1 側をコア 1 で回すための引数。 */
+typedef struct {
+    uint32_t nlb, runtime_ms;
+    int      is_read;
+    uint32_t cnt, el;
+    uint64_t by;
+} shell_tcp2_run_t;
+
+static void shell_tcp2_run_fn(void *arg)
+{
+    shell_tcp2_run_t *r = (shell_tcp2_run_t *)arg;
+    if (r->is_read) nvme_read_pipelined_run(&s_nvme_ctx2, 1u, 0u, s_nvmetcp_buf2, r->nlb, r->runtime_ms,
+                                            &r->cnt, &r->by, &r->el);
+    else            nvme_write_pipelined_run(&s_nvme_ctx2, 1u, 0u, s_nvmetcp_buf2, r->nlb, r->runtime_ms,
+                                             &r->cnt, &r->by, &r->el);
+}
+
+/*=================================================================
+ * 2 ポートで 1 条件を測る。PF1 側をコア 1 のジョブとして始めてから、PF0 側をこのコア(コア 0)で回し、
+ * 両方の完了数・バイト数を足す。経過時間は長いほうを採る。
+ * ===============================================================*/
+static void tcp_measure2(uint32_t chunk, int is_read, uint32_t runtime_ms, bench_res_t *out)
+{
+    shell_tcp2_run_t r1 = { chunk / s_nvme_ctx2.lba_size, runtime_ms, is_read, 0, 0, 0 };
+    shell_oncore_t o;
+    int started = (shell_oncore_start(&o, 1u, shell_tcp2_run_fn, &r1) == 0);
+    uint32_t nlb = chunk / s_nvme_ctx.lba_size;
+    uint32_t cnt = 0, el = 0; uint64_t by = 0;
+    if (is_read) nvme_read_pipelined_run(&s_nvme_ctx, 1u, 0u, s_nvmetcp_buf, nlb, runtime_ms, &cnt, &by, &el);
+    else         nvme_write_pipelined_run(&s_nvme_ctx, 1u, 0u, s_nvmetcp_buf, nlb, runtime_ms, &cnt, &by, &el);
+    if (started) shell_oncore_wait(&o);
+    uart_printf("[tcp] chunk=%u %s: PF0 %u 回 %u ms / PF1 %u 回 %u ms\n", chunk, is_read ? "read " : "write",
+                cnt, el, r1.cnt, r1.el);
+    out->chunk      = chunk;
+    out->is_read    = is_read;
+    out->bytes      = by + r1.by;
+    out->count      = cnt + r1.cnt;
+    out->elapsed_ms = (el > r1.el) ? el : r1.el;
+    if (el == 0u || r1.el == 0u) out->elapsed_ms = 0u;  /* 片方が失敗したら測定失敗 */
+}
+
 /*=================================================================
  * シェルの `tcpbench`。セッションを確立(既にあれば再利用)し、指定 chunk ×
  * read/write でスループットを測って表を出す。
@@ -5167,14 +5323,21 @@ static void shell_tcpbench(char *args)
      * セッションを張り直さずに変えられる。 */
     nvme_set_io_qdepth(pl.qd);
     if (shell_ensure_tcp_session(pl.hdgst, pl.ddgst, pl.ipv6, pl.tls) != 0) return;
+    if (pl.twoport && shell_ensure_tcp_session2(pl.hdgst, pl.ddgst, pl.tls) != 0) return;
     if (pl.hdgst != s_nvme_ctx.io.hdgst || pl.ddgst != s_nvme_ctx.io.ddgst) {
         uart_printf("[!] tcpbench: digestの合意結果が要求と異なります "
                     "(要求 hdgst=%u ddgst=%u / 合意 hdgst=%u ddgst=%u)\n",
                     pl.hdgst, pl.ddgst, s_nvme_ctx.io.hdgst, s_nvme_ctx.io.ddgst);
     }
     for (unsigned i = 0; i < sizeof(s_nvmetcp_buf); i++) s_nvmetcp_buf[i] = (uint8_t)(0x5au ^ (i * 7u));
+    for (unsigned i = 0; i < sizeof(s_nvmetcp_buf2); i++) s_nvmetcp_buf2[i] = (uint8_t)(0x5au ^ (i * 7u));
     bench_res_t res[2u * BENCH_MAX_CHUNKS]; unsigned nr = 0;
     for (unsigned c = 0; c < pl.nchunks; c++) {
+        if (pl.twoport) {
+            if (pl.do_w) tcp_measure2(pl.chunks[c], 0, pl.runtime_ms, &res[nr++]);
+            if (pl.do_r) tcp_measure2(pl.chunks[c], 1, pl.runtime_ms, &res[nr++]);
+            continue;
+        }
         if (pl.do_w) tcp_measure(pl.chunks[c], 0, pl.runtime_ms, &res[nr++]);
         if (pl.do_r) tcp_measure(pl.chunks[c], 1, pl.runtime_ms, &res[nr++]);
     }
@@ -5187,21 +5350,89 @@ static void shell_tcpbench(char *args)
                             : (s_nvme_ctx.io.hdgst ? "+hdgst" : "+ddgst");
         for (unsigned k = 0; suffix[k] && o + 1u < sizeof(transport); k++) transport[o++] = suffix[k];
     }
+    if (pl.twoport) {
+        const char *suffix = " 2port";
+        for (unsigned k = 0; suffix[k] && o + 1u < sizeof(transport); k++) transport[o++] = suffix[k];
+    }
     transport[o] = 0;
-    bench_summary(transport, nvme_io_qdepth(), pl.runtime_ms, res, nr);
+    /* 2 ポートのときの qd は 2 ポートの合計(平均レイテンシ = 合計の深さ / IOPS)。 */
+    bench_summary(transport, nvme_io_qdepth() * (pl.twoport ? 2u : 1u), pl.runtime_ms, res, nr);
 }
 
 /* ---- iSCSI イニシエータ(PLAN_iscsi.md 段階 D)---- */
-static struct {
+typedef struct {
     int      set;
     uint32_t ip;
     uint16_t port;
     char     iqn[224];
-} s_iscsi_remote;
+} shell_iscsi_remote_t;
+static shell_iscsi_remote_t s_iscsi_remote;
+/* 2 ポートのイニシエータの PF1 側の相手(`iscsitarget pf1 <ip> [port] [iqn]`)。PF1 側はコア 1 で動かす。 */
+static shell_iscsi_remote_t s_iscsi_remote2;
+
+/* PF1 側の iSCSI イニシエータをコア 1 で操作するための引数。 */
+typedef struct {
+    int op;                  /* 0=接続、1=測定、2=閉じる、3=状態 */
+    netaddr_t addr; uint16_t port; const char *iqn; int hd, dd;
+    int is_read; uint32_t chunk, qd, runtime_ms;
+    uint64_t bytes; uint32_t count, el, mis;
+    int rc, connected;
+} shell_iscsi2_t;
+
+static void shell_iscsi2_fn(void *arg)
+{
+    shell_iscsi2_t *a = (shell_iscsi2_t *)arg;
+    switch (a->op) {
+    case 0: a->rc = iscsi_ini_connect(&a->addr, a->port, a->iqn, a->hd, a->dd); break;
+    case 1: a->rc = iscsi_ini_bench(a->is_read, a->chunk, a->qd, a->runtime_ms, &a->bytes, &a->count,
+                                    &a->el, &a->mis); break;
+    case 2: iscsi_ini_close(); break;
+    default: break;
+    }
+    a->connected = iscsi_ini_digest(&a->hd, &a->dd);
+}
+
+/* PF1 側の操作をコア 1 で行い、終わるまで待つ。 */
+static int shell_iscsi2_call(shell_iscsi2_t *a)
+{
+    netif_t *pf1 = netif_find("mlx5-pf1");
+    if (!pf1 || smp_boot_core1() != 0) return -1;
+    netif_set_owner_core(pf1, 1u);
+    shell_oncore_t o;
+    if (shell_oncore_start(&o, 1u, shell_iscsi2_fn, a) != 0) return -1;
+    shell_oncore_wait(&o);
+    return 0;
+}
 
 static void shell_iscsitarget(char *args)
 {
     while (*args == ' ') args++;
+    if (strncmp(args, "pf1", 3) == 0 && (args[3] == ' ' || args[3] == 0)) {
+        args += 3;
+        while (*args == ' ') args++;
+        shell_iscsi2_t a; memset(&a, 0, sizeof(a)); a.op = 2;
+        shell_iscsi2_call(&a);
+        if (*args == 0 || strncmp(args, "off", 3) == 0) {
+            if (*args) s_iscsi_remote2.set = 0;
+            uart_printf("iscsitarget pf1: %s\n", s_iscsi_remote2.set ? "設定あり" : "未設定");
+            return;
+        }
+        char *tok[3];
+        unsigned nt = shell_tokenize(args, tok, 3);
+        unsigned o[4] = {0};
+        const char *q = tok[0];
+        for (unsigned i = 0; i < 4; i++) {
+            while (*q >= '0' && *q <= '9') { o[i] = o[i] * 10u + (unsigned)(*q - '0'); q++; }
+            if (*q == '.') q++;
+        }
+        s_iscsi_remote2.ip = ip_from_octets((uint8_t)o[0], (uint8_t)o[1], (uint8_t)o[2], (uint8_t)o[3]);
+        s_iscsi_remote2.port = (nt >= 2 && atoi(tok[1]) > 0) ? (uint16_t)atoi(tok[1]) : 3260u;
+        s_iscsi_remote2.iqn[0] = 0;
+        if (nt >= 3) strncpy(s_iscsi_remote2.iqn, tok[2], sizeof(s_iscsi_remote2.iqn) - 1u);
+        s_iscsi_remote2.set = 1;
+        uart_printf("iscsitarget pf1: 設定した(次の iscsibench .. 2port で繋ぐ)\n");
+        return;
+    }
     if (*args == 0) {
         if (!s_iscsi_remote.set) { uart_printf("iscsitarget: 未設定\n"); return; }
         uart_printf("iscsitarget: %u.%u.%u.%u:%u %s\n", (unsigned)(s_iscsi_remote.ip >> 24),
@@ -5270,14 +5501,54 @@ static void shell_iscsi_chap(char *args, int target)
 }
 
 /* iSER イニシエータの接続先(`isertarget <ip> <mac> [iqn]`)。PLAN_iscsi.md 段階 I。 */
-static struct { int set; uint32_t ip; uint8_t mac[6]; char iqn[224]; } s_iser_remote;
+typedef struct { int set; uint32_t ip; uint8_t mac[6]; char iqn[224]; } shell_iser_remote_t;
+static shell_iser_remote_t s_iser_remote_i[2];   /* [1] = 2 ポートのときの PF1 側(`isertarget pf1 ..`)*/
+#define s_iser_remote (s_iser_remote_i[0])
+
+/* PF1 側の iSER イニシエータをコア 1 で操作するための引数。 */
+typedef struct {
+    int op;                  /* 0=接続、1=測定、2=閉じる、3=状態 */
+    int is_read; uint32_t chunk, qd, runtime_ms;
+    uint64_t bytes; uint32_t count, el, mis;
+    int rc, connected;
+} shell_iser2_t;
+
+static void shell_iser2_fn(void *arg)
+{
+    shell_iser2_t *a = (shell_iser2_t *)arg;
+    const shell_iser_remote_t *r = &s_iser_remote_i[1];
+    switch (a->op) {
+    case 0: a->rc = iscsi_iser_connect(&s_dev1, r->ip, r->mac, r->iqn); break;
+    case 1: a->rc = iscsi_iser_bench(a->is_read, a->chunk, a->qd, a->runtime_ms, &a->bytes, &a->count,
+                                     &a->el, &a->mis); break;
+    case 2: iscsi_iser_close(); break;
+    default: break;
+    }
+    a->connected = iscsi_iser_connected();
+}
+
+static int shell_iser2_call(shell_iser2_t *a)
+{
+    if (smp_boot_core1() != 0) return -1;
+    shell_oncore_t o;
+    if (shell_oncore_start(&o, 1u, shell_iser2_fn, a) != 0) return -1;
+    shell_oncore_wait(&o);
+    return 0;
+}
 
 static void shell_isertarget(char *args)
 {
     while (*args == ' ') args++;
-    if (*args == 0) { iscsi_iser_status(); return; }
-    iscsi_iser_close();
-    if (strncmp(args, "off", 3) == 0) { s_iser_remote.set = 0; uart_printf("isertarget: 解除\n"); return; }
+    unsigned inst = 0;
+    if (strncmp(args, "pf1", 3) == 0 && (args[3] == ' ' || args[3] == 0)) {
+        inst = 1; args += 3;
+        while (*args == ' ') args++;
+    }
+    shell_iser_remote_t *rr = &s_iser_remote_i[inst];
+    if (*args == 0) { if (inst) uart_printf("isertarget pf1: %s\n", rr->set ? "設定あり" : "未設定"); else iscsi_iser_status(); return; }
+    if (inst) { shell_iser2_t a; memset(&a, 0, sizeof(a)); a.op = 2; shell_iser2_call(&a); }
+    else iscsi_iser_close();
+    if (strncmp(args, "off", 3) == 0) { rr->set = 0; uart_printf("isertarget: 解除\n"); return; }
     char *tok[3];
     const unsigned nt = shell_tokenize(args, tok, 3);
     if (nt < 2) { uart_printf("isertarget: <ip> <相手の MAC> [iqn]\n"); return; }
@@ -5287,7 +5558,7 @@ static void shell_isertarget(char *args)
         while (*q >= '0' && *q <= '9') { o[i] = o[i] * 10u + (unsigned)(*q - '0'); q++; }
         if (*q == '.') q++;
     }
-    s_iser_remote.ip = ip_from_octets((uint8_t)o[0], (uint8_t)o[1], (uint8_t)o[2], (uint8_t)o[3]);
+    rr->ip = ip_from_octets((uint8_t)o[0], (uint8_t)o[1], (uint8_t)o[2], (uint8_t)o[3]);
     q = tok[1];
     for (unsigned i = 0; i < 6; i++) {
         unsigned v = 0;
@@ -5299,14 +5570,14 @@ static void shell_isertarget(char *args)
             v = (v << 4) | (unsigned)d;
             q++;
         }
-        s_iser_remote.mac[i] = (uint8_t)v;
+        rr->mac[i] = (uint8_t)v;
         if (*q == ':' || *q == '-') q++;
     }
     const char *iqn = nt >= 3 ? tok[2] : "iqn.2026-10.local.precision:ram0";
-    const size_t l = strlen(iqn) < sizeof(s_iser_remote.iqn) - 1u ? strlen(iqn) : sizeof(s_iser_remote.iqn) - 1u;
-    memcpy(s_iser_remote.iqn, iqn, l);
-    s_iser_remote.iqn[l] = 0;
-    s_iser_remote.set = 1;
+    const size_t l = strlen(iqn) < sizeof(rr->iqn) - 1u ? strlen(iqn) : sizeof(rr->iqn) - 1u;
+    memcpy(rr->iqn, iqn, l);
+    rr->iqn[l] = 0;
+    rr->set = 1;
     uart_printf("isertarget: 設定した(次の iserbench で繋ぐ)\n");
 }
 
@@ -5314,6 +5585,16 @@ static void shell_iserbench(char *args)
 {
     if (!s_iser_remote.set) { uart_printf("iserbench: 先に isertarget <ip> <mac> [iqn]\n"); return; }
     bench_plan_t pl; bench_plan_parse(args, &pl);
+    shell_iser2_t a2; memset(&a2, 0, sizeof(a2));
+    if (pl.twoport) {
+        if (!s_iser_remote_i[1].set) { uart_printf("iserbench: 2port には先に isertarget pf1 <ip> <mac> [iqn]\n"); return; }
+        a2.op = 3; shell_iser2_call(&a2);
+        if (!a2.connected) {
+            a2.op = 0;
+            if (shell_iser2_call(&a2) != 0 || a2.rc < 0) { uart_printf("iserbench: PF1 側の接続に失敗\n"); return; }
+            uart_printf("iserbench: PF1 側の接続完了(コア 1)\n");
+        }
+    }
     if (!iscsi_iser_connected() &&
         iscsi_iser_connect(&s_dev0, s_iser_remote.ip, s_iser_remote.mac, s_iser_remote.iqn) < 0) {
         uart_printf("iserbench: 接続に失敗\n");
@@ -5327,10 +5608,26 @@ static void shell_iserbench(char *args)
             e->chunk = pl.chunks[c];
             e->is_read = is_read;
             uint32_t mis = 0;
+            shell_oncore_t o2; int started = 0;
+            if (pl.twoport) {
+                a2.op = 1; a2.is_read = is_read; a2.chunk = pl.chunks[c]; a2.qd = pl.qd; a2.runtime_ms = pl.runtime_ms;
+                a2.bytes = 0; a2.count = 0; a2.el = 0; a2.mis = 0;
+                started = (shell_oncore_start(&o2, 1u, shell_iser2_fn, &a2) == 0);
+            }
             if (iscsi_iser_bench(is_read, pl.chunks[c], pl.qd, pl.runtime_ms, &e->bytes, &e->count,
                                  &e->elapsed_ms, &mis) < 0) {
                 e->count = 0;
                 e->elapsed_ms = 0;
+            }
+            if (pl.twoport) {
+                if (started) shell_oncore_wait(&o2);
+                uart_printf("[iser] chunk=%u %s: PF0 %u 回 %u ms / PF1 %u 回 %u ms\n", pl.chunks[c],
+                            is_read ? "read " : "write", e->count, e->elapsed_ms, a2.count, a2.el);
+                if (!started || a2.rc < 0 || a2.el == 0u || e->elapsed_ms == 0u) { e->count = 0; e->elapsed_ms = 0; }
+                else {
+                    e->bytes += a2.bytes; e->count += a2.count; mis += a2.mis;
+                    if (a2.el > e->elapsed_ms) e->elapsed_ms = a2.el;
+                }
             }
             if (is_read)
                 uart_printf("[iser] chunk=%u read : %u 回, %u ms, 照合の不一致 %u\n", pl.chunks[c], e->count,
@@ -5338,7 +5635,7 @@ static void shell_iserbench(char *args)
             if (!iscsi_iser_connected()) break;
         }
     }
-    bench_summary("iser", pl.qd, pl.runtime_ms, res, nr);
+    bench_summary(pl.twoport ? "iser 2port" : "iser", pl.qd * (pl.twoport ? 2u : 1u), pl.runtime_ms, res, nr);
 }
 
 static void shell_iscsidiscover(void)
@@ -5357,6 +5654,18 @@ static void shell_iscsibench(char *args)
 {
     if (!s_iscsi_remote.set) { uart_printf("iscsibench: 先に iscsitarget <ip> [port] [iqn]\n"); return; }
     bench_plan_t pl; bench_plan_parse(args, &pl);
+    shell_iscsi2_t a2; memset(&a2, 0, sizeof(a2));
+    if (pl.twoport) {
+        if (!s_iscsi_remote2.set) { uart_printf("iscsibench: 2port には先に iscsitarget pf1 <ip> [port] [iqn]\n"); return; }
+        a2.op = 3; shell_iscsi2_call(&a2);
+        if (a2.connected && (a2.hd != pl.hdgst || a2.dd != pl.ddgst)) { a2.op = 2; shell_iscsi2_call(&a2); a2.connected = 0; }
+        if (!a2.connected) {
+            a2.op = 0; a2.addr = netaddr_v4(s_iscsi_remote2.ip); a2.port = s_iscsi_remote2.port;
+            a2.iqn = s_iscsi_remote2.iqn; a2.hd = pl.hdgst; a2.dd = pl.ddgst;
+            if (shell_iscsi2_call(&a2) != 0 || a2.rc < 0) { uart_printf("iscsibench: PF1 側の接続に失敗\n"); return; }
+            uart_printf("iscsibench: PF1 側の接続完了(コア 1)\n");
+        }
+    }
     int hd = 0, dd = 0;
     if (iscsi_ini_digest(&hd, &dd) && (hd != pl.hdgst || dd != pl.ddgst)) {
         uart_printf("iscsibench: ダイジェストの指定が変わったので張り直す\n");
@@ -5381,10 +5690,26 @@ static void shell_iscsibench(char *args)
             e->chunk = pl.chunks[c];
             e->is_read = is_read;
             uint32_t mis = 0;
+            shell_oncore_t o2; int started = 0;
+            if (pl.twoport) {
+                a2.op = 1; a2.is_read = is_read; a2.chunk = pl.chunks[c]; a2.qd = pl.qd; a2.runtime_ms = pl.runtime_ms;
+                a2.bytes = 0; a2.count = 0; a2.el = 0; a2.mis = 0;
+                started = (shell_oncore_start(&o2, 1u, shell_iscsi2_fn, &a2) == 0);
+            }
             if (iscsi_ini_bench(is_read, pl.chunks[c], pl.qd, pl.runtime_ms, &e->bytes, &e->count,
                                 &e->elapsed_ms, &mis) < 0) {
                 e->count = 0;
                 e->elapsed_ms = 0;
+            }
+            if (pl.twoport) {
+                if (started) shell_oncore_wait(&o2);
+                uart_printf("[iscsi] chunk=%u %s: PF0 %u 回 %u ms / PF1 %u 回 %u ms\n", pl.chunks[c],
+                            is_read ? "read " : "write", e->count, e->elapsed_ms, a2.count, a2.el);
+                if (!started || a2.rc < 0 || a2.el == 0u || e->elapsed_ms == 0u) { e->count = 0; e->elapsed_ms = 0; }
+                else {
+                    e->bytes += a2.bytes; e->count += a2.count; mis += a2.mis;
+                    if (a2.el > e->elapsed_ms) e->elapsed_ms = a2.el;
+                }
             }
             if (is_read)
                 uart_printf("[iscsi] chunk=%u read : %u 回, %u ms, 照合の不一致 %u\n", pl.chunks[c], e->count,
@@ -5395,8 +5720,9 @@ static void shell_iscsibench(char *args)
         }
     }
     iscsi_ini_digest(&hd, &dd);
-    bench_summary(hd && dd ? "iscsi+hdgst+ddgst" : hd ? "iscsi+hdgst" : dd ? "iscsi+ddgst" : "iscsi",
-                  pl.qd, pl.runtime_ms, res, nr);
+    bench_summary(pl.twoport ? (hd && dd ? "iscsi+hdgst+ddgst 2port" : "iscsi 2port")
+                             : (hd && dd ? "iscsi+hdgst+ddgst" : hd ? "iscsi+hdgst" : dd ? "iscsi+ddgst" : "iscsi"),
+                  pl.qd * (pl.twoport ? 2u : 1u), pl.runtime_ms, res, nr);
 }
 
 /*=================================================================
@@ -5426,11 +5752,16 @@ static void shell_rdmabench(char *args)
             bench_res_t *e = &res[nr++];
             e->chunk = pl.chunks[c];
             e->is_read = is_read;
-            nvme_rdma_run_bench(&s_dev0, &s_dev1, pl.runtime_ms, is_read, pl.chunks[c], qd,
-                                &e->bytes, &e->count, &e->elapsed_ms);
+            if (pl.twoport)
+                nvme_rdma_run_bench2(&s_dev0, &s_dev1, pl.runtime_ms, is_read, pl.chunks[c], qd,
+                                     &e->bytes, &e->count, &e->elapsed_ms);
+            else
+                nvme_rdma_run_bench(&s_dev0, &s_dev1, pl.runtime_ms, is_read, pl.chunks[c], qd,
+                                    &e->bytes, &e->count, &e->elapsed_ms);
         }
     }
-    bench_summary("rocev2", qd, pl.runtime_ms, res, nr);
+    /* 2 ポートのときの qd は 2 ポートの合計。 */
+    bench_summary(pl.twoport ? "rocev2 2port" : "rocev2", qd * (pl.twoport ? 2u : 1u), pl.runtime_ms, res, nr);
 }
 
 /*=================================================================
@@ -5987,8 +6318,14 @@ static void shell_dispatch(char *line, int s0, int s1)
          * こちらで決めるため。 */
         char *arg = line + 10;
         while (*arg == ' ') arg++;
+        /* `rdmatarget pf1 ..` は 2 ポートのイニシエータの PF1 側の相手(`bench .. 2port` で使う)。 */
+        unsigned rinst = 0;
+        if (strncmp(arg, "pf1", 3) == 0 && (arg[3] == ' ' || arg[3] == 0)) {
+            rinst = 1; arg += 3;
+            while (*arg == ' ') arg++;
+        }
         if (*arg == 0) {
-            const nvme_rdma_remote_t *rt = nvme_rdma_remote_target();
+            const nvme_rdma_remote_t *rt = nvme_rdma_remote_target_inst(rinst);
             if (!rt->enabled) {
                 uart_printf("rdmatarget: 未設定(bench は同一プロセス内のターゲットを使います)\n");
             } else {
@@ -6001,7 +6338,7 @@ static void shell_dispatch(char *line, int s0, int s1)
                             rt->subnqn[0] ? rt->subnqn : "(自作ターゲットの既定)");
             }
         } else if (strncmp(arg, "off", 3) == 0) {
-            nvme_rdma_set_remote_target(0, 0, 0, 0, 0);
+            nvme_rdma_set_remote_target_inst(rinst, 0, 0, 0, 0, 0);
             uart_printf("rdmatarget: 解除しました\n");
         } else {
             char *tok[8];
@@ -6038,10 +6375,10 @@ static void shell_dispatch(char *line, int s0, int s1)
                 }
                 uint16_t port = (nt >= 3) ? (uint16_t)atoi(tok[2]) : 0u;
                 const char *subnqn = (nt >= 4) ? tok[3] : 0;
-                nvme_rdma_set_remote_target(1, ip_from_octets((uint8_t)a, (uint8_t)b,
+                nvme_rdma_set_remote_target_inst(rinst, 1, ip_from_octets((uint8_t)a, (uint8_t)b,
                                                               (uint8_t)c, (uint8_t)d),
                                             mac, port, subnqn);
-                const nvme_rdma_remote_t *rt = nvme_rdma_remote_target();
+                const nvme_rdma_remote_t *rt = nvme_rdma_remote_target_inst(rinst);
                 uart_printf("rdmatarget: %u.%u.%u.%u:%u mac=%02x:%02x:%02x:%02x:%02x:%02x へ繋ぎます\n",
                             a, b, c, d, (unsigned)rt->port,
                             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
@@ -6888,6 +7225,27 @@ static void shell_dispatch(char *line, int s0, int s1)
          * MAC が要らないのは、TCP は L2 の宛先を ARP で解決するため。 */
         char *arg = line + 9;
         while (*arg == ' ') arg++;
+        /* `tcptarget pf1 ..` は 2 ポートのイニシエータの PF1 側の相手(`tcpbench .. 2port` で使う)。 */
+        shell_tcp_remote_t *rt = &s_tcp_remote;
+        if (strncmp(arg, "pf1", 3) == 0 && (arg[3] == ' ' || arg[3] == 0)) {
+            rt = &s_tcp_remote2;
+            arg += 3;
+            while (*arg == ' ') arg++;
+            if (*arg == 0) {
+                uart_printf("tcptarget pf1: %s %u.%u.%u.%u:%u subnqn=%s\n", rt->enabled ? "" : "(未設定)",
+                            (unsigned)((rt->ip >> 24) & 0xFFu), (unsigned)((rt->ip >> 16) & 0xFFu),
+                            (unsigned)((rt->ip >> 8) & 0xFFu), (unsigned)(rt->ip & 0xFFu),
+                            (unsigned)rt->port, rt->subnqn);
+                return;
+            }
+            if (strncmp(arg, "off", 3) == 0) {
+                shell_tcp2_session_close("PF1 側の相手を解除");
+                rt->enabled = 0; rt->ip = 0; rt->port = 0; rt->subnqn[0] = 0;
+                uart_printf("tcptarget pf1: 解除しました\n");
+                return;
+            }
+            shell_tcp2_session_close(NULL);
+        }
         if (*arg == 0) {
             if (!s_tcp_remote.enabled) {
                 uart_printf("tcptarget: 未設定(tcpbench は同一プロセス内のターゲットを使います)\n");
@@ -6916,26 +7274,34 @@ static void shell_dispatch(char *line, int s0, int s1)
                 *slot[i] = v;
                 if (*q == '.') q++;
             }
-            s_tcp_remote.ip   = ip_from_octets((uint8_t)a, (uint8_t)b, (uint8_t)c, (uint8_t)d);
-            s_tcp_remote.port = (nt >= 2) ? (uint16_t)atoi(tok[1]) : 4420u;
-            if (s_tcp_remote.port == 0) s_tcp_remote.port = 4420u;
-            s_tcp_remote.subnqn[0] = 0;
+            rt->ip   = ip_from_octets((uint8_t)a, (uint8_t)b, (uint8_t)c, (uint8_t)d);
+            rt->port = (nt >= 2) ? (uint16_t)atoi(tok[1]) : 4420u;
+            if (rt->port == 0) rt->port = 4420u;
+            rt->subnqn[0] = 0;
             if (nt >= 3) {
                 unsigned k = 0;
-                while (tok[2][k] && k + 1u < sizeof(s_tcp_remote.subnqn)) {
-                    s_tcp_remote.subnqn[k] = tok[2][k]; k++;
+                while (tok[2][k] && k + 1u < sizeof(rt->subnqn)) {
+                    rt->subnqn[k] = tok[2][k]; k++;
                 }
-                s_tcp_remote.subnqn[k] = 0;
+                rt->subnqn[k] = 0;
             }
-            s_tcp_remote.enabled = 1;
-            uart_printf("tcptarget: %u.%u.%u.%u:%u へ繋ぎます (subnqn=%s)\n",
-                        a, b, c, d, (unsigned)s_tcp_remote.port,
-                        s_tcp_remote.subnqn[0] ? s_tcp_remote.subnqn : "(自作ターゲットの既定)");
+            rt->enabled = 1;
+            uart_printf("tcptarget%s: %u.%u.%u.%u:%u へ繋ぎます (subnqn=%s)\n", rt == &s_tcp_remote2 ? " pf1" : "",
+                        a, b, c, d, (unsigned)rt->port,
+                        rt->subnqn[0] ? rt->subnqn : "(自作ターゲットの既定)");
         }
     } else if (strncmp(line, "tcpdisconnect", 13) == 0) {
         shell_tcpdisconnect();
     } else if (strncmp(line, "fragrecv", 8) == 0) {
         shell_fragrecv(line + 8);
+    } else if (strncmp(line, "rocedup", 7) == 0) {
+        const char *pp = strstr(line + 7, "port");
+        if (pp) ip_roce_dup_set_port((uint16_t)strtoul(pp + 4, NULL, 10));
+        else ip_roce_dup_show(strstr(line + 7, "clear") != NULL);
+    } else if (strncmp(line, "mcpromisc", 9) == 0) {
+        int on = strstr(line + 9, "off") == NULL;
+        uart_printf("mcpromisc: %s(%s)\n", on ? "on" : "off",
+                    mlx5_net_set_allmulti(on) == 0 ? "ok" : "失敗");
     } else if (strncmp(line, "fragstat", 8) == 0) {
         shell_fragstat(line + 8);
     } else if (strncmp(line, "hdgstcorrupt", 12) == 0) {
@@ -7064,6 +7430,8 @@ static void shell_dispatch(char *line, int s0, int s1)
                     "  termtest                              NVMe/TCP Terminate Connection Request(陰性対照つき)\n"
                     "  fragrecv [ポート] [秒]                UDPを待ち受けて長さと総和を報告(外部から断片化して送る用)\n"
                     "  fragstat [clear]                      受信側のIP断片組み立ての統計\n"
+                    "  rocedup [clear|port N]                Ethernet の受信キューへ届いた RoCEv2 の数(port は陽性対照用)\n"
+                    "  mcpromisc on|off                      vport の promisc_mc(全マルチキャスト受信)\n"
                     "  qploop [N]                            RC QPの作成/破棄をN回繰り返しFWリソース枯渇を見る\n"
                     "  nvmediscover [dump]                   Discovery Log Pageを取得(dumpで16進出力)\n"
                     "  nvmens [add <nsid> | del <nsid>]      名前空間の一覧/追加/削除(AERで通知)\n"

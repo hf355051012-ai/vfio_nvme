@@ -1277,6 +1277,15 @@ int mlx5_net_set_rss(unsigned ncores)
     return rc;
 }
 
+/* 両 PF の promisc_mc を切り替える(シェルの `mcpromisc`)。 */
+int mlx5_net_set_allmulti(int on)
+{
+    int rc = 0;
+    if (s_state_pf0.dev && mlx5_nic_vport_set_allmulti(s_state_pf0.dev, on) != 0) rc = -1;
+    if (s_state_pf1.dev && mlx5_nic_vport_set_allmulti(s_state_pf1.dev, on) != 0) rc = -1;
+    return rc;
+}
+
 int mlx5_net_register_dual(mlx5_dev_t *dev0, mlx5_dev_t *dev1)
 {
     mlx5_netif_setup(&s_ctx_pf0, &s_state_pf0, dev0, "mlx5-pf0",

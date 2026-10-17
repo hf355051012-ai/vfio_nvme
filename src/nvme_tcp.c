@@ -8,6 +8,7 @@
 #include "timestamp.h"
 #include "crc32c.h"
 #include "nvmet_tls.h"
+#include "smp.h"
 
 /* TLS の送信(段階 F)。失敗なら 1(呼び出し側の「送信失敗」の判定にそのまま使う)。 */
 static int nvme_tls_send_or_fail(nvme_tcp_conn_t *c, const void *p1, uint32_t l1,
@@ -20,6 +21,14 @@ static int nvme_tls_send_or_fail(nvme_tcp_conn_t *c, const void *p1, uint32_t l1
 #define NVME_TCP_RESP_TIMEOUT_MS   10000u
 
 #define NVME_TCP_H2C_CHUNK_MAX 262144u
+
+/* PDU を組む作業領域。**コアごと**(2 ポートのイニシエータはポートごとに別のコアで送る)。 */
+static uint8_t s_cmd_buf_pc[SMP_MAX_CORES][NVME_TCP_CMD_PDU_LEN + 2u * NVME_TCP_DGST_LEN + NVME_TCP_INLINE_DATA_MAX] __attribute__((aligned(64)));
+static uint8_t s_cmd_async_buf_pc[SMP_MAX_CORES][NVME_TCP_CMD_PDU_LEN + NVME_TCP_DGST_LEN] __attribute__((aligned(64)));
+static uint8_t s_icd_hdr_pc[SMP_MAX_CORES][NVME_TCP_CMD_PDU_LEN + NVME_TCP_DGST_LEN] __attribute__((aligned(64)));
+static uint8_t s_h2c_buf_pc[SMP_MAX_CORES][NVME_TCP_DATA_PDU_LEN + 2u * NVME_TCP_DGST_LEN + NVME_TCP_H2C_CHUNK_MAX] __attribute__((aligned(64)));
+static uint8_t s_term_buf_pc[SMP_MAX_CORES][NVME_TCP_TERM_PLEN_MAX] __attribute__((aligned(64)));
+static uint8_t s_icreq_buf_pc[SMP_MAX_CORES][NVME_TCP_ICREQ_LEN] __attribute__((aligned(64)));
 
 /*=================================================================
  * ヘッダダイジェストが有効なら 4、無効なら 0 を返す。PDU の plen/pdo や
@@ -226,8 +235,7 @@ int nvme_tcp_send_cmd(nvme_tcp_conn_t *c, const nvme_sqe_t *sqe,
         return -1;
     }
 
-    static uint8_t s_cmd_buf[NVME_TCP_CMD_PDU_LEN + 2u * NVME_TCP_DGST_LEN + NVME_TCP_INLINE_DATA_MAX]
-        __attribute__((aligned(64)));
+    uint8_t *s_cmd_buf = s_cmd_buf_pc[smp_core_index()];
 
     uint16_t cid = c->next_cid++;
     int has_inline_data = (!use_r2t && data != NULL && dlen > 0);
@@ -286,8 +294,7 @@ int nvme_tcp_send_cmd(nvme_tcp_conn_t *c, const nvme_sqe_t *sqe,
  * ===============================================================*/
 int nvme_tcp_send_cmd_async(nvme_tcp_conn_t *c, const nvme_sqe_t *sqe, uint16_t *out_cid)
 {
-    static uint8_t s_cmd_async_buf[NVME_TCP_CMD_PDU_LEN + NVME_TCP_DGST_LEN]
-        __attribute__((aligned(64)));
+    uint8_t *s_cmd_async_buf = s_cmd_async_buf_pc[smp_core_index()];
 
     uint16_t cid = c->next_cid++;
     uint32_t hd = nvme_tcp_hdgst_len(c);
@@ -347,10 +354,19 @@ volatile uint32_t g_nvme_tcp_batch = 1u;
  * 溜め込み、囲まなければ従来どおり即送信する(admin など 1 発ものを
  * 溜めたまま忘れる事故を防ぐ)。 */
 #define NVME_TCP_TX_BATCH_MAX 9216u
-static uint8_t  s_tx_batch[NVME_TCP_TX_BATCH_MAX] __attribute__((aligned(64)));
-static uint32_t s_tx_batch_len;
-static int      s_tx_batching;
-static uint32_t s_tx_hold_rounds;
+typedef struct {
+    uint8_t  buf[NVME_TCP_TX_BATCH_MAX];
+    uint32_t len;
+    int      batching;
+    uint32_t hold_rounds;
+} __attribute__((aligned(64))) nvme_tx_batch_pc_t;
+/* コアごと(2 ポートのイニシエータはポートごとに別のコアで回す。共有すると片方の接続へ
+ * もう片方のコマンドが混ざる)。 */
+static nvme_tx_batch_pc_t s_tx_batch_pc[SMP_MAX_CORES];
+#define s_tx_batch       (s_tx_batch_pc[smp_core_index()].buf)
+#define s_tx_batch_len   (s_tx_batch_pc[smp_core_index()].len)
+#define s_tx_batching    (s_tx_batch_pc[smp_core_index()].batching)
+#define s_tx_hold_rounds (s_tx_batch_pc[smp_core_index()].hold_rounds)
 
 /* Nagle 的な溜め込みで保留してよい最大周回数(0=溜めない)。`tcpnagle`。 */
 volatile uint32_t g_nvme_tcp_nagle = 0u;
@@ -486,8 +502,7 @@ static int nvme_tcp_tx_put(nvme_tcp_conn_t *c, const void *p1, uint32_t l1,
 int nvme_tcp_send_cmd_inline_async(nvme_tcp_conn_t *c, const nvme_sqe_t *sqe,
                                    const void *data, uint32_t dlen, uint16_t *out_cid)
 {
-    static uint8_t s_icd_hdr[NVME_TCP_CMD_PDU_LEN + NVME_TCP_DGST_LEN]
-        __attribute__((aligned(64)));
+    uint8_t *s_icd_hdr = s_icd_hdr_pc[smp_core_index()];
 
     uint16_t cid = c->next_cid++;
     uint32_t hd  = nvme_tcp_hdgst_len(c);
@@ -600,8 +615,7 @@ int nvme_tcp_send_h2c_data_ex(nvme_tcp_conn_t *c, uint16_t cid, uint16_t ttag,
         return -1;
     }
 
-    static uint8_t s_h2c_buf[NVME_TCP_DATA_PDU_LEN + 2u * NVME_TCP_DGST_LEN + NVME_TCP_H2C_CHUNK_MAX]
-        __attribute__((aligned(64)));
+    uint8_t *s_h2c_buf = s_h2c_buf_pc[smp_core_index()];
 
     const uint8_t *src = (const uint8_t *)data;
     uint32_t hd = nvme_tcp_hdgst_len(c);
@@ -738,7 +752,7 @@ int nvme_tcp_recv_poll(nvme_tcp_conn_t *c, nvme_tcp_xfer_t *x)
 int nvme_tcp_send_term(nvme_tcp_conn_t *c, uint16_t fes, uint32_t fei,
                         const uint8_t *pdu, uint32_t pdu_len)
 {
-    static uint8_t s_term_buf[NVME_TCP_TERM_PLEN_MAX] __attribute__((aligned(64)));
+    uint8_t *s_term_buf = s_term_buf_pc[smp_core_index()];
     uint32_t total = nvme_tcp_build_term(s_term_buf, NVME_TCP_PDU_H2C_TERM,
                                           fes, fei, pdu, pdu_len);
     g_nvme_tcp_term_sent++;
@@ -765,7 +779,7 @@ int nvme_tcp_send_icreq(nvme_tcp_conn_t *c)
     c->hdgst        = 0;
     c->ddgst        = 0;
 
-    static uint8_t s_icreq_buf[NVME_TCP_ICREQ_LEN] __attribute__((aligned(64)));
+    uint8_t *s_icreq_buf = s_icreq_buf_pc[smp_core_index()];
     for (uint32_t i = 0; i < NVME_TCP_ICREQ_LEN; i++) s_icreq_buf[i] = 0;
 
     s_icreq_buf[0] = NVME_TCP_PDU_ICREQ;         /* hdr.type */

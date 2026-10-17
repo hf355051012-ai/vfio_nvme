@@ -109,6 +109,8 @@ void nvme_update_lba_size_from_id_ns(nvme_ctx_t *ctx, uint32_t nsid, const void 
 /* 接続先を netaddr_t で指定する本体。IPv4/IPv6 のどちらでもよい。 */
 int nvme_connect_job_start_addr(nvme_ctx_t *ctx, const netaddr_t *addr, uint16_t port,
                                 const char *subnqn);
+int nvme_connect_job_start_on(nvme_ctx_t *ctx, const netaddr_t *addr, uint16_t port,
+                              const char *subnqn, void *src, int core);
 
 /* IPv4 用の薄いラッパ。 */
 int nvme_connect_job_start(nvme_ctx_t *ctx, uint32_t ip, uint16_t port, const char *subnqn);

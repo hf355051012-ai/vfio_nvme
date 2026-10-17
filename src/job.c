@@ -196,6 +196,15 @@ static int job_affinity_busy_locked(unsigned skip_index, void *key)
     return 0;
 }
 
+/*=================================================================
+ * ジョブの step() の中から job_scheduler_tick() を入れ子で呼べるようにする / 戻す。
+ * 通常は入れ子の呼び出しは何もしない。長く走るジョブ(2 ポートのイニシエータの PF1 側の操作を
+ * コア 1 で行うシェルのジョブ)の中で、同じコアの別のジョブ(RDMA の接続管理など)を回すために使う。
+ * 呼んだジョブ自身は claim 済みなので入れ子の巡回では走らない。必ず組で呼ぶこと。
+ * ===============================================================*/
+void job_tick_reenter_begin(void) { s_ticking[smp_core_index()] = 0; }
+void job_tick_reenter_end(void)   { s_ticking[smp_core_index()] = 1; }
+
 void job_scheduler_tick(void)
 {
     unsigned core = smp_core_index();

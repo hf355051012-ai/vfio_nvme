@@ -48,4 +48,7 @@ net_buf_t *ip_prepare_send_buf(const uint8_t dst_ip[4], const uint8_t dst_mac[6]
 
 int ip_send_prepared(net_buf_t *nb, uint16_t payload_len);
 
+void ip_roce_dup_show(int clear);
+void ip_roce_dup_set_port(uint16_t port);
+
 #endif /* IP_H */

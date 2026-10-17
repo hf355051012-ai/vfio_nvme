@@ -62,6 +62,8 @@ job_t *job_spawn(job_step_fn step, void *ctx, const char *name);
 void job_set_affinity(job_t *job, void *affinity_key);
 
 void job_pin_to_core(job_t *job, unsigned core);
+void job_tick_reenter_begin(void);
+void job_tick_reenter_end(void);
 
 /* 自分を眠らせる / 起こす。**ジョブ自身の step() から呼ぶこと**(呼び出し中は
  * そのジョブを claim しているので、ロック無しで書いてよい)。

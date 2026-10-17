@@ -20,6 +20,7 @@
 #include "timer.h"
 #include "uart.h"
 #include "cache.h"
+#include "smp.h"
 #include <string.h>
 
 #define ISER_HDR_LEN   28u
@@ -66,10 +67,17 @@ typedef struct {
     uint8_t       rx[II_RX_SLOTS][II_RX_BYTES] __attribute__((aligned(64)));
 } ii_t;
 
-static ii_t s;
-static uint8_t s_wbuf[II_BUF_MAX] __attribute__((aligned(4096)));
-static uint8_t s_rbuf[II_BUF_MAX] __attribute__((aligned(4096)));
-static uint8_t s_sbuf[4096] __attribute__((aligned(4096)));
+/* **2 ポートのイニシエータ(`isertarget pf1 ..` + `iserbench .. 2port`)のため、実体は 2 つ持つ。**
+ * PF0 側はコア 0、PF1 側はコア 1 で動かすので、呼んだコアで実体を選ぶ(コア 0 = PF0、それ以外 = PF1)。 */
+#define II_INST (smp_core_index() ? 1u : 0u)
+static ii_t s_ii[2];
+static uint8_t s_wbuf_i[2][II_BUF_MAX] __attribute__((aligned(4096)));
+static uint8_t s_rbuf_i[2][II_BUF_MAX] __attribute__((aligned(4096)));
+static uint8_t s_sbuf_i[2][4096] __attribute__((aligned(4096)));
+#define s      (s_ii[II_INST])
+#define s_wbuf (s_wbuf_i[II_INST])
+#define s_rbuf (s_rbuf_i[II_INST])
+#define s_sbuf (s_sbuf_i[II_INST])
 
 static void put64(uint8_t *p, uint64_t v) { iscsi_put32(p, (uint32_t)(v >> 32)); iscsi_put32(p + 4, (uint32_t)v); }
 
@@ -303,7 +311,7 @@ static int login(const char *target)
     s.max_burst = 262144u;
     s.tgt_recv_dsl = 8192u;
     s.immediate_data = 1;
-    s.isid[0] = 0x80; s.isid[1] = 'v'; s.isid[2] = 'f'; s.isid[3] = 'i'; s.isid[4] = 'o'; s.isid[5] = 0x10;
+    s.isid[0] = 0x80; s.isid[1] = 'v'; s.isid[2] = 'f'; s.isid[3] = 'i'; s.isid[4] = 'o'; s.isid[5] = (uint8_t)(0x10u + II_INST);
     s.cmdsn = 1;
     s.expstatsn = 0;
     const uint8_t *payload = kv;
@@ -359,10 +367,11 @@ int iscsi_iser_connect(mlx5_dev_t *dev, uint32_t ip, const uint8_t mac[6], const
     s.outstanding = s.errors = s.rejects = s.nop_in = s.sends_inflight = 0;
     s.logout_req = 0;
     s.rq_head = s.rq_tail = 0;
-    netif_t *pf0 = netif_find("mlx5-pf0");
-    if (pf0) netif_activate(pf0);
+    const char *label = II_INST ? "mlx5-pf1" : "mlx5-pf0";
+    netif_t *pf = netif_find(label);
+    if (pf) netif_activate(pf);
     static const uint8_t zero_mac[6] = {0};
-    rdma_cm_fill_addr(&s.cm, dev, "mlx5-pf0", "__override__", 0u, ip, zero_mac, mac);
+    rdma_cm_fill_addr(&s.cm, dev, label, "__override__", 0u, ip, zero_mac, mac);
     s.cm.is_active = 1;
     s.cm.skip_ping = 1;
     s.cm.rc_qp_index = II_QP_INDEX;

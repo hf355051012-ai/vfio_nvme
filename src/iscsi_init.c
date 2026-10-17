@@ -18,6 +18,7 @@
 #include "timer.h"
 #include "uart.h"
 #include "crc32c.h"
+#include "smp.h"
 #include <string.h>
 
 #define INI_MAX_TASKS   256u
@@ -72,10 +73,17 @@ typedef struct {
     uint8_t    data[INI_RX_DATA_MAX + 8u] __attribute__((aligned(64)));
 } ini_t;
 
-static ini_t s;
-static uint8_t s_wbuf[INI_BUF_MAX] __attribute__((aligned(4096)));   /* 書き込みの模様 */
-static uint8_t s_rbuf[INI_BUF_MAX] __attribute__((aligned(4096)));   /* 読み出し先 */
-static uint8_t s_sbuf[4096];                                          /* 同期コマンド用 */
+/* **2 ポートのイニシエータ(`iscsitarget pf1 ..` + `iscsibench .. 2port`)のため、実体は 2 つ持つ。**
+ * PF0 側はコア 0、PF1 側はコア 1 で動かすので、呼んだコアで実体を選ぶ(コア 0 = PF0、それ以外 = PF1)。 */
+#define INI_INST (smp_core_index() ? 1u : 0u)
+static ini_t s_ini[2];
+static uint8_t s_wbuf_i[2][INI_BUF_MAX] __attribute__((aligned(4096)));   /* 書き込みの模様 */
+static uint8_t s_rbuf_i[2][INI_BUF_MAX] __attribute__((aligned(4096)));   /* 読み出し先 */
+static uint8_t s_sbuf_i[2][4096];                                          /* 同期コマンド用 */
+#define s      (s_ini[INI_INST])
+#define s_wbuf (s_wbuf_i[INI_INST])
+#define s_rbuf (s_rbuf_i[INI_INST])
+#define s_sbuf (s_sbuf_i[INI_INST])
 
 enum { PH_BHS = 0, PH_AHS, PH_HDGST, PH_DATA, PH_PAD, PH_DDGST };
 
@@ -348,8 +356,8 @@ static int scsi_sync(const uint8_t cdb[16], int is_read, uint8_t *buf, uint32_t 
 
 static int tcp_open(const netaddr_t *dst, uint16_t port)
 {
-    netif_t *pf0 = netif_find("mlx5-pf0");
-    if (pf0) netif_activate(pf0);
+    netif_t *pf = netif_find(INI_INST ? "mlx5-pf1" : "mlx5-pf0");
+    if (pf) netif_activate(pf);
     memset(&s.tcp, 0, sizeof(s.tcp));
     tcp_connect_begin_to(&s.tcp, dst, port);
     const uint64_t t0 = timer_now();
@@ -555,7 +563,7 @@ static int login(int discovery, const char *target, int want_hd, int want_dd)
     s.p.initial_r2t = 1;
     s.p.immediate_data = 1;
     s.p.max_outstanding_r2t = 1;
-    s.isid[0] = 0x80; s.isid[1] = 'v'; s.isid[2] = 'f'; s.isid[3] = 'i'; s.isid[4] = 'o'; s.isid[5] = discovery ? 1 : 0;
+    s.isid[0] = 0x80; s.isid[1] = 'v'; s.isid[2] = 'f'; s.isid[3] = 'i'; s.isid[4] = 'o'; s.isid[5] = discovery ? 1 : (INI_INST ? 2 : 0);
     s.cmdsn = 1;
     s.expstatsn = 0;
     const uint8_t *payload = kv;

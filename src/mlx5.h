@@ -219,6 +219,9 @@ int mlx5_net_register_dual(mlx5_dev_t *dev0, mlx5_dev_t *dev1);
 /* catch-all の FTE の転送先を直接 TIR / RSS TIR で張り替える(受信の分散)。 */
 int mlx5_set_rss_enable(mlx5_dev_t *dev, unsigned ncores);
 int mlx5_net_set_rss(unsigned ncores);
+/* vport の promisc_mc(全マルチキャストの受信)を立てる / 下ろす。 */
+int mlx5_nic_vport_set_allmulti(mlx5_dev_t *dev, int on);
+int mlx5_net_set_allmulti(int on);
 
 /* **ポートと受信キューの統計(`nicstat`)。** 性能の分析で「線が止められていた(PAUSE)」
  * 「NIC が捨てた」を直接数えるためのもの。値は起動からの累計(差分は呼ぶ側で取る)。

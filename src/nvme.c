@@ -32,7 +32,9 @@ static const uint8_t NVME_HOST_ID[16] = {
 
 /* 内蔵イニシエータの TLS(段階 F)。admin と IO キュー(1 本)で 1 個ずつ。 */
 #include "nvmet_tls.h"
-static nvmet_tls_conn_t s_cli_tls[2];
+/* コアごと(2 ポートのイニシエータは、ポート 1 の接続をコア 1 で張る)。 */
+static nvmet_tls_conn_t s_cli_tls_pc[SMP_MAX_CORES][2];
+#define s_cli_tls (s_cli_tls_pc[smp_core_index()])
 
 #define NVME_CNTLID_DYNAMIC 0xFFFFu  /* Fabrics Connect(admin queue): controller ID割り当てをtargetに任せる */
 
@@ -1187,6 +1189,23 @@ static job_result_t nvme_connect_job_step(job_t *self)
 int nvme_connect_job_start_addr(nvme_ctx_t *ctx, const netaddr_t *addr, uint16_t port,
                                 const char *subnqn)
 {
+    return nvme_connect_job_start_on(ctx, addr, port, subnqn, g_active_ctx, -1);
+}
+
+/*=================================================================
+ * nvme_connect_job_start_addr() の、出ていく PF と動かすコアを指定する版。
+ * 2 ポートのイニシエータで、ポート 1 の接続を PF1 から、コア 1 で張るために使う
+ * (TCP の接続はそれを張ったコアの表に載るので、受信を見るコアで張る必要がある)。
+ *
+ * 引数:
+ *   src  - 出ていくインターフェース(netif_t *)
+ *   core - 接続ジョブを動かすコア(-1 なら呼んだコア)
+ * コール元:
+ *   nvme_connect_job_start_addr()、シェルの tcpbench(2 ポート)
+ * ===============================================================*/
+int nvme_connect_job_start_on(nvme_ctx_t *ctx, const netaddr_t *addr, uint16_t port,
+                              const char *subnqn, void *src, int core)
+{
     if (ctx->busy) {
         uart_printf("[!] nvme: 前回の操作がまだ実行中です\n");
         return -1;
@@ -1213,7 +1232,7 @@ int nvme_connect_job_start_addr(nvme_ctx_t *ctx, const netaddr_t *addr, uint16_t
     s_nvme_connect_job_ctx.ctx     = ctx;
     s_nvme_connect_job_ctx.addr    = *addr;
     s_nvme_connect_job_ctx.port    = port;
-    s_nvme_connect_job_ctx.src_ctx = g_active_ctx;
+    s_nvme_connect_job_ctx.src_ctx = (netif_t *)src;
 
     job_t *connect_job = job_spawn(nvme_connect_job_step, &s_nvme_connect_job_ctx, "nvme-connect");
     if (!connect_job) {
@@ -1222,6 +1241,7 @@ int nvme_connect_job_start_addr(nvme_ctx_t *ctx, const netaddr_t *addr, uint16_t
         return -1;
     }
     job_set_affinity(connect_job, s_nvme_connect_job_ctx.src_ctx);
+    if (core >= 0) job_pin_to_core(connect_job, (unsigned)core);
     return 0;
 }
 
@@ -1317,7 +1337,10 @@ typedef struct {
     uint32_t   len;
 } nvme_pipeline_slot_t;
 
-static nvme_pipeline_slot_t s_pl_slots[NVME_IO_QDEPTH];
+/* **2 ポートのイニシエータ(ポートごとに別のコアで回す)のため、パイプラインの状態はコアごとに持つ。**
+ * 関数やファイルの static をコアをまたいで共有すると、2 つのポートの処理が同じ領域を書き合う。 */
+static nvme_pipeline_slot_t s_pl_slots_pc[SMP_MAX_CORES][NVME_IO_QDEPTH];
+#define s_pl_slots (s_pl_slots_pc[smp_core_index()])
 
 /* イニシエータのパイプライン計装(シェルの `plstat`)。**深さを上げても
  * スループットが伸びない**のが CPU 律速なのか待ちなのかは、これが無いと
@@ -1367,11 +1390,18 @@ typedef enum {
     PL_RX_R2T_REST,
 } nvme_pipeline_rx_state_t;
 
-static nvme_pipeline_rx_state_t s_pl_rx_state;
-static nvme_tcp_xfer_t          s_pl_xfer;
-static uint8_t                  s_pl_hdr_buf[NVME_TCP_HDR_LEN];
-/* 型固有部(16)+ヘッダダイジェスト(4)を1回でまとめて受ける。 */
-static uint8_t                  s_pl_rest_buf[16 + 4];
+typedef struct {
+    nvme_pipeline_rx_state_t rx_state;
+    nvme_tcp_xfer_t          xfer;
+    uint8_t                  hdr_buf[NVME_TCP_HDR_LEN];
+    /* 型固有部(16)+ヘッダダイジェスト(4)を1回でまとめて受ける。 */
+    uint8_t                  rest_buf[16 + 4];
+} __attribute__((aligned(64))) nvme_pl_rx_pc_t;
+static nvme_pl_rx_pc_t s_pl_rx_pc[SMP_MAX_CORES];
+#define s_pl_rx_state (s_pl_rx_pc[smp_core_index()].rx_state)
+#define s_pl_xfer     (s_pl_rx_pc[smp_core_index()].xfer)
+#define s_pl_hdr_buf  (s_pl_rx_pc[smp_core_index()].hdr_buf)
+#define s_pl_rest_buf (s_pl_rx_pc[smp_core_index()].rest_buf)
 
 /*=================================================================
  * write パイプラインの送信済み・未完了スロットから cid が一致するものを探す。
@@ -1438,9 +1468,15 @@ typedef struct {
 } nvme_h2c_pending_t;
 
 #define NVME_H2C_PENDING_MAX NVME_IO_QDEPTH
-static nvme_h2c_pending_t s_h2c_pending[NVME_H2C_PENDING_MAX];
-static unsigned s_h2c_pending_head;
-static unsigned s_h2c_pending_count;
+typedef struct {
+    nvme_h2c_pending_t q[NVME_H2C_PENDING_MAX];
+    unsigned head;
+    unsigned count;
+} __attribute__((aligned(64))) nvme_h2c_pending_pc_t;
+static nvme_h2c_pending_pc_t s_h2c_pending_pc[SMP_MAX_CORES];
+#define s_h2c_pending       (s_h2c_pending_pc[smp_core_index()].q)
+#define s_h2c_pending_head  (s_h2c_pending_pc[smp_core_index()].head)
+#define s_h2c_pending_count (s_h2c_pending_pc[smp_core_index()].count)
 
 /*=================================================================
  * 受信した R2T を H2CData 送信待ちの FIFO へ積む(送信自体は
@@ -1607,7 +1643,8 @@ typedef struct {
     int      header_sent;
 } nvme_h2c_cursor_t;
 
-static nvme_h2c_cursor_t s_h2c_cursor;
+static nvme_h2c_cursor_t s_h2c_cursor_pc[SMP_MAX_CORES];
+#define s_h2c_cursor (s_h2c_cursor_pc[smp_core_index()])
 
 /*=================================================================
  * H2CData 送信 FIFO と送信カーソルを初期状態へ戻す(ベンチ開始時)。

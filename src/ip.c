@@ -13,8 +13,74 @@
 #include "netaddr.h"
 #include "ipfrag.h"
 
-/* [切り分け] Ethernet RX へ複製されて来た RoCEv2(UDP 4791)を数える。 */
-volatile uint32_t g_roce_rx_seen;
+/* [切り分け] Ethernet の受信キューへ届いた RoCEv2(UDP 4791)を数える(`rocedup`)。
+ * 宛先 QP 番号(BTH の byte 5-7)ごとに件数と最後の opcode を控える。 */
+#define ROCE_DUP_QPN_SLOTS 8u
+typedef struct {
+    volatile uint64_t total, gsi, other_qpn, ours, not_ours, overflow;
+    struct { volatile uint32_t qpn, cnt; volatile uint8_t op; } q[ROCE_DUP_QPN_SLOTS];
+} roce_dup_stat_t;
+static roce_dup_stat_t s_roce_dup;
+/* 数える宛先ポート。既定は 4791。陽性対照のときだけ別のポートにする(`rocedup port N`)。 */
+static volatile uint16_t s_roce_dup_port = UDP_PORT_ROCEV2;
+
+static void roce_dup_count(const uint8_t *udp, uint32_t len, const uint8_t dst[4])
+{
+    s_roce_dup.total++;
+    if (netif_find_by_ip(ip_from_octets(dst[0], dst[1], dst[2], dst[3]))) s_roce_dup.ours++;
+    else s_roce_dup.not_ours++;
+    if (len < 8u + 12u) return;
+    const uint8_t *bth = udp + 8;
+    uint32_t qpn = ((uint32_t)bth[5] << 16) | ((uint32_t)bth[6] << 8) | bth[7];
+    if (qpn == 1u) s_roce_dup.gsi++; else s_roce_dup.other_qpn++;
+    for (unsigned i = 0; i < ROCE_DUP_QPN_SLOTS; i++) {
+        if (s_roce_dup.q[i].cnt && s_roce_dup.q[i].qpn == qpn) {
+            s_roce_dup.q[i].cnt++; s_roce_dup.q[i].op = bth[0]; return;
+        }
+        if (!s_roce_dup.q[i].cnt) {
+            s_roce_dup.q[i].qpn = qpn; s_roce_dup.q[i].op = bth[0]; s_roce_dup.q[i].cnt = 1; return;
+        }
+    }
+    s_roce_dup.overflow++;
+}
+
+/*=================================================================
+ * シェルの `rocedup port N`。数える宛先ポートを変える(陽性対照用。0 で 4791 に戻す)。
+ * コール元:
+ *   shell_dispatch()
+ * ===============================================================*/
+void ip_roce_dup_set_port(uint16_t port)
+{
+    s_roce_dup_port = port ? port : UDP_PORT_ROCEV2;
+    uart_printf("rocedup: 数える宛先ポート = %u\n", (unsigned)s_roce_dup_port);
+}
+
+/*=================================================================
+ * シェルの `rocedup`。Ethernet の受信キューへ届いた RoCEv2 の数を出す。
+ * 引数:
+ *   clear - 非 0 なら 0 に戻す
+ * コール元:
+ *   shell_dispatch()
+ * ===============================================================*/
+void ip_roce_dup_show(int clear)
+{
+    if (clear) {
+        volatile uint8_t *p = (volatile uint8_t *)&s_roce_dup;
+        for (unsigned i = 0; i < sizeof(s_roce_dup); i++) p[i] = 0;
+        uart_printf("rocedup: 0 に戻しました\n");
+        return;
+    }
+    uart_printf("rocedup: 計 %llu(宛先が自分 %llu / 自分以外 %llu)、宛先 QP=1(GSI)%llu / それ以外 %llu\n",
+                (unsigned long long)s_roce_dup.total, (unsigned long long)s_roce_dup.ours,
+                (unsigned long long)s_roce_dup.not_ours, (unsigned long long)s_roce_dup.gsi,
+                (unsigned long long)s_roce_dup.other_qpn);
+    for (unsigned i = 0; i < ROCE_DUP_QPN_SLOTS; i++) {
+        if (!s_roce_dup.q[i].cnt) break;
+        uart_printf("  qpn=0x%06x 件数=%u 最後の opcode=0x%02x\n",
+                    s_roce_dup.q[i].qpn, s_roce_dup.q[i].cnt, s_roce_dup.q[i].op);
+    }
+    if (s_roce_dup.overflow) uart_printf("  (表に入らなかった %llu)\n", (unsigned long long)s_roce_dup.overflow);
+}
 
 #define IP_OFF_VER_IHL     offsetof(ip_header_t, ver_ihl)
 #define IP_OFF_TOS         offsetof(ip_header_t, tos)
@@ -117,6 +183,16 @@ void ip_handle_frame(const uint8_t *payload, size_t len, const uint8_t *src_mac)
         return;
     }
 
+    /* RoCEv2(UDP 4791)は NIC の RDMA の受信が QP へ配るもので、ここへ届いた写しは宛先を問わず
+     * 数えて捨てる(`rocedup`。ICMP のエラーも返さない)。宛先の判定より前に置くのは、
+     * 自分以外の宛先の写しも数えるため。 */
+    if (in[IP_OFF_PROTOCOL] == IP_PROTO_UDP && total_len >= sizeof(ip_header_t) + 4u &&
+        rd16be(in + sizeof(ip_header_t) + 2) == s_roce_dup_port) {
+        uint8_t d[4] = { in[IP_OFF_DST_IP], in[IP_OFF_DST_IP + 1], in[IP_OFF_DST_IP + 2], in[IP_OFF_DST_IP + 3] };
+        roce_dup_count(payload + sizeof(ip_header_t), (uint32_t)(total_len - sizeof(ip_header_t)), d);
+        return;
+    }
+
     uint32_t dst_ip = rd32be(in + IP_OFF_DST_IP);
     if (dst_ip != NET_SELF_IP) {
         return;
@@ -183,26 +259,8 @@ void ip_handle_frame(const uint8_t *payload, size_t len, const uint8_t *src_mac)
         dst_ip_oct[2] = in[IP_OFF_DST_IP + 2];
         dst_ip_oct[3] = in[IP_OFF_DST_IP + 3];
         if (udp_input(ip_payload, ip_payload_len, src_ip, dst_ip_oct, src_mac) == -1) {
-            /* 待ち受けの無いポート宛 -- Port Unreachable を返す。ただし RoCEv2
-             * (UDP 4791)は例外。RoCEv2 のフレームは HW が QP へ配送するのと
-             * 同時に catch-all フローステアリング経由で Ethernet RX にも複製
-             * されて来る(自分自身の RDMA トラフィックが毎パケットここへ落ちる)。
-             * これに ICMP エラーを返すと相手へ大量の無意味なエラーを送りつけ、
-             * TX スロットを浪費するだけなので黙って捨てる。 */
-            uint16_t dport = (ip_payload_len >= 4u)
-                                 ? rd16be((const volatile uint8_t *)ip_payload + 2)
-                                 : 0u;
-            if (dport != UDP_PORT_ROCEV2) {
-                icmp_send_dest_unreach(ICMP_CODE_PORT_UNREACH, payload, len, src_ip, src_mac);
-            } else if (g_roce_rx_seen < 12u) {
-                /* [切り分け] RoCEv2 が Ethernet RX に複製されて来ているか。
-                 * ここに出るなら「フレームは受信側 PF まで届いている」。 */
-                g_roce_rx_seen++;
-                uart_printf("[IP] RoCEv2 RX: %u.%u.%u.%u -> %u.%u.%u.%u len=%u\n",
-                            src_ip[0], src_ip[1], src_ip[2], src_ip[3],
-                            dst_ip_oct[0], dst_ip_oct[1], dst_ip_oct[2], dst_ip_oct[3],
-                            (unsigned)ip_payload_len);
-            }
+            /* 待ち受けの無いポート宛 -- Port Unreachable を返す。 */
+            icmp_send_dest_unreach(ICMP_CODE_PORT_UNREACH, payload, len, src_ip, src_mac);
         }
     } else {
         /* 上位が居ないプロトコルは Protocol Unreachable を返す。相手を無駄に
