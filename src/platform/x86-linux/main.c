@@ -1005,15 +1005,15 @@ static void shell_rsttest(void)
                 uart_printf("rsttest: NG -- RFC 5961 の検査用コネクションを張れず\n");
             } else {
                 uint32_t dropped0 = g_tcp_rst_dropped_count;
-                /* [3] 受信ウィンドウのはるか先を指す RST */
-                tcp_debug_inject_rst(&s_cli2, s_cli2.rcv_seq + 1000000u);
+                /* [3] 受信ウィンドウのはるか先を指す RST(窓は最大でも tcprcvbuf の半分 = 32MB なので 256MB 先)*/
+                tcp_debug_inject_rst(&s_cli2, s_cli2.rcv_seq + 0x10000000u);
                 for (uint64_t t0 = timer_now(); !timeout_ms(t0, 200u); ) {
                     net_poll_all_and_dispatch();
                     tcp_poll();
                 }
                 int survived = (s_cli2.state == TCP_ESTABLISHED);
                 int counted  = (g_tcp_rst_dropped_count > dropped0);
-                uart_printf("rsttest: %s [3] 窓外の RST(seq=RCV.NXT+1000000)-- "
+                uart_printf("rsttest: %s [3] 窓外の RST(seq=RCV.NXT+256MB)-- "
                             "接続は %s、破棄カウンタ %s\n",
                             (survived && counted) ? "OK" : "NG",
                             survived ? "生存" : "切断された",
@@ -2331,7 +2331,7 @@ static void shell_nicstat(const char *args)
     for (unsigned i = 0; i < NICSTAT_TCP_N; i++) t[i] -= s_nic_tcp_base[i];
     uart_printf("  TCP 送信側: 再送 %llu(うち高速再送 %llu)、受けた重複 ACK %llu\n",
                 (unsigned long long)t[0], (unsigned long long)t[1], (unsigned long long)t[2]);
-    uart_printf("  TCP 受信側: 順序の飛び %llu(先読み満杯で捨て %llu)、受け取り済みの再送 %llu、"
+    uart_printf("  TCP 受信側: 順序の飛び %llu(置き場に置けず捨て %llu)、受け取り済みの再送 %llu、"
                 "バッファ不足 %llu、チェックサム不正 %llu、PAWS %llu\n",
                 (unsigned long long)t[3], (unsigned long long)t[4], (unsigned long long)t[5],
                 (unsigned long long)t[6], (unsigned long long)t[7], (unsigned long long)t[8]);
@@ -7365,10 +7365,38 @@ static void shell_dispatch(char *line, int s0, int s1)
         while (*a == ' ') a++;
         if (*a) {
             g_tcp_rwin_cap = (uint32_t)strtoul(a, NULL, 10);
-            g_tcp_rcv_wscale = (g_tcp_rwin_cap > 1048560u) ? 6u : 4u;
+            g_tcp_rcv_wscale = (g_tcp_rwin_cap > (65535u << 7)) ? 9u : 7u;
         }
         uart_printf("tcprwin: 受信窓の上限 %u バイト(0 = 既定)、Window Scale %u(次に張る接続から)\n",
                     (unsigned)g_tcp_rwin_cap, (unsigned)g_tcp_rcv_wscale);
+    } else if (strncmp(line, "tcprcvbuf", 9) == 0) {
+        /* 接続ごとの受信の予算(順序外の置き場の上限、窓はその半分)。次に送る ACK から効く。 */
+        const char *a = line + 9;
+        while (*a == ' ') a++;
+        if (*a) {
+            unsigned long v = strtoul(a, NULL, 0);
+            if (v < 65536ul || v > 64ul * 1024ul * 1024ul) {
+                uart_printf("tcprcvbuf: 65536 〜 67108864 バイトで指定してください\n");
+            } else {
+                g_tcp_rcvbuf = (uint32_t)v;
+            }
+        }
+        uint32_t used = 0, total = 0, peak = 0;
+        tcp_ooo_pool_stats(&used, &total, &peak);
+        uint32_t pdrop = 0;
+        for (unsigned c = 0; c < SMP_MAX_CORES; c++) pdrop += g_tcp_rx_ooo_pool_drop[c];
+        uart_printf("tcprcvbuf: 接続ごとの予算 %u バイト(窓はその半分、既定 8388608)、順序外の扱い=%s\n",
+                    (unsigned)g_tcp_rcvbuf, g_tcp_ooo_legacy ? "legacy(64 個)" : "bytes");
+        uart_printf("tcprcvbuf: 共有の置き場 使用 %u / %u バイト(最大 %u)、置き場が尽きて捨てた %u\n",
+                    (unsigned)used, (unsigned)total, (unsigned)peak, (unsigned)pdrop);
+    } else if (strncmp(line, "tcpooo", 6) == 0) {
+        /* 陰性対照: legacy = 接続ごとに 64 セグメント・窓 64 x MSS(以前の作り)、bytes = 予算で抑える(既定)。 */
+        const char *a = line + 6;
+        while (*a == ' ') a++;
+        if (strncmp(a, "legacy", 6) == 0) g_tcp_ooo_legacy = 1u;
+        else if (strncmp(a, "bytes", 5) == 0) g_tcp_ooo_legacy = 0u;
+        uart_printf("tcpooo: %s\n", g_tcp_ooo_legacy ? "legacy(接続ごとに 64 セグメント、窓 64 x MSS)"
+                                                     : "bytes(接続ごとの予算 tcprcvbuf で抑える)");
     } else if (strncmp(line, "ackthresh", 9) == 0) {
         shell_ackthresh(line + 9);
     } else if (strncmp(line, "ackhold", 7) == 0) {

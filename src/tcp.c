@@ -98,7 +98,9 @@ void tcp_copy_stats_get(uint64_t *c2_ns, uint64_t *c2_by,
 
 #define TCP_RECV_NOACK_ACK_THRESHOLD_MSS 2u
 
-#define TCP_RCV_WSCALE 4u
+/* 自分が名乗る Window Scale。窓は最大 65535 << 7 = 約 8.4MB まで表せる
+ * (既定の窓 = tcprcvbuf の半分 = 4MB に足りる値。Linux は tcp_rmem の上限に合わせて決める)。 */
+#define TCP_RCV_WSCALE 7u
 
 #define TCP_INITIAL_RTO_MS      500u
 #define TCP_RTO_MIN_MS           200u
@@ -112,7 +114,21 @@ void tcp_copy_stats_get(uint64_t *c2_ns, uint64_t *c2_by,
 #define TCP_SEND_OVERALL_TIMEOUT_MS 30000u  /* tcp_send()全体(複数セグメント/再送込み)の上限 */
 #define TCP_CLOSE_FIN_WAIT_MS        2000u  /* 自分のFINがACKされた後、相手のFINを待つ時間 */
 
+/* 陰性対照(`tcpooo legacy`)のときだけ使う、接続ごとの順序外のセグメント数の上限と窓の上限
+ * (64 x MSS)。既定はバイト数の予算(g_tcp_rcvbuf)で抑える。 */
 #define TCP_OOO_SLOTS 64u
+
+/* **順序外に届いたセグメントの置き場は、全接続で共有する領域から取る**(Linux と同じく
+ * 個数ではなく量で抑えるため)。枠は 2 種類で、セグメントの長さで使い分ける。
+ * 使用量は枠の大きさで数える(Linux が skb の truesize で数えるのと同じ)。
+ *   小: 2KB  x 8192 = 16MB(MSS 1448 の相手や小さい PDU)
+ *   大: 10KB x 6144 = 60MB(ジャンボフレームの 1 セグメント。TCP_MSS_LOCAL が収まる) */
+#define TCP_OOO_SMALL_BYTES 2048u
+#define TCP_OOO_SMALL_N     8192u
+#define TCP_OOO_BIG_BYTES   10240u
+#define TCP_OOO_BIG_N       6144u
+#define TCP_OOO_NODES       (TCP_OOO_SMALL_N + TCP_OOO_BIG_N)
+#define TCP_OOO_NONE        0xFFFFu
 
 #define TCP_ASYNC_SLOTS 16u
 
@@ -210,6 +226,15 @@ volatile uint32_t g_tcp_ack_thin_off[SMP_MAX_CORES];
  * 1,048,560 を超えるときは、次に張る接続から Window Scale を 6 にする(4 では 65535 << 4 で頭打ち)。 */
 volatile uint32_t g_tcp_rwin_cap = 0u;
 volatile uint8_t  g_tcp_rcv_wscale = TCP_RCV_WSCALE;
+/* 接続ごとの受信の予算(バイト、Linux の sk_rcvbuf に当たる。`tcprcvbuf`)。順序外の置き場の使用量
+ * (枠の大きさで数える)をこの値まで許し、**広告する窓はその半分にする**(Linux の
+ * tcp_adv_win_scale = 1 と同じ。枠の大きさとデータの長さの差を吸収する余白)。 */
+volatile uint32_t g_tcp_rcvbuf = 8u * 1024u * 1024u;
+/* 陰性対照: 1 にすると順序外を接続ごとに 64 セグメント・窓 64 x MSS までにする(`tcpooo legacy`)。 */
+volatile uint8_t  g_tcp_ooo_legacy = 0u;
+/* 共有の置き場が尽きて捨てた数(コアごと)と、置き場の使用量の最大(バイト)。 */
+volatile uint32_t g_tcp_rx_ooo_pool_drop[SMP_MAX_CORES];
+volatile uint32_t g_tcp_ooo_pool_peak;
 
 /* ACK を間引く対象とする受信セグメントの最小長(0 = MSS/8 を使う)。
  * **小さいセグメント(write の応答 PDU など)を待たせないため。** */
@@ -385,14 +410,6 @@ uint32_t tcp_rx_buf_size(void)
     return TCP_RX_BUF_SIZE;
 }
 
-/* 順序入れ替わりセグメント1件分の保持スロット(tcp_priv_t.ooo[]参照)。 */
-typedef struct {
-    volatile int      valid;
-    volatile uint32_t seq;
-    uint8_t           buf[TCP_MSS_LOCAL];
-    volatile uint16_t len;
-} tcp_ooo_slot_t;
-
 typedef struct {
     uint32_t seq;      /* このセグメントの先頭seq */
     uint16_t len;
@@ -479,12 +496,11 @@ typedef struct {
     uint8_t           sack_enabled;
     uint8_t           sack_rx_count;
     struct { uint32_t start, end; } sack_rx[TCP_SACK_MAX_BLOCKS];
-    /* 有効な ooo スロットの数。**純 ACK ごとに 64 スロットを走査しない**ため
-     * だけに持つ(0 なら SACK ブロックの組み立てを丸ごと省ける)。 */
+    /* 順序外に持っているセグメントの数。 */
     unsigned          ooo_count;
 
     /* 受信側として相手へ知らせる「届いている区間」。**順序不正セグメントを
-     * 置くたびに差分で更新する。** 送るたびに ooo[] 64 スロットから作り直すと
+     * 置くたびに差分で更新する。** 送るたびに順序外の列から作り直すと
      * 結合が O(n^3) になり、順序不正が数十個たまる read の経路で実測 2.5 倍
      * 遅くなった(ACK 1 個ごとに 2 回呼ばれるため)。 */
     uint8_t           sack_tx_count;
@@ -525,7 +541,9 @@ typedef struct {
     uint32_t          last_ack_sent;
     uint16_t          last_win_sent;
 
-    tcp_ooo_slot_t ooo[TCP_OOO_SLOTS];
+    /* 順序外に届いたセグメントの列(seq の順、重なり無し)。中身は共有の置き場(s_ooo_*)にある。 */
+    uint16_t          ooo_head;
+    uint32_t          ooo_bytes;   /* この接続が使っている置き場の量(枠の大きさの合計) */
 
     tcp_async_slot_t async_slots[TCP_ASYNC_SLOTS];
     unsigned          async_head;
@@ -877,6 +895,210 @@ uint32_t tcp_conn_arg(const tcp_conn_t *conn, uint32_t value)
 
 static inline int tcp_seq_lt(uint32_t a, uint32_t b) { return (int32_t)(a - b) < 0; }
 static inline int tcp_seq_gt(uint32_t a, uint32_t b) { return (int32_t)(a - b) > 0; }
+
+/* 順序外の置き場(全コア共通)。番号 0〜8191 が小、8192〜 が大の枠。順序外が起きるのは
+ * ロスのときだけなので、1 本のロックで足りる(受け取った側のコアと、接続を初期化するコアが
+ * 違うことがあるので、コアごとには分けない)。 */
+static smp_spinlock_t s_ooo_lock;
+static uint8_t  s_ooo_small[TCP_OOO_SMALL_N][TCP_OOO_SMALL_BYTES] __attribute__((aligned(64)));
+static uint8_t  s_ooo_big[TCP_OOO_BIG_N][TCP_OOO_BIG_BYTES] __attribute__((aligned(64)));
+static uint32_t s_ooo_seq[TCP_OOO_NODES];
+static uint16_t s_ooo_len[TCP_OOO_NODES];
+static uint16_t s_ooo_next[TCP_OOO_NODES];
+static uint16_t s_ooo_free_small[TCP_OOO_SMALL_N];
+static uint16_t s_ooo_free_big[TCP_OOO_BIG_N];
+static uint32_t s_ooo_nfree_small;
+static uint32_t s_ooo_nfree_big;
+static uint8_t  s_ooo_ready;
+static uint32_t s_ooo_used;   /* 置き場全体の使用量(バイト) */
+
+static inline uint32_t tcp_ooo_node_bytes(uint16_t n)
+{
+    return (n < TCP_OOO_SMALL_N) ? TCP_OOO_SMALL_BYTES : TCP_OOO_BIG_BYTES;
+}
+
+static inline uint8_t *tcp_ooo_data(uint16_t n)
+{
+    return (n < TCP_OOO_SMALL_N) ? s_ooo_small[n] : s_ooo_big[n - TCP_OOO_SMALL_N];
+}
+
+/*=================================================================
+ * 置き場の空き一覧を初めて使うときに作る(s_ooo_lock を持って呼ぶ)。
+ * ===============================================================*/
+static void tcp_ooo_pool_init_locked(void)
+{
+    if (s_ooo_ready) return;
+    for (uint32_t i = 0; i < TCP_OOO_SMALL_N; i++) {
+        s_ooo_free_small[i] = (uint16_t)(TCP_OOO_SMALL_N - 1u - i);
+    }
+    for (uint32_t i = 0; i < TCP_OOO_BIG_N; i++) {
+        s_ooo_free_big[i] = (uint16_t)(TCP_OOO_SMALL_N + TCP_OOO_BIG_N - 1u - i);
+    }
+    s_ooo_nfree_small = TCP_OOO_SMALL_N;
+    s_ooo_nfree_big   = TCP_OOO_BIG_N;
+    s_ooo_ready = 1;
+}
+
+/*=================================================================
+ * 枠を 1 つ返す(s_ooo_lock を持って呼ぶ)。
+ * ===============================================================*/
+static void tcp_ooo_node_free_locked(tcp_priv_t *priv, uint16_t n)
+{
+    uint32_t b = tcp_ooo_node_bytes(n);
+    if (n < TCP_OOO_SMALL_N) s_ooo_free_small[s_ooo_nfree_small++] = n;
+    else                     s_ooo_free_big[s_ooo_nfree_big++] = n;
+    s_ooo_used -= b;
+    priv->ooo_bytes -= b;
+    if (priv->ooo_count > 0) priv->ooo_count--;
+}
+
+/*=================================================================
+ * 接続が持っている順序外のセグメントを全部捨てる(接続の初期化・後始末)。
+ *
+ * コール元:
+ *   tcp_priv_init(), tcp_ooo_sweep()
+ * ===============================================================*/
+static void tcp_ooo_release_all(tcp_priv_t *priv)
+{
+    /* 一度も使っていない枠(.bss のゼロ = ooo_head 0)もここを通るので、数で判定する。 */
+    if (priv->ooo_count == 0u && priv->ooo_bytes == 0u) { priv->ooo_head = TCP_OOO_NONE; return; }
+    smp_spin_lock(&s_ooo_lock);
+    uint16_t n = priv->ooo_head;
+    while (n != TCP_OOO_NONE) {
+        uint16_t nx = s_ooo_next[n];
+        tcp_ooo_node_free_locked(priv, n);
+        n = nx;
+    }
+    priv->ooo_head  = TCP_OOO_NONE;
+    priv->ooo_bytes = 0;
+    priv->ooo_count = 0;
+    smp_spin_unlock(&s_ooo_lock);
+}
+
+/*=================================================================
+ * 順序外に届いたセグメントを列へ入れる。**seq の順・重なり無し**を保つ:
+ *   - 前のセグメントと重なる先頭は切り詰める(先に届いたほうを残す)
+ *   - 丸ごと含んでしまう後ろのセグメントは捨てて、新しいほうで置き換える
+ *   - 後ろのセグメントと重なる末尾は切り詰める
+ * Linux の tcp_data_queue_ofo() と同じ扱い。
+ *
+ * 引数:
+ *   priv / rcv_seq     - 接続の状態と、今の受信位置(seq > rcv_seq が前提)
+ *   seq / data / len   - 受け取ったセグメント
+ * 戻り値:
+ *   1 = 置いた、0 = 全部持っていた(重複)、-1 = 接続の予算を超えるので捨てた
+ *   -2 = 陰性対照の 64 個の上限で捨てた、-3 = 共有の置き場が尽きて捨てた
+ * コール元:
+ *   tcp_input_addr()
+ * ===============================================================*/
+static int tcp_ooo_insert(tcp_priv_t *priv, uint32_t seq,
+                          const volatile uint8_t *data, uint16_t len)
+{
+    uint32_t s = seq, e = seq + len;
+    smp_spin_lock(&s_ooo_lock);
+    tcp_ooo_pool_init_locked();
+
+    uint16_t prev = TCP_OOO_NONE, cur = priv->ooo_head;
+    /* 新しい区間より完全に前にあるものは飛ばす。 */
+    while (cur != TCP_OOO_NONE &&
+           !tcp_seq_lt(s, s_ooo_seq[cur] + s_ooo_len[cur])) {   /* cur の終わり <= s */
+        prev = cur;
+        cur  = s_ooo_next[cur];
+    }
+    /* 前のセグメントが新しい区間の先頭にかかっている。 */
+    if (cur != TCP_OOO_NONE && tcp_seq_lt(s_ooo_seq[cur], s)) {
+        uint32_t cend = s_ooo_seq[cur] + s_ooo_len[cur];
+        if (!tcp_seq_lt(cend, e)) {          /* 丸ごと持っている */
+            smp_spin_unlock(&s_ooo_lock);
+            return 0;
+        }
+        s    = cend;
+        prev = cur;
+        cur  = s_ooo_next[cur];
+    }
+    /* 新しい区間に丸ごと含まれるものは捨てる(新しいほうが同じ範囲を運んでいる)。 */
+    while (cur != TCP_OOO_NONE &&
+           !tcp_seq_lt(e, s_ooo_seq[cur] + s_ooo_len[cur])) {   /* cur の終わり <= e */
+        uint16_t nx = s_ooo_next[cur];
+        if (prev == TCP_OOO_NONE) priv->ooo_head = nx; else s_ooo_next[prev] = nx;
+        tcp_ooo_node_free_locked(priv, cur);
+        cur = nx;
+    }
+    /* 後ろのセグメントが末尾にかかっている。 */
+    if (cur != TCP_OOO_NONE && tcp_seq_lt(s_ooo_seq[cur], e)) e = s_ooo_seq[cur];
+    if (s == e) {
+        smp_spin_unlock(&s_ooo_lock);
+        return 0;
+    }
+
+    uint32_t n_len = e - s;
+    int small = (n_len <= TCP_OOO_SMALL_BYTES);
+    uint32_t nbytes = small ? TCP_OOO_SMALL_BYTES : TCP_OOO_BIG_BYTES;
+    if (g_tcp_ooo_legacy) {
+        if (priv->ooo_count >= TCP_OOO_SLOTS) {
+            smp_spin_unlock(&s_ooo_lock);
+            return -2;
+        }
+    } else if (priv->ooo_bytes + nbytes > g_tcp_rcvbuf) {
+        smp_spin_unlock(&s_ooo_lock);
+        return -1;
+    }
+    uint16_t node;
+    if (small && s_ooo_nfree_small > 0u) {
+        node = s_ooo_free_small[--s_ooo_nfree_small];
+    } else if (s_ooo_nfree_big > 0u) {
+        node = s_ooo_free_big[--s_ooo_nfree_big];   /* 小が尽きたら大で代用する */
+        nbytes = TCP_OOO_BIG_BYTES;
+        if (!g_tcp_ooo_legacy && priv->ooo_bytes + nbytes > g_tcp_rcvbuf) {
+            s_ooo_free_big[s_ooo_nfree_big++] = node;
+            smp_spin_unlock(&s_ooo_lock);
+            return -1;
+        }
+    } else {
+        smp_spin_unlock(&s_ooo_lock);
+        return -3;
+    }
+    volatile_fast_copy(tcp_ooo_data(node), data + (s - seq), n_len);
+    s_ooo_seq[node]  = s;
+    s_ooo_len[node]  = (uint16_t)n_len;
+    s_ooo_next[node] = cur;
+    if (prev == TCP_OOO_NONE) priv->ooo_head = node; else s_ooo_next[prev] = node;
+    priv->ooo_bytes += nbytes;
+    priv->ooo_count++;
+    s_ooo_used += nbytes;
+    if (s_ooo_used > g_tcp_ooo_pool_peak) g_tcp_ooo_pool_peak = s_ooo_used;
+    smp_spin_unlock(&s_ooo_lock);
+    return 1;
+}
+
+/*=================================================================
+ * 閉じた接続が持ったままの順序外のセグメントを返す(冷たい経路で、自コアの接続だけ)。
+ * 接続が閉じる道は多いので、それぞれで返す代わりにここでまとめて拾う。
+ *
+ * コール元:
+ *   tcp_poll_once_ex()
+ * ===============================================================*/
+static void tcp_ooo_sweep(unsigned core)
+{
+    for (unsigned i = 0; i < TCP_MAX_CONNS; i++) {
+        tcp_priv_t *pv = &s_priv[core][i];
+        if (pv->ooo_head == TCP_OOO_NONE) continue;
+        tcp_conn_t *c = s_conns[core][i];
+        if (c == NULL || c->state == TCP_CLOSED || c->state == TCP_TIME_WAIT) {
+            tcp_ooo_release_all(pv);
+        }
+    }
+}
+
+/*=================================================================
+ * 置き場の状態(シェルの `tcprcvbuf` 表示用)。NULL 可。
+ * ===============================================================*/
+void tcp_ooo_pool_stats(uint32_t *used, uint32_t *total, uint32_t *peak)
+{
+    if (used)  *used  = s_ooo_used;
+    if (total) *total = TCP_OOO_SMALL_N * TCP_OOO_SMALL_BYTES + TCP_OOO_BIG_N * TCP_OOO_BIG_BYTES;
+    if (peak)  *peak  = g_tcp_ooo_pool_peak;
+}
 
 /*=================================================================
  * data を受信循環バッファへ追記する。折り返しをまたぐ場合は 2 回に分けて
@@ -1420,23 +1642,30 @@ static inline uint16_t tcp_checksum(const netaddr_t *local, const netaddr_t *rem
  * コール元:
  *   tcp_send_segment(), tcp_recv_internal()
  * ===============================================================*/
+static uint32_t tcp_rcv_window_bytes(const tcp_conn_t *conn, const tcp_priv_t *priv)
+{
+    /* 受信キューの容量の半分。窓いっぱいのデータが一度に届いても、受信キューの
+     * 枠が尽きないようにする。 */
+    uint32_t cap = (uint32_t)net_active_rx_ring_size() * (uint32_t)conn->snd_mss / 2u;
+    /* **順序外で保持できる量より大きな窓を広告しない。** 広告値だけ大きいと、
+     * 穴が 1 つできた瞬間に受信側が自分で捨てることになり、その損失は相手からは
+     * 見えない(SACK では再送されず RTO 待ちになる)。予算は枠の大きさで数えるので、
+     * 窓はその半分にして余白を取る(tcp_ooo_insert())。 */
+    uint32_t ooo_cap = g_tcp_ooo_legacy ? (uint32_t)TCP_OOO_SLOTS * (uint32_t)conn->snd_mss
+                                        : g_tcp_rcvbuf / 2u;
+    if (cap > ooo_cap) cap = ooo_cap;
+    if (g_tcp_rwin_cap) cap = g_tcp_rwin_cap;   /* [試験] tcprwin */
+    /* upcall の無い接続は、順番どおりのデータを rx_buf に積むので、その空きも上限になる。 */
+    if (priv->recv_upcall == NULL) {
+        uint32_t room = TCP_RX_BUF_SIZE - priv->rx_count;
+        if (cap > room) cap = room;
+    }
+    return cap;
+}
+
 static uint16_t tcp_wire_window(tcp_conn_t *conn, tcp_priv_t *priv, uint8_t flags)
 {
-    uint32_t ring_capacity_bytes = (uint32_t)net_active_rx_ring_size() * (uint32_t)conn->snd_mss;
-    uint32_t safe_window_cap = (ring_capacity_bytes >= TCP_RX_BUF_SIZE)
-                                   ? TCP_RX_BUF_SIZE
-                                   : (ring_capacity_bytes / 2u);
-    /* **順序不正で保持できる量より大きなウィンドウを広告しない。**
-     * rx_buf(16MB)は「順番どおり届いたデータ」の置き場で、穴が空いている
-     * 間に届く先のデータは ooo[] の 64 スロットにしか置けない。広告値だけ
-     * 大きいと、穴が 1 つできた瞬間に**受信側が自分で捨てる**ことになり、
-     * その損失は相手からは見えない(SACK では再送されず RTO 待ちになる)。
-     * 実測で 4136 個を捨てていた。 */
-    uint32_t ooo_capacity = (uint32_t)TCP_OOO_SLOTS * (uint32_t)conn->snd_mss;
-    if (safe_window_cap > ooo_capacity) safe_window_cap = ooo_capacity;
-    if (g_tcp_rwin_cap) safe_window_cap = g_tcp_rwin_cap;   /* [試験] tcprwin */
-    uint32_t actual_window = TCP_RX_BUF_SIZE - priv->rx_count;
-    if (actual_window > safe_window_cap) actual_window = safe_window_cap;
+    uint32_t actual_window = tcp_rcv_window_bytes(conn, priv);
     if ((flags & TCP_FLAG_SYN) || !priv->wscale_enabled) {
         return (actual_window > 0xFFFFu) ? 0xFFFFu : (uint16_t)actual_window;
     }
@@ -2005,14 +2234,7 @@ static int tcp_send_segment_lso(tcp_conn_t *conn, tcp_priv_t *priv,
     tcph[TCP_OFF_FLAGS] = TCP_FLAG_PSH | TCP_FLAG_ACK;
     priv->ts_last_ack_sent = conn->rcv_seq;
 
-    uint32_t ring_capacity_bytes = (uint32_t)ETH_RX_RING_SIZE * (uint32_t)conn->snd_mss;
-    uint32_t safe_window_cap = ring_capacity_bytes / 2u;
-    /* tcp_wire_window() と同じ理由で ooo[] の容量で頭打ちにする。 */
-    uint32_t ooo_capacity = (uint32_t)TCP_OOO_SLOTS * (uint32_t)conn->snd_mss;
-    if (safe_window_cap > ooo_capacity) safe_window_cap = ooo_capacity;
-    if (g_tcp_rwin_cap) safe_window_cap = g_tcp_rwin_cap;   /* [試験] tcprwin */
-    uint32_t actual_window = TCP_RX_BUF_SIZE - priv->rx_count;
-    if (actual_window > safe_window_cap) actual_window = safe_window_cap;
+    uint32_t actual_window = tcp_rcv_window_bytes(conn, priv);
     uint16_t wire_window;
     if (!priv->wscale_enabled) {
         wire_window = (actual_window > 0xFFFFu) ? 0xFFFFu : (uint16_t)actual_window;
@@ -2581,6 +2803,7 @@ static void tcp_poll_once_ex(int check_ctrl_c)
     if ((++s_cold_tick & 0xFFu) == 0u) {
         tcp_backlog_reap();
         if (g_tcp_keepalive_enable) tcp_keepalive_check(core);
+        tcp_ooo_sweep(core);
     }
 }
 
@@ -2990,6 +3213,9 @@ static void tcp_priv_init(tcp_priv_t *priv, unsigned core)
     priv->ka_seen          = 0;
     priv->ka_idle_since    = 0;
     priv->ka_probes        = 0;
+    tcp_ooo_release_all(priv);
+    priv->ooo_head         = TCP_OOO_NONE;
+    priv->ooo_bytes        = 0;
     priv->ooo_count        = 0;
     priv->unacked_full_segments = 0;
     priv->unacked_consumed_bytes = 0;
@@ -3001,9 +3227,6 @@ static void tcp_priv_init(tcp_priv_t *priv, unsigned core)
     priv->ack_piggy_ok = 0;   /* 前にこの枠を使った接続の設定を持ち越さない */
     priv->last_ack_sent = 0;
     priv->last_win_sent = 0;
-    for (unsigned i = 0; i < TCP_OOO_SLOTS; i++) {
-        priv->ooo[i].valid = 0;
-    }
     priv->async_head  = 0;
     priv->async_count = 0;
     priv->async_short_head  = 0;
@@ -4541,12 +4764,10 @@ void tcp_debug_dump_rx(const tcp_conn_t *conn)
     uart_printf("[DEBUG] unacked_full_segments=%u\n", priv->unacked_full_segments);
 
     int any_ooo = 0;
-    for (unsigned i = 0; i < TCP_OOO_SLOTS; i++) {
-        if (priv->ooo[i].valid) {
-            uart_printf("[DEBUG] ooo[%u]: seq=%u len=%u\n",
-                        i, priv->ooo[i].seq, (unsigned)priv->ooo[i].len);
-            any_ooo = 1;
-        }
+    for (uint16_t n = priv->ooo_head; n != TCP_OOO_NONE; n = s_ooo_next[n]) {
+        uart_printf("[DEBUG] ooo[%u]: seq=%u len=%u\n",
+                    (unsigned)n, s_ooo_seq[n], (unsigned)s_ooo_len[n]);
+        any_ooo = 1;
     }
     if (!any_ooo) {
         uart_printf("[DEBUG] ooo: 全スロット空き\n");
@@ -5267,6 +5488,14 @@ void tcp_input_addr(const uint8_t *pkt, uint16_t len,
         } else if (payload_len > 0) {
             uint32_t free_space = TCP_RX_BUF_SIZE - priv->rx_count;
             int accepted_inorder = 0;
+            /* **先頭が受け取り済みの範囲にかかるセグメントは、新しい部分だけ受け取る**
+             * (送り直しの区切りが前回と違うと、こういうセグメントが来る)。 */
+            if (tcp_seq_lt(seq, conn->rcv_seq) && tcp_seq_lt(conn->rcv_seq, seq + payload_len)) {
+                uint32_t d = conn->rcv_seq - seq;
+                payload     += d;
+                payload_len  = (uint16_t)(payload_len - d);
+                seq          = conn->rcv_seq;
+            }
             if (seq == conn->rcv_seq && (priv->recv_upcall || payload_len <= free_space)) {
                 accepted_inorder = 1;
                 tcp_deliver_data(priv, payload, payload_len);
@@ -5275,64 +5504,56 @@ void tcp_input_addr(const uint8_t *pkt, uint16_t len,
                 if (priv->sack_tx_count) tcp_sack_tx_trim(priv, conn->rcv_seq);
                 if(ts_log_mode()&TS_MODE_HOTPATH) ts_log(TS_MK(TS_FILE_TCP, TS_FUNC_tcp_input, 5), tcp_conn_arg(conn, payload_len));
 
-                for (;;) {
-                    int spliced = 0;
-                    free_space = TCP_RX_BUF_SIZE - priv->rx_count;
-                    for (unsigned i = 0; i < TCP_OOO_SLOTS; i++) {
-                        if (priv->ooo[i].valid && priv->ooo[i].seq == conn->rcv_seq &&
-                            (priv->recv_upcall || priv->ooo[i].len <= free_space)) {
-                            tcp_deliver_data(priv, priv->ooo[i].buf, priv->ooo[i].len);
-                            conn->rcv_seq += priv->ooo[i].len;
-                            priv->ooo[i].valid = 0;
-                            if (priv->ooo_count > 0) priv->ooo_count--;
-                            if (priv->sack_tx_count) tcp_sack_tx_trim(priv, conn->rcv_seq);
-                            spliced = 1;
-                            break;
-                        }
+                /* 穴が埋まった。続きを順序外の列の先頭から渡す(列は seq の順)。 */
+                while (priv->ooo_head != TCP_OOO_NONE) {
+                    uint16_t n = priv->ooo_head;
+                    uint32_t nseq = s_ooo_seq[n];
+                    uint32_t nend = nseq + s_ooo_len[n];
+                    if (tcp_seq_gt(nseq, conn->rcv_seq)) break;          /* まだ穴がある */
+                    if (!tcp_seq_lt(conn->rcv_seq, nend)) {              /* 全部受け取り済み */
+                        smp_spin_lock(&s_ooo_lock);
+                        priv->ooo_head = s_ooo_next[n];
+                        tcp_ooo_node_free_locked(priv, n);
+                        smp_spin_unlock(&s_ooo_lock);
+                        continue;
                     }
-                    if (!spliced) break;
+                    uint32_t off = conn->rcv_seq - nseq;
+                    uint16_t nlen = (uint16_t)(nend - conn->rcv_seq);
+                    free_space = TCP_RX_BUF_SIZE - priv->rx_count;
+                    if (!priv->recv_upcall && nlen > free_space) break;  /* 読まれるのを待つ */
+                    tcp_deliver_data(priv, tcp_ooo_data(n) + off, nlen);
+                    conn->rcv_seq += nlen;
+                    smp_spin_lock(&s_ooo_lock);
+                    priv->ooo_head = s_ooo_next[n];
+                    tcp_ooo_node_free_locked(priv, n);
+                    smp_spin_unlock(&s_ooo_lock);
+                    if (priv->sack_tx_count) tcp_sack_tx_trim(priv, conn->rcv_seq);
                 }
             } else if (seq == conn->rcv_seq) {
                 g_tcp_rx_nospace[core]++;
                 if(ts_log_mode()&TS_MODE_HOTPATH) ts_log(TS_MK(TS_FILE_TCP, TS_FUNC_tcp_input, 6), tcp_conn_arg(conn, payload_len));
             } else if (tcp_seq_gt(seq, conn->rcv_seq) && payload_len <= TCP_MSS_LOCAL) {
-                int already = 0;
-                for (unsigned i = 0; i < TCP_OOO_SLOTS; i++) {
-                    if (priv->ooo[i].valid && priv->ooo[i].seq == seq) {
-                        already = 1;
-                        break;
-                    }
-                }
-                if (!already) {
-                    int stored = 0;
-                    for (unsigned i = 0; i < TCP_OOO_SLOTS; i++) {
-                        if (!priv->ooo[i].valid) {
-                            for (uint16_t j = 0; j < payload_len; j++) {
-                                priv->ooo[i].buf[j] = payload[j];
-                            }
-                            priv->ooo[i].seq = seq;
-                            priv->ooo[i].len = payload_len;
-                            priv->ooo[i].valid = 1;
-                            priv->ooo_count++;
-                            if (priv->sack_enabled) tcp_sack_tx_add(priv, seq, payload_len);
-                            g_tcp_rx_ooo[core]++;
-                            /* ここは ts_log だけにしてある。以前は 1 セグメントごとに
-                             * uart_printf していたが、高速再送(C2)を入れて順序不正の
-                             * 到着が「異常」ではなく通常の回復過程になると、受信ホット
-                             * パスでコンソール出力が延々と走る。実測でロス注入時の
-                             * スループットがこの出力に支配され、さらに RX リングが
-                             * 溢れて二次的なロスを生んでいた。 */
-                            if(ts_log_mode()&TS_MODE_HOTPATH) ts_log(TS_MK(TS_FILE_TCP, TS_FUNC_tcp_input, 7), tcp_conn_arg(conn, payload_len));
-                            stored = 1;
-                            break;
-                        }
-                    }
-                    if (!stored) {
-                        g_tcp_rx_ooo_drop[core]++;
-                        if(ts_log_mode()&TS_MODE_HOTPATH) ts_log(TS_MK(TS_FILE_TCP, TS_FUNC_tcp_input, 8), tcp_conn_arg(conn, payload_len));
-                        uart_printf("[!] TCP: 順序不正セグメントを破棄(先読みバッファ満杯 "
-                                    "TCP_OOO_SLOTS=%u) (seq=%u rcv_seq=%u len=%u)\n",
-                                    TCP_OOO_SLOTS, seq, conn->rcv_seq, payload_len);
+                int r = tcp_ooo_insert(priv, seq, payload, payload_len);
+                if (r == 1) {
+                    if (priv->sack_enabled) tcp_sack_tx_add(priv, seq, payload_len);
+                    g_tcp_rx_ooo[core]++;
+                    /* ここは ts_log だけにしてある(順序外の到着は回復の途中で普通に起きるので、
+                     * 1 セグメントごとにコンソールへ出すと受信が出力に支配される)。 */
+                    if(ts_log_mode()&TS_MODE_HOTPATH) ts_log(TS_MK(TS_FILE_TCP, TS_FUNC_tcp_input, 7), tcp_conn_arg(conn, payload_len));
+                } else if (r == 0) {
+                    g_tcp_rx_dup[core]++;    /* 全部持っていた */
+                } else {
+                    if (r == -3) g_tcp_rx_ooo_pool_drop[core]++;
+                    g_tcp_rx_ooo_drop[core]++;
+                    if(ts_log_mode()&TS_MODE_HOTPATH) ts_log(TS_MK(TS_FILE_TCP, TS_FUNC_tcp_input, 8), tcp_conn_arg(conn, payload_len));
+                    /* 表示は 1, 2, 4, 8 .. 回目だけ(溢れ続けると受信が出力に支配される)。 */
+                    uint32_t nd = g_tcp_rx_ooo_drop[core];
+                    if ((nd & (nd - 1u)) == 0u) {
+                        uart_printf("[!] TCP: 順序外のセグメントを破棄(%s、接続の使用 %u / 予算 %u バイト、%u 個)"
+                                    "(seq=%u rcv_seq=%u len=%u、%u 回目)\n",
+                                    (r == -2) ? "陰性対照の 64 個" : (r == -3) ? "共有の置き場が尽きた" : "接続の予算を超えた",
+                                    (unsigned)priv->ooo_bytes, (unsigned)g_tcp_rcvbuf, priv->ooo_count,
+                                    seq, conn->rcv_seq, payload_len, (unsigned)nd);
                     }
                 }
             } else if (tcp_seq_gt(seq, conn->rcv_seq)) {

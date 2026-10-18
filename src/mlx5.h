@@ -18,14 +18,21 @@
 #define MLX5_CQ_BUF_SIZE    65536u
 #define MLX5_CQ_DBR_SIZE    64u
 
-#define MLX5_RQ_WQE_SIZE    4096u
-#define MLX5_RQ_DBR_SIZE    64u
+/* 受信キューの枠の数。**TCP の受信窓の上限(枠の数 x MSS の半分)も決める**(tcp.c の
+ * tcp_rcv_window_bytes())。256 枠で窓は約 1.18MB まで。増やすと窓は広がるが、受信バッファ
+ * (1 枠 10KB)が L3 に収まらなくなり、遅延の無い直結では遅くなる(512 枠で iSCSI の 256KiB 書き込みが
+ * 約 7%、1024 枠で約 12%)。往復時間の長い経路で使うときは `make EXTRA_CFLAGS=-DMLX5_RQ_NUM_WQES=1024u`。
+ * WQE は 1 個 16 バイトで、その領域を 1 ページとして渡す(mlx5_create_rq())。 */
+#ifndef MLX5_RQ_NUM_WQES
 #define MLX5_RQ_NUM_WQES    256u
+#endif
+#define MLX5_RQ_WQE_SIZE    ((MLX5_RQ_NUM_WQES * 16u < 4096u) ? 4096u : MLX5_RQ_NUM_WQES * 16u)
+#define MLX5_RQ_DBR_SIZE    64u
 #define MLX5_JUMBO_MAX_LEN  10240u
 #define MLX5_RQ_BUF_PER_WQE MLX5_JUMBO_MAX_LEN
 
 #define MLX5_RX_HEADROOM    2u
-#define MLX5_RQ_DATA_SIZE   ((uint64_t)MLX5_RQ_NUM_WQES * MLX5_RQ_BUF_PER_WQE) // 512KB
+#define MLX5_RQ_DATA_SIZE   ((uint64_t)MLX5_RQ_NUM_WQES * MLX5_RQ_BUF_PER_WQE) // 256 枠で 2.5MB
 
 #define MLX5_SQ_CQ_BUF_SIZE 65536u
 #define MLX5_SQ_CQ_DBR_SIZE 64u

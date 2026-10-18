@@ -166,7 +166,7 @@ int mlx5_hca_bringup(mlx5_dev_t *dev, const char *label, int monitor_only) {
                 s_rqcq_buf[pf][q] = (uintptr_t)dma_alloc(MLX5_CQ_BUF_SIZE, 4096u, DMA_COHERENT).cpu;
                 s_rqcq_dbr[pf][q] = (uintptr_t)dma_alloc(MLX5_CQ_DBR_SIZE, 64u,   DMA_COHERENT).cpu;
                 s_rqdata[pf][q]   = (uintptr_t)dma_alloc(MLX5_RQ_DATA_SIZE, 4096u, DMA_COHERENT).cpu;
-                s_rqwqe[pf][q]    = (uintptr_t)dma_alloc(MLX5_RQ_WQE_SIZE, 4096u, DMA_DEVICE).cpu;
+                s_rqwqe[pf][q]    = (uintptr_t)dma_alloc(MLX5_RQ_WQE_SIZE, MLX5_RQ_WQE_SIZE, DMA_DEVICE).cpu;
                 s_rqdbr[pf][q]    = (uintptr_t)dma_alloc(MLX5_RQ_DBR_SIZE, 64u,   DMA_DEVICE).cpu;
             }
             /* **送信キューはコアごとに 1 本ずつ**(排他を無くすため)。 */
@@ -1749,8 +1749,10 @@ static int mlx5_create_rq(mlx5_dev_t *dev, unsigned rxq_idx, uint32_t cqn, uint3
     }
 
     in[113] = 4u; // log_wq_stride=4 (16バイト)
-    in[114] = 0u; // log_wq_pg_sz=0 (4KB)
-    in[115] = 8u; // log_wq_sz=8 (256エントリ)
+    /* WQE の領域(MLX5_RQ_WQE_SIZE)を 1 ページとして渡す。物理アドレスの表は 1 項目だけなので、
+     * 領域は物理的に連続で、その大きさに揃っていること(dma_alloc の整列で保証する)。 */
+    in[114] = (uint8_t)(__builtin_ctz(MLX5_RQ_WQE_SIZE) - 12); // log_wq_pg_sz
+    in[115] = (uint8_t)__builtin_ctz(MLX5_RQ_NUM_WQES);        // log_wq_sz
 
     uint64_t wqe_pa = mlx5_dma_addr((volatile void *)(uintptr_t)(uint64_t)dev->rxq[rxq_idx].wqe_cpu);
     for (unsigned b = 0; b < 8; b++) {

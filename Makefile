@@ -9,6 +9,8 @@
 CC      := gcc
 CFLAGS  := -Wall -Wextra -O2 -ffunction-sections -fdata-sections -MMD -MP \
            -Iinclude -Isrc -msse4.2 -mpclmul -pthread -D_GNU_SOURCE
+# 試験用に定数を差し替える(例: make -B EXTRA_CFLAGS=-DMLX5_RQ_NUM_WQES=256u)
+CFLAGS  += $(EXTRA_CFLAGS)
 LDFLAGS := -pthread -Wl,--gc-sections
 
 SRC_DIR   := src
