@@ -179,18 +179,23 @@ volatile uint32_t g_tcp_rx_nospace[SMP_MAX_CORES];
 volatile uint32_t g_tcp_rx_csum_drop[SMP_MAX_CORES];
 volatile uint32_t g_tcp_rx_paws_drop[SMP_MAX_CORES];
 
-/* **既定 1(= 受信セグメントごとに ACK)。** 4 にすると相手の ACK 処理は
- * 減るが、**得か損かは相手が飽和しているかで逆になる**:
+/* **既定 4(= 大きい受信セグメント 4 個ごとに ACK)。** 受信セグメントごとに ACK を返すと、相手(送り手)は
+ * その ACK の受信処理に CPU を取られる。OptiPlex の Linux / SPDK のイニシエータから自作のターゲットへ書き込むとき、
+ * 送り手の時間の約 1 割が ACK の受信処理だった。4 にすると(MiB/s、ターゲット 1 コア):
  *
- * | | 相手の状態 | ackthresh 4 の効果 |
- * |---|---|---|
- * | 方向A(自製=イニシエータ、相手 nvmet)| **cpu0 が 100%** | **+12〜38%** |
- * | 方向B(自製=ターゲット、相手 nvme-tcp)| 余裕あり(25〜32%)| **-7〜10%** |
+ * | イニシエータ | 条件 | ackthresh 1 | 2 | 4 |
+ * |---|---|---|---|---|
+ * | Linux(fio、2 ポート)| 書き込み 64KiB / 256KiB | 3,619 / 3,770 | 3,819 / 3,999 | 4,596 / 5,002 |
+ * | Linux | 読み出し 8k / 64k / 256k | 1,760 / 4,338 / 4,377 | 1,622 / 4,344 / 4,343 | 1,793 / 4,371 / 4,452 |
+ * | spdk_nvme_perf | 書き込み 256KiB | 4,779〜4,845 | 5,030〜5,055 | 5,133〜5,196 |
  *
- * **相手に余裕があるときは、ACK を間引くと送信の駆動(ACK clocking)が
- * 粗くなって損をする。** 既定は 1 にして退行させず、**相手が飽和して
- * いると分かっている条件でだけ `ackthresh 4` を使う。** */
-volatile uint32_t g_tcp_ack_threshold = 1u;
+ * 返していない ACK は、次にこちらから送るセグメント(応答など)に相乗りするか、受信の周回
+ * `g_tcp_ack_hold` 回のうちに必ず返す(相手がデータを送り終えて黙ったときに、相手の再送タイマまで
+ * 待たせないため)。`ackthresh 1` が 1 セグメントごとに ACK する陰性対照。 */
+volatile uint32_t g_tcp_ack_threshold = 4u;
+/* 間引いて返していない ACK を返すまでの受信の周回数(`ackhold N`、0 = 上限なし = 次に送るセグメントまで待つ)。
+ * 1 周は 0.3〜0.4 マイクロ秒なので、64 で約 25 マイクロ秒。 */
+volatile uint32_t g_tcp_ack_hold = 64u;
 /* [試験] 受信窓の上限を手で決める(`tcprwin <バイト>`、0 = 既定の上限 = 順序外の枠と受信キューの容量)。
  * 1,048,560 を超えるときは、次に張る接続から Window Scale を 6 にする(4 では 65535 << 4 で頭打ち)。 */
 volatile uint32_t g_tcp_rwin_cap = 0u;
@@ -1755,6 +1760,7 @@ static int tcp_send_segment(tcp_conn_t *conn, tcp_priv_t *priv, uint8_t flags,
     /* **確立後のセグメントは必ず ACK ビットを立てて現在の rcv_seq を運ぶ**
      * ので、借りていた ACK はこれで返せる(相乗り)。 */
     priv->ack_deferred = 0;
+    priv->unacked_full_segments = 0;
 
     if (g_tcp_tx_drop_every != 0u && tcp_tx_should_drop(data_len)) {
         return 0;  /* 送ったことにして捨てる(ロス注入、txdrop) */
@@ -5326,6 +5332,12 @@ void tcp_input_addr(const uint8_t *pkt, uint16_t len,
                 if (priv->unacked_full_segments >= g_tcp_ack_threshold) {
                     tcp_send_segment(conn, priv, TCP_FLAG_ACK, NULL, 0);
                     priv->unacked_full_segments = 0;
+                } else if (g_tcp_ack_hold != 0u && priv->ack_deferred == 0u) {
+                    /* **返していない ACK の期限。** 最初に返さなかったセグメントから数えて
+                     * 受信の周回 g_tcp_ack_hold 回で tcp_ack_flush_deferred() が返す(延長はしない)。
+                     * こちらから何か送れば相乗りして消える。 */
+                    priv->ack_deferred = (uint8_t)((g_tcp_ack_hold > 255u) ? 255u : g_tcp_ack_hold);
+                    s_ack_deferred_any[core] = 1;
                 }
             } else if (g_tcp_ack_piggyback && priv->ack_piggy_ok) {
                 /* **応答へ相乗りさせる。** 相乗りを頼んだコネクション(nvmet の IO

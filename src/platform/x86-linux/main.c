@@ -5841,8 +5841,8 @@ static void shell_ackthresh(char *args)
         if (n < 1u) n = 1u;
         g_tcp_ack_threshold = n;
     }
-    uart_printf("ackthresh: %u (フルサイズ%uセグメント毎にACK)\n",
-                (unsigned)g_tcp_ack_threshold, (unsigned)g_tcp_ack_threshold);
+    uart_printf("ackthresh: %u(大きい受信セグメント %u 個ごとに ACK。返していない ACK は受信の周回 %u 回で返す)\n",
+                (unsigned)g_tcp_ack_threshold, (unsigned)g_tcp_ack_threshold, (unsigned)g_tcp_ack_hold);
 }
 
 /*=================================================================
@@ -7340,6 +7340,12 @@ static void shell_dispatch(char *line, int s0, int s1)
                     (unsigned)g_tcp_rwin_cap, (unsigned)g_tcp_rcv_wscale);
     } else if (strncmp(line, "ackthresh", 9) == 0) {
         shell_ackthresh(line + 9);
+    } else if (strncmp(line, "ackhold", 7) == 0) {
+        const char *a = line + 7;
+        while (*a == ' ') a++;
+        if (*a >= '0' && *a <= '9') g_tcp_ack_hold = (uint32_t)strtoul(a, NULL, 10);
+        uart_printf("ackhold: %u(間引いて返していない ACK を受信の周回この回数で返す。0 = 次に送るまで待つ)\n",
+                    (unsigned)g_tcp_ack_hold);
     } else if (strncmp(line, "txdrop", 6) == 0) {
         shell_txdrop(line + 6);
     } else if (strncmp(line, "backlogtest", 11) == 0) {
