@@ -293,6 +293,11 @@ volatile uint32_t g_tcp_sack_skipped_count;
 
 /* 受信側として SACK ブロックを載せた ACK の数。 */
 volatile uint32_t g_tcp_sack_sent_count;
+/* DSACK(RFC 2883)。受け取り済みのデータが届いたら、次の純 ACK の先頭の SACK ブロックでその範囲を
+ * 知らせる。送り手(Linux)はこれで「送り直しは無駄だった」と知り、届く順番の入れ替わりを
+ * ロスと見て下げた cwnd を戻す。0 = 返さない(陰性対照、`tcpsack dsack off`)。 */
+volatile uint32_t g_tcp_dsack_enable = 1u;
+volatile uint32_t g_tcp_dsack_sent_count;
 
 /* 送信側として SACK オプションを読み取った回数(scoreboard の更新回数)。 */
 volatile uint32_t g_tcp_sack_rx_count;
@@ -505,6 +510,9 @@ typedef struct {
      * 遅くなった(ACK 1 個ごとに 2 回呼ばれるため)。 */
     uint8_t           sack_tx_count;
     uint8_t           sack_tx_recent;  /* 直近に触った添字(先頭に置く) */
+    /* 次の純 ACK で知らせる DSACK の範囲(受け取り済みのデータが届いた)。1 回知らせたら消す。 */
+    uint8_t           dsack_valid;
+    uint32_t          dsack_start, dsack_end;
     struct { uint32_t start, end; } sack_tx[TCP_SACK_TX_MAX];
 
     /* Keepalive(RFC 1122 4.2.3.6)。**受信のたびに時刻を書かない** --
@@ -1675,6 +1683,15 @@ static uint16_t tcp_wire_window(tcp_conn_t *conn, tcp_priv_t *priv, uint8_t flag
 
 typedef struct { uint32_t start, end; } tcp_sack_range_t;
 
+/* 受け取り済みのデータ [s, e) が届いた。SACK を合意した接続なら、次の純 ACK で DSACK として知らせる。 */
+static inline void tcp_dsack_note(tcp_priv_t *priv, uint32_t s, uint32_t e)
+{
+    if (!priv->sack_enabled || !g_tcp_dsack_enable || s == e) return;
+    priv->dsack_valid = 1;
+    priv->dsack_start = s;
+    priv->dsack_end   = e;
+}
+
 /*=================================================================
  * 受信側として相手へ知らせる SACK ブロックを組み立てる。順序不正のまま
  * 保持しているセグメント(ooo[])を連続する区間へまとめ、RFC 2018 に
@@ -1692,7 +1709,14 @@ static unsigned tcp_sack_collect(const tcp_priv_t *priv, const tcp_conn_t *conn,
                                   tcp_sack_range_t out[TCP_SACK_MAX_BLOCKS])
 {
     unsigned n = 0;
-    if (priv->sack_tx_count == 0u) return 0;
+    /* **DSACK は先頭のブロックに置く**(RFC 2883 4)。相手は「先頭のブロックが累積 ACK より前か、
+     * 2 番目のブロックに含まれる」ことで DSACK と見分ける。 */
+    if (priv->dsack_valid) {
+        out[0].start = priv->dsack_start;
+        out[0].end   = priv->dsack_end;
+        n = 1;
+    }
+    if (priv->sack_tx_count == 0u) return n;
 
     /* 直近に触った区間を先頭に置く(RFC 2018 4: 相手はこれで最新の状況を
      * 必ず受け取れる -- 後ろのブロックは ACK が落ちると失われうる)。 */
@@ -1992,6 +2016,10 @@ static void tcp_build_options(tcp_conn_t *conn, tcp_priv_t *priv, uint8_t flags,
     if (o < end && priv->sack_enabled && data_len == 0u && (flags & TCP_FLAG_ACK)) {
         tcp_sack_range_t blk[TCP_SACK_MAX_BLOCKS];
         unsigned n = tcp_sack_collect(priv, conn, blk);
+        if (priv->dsack_valid) {    /* DSACK は 1 回だけ知らせる */
+            priv->dsack_valid = 0;
+            g_tcp_dsack_sent_count++;
+        }
         if (n > 0) {
             tcph[o + 0] = TCP_OPT_KIND_NOP;
             tcph[o + 1] = TCP_OPT_KIND_NOP;
@@ -3026,12 +3054,20 @@ static int tcp_input_options(tcp_conn_t *conn, tcp_priv_t *priv,
                  * ここに入っている範囲は送り直さない。 */
                 unsigned n = (unsigned)(l - 2u) / 8u;
                 if (n > TCP_SACK_MAX_BLOCKS) n = TCP_SACK_MAX_BLOCKS;
-                priv->sack_rx_count = (uint8_t)n;
                 g_tcp_sack_rx_count++;
+                /* 累積 ACK より前のブロック(相手の DSACK)は scoreboard に入れない。送り直しの判定に使わない
+                 * 範囲で、3 つしかない枠を 1 つ埋めてしまうため。 */
+                uint32_t seg_ack = rd32be(in + TCP_OFF_ACK);
+                unsigned k = 0;
                 for (unsigned b = 0; b < n; b++) {
-                    priv->sack_rx[b].start = rd32be(o + i + 2 + 8u * b);
-                    priv->sack_rx[b].end   = rd32be(o + i + 6 + 8u * b);
+                    uint32_t bs = rd32be(o + i + 2 + 8u * b);
+                    uint32_t be = rd32be(o + i + 6 + 8u * b);
+                    if (!tcp_seq_gt(be, seg_ack)) continue;
+                    priv->sack_rx[k].start = bs;
+                    priv->sack_rx[k].end   = be;
+                    k++;
                 }
+                priv->sack_rx_count = (uint8_t)k;
             }
             i = (uint8_t)(i + l);
         }
@@ -3210,6 +3246,7 @@ static void tcp_priv_init(tcp_priv_t *priv, unsigned core)
     priv->sack_rx_count    = 0;
     priv->sack_tx_count    = 0;
     priv->sack_tx_recent   = 0;
+    priv->dsack_valid      = 0;
     priv->ka_seen          = 0;
     priv->ka_idle_since    = 0;
     priv->ka_probes        = 0;
@@ -5492,6 +5529,7 @@ void tcp_input_addr(const uint8_t *pkt, uint16_t len,
              * (送り直しの区切りが前回と違うと、こういうセグメントが来る)。 */
             if (tcp_seq_lt(seq, conn->rcv_seq) && tcp_seq_lt(conn->rcv_seq, seq + payload_len)) {
                 uint32_t d = conn->rcv_seq - seq;
+                tcp_dsack_note(priv, seq, conn->rcv_seq);
                 payload     += d;
                 payload_len  = (uint16_t)(payload_len - d);
                 seq          = conn->rcv_seq;
@@ -5542,6 +5580,7 @@ void tcp_input_addr(const uint8_t *pkt, uint16_t len,
                     if(ts_log_mode()&TS_MODE_HOTPATH) ts_log(TS_MK(TS_FILE_TCP, TS_FUNC_tcp_input, 7), tcp_conn_arg(conn, payload_len));
                 } else if (r == 0) {
                     g_tcp_rx_dup[core]++;    /* 全部持っていた */
+                    tcp_dsack_note(priv, seq, seq + payload_len);
                 } else {
                     if (r == -3) g_tcp_rx_ooo_pool_drop[core]++;
                     g_tcp_rx_ooo_drop[core]++;
@@ -5560,6 +5599,7 @@ void tcp_input_addr(const uint8_t *pkt, uint16_t len,
                 if(ts_log_mode()&TS_MODE_HOTPATH) ts_log(TS_MK(TS_FILE_TCP, TS_FUNC_tcp_input, 9), tcp_conn_arg(conn, payload_len));
             } else {
                 g_tcp_rx_dup[core]++;   /* 既に受け取った範囲(seq < rcv_seq)*/
+                tcp_dsack_note(priv, seq, seq + payload_len);
             }
             /* **「ちょうどフルサイズのときだけ間引く」ではいけない。**
              * NVMe/TCP の PDU は 4120B / 8240B のように MSS(9204)ちょうどには
@@ -5582,7 +5622,12 @@ void tcp_input_addr(const uint8_t *pkt, uint16_t len,
             uint32_t ack_min = (g_tcp_ack_min_seg != 0u)
                              ? g_tcp_ack_min_seg : (uint32_t)(conn->snd_mss / 8u);
             uint32_t ack_th = priv->ack_thin_off ? 1u : g_tcp_ack_threshold;
-            if (accepted_inorder && payload_len >= ack_min) {
+            if (priv->dsack_valid) {
+                /* **DSACK はすぐ純 ACK で返す。** SACK のブロックはデータを運ばないセグメントにしか
+                 * 載らないので、応答への相乗りや間引きを待つと届かない。 */
+                tcp_send_segment(conn, priv, TCP_FLAG_ACK, NULL, 0);
+                priv->unacked_full_segments = 0;
+            } else if (accepted_inorder && payload_len >= ack_min) {
                 priv->unacked_full_segments++;
                 if (priv->unacked_full_segments >= ack_th) {
                     if (priv->ack_hold_thin) tcp_ack_thin_note(priv, core, 0);

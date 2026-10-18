@@ -63,6 +63,8 @@ extern volatile uint32_t g_tcp_rtt_update_count; /* RTT 推定を更新した総
 extern volatile uint32_t g_tcp_sack_enable;
 extern volatile uint32_t g_tcp_sack_skipped_count; /* SACK 済みで送り直さずに済んだ数 */
 extern volatile uint32_t g_tcp_sack_sent_count;    /* SACK ブロックを載せた ACK の数 */
+extern volatile uint32_t g_tcp_dsack_enable;       /* 受け取り済みのデータに DSACK を返す(既定 1)*/
+extern volatile uint32_t g_tcp_dsack_sent_count;   /* DSACK を載せた ACK の数 */
 extern volatile uint32_t g_tcp_sack_rx_count;      /* SACK オプションを読み取った回数 */
 extern volatile uint32_t g_tcp_sack_probe_count;   /* 判定を試みた回数(切り分け用) */
 extern volatile uint32_t g_tcp_sack_noinfo_count;  /* scoreboard が空だった回数 */

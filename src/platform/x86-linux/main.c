@@ -2079,7 +2079,13 @@ static void shell_sacktest(char *args)
 static void shell_tcpsack(char *args)
 {
     while (*args == ' ') args++;
-    if (strncmp(args, "on", 2) == 0) {
+    if (strncmp(args, "dsack", 5) == 0) {
+        /* DSACK(受け取り済みのデータが届いたことを知らせる)の on / off。off は陰性対照。 */
+        const char *a = args + 5;
+        while (*a == ' ') a++;
+        if (strncmp(a, "off", 3) == 0) g_tcp_dsack_enable = 0;
+        else if (strncmp(a, "on", 2) == 0) g_tcp_dsack_enable = 1;
+    } else if (strncmp(args, "on", 2) == 0) {
         g_tcp_sack_enable = 1;
     } else if (strncmp(args, "off", 3) == 0) {
         g_tcp_sack_enable = 0;
@@ -2092,8 +2098,9 @@ static void shell_tcpsack(char *args)
     } else if (strncmp(args, "use", 3) == 0) {
         g_tcp_sack_use_tx = 1;
     }
-    uart_printf("tcpsack: %s(次に張るコネクションから。既存のものは変わらない)\n",
-                g_tcp_sack_enable ? "有効" : "無効");
+    uart_printf("tcpsack: %s(次に張るコネクションから。既存のものは変わらない)、DSACK %s(送った %u)\n",
+                g_tcp_sack_enable ? "有効" : "無効", g_tcp_dsack_enable ? "on" : "off",
+                (unsigned)g_tcp_dsack_sent_count);
     uart_printf("tcpsack: 送信省略=%u / ブロック送出=%u / ブロック受領=%u / 再送セグメント=%u\n",
                 (unsigned)g_tcp_sack_skipped_count, (unsigned)g_tcp_sack_sent_count,
                 (unsigned)g_tcp_sack_rx_count, (unsigned)g_tcp_retransmit_segs);
