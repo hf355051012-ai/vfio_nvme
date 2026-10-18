@@ -1602,9 +1602,38 @@ static void shell_fragstat(char *args)
         uart_printf("fragstat: 組み立て途中を破棄しました\n");
     }
     uint32_t completed = 0, dropped = 0, timeouts = 0, active = 0;
+    uint32_t used = 0, peak = 0, refused = 0;
     ipfrag_stats(&completed, &dropped, &timeouts, &active);
+    ipfrag_mem_stats(&used, &peak, &refused);
     uart_printf("fragstat: 組み立て完了=%u / 破棄=%u / 時間切れ=%u / 進行中=%u\n",
                 (unsigned)completed, (unsigned)dropped, (unsigned)timeouts, (unsigned)active);
+    uart_printf("fragstat: 領域 使用 %u / 最大 %u / 上限 %u バイト、上限で断った断片 %u\n",
+                (unsigned)used, (unsigned)peak, (unsigned)g_ipfrag_mem_limit, (unsigned)refused);
+}
+
+/*=================================================================
+ * シェルの `fraglimit`。断片の組み立てに使ってよい領域の上限
+ * (Linux の net.ipv4.ipfrag_high_thresh に相当)。
+ *
+ * 引数:
+ *   args - バイト数(省略で表示のみ)。IPFRAG_POOL_BYTES まで
+ * コール元:
+ *   shell_dispatch()
+ * ===============================================================*/
+static void shell_fraglimit(char *args)
+{
+    while (*args == ' ') args++;
+    if (*args) {
+        unsigned long v = strtoul(args, NULL, 0);
+        if (v < IPFRAG_PAGE_BYTES || v > IPFRAG_POOL_BYTES) {
+            uart_printf("fraglimit: %u 〜 %u バイトで指定してください\n",
+                        (unsigned)IPFRAG_PAGE_BYTES, (unsigned)IPFRAG_POOL_BYTES);
+            return;
+        }
+        g_ipfrag_mem_limit = (uint32_t)v;
+    }
+    uart_printf("fraglimit: %u バイト(既定 %u)\n",
+                (unsigned)g_ipfrag_mem_limit, (unsigned)IPFRAG_POOL_BYTES);
 }
 
 /*=================================================================
@@ -7318,6 +7347,8 @@ static void shell_dispatch(char *line, int s0, int s1)
                     mlx5_net_set_allmulti(on) == 0 ? "ok" : "失敗");
     } else if (strncmp(line, "fragstat", 8) == 0) {
         shell_fragstat(line + 8);
+    } else if (strncmp(line, "fraglimit", 9) == 0) {
+        shell_fraglimit(line + 9);
     } else if (strncmp(line, "hdgstcorrupt", 12) == 0) {
         shell_hdgstcorrupt(line + 12);
     } else if (strncmp(line, "termtest", 8) == 0) {
@@ -7477,6 +7508,7 @@ static void shell_dispatch(char *line, int s0, int s1)
                     "  termtest                              NVMe/TCP Terminate Connection Request(陰性対照つき)\n"
                     "  fragrecv [ポート] [秒]                UDPを待ち受けて長さと総和を報告(外部から断片化して送る用)\n"
                     "  fragstat [clear]                      受信側のIP断片組み立ての統計\n"
+                    "  fraglimit [バイト]                    断片の組み立てに使う領域の上限(既定 4MB)\n"
                     "  rxstat [on|off|clear]                 受信の周回の計数(1 回に拾うフレーム数・待っていた CQE・時間)\n"
                     "  rocedup [clear|port N]                Ethernet の受信キューへ届いた RoCEv2 の数(port は陽性対照用)\n"
                     "  mcpromisc on|off                      vport の promisc_mc(全マルチキャスト受信)\n"
