@@ -7344,8 +7344,25 @@ static void shell_dispatch(char *line, int s0, int s1)
         const char *a = line + 7;
         while (*a == ' ') a++;
         if (*a >= '0' && *a <= '9') g_tcp_ack_hold = (uint32_t)strtoul(a, NULL, 10);
-        uart_printf("ackhold: %u(間引いて返していない ACK を受信の周回この回数で返す。0 = 次に送るまで待つ)\n",
-                    (unsigned)g_tcp_ack_hold);
+        if (strstr(a, "clear")) {
+            for (unsigned c = 0; c < SMP_MAX_CORES; c++) {
+                g_tcp_ack_by_count[c] = 0; g_tcp_ack_by_expiry[c] = 0; g_tcp_ack_thin_off[c] = 0;
+            }
+        }
+        uint32_t bc = 0, be = 0, bo = 0;
+        for (unsigned c = 0; c < SMP_MAX_CORES; c++) {
+            bc += g_tcp_ack_by_count[c]; be += g_tcp_ack_by_expiry[c]; bo += g_tcp_ack_thin_off[c];
+        }
+        uart_printf("ackhold: %u(間引いて返していない ACK を受信の周回この回数で返す。0 = 次に送るまで待つ)\n"
+                    "  間引いた ACK の返し方: 溜まって返した %u / 期限切れで返した %u(%u%%)、間引きをやめた接続 %u(ackadapt %u%%)\n",
+                    (unsigned)g_tcp_ack_hold, (unsigned)bc, (unsigned)be,
+                    (unsigned)((bc + be) ? (uint64_t)be * 100u / (bc + be) : 0u), (unsigned)bo, (unsigned)g_tcp_ack_adapt);
+    } else if (strncmp(line, "ackadapt", 8) == 0) {
+        const char *a = line + 8;
+        while (*a == ' ') a++;
+        if (*a >= '0' && *a <= '9') g_tcp_ack_adapt = (uint32_t)strtoul(a, NULL, 10);
+        uart_printf("ackadapt: %u%%(間引いた ACK のうち期限切れで返した割合がこれ以上の接続は、間引きをやめる。0 = 判定しない)\n",
+                    (unsigned)g_tcp_ack_adapt);
     } else if (strncmp(line, "txdrop", 6) == 0) {
         shell_txdrop(line + 6);
     } else if (strncmp(line, "backlogtest", 11) == 0) {

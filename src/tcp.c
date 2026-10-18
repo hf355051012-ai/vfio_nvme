@@ -196,6 +196,16 @@ volatile uint32_t g_tcp_ack_threshold = 4u;
 /* 間引いて返していない ACK を返すまでの受信の周回数(`ackhold N`、0 = 上限なし = 次に送るセグメントまで待つ)。
  * 1 周は 0.3〜0.4 マイクロ秒なので、64 で約 25 マイクロ秒。 */
 volatile uint32_t g_tcp_ack_hold = 64u;
+/* 間引きをやめる判定(`ackadapt N`、既定 50、0 = 判定しない)。間引いて返さなかった ACK が、4 個溜まって返る前に
+ * 期限切れで返った割合が N% 以上なら、その接続では間引きをやめる(以後 1 個ごとに ACK)。相手が送信バッファの
+ * 小さい送り手で、ACK が返るまで次を送れずに止まっていることの印である。判定は返し方 256 回ごと。
+ * 期限切れの割合は、spdk_nvme_perf の平文の書き込みで 2〜9%、Linux の iSCSI で 0%、spdk_nvme_perf の TLS(OpenSSL の
+ * ssl ソケット)で 95〜99%。TLS の接続を間引き続けると、64KiB 以上の書き込みが 1,608 / 1,840 → 1,117 MiB/s に落ちる。 */
+volatile uint32_t g_tcp_ack_adapt = 50u;
+/* 間引いた ACK の返し方の計数(コアごと): 4 個溜まって返した / 期限切れで返した / 間引きをやめた接続の数 */
+volatile uint32_t g_tcp_ack_by_count[SMP_MAX_CORES];
+volatile uint32_t g_tcp_ack_by_expiry[SMP_MAX_CORES];
+volatile uint32_t g_tcp_ack_thin_off[SMP_MAX_CORES];
 /* [試験] 受信窓の上限を手で決める(`tcprwin <バイト>`、0 = 既定の上限 = 順序外の枠と受信キューの容量)。
  * 1,048,560 を超えるときは、次に張る接続から Window Scale を 6 にする(4 では 65535 << 4 で頭打ち)。 */
 volatile uint32_t g_tcp_rwin_cap = 0u;
@@ -502,6 +512,10 @@ typedef struct {
      * あたり 0.27〜0.37 パケットなのに対し自製は 1.18〜2.00 だった)。
      * upcall を持つコネクション(= 応答が必ず出る)だけで使う。 */
     uint8_t           ack_deferred;   /* 残り何周まで借りておけるか(0=借り無し)*/
+    uint8_t           ack_hold_thin;  /* ack_deferred が間引きの期限(相乗り待ちではない)*/
+    uint8_t           ack_thin_off;   /* この接続では間引きをやめた(ackadapt の判定)*/
+    uint16_t          thin_n;         /* 判定の窓: 間引いた ACK を返した回数 */
+    uint16_t          thin_exp;       /* そのうち期限切れで返した回数 */
     uint8_t           ack_piggy_ok;   /* このコネクションで相乗りしてよいか */
 
     uint32_t          unacked_consumed_bytes;
@@ -1003,6 +1017,19 @@ static uint8_t s_ack_deferred_any[SMP_MAX_CORES];
  * コール元:
  *   net_poll_all_and_dispatch()
  * ===============================================================*/
+static void tcp_ack_thin_note(tcp_priv_t *priv, unsigned core, int expired)
+{
+    if (expired) { g_tcp_ack_by_expiry[core]++; priv->thin_exp++; }
+    else g_tcp_ack_by_count[core]++;
+    if (++priv->thin_n < 256u) return;
+    if (g_tcp_ack_adapt != 0u && (uint32_t)priv->thin_exp * 100u >= g_tcp_ack_adapt * (uint32_t)priv->thin_n) {
+        priv->ack_thin_off = 1;
+        g_tcp_ack_thin_off[core]++;
+    }
+    priv->thin_n = 0;
+    priv->thin_exp = 0;
+}
+
 void tcp_ack_flush_deferred(void)
 {
     unsigned core = smp_core_index();
@@ -1014,6 +1041,7 @@ void tcp_ack_flush_deferred(void)
         tcp_priv_t *priv = &s_priv[core][i];
         if (!priv->ack_deferred) continue;
         if (--priv->ack_deferred != 0u) { still = 1; continue; }
+        if (priv->ack_hold_thin) tcp_ack_thin_note(priv, core, 1);
         tcp_send_segment(c, priv, TCP_FLAG_ACK, NULL, 0);
     }
     s_ack_deferred_any[core] = still;
@@ -1761,6 +1789,7 @@ static int tcp_send_segment(tcp_conn_t *conn, tcp_priv_t *priv, uint8_t flags,
      * ので、借りていた ACK はこれで返せる(相乗り)。 */
     priv->ack_deferred = 0;
     priv->unacked_full_segments = 0;
+    priv->ack_hold_thin = 0;
 
     if (g_tcp_tx_drop_every != 0u && tcp_tx_should_drop(data_len)) {
         return 0;  /* 送ったことにして捨てる(ロス注入、txdrop) */
@@ -2965,6 +2994,10 @@ static void tcp_priv_init(tcp_priv_t *priv, unsigned core)
     priv->unacked_full_segments = 0;
     priv->unacked_consumed_bytes = 0;
     priv->ack_deferred = 0;
+    priv->ack_hold_thin = 0;
+    priv->ack_thin_off  = 0;
+    priv->thin_n = 0;
+    priv->thin_exp = 0;
     priv->ack_piggy_ok = 0;   /* 前にこの枠を使った接続の設定を持ち越さない */
     priv->last_ack_sent = 0;
     priv->last_win_sent = 0;
@@ -5327,9 +5360,11 @@ void tcp_input_addr(const uint8_t *pkt, uint16_t len,
              * (`g_tcp_ack_min_seg` で調整可能。0 = 大きさを見ない)。 */
             uint32_t ack_min = (g_tcp_ack_min_seg != 0u)
                              ? g_tcp_ack_min_seg : (uint32_t)(conn->snd_mss / 8u);
+            uint32_t ack_th = priv->ack_thin_off ? 1u : g_tcp_ack_threshold;
             if (accepted_inorder && payload_len >= ack_min) {
                 priv->unacked_full_segments++;
-                if (priv->unacked_full_segments >= g_tcp_ack_threshold) {
+                if (priv->unacked_full_segments >= ack_th) {
+                    if (priv->ack_hold_thin) tcp_ack_thin_note(priv, core, 0);
                     tcp_send_segment(conn, priv, TCP_FLAG_ACK, NULL, 0);
                     priv->unacked_full_segments = 0;
                 } else if (g_tcp_ack_hold != 0u && priv->ack_deferred == 0u) {
@@ -5337,6 +5372,7 @@ void tcp_input_addr(const uint8_t *pkt, uint16_t len,
                      * 受信の周回 g_tcp_ack_hold 回で tcp_ack_flush_deferred() が返す(延長はしない)。
                      * こちらから何か送れば相乗りして消える。 */
                     priv->ack_deferred = (uint8_t)((g_tcp_ack_hold > 255u) ? 255u : g_tcp_ack_hold);
+                    priv->ack_hold_thin = 1;
                     s_ack_deferred_any[core] = 1;
                 }
             } else if (g_tcp_ack_piggyback && priv->ack_piggy_ok) {

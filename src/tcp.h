@@ -28,6 +28,10 @@ extern volatile uint8_t  g_tcp_rcv_wscale;
 /* ACK を間引く対象とする受信セグメントの最小長(0 = MSS/8)。`ackminseg`。 */
 extern volatile uint32_t g_tcp_ack_min_seg;
 extern volatile uint32_t g_tcp_ack_hold;
+extern volatile uint32_t g_tcp_ack_adapt;
+extern volatile uint32_t g_tcp_ack_by_count[];
+extern volatile uint32_t g_tcp_ack_by_expiry[];
+extern volatile uint32_t g_tcp_ack_thin_off[];
 
 /* ロス注入(シェルの `txdrop <N>`)。0=無効、N ならデータセグメント N 個に 1 個を
  * 送らずに捨てる。ループバックではロスが起きないため、高速再送の検証に要る。 */
