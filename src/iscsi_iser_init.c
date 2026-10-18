@@ -67,13 +67,14 @@ typedef struct {
     uint8_t       rx[II_RX_SLOTS][II_RX_BYTES] __attribute__((aligned(64)));
 } ii_t;
 
-/* **2 ポートのイニシエータ(`isertarget pf1 ..` + `iserbench .. 2port`)のため、実体は 2 つ持つ。**
- * PF0 側はコア 0、PF1 側はコア 1 で動かすので、呼んだコアで実体を選ぶ(コア 0 = PF0、それ以外 = PF1)。 */
-#define II_INST (smp_core_index() ? 1u : 0u)
-static ii_t s_ii[2];
-static uint8_t s_wbuf_i[2][II_BUF_MAX] __attribute__((aligned(4096)));
-static uint8_t s_rbuf_i[2][II_BUF_MAX] __attribute__((aligned(4096)));
-static uint8_t s_sbuf_i[2][4096] __attribute__((aligned(4096)));
+/* **実体はコアごとに 1 つ持ち、呼んだコアで選ぶ。** 2 ポート(`iserbench .. 2port`)は PF0 側をコア 0、PF1 側を
+ * コア 1 で、1 ポートに複数の接続(`iserbench .. x<N>`)は接続 i をコア i+1 で動かす。PF と QP 番号は接続のときに
+ * 決める(iscsi_iser_connect() はコア 0 = PF0、それ以外 = PF1 の 1 本目)。 */
+#define II_INST smp_core_index()
+static ii_t s_ii[SMP_MAX_CORES];
+static uint8_t s_wbuf_i[SMP_MAX_CORES][II_BUF_MAX] __attribute__((aligned(4096)));
+static uint8_t s_rbuf_i[SMP_MAX_CORES][II_BUF_MAX] __attribute__((aligned(4096)));
+static uint8_t s_sbuf_i[SMP_MAX_CORES][4096] __attribute__((aligned(4096)));
 #define s      (s_ii[II_INST])
 #define s_wbuf (s_wbuf_i[II_INST])
 #define s_rbuf (s_rbuf_i[II_INST])
@@ -311,7 +312,7 @@ static int login(const char *target)
     s.max_burst = 262144u;
     s.tgt_recv_dsl = 8192u;
     s.immediate_data = 1;
-    s.isid[0] = 0x80; s.isid[1] = 'v'; s.isid[2] = 'f'; s.isid[3] = 'i'; s.isid[4] = 'o'; s.isid[5] = (uint8_t)(0x10u + II_INST);
+    s.isid[0] = 0x80; s.isid[1] = 'v'; s.isid[2] = 'f'; s.isid[3] = 'i'; s.isid[4] = 'o'; s.isid[5] = (uint8_t)(0x10u + II_INST);   /* 実体ごとに別の ISID */
     s.cmdsn = 1;
     s.expstatsn = 0;
     const uint8_t *payload = kv;
@@ -355,26 +356,40 @@ static int login(const char *target)
 static void teardown(void)
 {
     if (s.cm.rc_qp.qpn) mlx5_qp_destroy(s.dev, &s.cm.rc_qp);
-    if (s.cm.gsi_qp && s.cm.gsi_qp->qpn) mlx5_qp_destroy(s.dev, s.cm.gsi_qp);
+    /* 借りた GSI(同じ PF の 1 本目のもの)は壊さない。 */
+    if (!s.cm.reuse_gsi && s.cm.gsi_qp && s.cm.gsi_qp->qpn) mlx5_qp_destroy(s.dev, s.cm.gsi_qp);
     s.connected = 0;
 }
 
 int iscsi_iser_connect(mlx5_dev_t *dev, uint32_t ip, const uint8_t mac[6], const char *target_iqn)
 {
+    return iscsi_iser_connect_ex(dev, II_INST ? 1u : 0u, 0u, -1, ip, mac, target_iqn);
+}
+
+int iscsi_iser_connect_ex(mlx5_dev_t *dev, unsigned pf, unsigned slot, int gsi_core,
+                          uint32_t ip, const uint8_t mac[6], const char *target_iqn)
+{
     if (s.connected) iscsi_iser_close();
+    if (slot > 7u) return -1;
     memset(s.task, 0, sizeof(s.task));
     s.dev = dev;
     s.outstanding = s.errors = s.rejects = s.nop_in = s.sends_inflight = 0;
     s.logout_req = 0;
     s.rq_head = s.rq_tail = 0;
-    const char *label = II_INST ? "mlx5-pf1" : "mlx5-pf0";
-    netif_t *pf = netif_find(label);
-    if (pf) netif_activate(pf);
+    const char *label = pf ? "mlx5-pf1" : "mlx5-pf0";
+    netif_t *nc = netif_find(label);
+    if (nc) netif_activate(nc);
     static const uint8_t zero_mac[6] = {0};
     rdma_cm_fill_addr(&s.cm, dev, label, "__override__", 0u, ip, zero_mac, mac);
     s.cm.is_active = 1;
     s.cm.skip_ping = 1;
-    s.cm.rc_qp_index = II_QP_INDEX;
+    s.cm.rc_qp_index = (uint8_t)(slot ? 7u + slot : II_QP_INDEX);   /* 1 本目 6、2 本目以降 8〜14 */
+    if (gsi_core >= 0) {
+        /* **GSI は 1 ポートに 1 本。** 2 本目以降はその PF の 1 本目の GSI を借りる(受信は cm_gsi_take() が
+         * 宛先ごとに振り分ける)。接続は 1 本ずつ張るので同時に見ることは無い。 */
+        s.cm.gsi_qp = s_ii[gsi_core].cm.gsi_qp;
+        s.cm.reuse_gsi = 1;
+    }
     s.cm.service_port = 3260u;
     s.cm.req_path_mtu = 5u;                  /* 4096(相手の Linux も netdev の MTU 9000 から 4096 を使う)*/
     s.cm.rep_priv_out[0] = 0x80u | 0x40u;   /* ZBVA を使えない / SEND_WITH_INVALIDATE を受けない */

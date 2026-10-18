@@ -64,6 +64,8 @@ void job_set_affinity(job_t *job, void *affinity_key);
 void job_pin_to_core(job_t *job, unsigned core);
 void job_tick_reenter_begin(void);
 void job_tick_reenter_end(void);
+/* このコアに pin されたジョブが 1 本でもあれば 1(手の空いたワーカを眠らせる判定に使う)。 */
+int job_core_has_jobs(unsigned core);
 
 /* 自分を眠らせる / 起こす。**ジョブ自身の step() から呼ぶこと**(呼び出し中は
  * そのジョブを claim しているので、ロック無しで書いてよい)。

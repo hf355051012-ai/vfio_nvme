@@ -231,6 +231,8 @@ void netif_activate(netif_t *ctx);
 void netif_register(netif_t *ctx);
 
 void netif_set_owner_core(netif_t *ctx, unsigned core);
+/* このコアが受信を見る(RSS の受信キューを持つ、または単一コアでインターフェースの持ち主)なら 1。 */
+int net_core_has_rx(unsigned core);
 
 netif_t *netif_find(const char *name);
 
@@ -256,6 +258,18 @@ int net_poll_all_and_dispatch(void);
  * **同じコネクションは必ず同じコアへ行く**ので、TCP の状態(s_conns[core])を
  * コアをまたいで触ることにはならない。 */
 extern volatile uint32_t g_net_mt_cores;
+
+/* RSS の鍵と表の長さ(mlx5.c の TIR / RQT と同じ値)。 */
+#define NET_RSS_TABLE_SIZE 64u
+extern const uint8_t g_net_rss_key[40];
+
+/*=================================================================
+ * IPv4 / TCP のフレーム(送信元 sip:sport -> 宛先 dip:dport)を、NIC の RSS がどのコアの受信キューへ
+ * 配るかを返す。NIC と同じ Toeplitz のハッシュを計算し、表(rxq[0..n-1] の繰り返し)を引く。
+ * 能動 open で、受信が自分のコアに来る送信元ポートを選ぶのに使う(tcp_connect_begin_addr())。
+ * 戻り値: コア番号(1..g_net_mt_cores)。RSS を使っていなければ -1
+ * ===============================================================*/
+int net_rss_core_v4(uint32_t sip, uint32_t dip, uint16_t sport, uint16_t dport);
 
 /* フレームを担当コアへ渡した回数と、リング満杯で捨てた数(`netmt` で表示)。 */
 extern volatile uint64_t g_net_mt_handoff;

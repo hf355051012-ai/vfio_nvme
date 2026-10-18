@@ -1980,15 +1980,9 @@ static int mlx5_create_tir_rss(mlx5_dev_t *dev, uint32_t rqtn, uint32_t tdn, uin
      * ビットへ効かず、全コネクションが同じバケツへ落ちた**(実機で 5 本とも
      * 同じコアになった)。固定値なのは、起動ごとに分散先が変わると測定が
      * 再現しないため。 */
-    static const uint8_t rss_key[40] = {
-        0x6du, 0x5au, 0x56u, 0xdau, 0x25u, 0x5bu, 0x0eu, 0xc2u,
-        0x41u, 0x67u, 0x25u, 0x3du, 0x43u, 0xa3u, 0x8fu, 0xb0u,
-        0xd0u, 0xcau, 0x2bu, 0xcbu, 0xaeu, 0x7bu, 0x30u, 0xb4u,
-        0x77u, 0xcbu, 0x2du, 0xa3u, 0x80u, 0x30u, 0xf2u, 0x0cu,
-        0x6au, 0x42u, 0xb7u, 0x3bu, 0xbeu, 0xacu, 0x01u, 0xfau,
-    };
+    _Static_assert(MLX5_RSS_TABLE_SIZE == NET_RSS_TABLE_SIZE, "RSS の表の長さは netif.h と同じにする");
     for (unsigned i = 0; i < 40u; i++) {
-        in[32 + 40 + i] = rss_key[i];
+        in[32 + 40 + i] = g_net_rss_key[i];   /* net_rss_core_v4() と同じ鍵(netif.c)*/
     }
 
     /* rx_hash_field_selector_outer:

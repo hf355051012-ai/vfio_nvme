@@ -43,12 +43,20 @@ static volatile uint8_t *nvmer_ramdisk_slot1(void)
 /* [0] = PF0 のイニシエータ、[1] = 2 ポートのときの PF1 のイニシエータ(`rdmatarget pf1 ..`)。 */
 static nvme_rdma_remote_t s_remote_i[2];
 #define s_remote (s_remote_i[0])
-/* イニシエータの実体。[1] は 2 ポートのときの PF1 側(コア 1 で回す)。 */
-static nvme_rdma_ctx_t s_init_ctx_i[2];
+/* イニシエータの実体。[1] は 2 ポートのときの PF1 側(コア 1 で回す)。`bench .. x<N>` では [0..N-1] を
+ * 接続ごとに使う(nvme_rdma_run_bench_mc())。 */
+#define NVMER_INST_MAX 6u
+static nvme_rdma_ctx_t s_init_ctx_i[NVMER_INST_MAX];
 #define s_init_ctx (s_init_ctx_i[0])
-static inline unsigned nvmer_inst(const nvme_rdma_ctx_t *c) { return (c == &s_init_ctx_i[1]) ? 1u : 0u; }
+/* 実体ごとの PF(相手は s_remote_i[PF])と、その PF の中での順番(RC QP の番号 = admin 2j / IO 2j+1)。 */
+static uint8_t s_inst_pf[NVMER_INST_MAX]   = { 0, 1, 0, 0, 0, 0 };
+static uint8_t s_inst_slot[NVMER_INST_MAX];
+static inline unsigned nvmer_inst(const nvme_rdma_ctx_t *c)
+{
+    return (c >= &s_init_ctx_i[0] && c < &s_init_ctx_i[NVMER_INST_MAX]) ? (unsigned)(c - &s_init_ctx_i[0]) : 0u;
+}
 /* 接続ジョブの中で使う、そのイニシエータの相手。 */
-#define NVMER_RMT (s_remote_i[nvmer_inst(ctx)])
+#define NVMER_RMT (s_remote_i[s_inst_pf[nvmer_inst(ctx)]])
 
 /* Identify Namespace の値を手で上書きする(0=上書きしない)。 */
 static uint32_t s_ns_ovr_lba_size;
@@ -516,7 +524,8 @@ typedef struct {
     unsigned rq_order[NVME_RDMA_PL_QDEPTH_MAX];
     unsigned rq_head, rq_tail;
 } nvmer_pl_t;
-static nvmer_pl_t s_pl_i[2] __attribute__((aligned(64)));
+static nvmer_pl_t s_pl_i[NVMER_INST_MAX] __attribute__((aligned(64)));
+static void nvmer_mc_release_extra(void);
 #define s_pl_slots     (s_pl_i[nvmer_inst(ctx)].slots)
 #define s_pl_send_bufs (s_pl_i[nvmer_inst(ctx)].send_bufs)
 #define s_pl_recv_bufs (s_pl_i[nvmer_inst(ctx)].recv_bufs)
@@ -888,7 +897,7 @@ job_result_t nvme_rdma_connect_job_step(job_t *self)
         ctx->io_cm.dev         = ctx->cm.dev;
         ctx->io_cm.gsi_qp      = ctx->cm.gsi_qp;
         ctx->io_cm.reuse_gsi   = 1;
-        ctx->io_cm.rc_qp_index = 1;
+        ctx->io_cm.rc_qp_index = (uint8_t)(ctx->cm.rc_qp_index + 1u);   /* admin の次(x<N> では接続ごとに 2 つずつ)*/
         ctx->io_cm.is_active   = 1;
         ctx->io_cm.skip_ping   = 1;
         ctx->io_cm.own_ip      = ctx->cm.own_ip;
@@ -1420,6 +1429,7 @@ void nvme_rdma_run_bench(mlx5_dev_t *dev0, mlx5_dev_t *dev1, uint32_t duration_m
     /* **外部ターゲットのときは同一プロセス内のターゲットを立てない。**
      * dev1 も使わない(PF1 は相手ではなく、ただの遊んでいるポートになる)。 */
     const int use_remote = s_remote.enabled;
+    nvmer_mc_release_extra();
     int target_ok = use_remote ? 1
                                : (s_target_resident && !s_target_ctx.failed &&
                                   s_target_resident_generation == dev1->bringup_generation);
@@ -1578,6 +1588,188 @@ void nvme_rdma_run_bench(mlx5_dev_t *dev0, mlx5_dev_t *dev1, uint32_t duration_m
 
 
 /*=================================================================
+ * 1 ポートに複数の接続(`bench .. x<N>`)。実体 i は専用のコア i+1 で回す。2 ポートのときは PF0 / PF1 に
+ * 交互に割り当てる。接続ごとに別のコントローラ(admin + IO キュー 1 本)を張る。
+ *
+ * - RC QP の番号は、同じ PF の中での順番 j に対して admin 2j / IO 2j+1(0〜5。6 は iSER、7 は rshort が使う)。
+ *   したがって 1 つの PF に 3 本まで。
+ * - GSI は PF に 1 本しか置けないので、同じ PF の 2 本目以降は 1 本目の GSI を共有する(reuse_gsi)。
+ *   同じ GSI を複数のコアが同時に見ないよう、**接続は 1 本ずつ張り**(短い読み出しを流して終える)、
+ *   それから全部を同時に測る。
+ * - ある PF の実体のどれかが張り直しになるときは、その PF の実体を全部張り直す(共有している GSI ごと
+ *   作り直すため)。
+ *
+ * コール元:
+ *   shell_rdmabench()(x<N>)
+ * ===============================================================*/
+static void nvmer_mc_teardown(nvme_rdma_ctx_t *c)
+{
+    nvmer_quiesce_jobs(c, &c->cm, 2000u);
+    nvmer_quiesce_jobs(c, &c->io_cm, 2000u);
+    nvmer_send_dreq(&c->io_cm);
+    nvmer_send_dreq(&c->cm);
+    nvmer_destroy_qp_if_valid(c->io_cm.dev, &c->io_cm.rc_qp);
+    nvmer_destroy_qp_if_valid(c->cm.dev, &c->cm.rc_qp);
+    if (!c->cm.reuse_gsi) nvmer_destroy_qp_if_valid(c->cm.dev, c->cm.gsi_qp);   /* 共有している GSI は壊さない */
+    for (uint32_t k = 0; k < sizeof(*c); k++) ((uint8_t *)c)[k] = 0;
+    dcache_clean_range((const void *)c, sizeof(*c));
+}
+
+static void nvmer_mc_set_bench(nvme_rdma_ctx_t *c, int is_read, uint32_t chunk, uint32_t dur, uint32_t qd)
+{
+    c->bench_enabled = 1;
+    c->bench_is_read = is_read ? 1 : 0;
+    c->bench_chunk_bytes = chunk;
+    c->bench_duration_ms = dur;
+    c->bench_qdepth = qd;
+    c->bench_cur_lba = 0;
+    c->done = 0;
+    c->failed = 0;
+    c->stop_requested = 0;
+}
+
+/* 1 ポート / 2 ポートの経路に戻る前に、x<N> が使った実体を片付ける。実体 0 は PF0 の 1 本目、実体 1 は PF1 の
+ * 1 本目のまま使えるが、それ以外(GSI を借りている 2 本目以降)は張り直しの邪魔になるので壊す。 */
+static void nvmer_mc_release_extra(void)
+{
+    for (unsigned k = NVMER_INST_MAX; k-- > 1u; ) {
+        nvme_rdma_ctx_t *c = &s_init_ctx_i[k];
+        int extra = (k >= 2u) || s_inst_slot[k] != 0u || s_inst_pf[k] != k;
+        if (extra && c->cm.dev != 0) nvmer_mc_teardown(c);
+        s_inst_pf[k] = (uint8_t)((k == 1u) ? 1u : 0u);
+        s_inst_slot[k] = 0;
+    }
+    s_inst_pf[0] = 0; s_inst_slot[0] = 0;
+}
+
+void nvme_rdma_run_bench_mc(mlx5_dev_t *dev0, mlx5_dev_t *dev1, unsigned n, int twoport,
+                            uint32_t duration_ms, int is_read, uint32_t chunk_bytes, uint32_t qdepth,
+                            uint64_t *out_bytes, uint32_t *out_count, uint32_t *out_elapsed_ms)
+{
+    if (out_bytes)      *out_bytes = 0;
+    if (out_count)      *out_count = 0u;
+    if (out_elapsed_ms) *out_elapsed_ms = 0u;
+    unsigned per_pf = twoport ? (n + 1u) / 2u : n;
+    if (n < 2u || n > NVMER_INST_MAX || per_pf > 3u) {
+        uart_printf("nvmermabench: x<N> は合計 2〜%u 本、1 つの PF に 3 本まで\n", (unsigned)NVMER_INST_MAX);
+        return;
+    }
+    if (!s_remote_i[0].enabled || (twoport && !s_remote_i[1].enabled)) {
+        uart_printf("nvmermabench: x<N> には rdmatarget(2port なら rdmatarget pf1 も)が要ります\n");
+        return;
+    }
+    if (smp_boot_cores_upto(n) != 0) {
+        uart_printf("nvmermabench: コア 1..%u を起こせない\n", n);
+        return;
+    }
+    if (qdepth > NVME_RDMA_PL_QDEPTH_MAX) qdepth = NVME_RDMA_PL_QDEPTH_MAX;
+    if (qdepth == 0) qdepth = 1u;
+    if (chunk_bytes == 0) chunk_bytes = 65536u;
+    if (chunk_bytes > NVME_RDMA_BENCH_BUF_MAX) chunk_bytes = NVME_RDMA_BENCH_BUF_MAX;
+    chunk_bytes -= chunk_bytes % 512u;
+    if (chunk_bytes == 0) chunk_bytes = 512u;
+
+    static const uint8_t mac_fb[2][6] = { {0x02, 0x00, 0x00, 0x00, 0x10, 0x10},
+                                          {0x02, 0x00, 0x00, 0x00, 0x10, 0x11} };
+    const uint32_t ip_fb[2] = { ip_from_octets(192, 168, 101, 10), ip_from_octets(192, 168, 101, 11) };
+    mlx5_dev_t *devs[2] = { dev0, dev1 };
+    const char *labels[2] = { "mlx5-pf0", "mlx5-pf1" };
+
+    /* 実体の割り当てが変わったか、張り直しが要る実体がある PF は、その PF の実体を全部張り直す。 */
+    int redo_pf[2] = { 0, 0 };
+    for (unsigned i = 0; i < n; i++) {
+        unsigned pf = twoport ? (i & 1u) : 0u, slot = twoport ? (i >> 1) : i;
+        nvme_rdma_ctx_t *c = &s_init_ctx_i[i];
+        if (s_inst_pf[i] != pf || s_inst_slot[i] != slot || !nvmer_conn_reusable(c, devs[pf])) redo_pf[pf] = 1;
+    }
+    for (unsigned k = NVMER_INST_MAX; k-- > 0; ) {   /* 2 本目以降(GSI を借りている側)から先に壊す */
+        nvme_rdma_ctx_t *c = &s_init_ctx_i[k];
+        if (c->cm.dev == 0) continue;
+        /* 今つながっている PF と、これから割り当てる PF のどちらかが張り直しなら壊す
+         * (実体の PF が変わるときに、前の PF だけを見ると古い状態のまま上書きしてしまう)。 */
+        unsigned old_pf = (c->cm.dev == devs[1]) ? 1u : 0u;
+        unsigned new_pf = twoport ? (k & 1u) : 0u;
+        if (k >= n || redo_pf[old_pf] || redo_pf[new_pf]) nvmer_mc_teardown(c);
+    }
+    for (unsigned i = 0; i < n; i++) {
+        unsigned pf = twoport ? (i & 1u) : 0u, slot = twoport ? (i >> 1) : i;
+        nvme_rdma_ctx_t *c = &s_init_ctx_i[i];
+        s_inst_pf[i] = (uint8_t)pf; s_inst_slot[i] = (uint8_t)slot;
+        if (!redo_pf[pf]) continue;
+        nvme_rdma_remote_t *r = &s_remote_i[pf];
+        rdma_cm_fill_addr(&c->cm, devs[pf], labels[pf], "__override__", ip_fb[pf], r->ip, mac_fb[pf], r->mac);
+        c->cm.service_port = r->port;
+        c->cm.req_path_mtu = s_path_mtu;
+        c->cm.rc_qp_index  = (uint8_t)(2u * slot);
+        if (slot > 0u) {
+            nvme_rdma_ctx_t *first = &s_init_ctx_i[twoport ? pf : 0u];
+            c->cm.gsi_qp    = first->cm.gsi_qp;
+            c->cm.reuse_gsi = 1;
+        }
+        /* **接続は 1 本ずつ張る**(同じ PF の GSI を複数のコアが同時に見ないため)。短い読み出しで終える。 */
+        nvmer_mc_set_bench(c, 1, c->lba_size ? c->lba_size : 512u, 1u, 1u);
+        job_t *j = job_spawn(nvme_rdma_connect_job_step, c, "nvme-rdma-mc-connect");
+        if (!j) { uart_printf("nvmermabench: FAILED (job table full)\n"); return; }
+        j->state = NVMER_ST_CM_SPAWN;
+        job_pin_to_core(j, i + 1u);
+        uint64_t t0 = timer_now();
+        while (!c->done && !timeout_ms(t0, 20000u)) job_scheduler_tick();
+        if (!c->done || c->failed || !c->io_queue_ready) {
+            uart_printf("nvmermabench: 接続 %u(%s、コア %u)に失敗した\n", i, labels[pf], i + 1u);
+            c->stop_requested = 1;
+            job_cancel_by_ctx(&c->cm);
+            job_cancel_by_ctx(&c->io_cm);
+            return;
+        }
+        uart_printf("nvmermabench: 接続 %u 完了(%s、コア %u、RC QP %u / %u)\n", i, labels[pf], i + 1u,
+                    (unsigned)c->cm.rc_qp_index, (unsigned)c->io_cm.rc_qp_index);
+    }
+
+    /* 全部を同時に測る。 */
+    for (unsigned i = 0; i < n; i++) {
+        nvme_rdma_ctx_t *c = &s_init_ctx_i[i];
+        nvmer_mc_set_bench(c, is_read, chunk_bytes, duration_ms, qdepth);
+        job_t *j = job_spawn(nvme_rdma_connect_job_step, c, "nvme-rdma-mc-bench");
+        if (!j) { uart_printf("nvmermabench: FAILED (job table full)\n"); return; }
+        j->state = nvmer_resume_state_after_identify(c);
+        job_pin_to_core(j, i + 1u);
+    }
+    uint64_t start = timer_now();
+    for (;;) {
+        int all = 1;
+        for (unsigned i = 0; i < n; i++) if (!s_init_ctx_i[i].done) all = 0;
+        if (all) break;
+        job_scheduler_tick();
+        if (timeout_ms(start, (uint64_t)duration_ms + 15000u)) {
+            uart_printf("nvmermabench: FAILED (overall timeout)\n");
+            break;
+        }
+    }
+    int ok = 1;
+    uint32_t count = 0; uint64_t bytes = 0;
+    for (unsigned i = 0; i < n; i++) {
+        nvme_rdma_ctx_t *c = &s_init_ctx_i[i];
+        c->stop_requested = 1;
+        if (!c->done || c->failed) {
+            ok = 0;
+            job_cancel_by_ctx(&c->cm);
+            job_cancel_by_ctx(&c->io_cm);
+            uart_printf("nvmermabench: 接続 %u FAILED (count=%u)\n", i, c->bench_count);
+        }
+        count += c->bench_count; bytes += c->bench_bytes;
+        uart_printf("nvmermabench: 接続 %u(コア %u)%u 回\n", i, i + 1u, c->bench_count);
+    }
+    {
+        uint64_t stop_start = timer_now();
+        while (!timeout_ms(stop_start, 2000u)) job_scheduler_tick();
+    }
+    if (!ok) return;
+    if (out_bytes)      *out_bytes = bytes;
+    if (out_count)      *out_count = count;
+    if (out_elapsed_ms) *out_elapsed_ms = duration_ms;
+}
+
+/*=================================================================
  * 2 ポートの NVMe-oF RDMA の測定。PF0 のイニシエータ(相手は `rdmatarget`)をコア 0 で、
  * PF1 のイニシエータ(相手は `rdmatarget pf1`)をコア 1 で同時に回し、完了数とバイト数を足す。
  * どちらも外部ターゲットへ繋ぐ形だけ(同一プロセス内のターゲットは立てない)。qdepth はポートごと。
@@ -1613,21 +1805,14 @@ void nvme_rdma_run_bench2(mlx5_dev_t *dev0, mlx5_dev_t *dev1, uint32_t duration_
     const uint32_t ip_fb[2] = { ip_from_octets(192, 168, 101, 10), ip_from_octets(192, 168, 101, 11) };
     mlx5_dev_t *devs[2] = { dev0, dev1 };
     const char *labels[2] = { "mlx5-pf0", "mlx5-pf1" };
+    nvmer_mc_release_extra();
 
     for (unsigned i = 0; i < 2u; i++) {
         nvme_rdma_ctx_t *c = &s_init_ctx_i[i];
         nvme_rdma_remote_t *r = &s_remote_i[i];
         const int reuse = nvmer_conn_reusable(c, devs[i]);
         if (!reuse) {
-            nvmer_quiesce_jobs(c, &c->cm, 2000u);
-            nvmer_quiesce_jobs(c, &c->io_cm, 2000u);
-            nvmer_send_dreq(&c->io_cm);
-            nvmer_send_dreq(&c->cm);
-            nvmer_destroy_qp_if_valid(c->io_cm.dev, &c->io_cm.rc_qp);
-            nvmer_destroy_qp_if_valid(c->cm.dev, &c->cm.rc_qp);
-            nvmer_destroy_qp_if_valid(c->cm.dev, c->cm.gsi_qp);
-            for (uint32_t k = 0; k < sizeof(*c); k++) ((uint8_t *)c)[k] = 0;
-            dcache_clean_range((const void *)c, sizeof(*c));
+            nvmer_mc_teardown(c);
             rdma_cm_fill_addr(&c->cm, devs[i], labels[i], "__override__", ip_fb[i], r->ip,
                               mac_fb[i], r->mac);
             c->cm.service_port = r->port;

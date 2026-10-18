@@ -102,7 +102,18 @@ static void *worker_main(void *argp)
     set_affinity(a->core_index);
 
     *a->alive = 1;
+    /* **手の空いたワーカは眠らせる。** ジョブも受信も持たないコアが回り続けると、CPU の数より多くコアを
+     * 起こしたとき(OptiPlex の core4 = CPU 0)に同じ CPU のコアの時間を半分奪う(イニシエータの x<N> の後に
+     * 従来の 2 ポートが半分に落ちた)。働いている間は 256 周に 1 回だけ確かめる。眠っている間は毎周確かめ、
+     * ジョブが pin されれば 100us 以内に起きる。 */
+    unsigned idle_chk = 0;
+    int sleeping = 0;
     for (;;) {
+        if (sleeping || ++idle_chk >= 256u) {
+            idle_chk = 0;
+            sleeping = !job_core_has_jobs(a->core_index) && !net_core_has_rx(a->core_index);
+            if (sleeping) { usleep(100); continue; }
+        }
         (*a->hb)++;
         sim_delay_tick();  /* 性能切り分け用(g_sim_delay_us[1]=core1、原因特定後は0のまま無害) */
         job_scheduler_tick();

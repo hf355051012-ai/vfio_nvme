@@ -3335,6 +3335,22 @@ static void tcp_connect_begin_addr(tcp_conn_t *conn, const netaddr_t *local_ip,
     uint32_t isn = (uint32_t)timer_now();
     conn->snd_seq   = isn;
     conn->local_port = (uint16_t)(49152u + (isn & 0x3fffu));
+    /* **RSS で受信を散らしているときは、相手からの受信が自分のコアの受信キューに来る送信元ポートを選ぶ。**
+     * TCP の接続は張ったコアの表(s_conns[core])にしか載らず、別のコアに届いた SYN|ACK は捨てられる。
+     * ポートを変えれば行き先のコアが変わるので、NIC と同じハッシュ(net_rss_core_v4())で当たるものを探す
+     * (当たる確率はコア数分の 1 なので、数回で見つかる)。 */
+    if (dst->family == NETADDR_V4 && core >= 1u) {
+        uint32_t rip = ((uint32_t)dst->a[0] << 24) | ((uint32_t)dst->a[1] << 16) |
+                       ((uint32_t)dst->a[2] << 8) | dst->a[3];
+        uint32_t lip = ((uint32_t)local_ip->a[0] << 24) | ((uint32_t)local_ip->a[1] << 16) |
+                       ((uint32_t)local_ip->a[2] << 8) | local_ip->a[3];
+        if (net_rss_core_v4(rip, lip, dst_port, conn->local_port) >= 0) {
+            for (uint32_t k = 0; k < 0x4000u; k++) {
+                uint16_t p = (uint16_t)(49152u + ((isn + k) & 0x3fffu));
+                if (net_rss_core_v4(rip, lip, dst_port, p) == (int)core) { conn->local_port = p; break; }
+            }
+        }
+    }
 
     tcp_priv_init(priv, core);
     tcp_priv_try_grant_mlx5_async_overflow(priv, core, (const netaddr_t *)&conn->local_ip);

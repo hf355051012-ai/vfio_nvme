@@ -12,6 +12,8 @@
 
 /* 通常セッションを張る(ログインまで)。target_iqn が NULL / 空なら Discovery で最初の対象を使う。 */
 int  iscsi_ini_connect(const netaddr_t *dst, uint16_t port, const char *target_iqn, int hdgst, int ddgst);
+/* 使う PF(0 / 1)を指定して繋ぐ。実体は呼んだコアのもの(1 ポートに複数の接続のとき接続 i をコア i+1 で張る)。 */
+int  iscsi_ini_connect_pf(unsigned pf, const netaddr_t *dst, uint16_t port, const char *target_iqn, int hdgst, int ddgst);
 void iscsi_ini_close(void);           /* ログアウトして閉じる */
 int  iscsi_ini_connected(void);
 int  iscsi_ini_digest(int *hd, int *dd);

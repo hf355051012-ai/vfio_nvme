@@ -419,6 +419,16 @@ void netif_unregister(netif_t *ctx)
  * コール元:
  *   shell_dispatch(), shell_ensure_tcp_session()
  * ===============================================================*/
+int net_core_has_rx(unsigned core)
+{
+    unsigned n = g_net_mt_cores;
+    if (n > 1u) return core >= 1u && core <= n;
+    for (unsigned i = 0; i < s_registered_count; i++) {
+        if (s_registered[i]->is_poll_owner && s_registered[i]->owner_core == core) return 1;
+    }
+    return 0;
+}
+
 void netif_set_owner_core(netif_t *ctx, unsigned core)
 {
     ctx->owner_core = core;
@@ -750,6 +760,43 @@ void netif_rxstat_show(int clear)
  * (s_conns[core] / s_priv[core])をコアまたぎで触ることにはならない。
  * net_buf は所有コアを持つので、渡した先で解放してよい(net_buf.c)。 */
 volatile uint32_t g_net_mt_cores = 1u;   /* 1 = 従来の単一コア(陰性対照) */
+
+/* RSS の鍵。**素性の分かっている標準の RSS 鍵を使う**(規則的な鍵だと入力ビットが出力の下位ビットへ効かず、
+ * 全コネクションが同じバケツへ落ちた)。固定値なのは、起動ごとに分散先が変わると測定が再現しないため。
+ * mlx5.c の TIR もこの鍵を使う。 */
+const uint8_t g_net_rss_key[40] = {
+    0x6du, 0x5au, 0x56u, 0xdau, 0x25u, 0x5bu, 0x0eu, 0xc2u,
+    0x41u, 0x67u, 0x25u, 0x3du, 0x43u, 0xa3u, 0x8fu, 0xb0u,
+    0xd0u, 0xcau, 0x2bu, 0xcbu, 0xaeu, 0x7bu, 0x30u, 0xb4u,
+    0x77u, 0xcbu, 0x2du, 0xa3u, 0x80u, 0x30u, 0xf2u, 0x0cu,
+    0x6au, 0x42u, 0xb7u, 0x3bu, 0xbeu, 0xacu, 0x01u, 0xfau,
+};
+
+int net_rss_core_v4(uint32_t sip, uint32_t dip, uint16_t sport, uint16_t dport)
+{
+    unsigned n = g_net_mt_cores;
+    if (n <= 1u) return -1;
+    /* ハッシュに入れる順は 送信元 IP / 宛先 IP / 送信元ポート / 宛先ポート(どれもネットワークのバイト順)。 */
+    uint8_t in[12] = {
+        (uint8_t)(sip >> 24), (uint8_t)(sip >> 16), (uint8_t)(sip >> 8), (uint8_t)sip,
+        (uint8_t)(dip >> 24), (uint8_t)(dip >> 16), (uint8_t)(dip >> 8), (uint8_t)dip,
+        (uint8_t)(sport >> 8), (uint8_t)sport, (uint8_t)(dport >> 8), (uint8_t)dport,
+    };
+    /* Toeplitz: 入力の 1 ビットごとに、鍵をそのビット位置から 32 ビット切り出したものを XOR する。 */
+    uint32_t h = 0;
+    uint32_t v = ((uint32_t)g_net_rss_key[0] << 24) | ((uint32_t)g_net_rss_key[1] << 16) |
+                 ((uint32_t)g_net_rss_key[2] << 8) | g_net_rss_key[3];
+    for (unsigned i = 0; i < sizeof(in); i++) {
+        for (unsigned b = 0; b < 8u; b++) {
+            if (in[i] & (0x80u >> b)) h ^= v;
+            v <<= 1;
+            if (g_net_rss_key[i + 4u] & (0x80u >> b)) v |= 1u;
+        }
+    }
+    /* 表はハッシュの下位ビットで引く。表の中身は rxq[0..n-1] の繰り返しで、コア c は rxq[c-1] を見る。 */
+    unsigned idx = h & (NET_RSS_TABLE_SIZE - 1u);
+    return (int)(idx % n) + 1;
+}
 volatile net_mt_counter_t g_net_mt_consumed[SMP_MAX_CORES];
 
 

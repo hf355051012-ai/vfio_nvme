@@ -10,6 +10,9 @@
 #include "mlx5.h"
 
 int  iscsi_iser_connect(mlx5_dev_t *dev, uint32_t ip, const uint8_t mac[6], const char *target_iqn);
+/* PF・同じ PF での番号(0〜7)・GSI を借りる実体のコア(-1 = 自分で作る)を指定して繋ぐ。実体は呼んだコアのもの。 */
+int  iscsi_iser_connect_ex(mlx5_dev_t *dev, unsigned pf, unsigned slot, int gsi_core,
+                           uint32_t ip, const uint8_t mac[6], const char *target_iqn);
 void iscsi_iser_close(void);
 int  iscsi_iser_connected(void);
 int  iscsi_iser_bench(int is_read, uint32_t chunk, uint32_t qd, uint32_t runtime_ms,

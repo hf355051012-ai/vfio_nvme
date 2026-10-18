@@ -205,6 +205,16 @@ static int job_affinity_busy_locked(unsigned skip_index, void *key)
 void job_tick_reenter_begin(void) { s_ticking[smp_core_index()] = 0; }
 void job_tick_reenter_end(void)   { s_ticking[smp_core_index()] = 1; }
 
+int job_core_has_jobs(unsigned core)
+{
+    unsigned high = s_job_high;
+    for (unsigned i = 0; i < high; i++) {
+        if (s_jobs[i].in_use &&
+            (s_jobs[i].pinned_core < 0 || (unsigned)s_jobs[i].pinned_core == core)) return 1;
+    }
+    return 0;
+}
+
 void job_scheduler_tick(void)
 {
     unsigned core = smp_core_index();

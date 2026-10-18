@@ -123,6 +123,10 @@ void nvme_rdma_run_bench(mlx5_dev_t *dev0, mlx5_dev_t *dev1, uint32_t duration_m
                          int is_read, uint32_t chunk_bytes, uint32_t qdepth,
                          uint64_t *out_bytes, uint32_t *out_count,
                          uint32_t *out_elapsed_ms);
+/* 1 ポートに複数の接続(`bench .. x<N>`)。n は接続の合計、実体 i は専用のコア i+1 で回す。 */
+void nvme_rdma_run_bench_mc(mlx5_dev_t *dev0, mlx5_dev_t *dev1, unsigned n, int twoport,
+                            uint32_t duration_ms, int is_read, uint32_t chunk_bytes, uint32_t qdepth,
+                            uint64_t *out_bytes, uint32_t *out_count, uint32_t *out_elapsed_ms);
 void nvme_rdma_run_bench2(mlx5_dev_t *dev0, mlx5_dev_t *dev1, uint32_t duration_ms,
                           int is_read, uint32_t chunk_bytes, uint32_t qdepth,
                           uint64_t *out_bytes, uint32_t *out_count,

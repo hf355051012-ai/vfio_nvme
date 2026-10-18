@@ -137,8 +137,9 @@ typedef struct {
 
 /* **RC QP を何本まで持てるか。** 0 番は admin(またはイニシエータの admin)、
  * 1 番以降が IO キュー。**ここが RDMA の IO キュー本数の上限**になる。
- * 1 本あたり WQE 64KB + CQ 64KB なので、8 本 x 2 PF で約 2MB。 */
-#define MLX5_NUM_RCQP 8u
+ * イニシエータの使い方: NVMe-oF RDMA 0〜5(接続ごとに admin / IO)、iSER 6 と 8〜14(1 ポートに複数の接続)、
+ * rshort 15(最後の番号)。1 本あたり WQE 64KB + CQ 64KB なので、16 本 x 2 PF で約 4MB。 */
+#define MLX5_NUM_RCQP 16u
 typedef struct {
     uintptr_t wqe_cpu;     // 旧 dev->qp_wqe_cpu / qp2_wqe_cpu
     uintptr_t dbr_cpu;     // 旧 dev->qp_dbr_cpu / qp2_dbr_cpu

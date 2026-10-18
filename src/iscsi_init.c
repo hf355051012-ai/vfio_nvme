@@ -73,13 +73,15 @@ typedef struct {
     uint8_t    data[INI_RX_DATA_MAX + 8u] __attribute__((aligned(64)));
 } ini_t;
 
-/* **2 ポートのイニシエータ(`iscsitarget pf1 ..` + `iscsibench .. 2port`)のため、実体は 2 つ持つ。**
- * PF0 側はコア 0、PF1 側はコア 1 で動かすので、呼んだコアで実体を選ぶ(コア 0 = PF0、それ以外 = PF1)。 */
-#define INI_INST (smp_core_index() ? 1u : 0u)
-static ini_t s_ini[2];
-static uint8_t s_wbuf_i[2][INI_BUF_MAX] __attribute__((aligned(4096)));   /* 書き込みの模様 */
-static uint8_t s_rbuf_i[2][INI_BUF_MAX] __attribute__((aligned(4096)));   /* 読み出し先 */
-static uint8_t s_sbuf_i[2][4096];                                          /* 同期コマンド用 */
+/* **実体はコアごとに 1 つ持ち、呼んだコアで選ぶ。** 2 ポート(`iscsibench .. 2port`)は PF0 側をコア 0、PF1 側を
+ * コア 1 で、1 ポートに複数の接続(`iscsibench .. x<N>`)は接続 i をコア i+1 で動かす。使う PF は接続のときに決める
+ * (iscsi_ini_connect() はコア 0 = PF0、それ以外 = PF1。iscsi_ini_connect_pf() は指定どおり)。 */
+#define INI_INST smp_core_index()
+static ini_t s_ini[SMP_MAX_CORES];
+static uint8_t s_ini_pf[SMP_MAX_CORES];
+static uint8_t s_wbuf_i[SMP_MAX_CORES][INI_BUF_MAX] __attribute__((aligned(4096)));   /* 書き込みの模様 */
+static uint8_t s_rbuf_i[SMP_MAX_CORES][INI_BUF_MAX] __attribute__((aligned(4096)));   /* 読み出し先 */
+static uint8_t s_sbuf_i[SMP_MAX_CORES][4096];                                          /* 同期コマンド用 */
 #define s      (s_ini[INI_INST])
 #define s_wbuf (s_wbuf_i[INI_INST])
 #define s_rbuf (s_rbuf_i[INI_INST])
@@ -356,7 +358,7 @@ static int scsi_sync(const uint8_t cdb[16], int is_read, uint8_t *buf, uint32_t 
 
 static int tcp_open(const netaddr_t *dst, uint16_t port)
 {
-    netif_t *pf = netif_find(INI_INST ? "mlx5-pf1" : "mlx5-pf0");
+    netif_t *pf = netif_find(s_ini_pf[INI_INST] ? "mlx5-pf1" : "mlx5-pf0");
     if (pf) netif_activate(pf);
     memset(&s.tcp, 0, sizeof(s.tcp));
     tcp_connect_begin_to(&s.tcp, dst, port);
@@ -563,7 +565,7 @@ static int login(int discovery, const char *target, int want_hd, int want_dd)
     s.p.initial_r2t = 1;
     s.p.immediate_data = 1;
     s.p.max_outstanding_r2t = 1;
-    s.isid[0] = 0x80; s.isid[1] = 'v'; s.isid[2] = 'f'; s.isid[3] = 'i'; s.isid[4] = 'o'; s.isid[5] = discovery ? 1 : (INI_INST ? 2 : 0);
+    s.isid[0] = 0x80; s.isid[1] = 'v'; s.isid[2] = 'f'; s.isid[3] = 'i'; s.isid[4] = 'o'; s.isid[5] = discovery ? 1 : (uint8_t)(INI_INST ? INI_INST + 1u : 0u);   /* 実体ごとに別の ISID(同じだと相手はセッションの作り直しとみなして前のを切る)*/
     s.cmdsn = 1;
     s.expstatsn = 0;
     const uint8_t *payload = kv;
@@ -639,7 +641,13 @@ int iscsi_ini_discover(const netaddr_t *dst, uint16_t port, char *first, unsigne
 
 int iscsi_ini_connect(const netaddr_t *dst, uint16_t port, const char *target_iqn, int hdgst, int ddgst)
 {
+    return iscsi_ini_connect_pf(INI_INST ? 1u : 0u, dst, port, target_iqn, hdgst, ddgst);
+}
+
+int iscsi_ini_connect_pf(unsigned pf, const netaddr_t *dst, uint16_t port, const char *target_iqn, int hdgst, int ddgst)
+{
     if (s.connected) iscsi_ini_close();
+    s_ini_pf[INI_INST] = (uint8_t)(pf ? 1u : 0u);
     char tn[ISCSI_NAME_MAX];
     if (!target_iqn || !target_iqn[0]) {
         if (iscsi_ini_discover(dst, port, tn, sizeof(tn)) < 0 || !tn[0]) {
