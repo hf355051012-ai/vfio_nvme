@@ -191,6 +191,10 @@ volatile uint32_t g_tcp_rx_paws_drop[SMP_MAX_CORES];
  * 粗くなって損をする。** 既定は 1 にして退行させず、**相手が飽和して
  * いると分かっている条件でだけ `ackthresh 4` を使う。** */
 volatile uint32_t g_tcp_ack_threshold = 1u;
+/* [試験] 受信窓の上限を手で決める(`tcprwin <バイト>`、0 = 既定の上限 = 順序外の枠と受信キューの容量)。
+ * 1,048,560 を超えるときは、次に張る接続から Window Scale を 6 にする(4 では 65535 << 4 で頭打ち)。 */
+volatile uint32_t g_tcp_rwin_cap = 0u;
+volatile uint8_t  g_tcp_rcv_wscale = TCP_RCV_WSCALE;
 
 /* ACK を間引く対象とする受信セグメントの最小長(0 = MSS/8 を使う)。
  * **小さいセグメント(write の応答 PDU など)を待たせないため。** */
@@ -441,6 +445,7 @@ typedef struct {
 
     int      wscale_enabled;
     uint8_t  snd_wscale;
+    uint8_t  rcv_wscale;   /* SYN で名乗った自分の shift(g_tcp_rcv_wscale をそのときに写す) */
     /* 相手がこれまでに広告した最大の受信窓(tcp_peer_win_max())。1 レコード = 1 セグメントで送る
      * TLS が、窓より大きいレコードを作って永久に待たないための上限に使う(SPDK の ssl ソケットは
      * Window Scale 無しの 4KB しか広告しない)。 */
@@ -1396,12 +1401,13 @@ static uint16_t tcp_wire_window(tcp_conn_t *conn, tcp_priv_t *priv, uint8_t flag
      * 実測で 4136 個を捨てていた。 */
     uint32_t ooo_capacity = (uint32_t)TCP_OOO_SLOTS * (uint32_t)conn->snd_mss;
     if (safe_window_cap > ooo_capacity) safe_window_cap = ooo_capacity;
+    if (g_tcp_rwin_cap) safe_window_cap = g_tcp_rwin_cap;   /* [試験] tcprwin */
     uint32_t actual_window = TCP_RX_BUF_SIZE - priv->rx_count;
     if (actual_window > safe_window_cap) actual_window = safe_window_cap;
     if ((flags & TCP_FLAG_SYN) || !priv->wscale_enabled) {
         return (actual_window > 0xFFFFu) ? 0xFFFFu : (uint16_t)actual_window;
     }
-    uint32_t scaled = actual_window >> TCP_RCV_WSCALE;
+    uint32_t scaled = actual_window >> priv->rcv_wscale;
     return (scaled > 0xFFFFu) ? 0xFFFFu : (uint16_t)scaled;
 }
 
@@ -1691,7 +1697,8 @@ static void tcp_build_options(tcp_conn_t *conn, tcp_priv_t *priv, uint8_t flags,
             tcph[o + 0] = TCP_OPT_KIND_NOP;
             tcph[o + 1] = TCP_OPT_KIND_WSCALE;
             tcph[o + 2] = 3;               /* オプション長(kind+len+shiftの3バイト) */
-            tcph[o + 3] = TCP_RCV_WSCALE;  /* shift count */
+            if (flags & TCP_FLAG_SYN) priv->rcv_wscale = g_tcp_rcv_wscale;
+            tcph[o + 3] = priv->rcv_wscale;  /* shift count */
             o += 4u;
         }
     }
@@ -1968,13 +1975,14 @@ static int tcp_send_segment_lso(tcp_conn_t *conn, tcp_priv_t *priv,
     /* tcp_wire_window() と同じ理由で ooo[] の容量で頭打ちにする。 */
     uint32_t ooo_capacity = (uint32_t)TCP_OOO_SLOTS * (uint32_t)conn->snd_mss;
     if (safe_window_cap > ooo_capacity) safe_window_cap = ooo_capacity;
+    if (g_tcp_rwin_cap) safe_window_cap = g_tcp_rwin_cap;   /* [試験] tcprwin */
     uint32_t actual_window = TCP_RX_BUF_SIZE - priv->rx_count;
     if (actual_window > safe_window_cap) actual_window = safe_window_cap;
     uint16_t wire_window;
     if (!priv->wscale_enabled) {
         wire_window = (actual_window > 0xFFFFu) ? 0xFFFFu : (uint16_t)actual_window;
     } else {
-        uint32_t scaled = actual_window >> TCP_RCV_WSCALE;
+        uint32_t scaled = actual_window >> priv->rcv_wscale;
         wire_window = (scaled > 0xFFFFu) ? 0xFFFFu : (uint16_t)scaled;
     }
     wr16be(tcph + TCP_OFF_WINDOW, wire_window);
@@ -2935,6 +2943,7 @@ static void tcp_priv_init(tcp_priv_t *priv, unsigned core)
     priv->recv_upcall_ctx = NULL;
     priv->wscale_enabled = 0;
     priv->snd_wscale     = 0;
+    priv->rcv_wscale     = g_tcp_rcv_wscale;
     priv->snd_win_max    = 0;
     priv->ts_enabled       = 0;
     priv->ts_recent        = 0;
@@ -5063,7 +5072,7 @@ void tcp_input_addr(const uint8_t *pkt, uint16_t len,
             rst_ok = 1;
         } else {
             uint32_t rwnd = (uint32_t)priv->last_win_sent;
-            if (priv->wscale_enabled) rwnd <<= TCP_RCV_WSCALE;
+            if (priv->wscale_enabled) rwnd <<= priv->rcv_wscale;
             if (rwnd == 0) rwnd = 1u;   /* 窓 0 でも RCV.NXT の 1 個だけは窓内 */
             int in_window = !tcp_seq_lt(seq, conn->rcv_seq) &&
                              tcp_seq_lt(seq, conn->rcv_seq + rwnd);

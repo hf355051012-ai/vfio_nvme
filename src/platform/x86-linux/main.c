@@ -6452,6 +6452,15 @@ static void shell_dispatch(char *line, int s0, int s1)
             shell_tcp_session_close("鍵を変えたのでセッションを張り直します");
             nvme_rdma_force_reconnect();
         }
+    } else if (strncmp(line, "nvmetioccsz", 11) == 0) {
+        /* [試験] in-capsule の上限の広告。`nvmet` を立てる前に */
+        const char *a = line + 11;
+        while (*a == ' ') a++;
+        if (*a) {
+            uint32_t v = (uint32_t)strtoul(a, NULL, 10);
+            g_nvmet_ioccsz_bytes = (v > NVMET_IOCCSZ_MAX_BYTES) ? NVMET_IOCCSZ_MAX_BYTES : (v & ~15u);
+        }
+        uart_printf("nvmetioccsz: in-capsule の上限 %u バイト(次に立てる nvmet から)\n", (unsigned)g_nvmet_ioccsz_bytes);
     } else if (strncmp(line, "nvmetls", 7) == 0) {
         /* nvmetls [<NVMeTLSkey-1:..> [cnsa|mlkem|x25519] [id0] [keylog <path>] | off]
          *
@@ -7294,6 +7303,11 @@ static void shell_dispatch(char *line, int s0, int s1)
         shell_tcpdisconnect();
     } else if (strncmp(line, "fragrecv", 8) == 0) {
         shell_fragrecv(line + 8);
+    } else if (strncmp(line, "rxstat", 6) == 0) {
+        /* [計数] 受信の周回。`rxstat on|off|clear`、引数なしで表示 */
+        if (strstr(line + 6, "on")) { g_rxstat_on = 1u; netif_rxstat_show(1); }
+        else if (strstr(line + 6, "off")) { g_rxstat_on = 0u; uart_printf("rxstat: off\n"); }
+        else netif_rxstat_show(strstr(line + 6, "clear") != NULL);
     } else if (strncmp(line, "rocedup", 7) == 0) {
         const char *pp = strstr(line + 7, "port");
         if (pp) ip_roce_dup_set_port((uint16_t)strtoul(pp + 4, NULL, 10));
@@ -7314,6 +7328,16 @@ static void shell_dispatch(char *line, int s0, int s1)
         shell_rdmabench(line + 5);
     } else if (strncmp(line, "simdelay", 8) == 0) {
         shell_simdelay(line + 8);
+    } else if (strncmp(line, "tcprwin", 7) == 0) {
+        /* [試験] 受信窓の上限。接続の無いときに設定すること(Window Scale は次の SYN から)。 */
+        const char *a = line + 7;
+        while (*a == ' ') a++;
+        if (*a) {
+            g_tcp_rwin_cap = (uint32_t)strtoul(a, NULL, 10);
+            g_tcp_rcv_wscale = (g_tcp_rwin_cap > 1048560u) ? 6u : 4u;
+        }
+        uart_printf("tcprwin: 受信窓の上限 %u バイト(0 = 既定)、Window Scale %u(次に張る接続から)\n",
+                    (unsigned)g_tcp_rwin_cap, (unsigned)g_tcp_rcv_wscale);
     } else if (strncmp(line, "ackthresh", 9) == 0) {
         shell_ackthresh(line + 9);
     } else if (strncmp(line, "txdrop", 6) == 0) {
@@ -7430,6 +7454,7 @@ static void shell_dispatch(char *line, int s0, int s1)
                     "  termtest                              NVMe/TCP Terminate Connection Request(陰性対照つき)\n"
                     "  fragrecv [ポート] [秒]                UDPを待ち受けて長さと総和を報告(外部から断片化して送る用)\n"
                     "  fragstat [clear]                      受信側のIP断片組み立ての統計\n"
+                    "  rxstat [on|off|clear]                 受信の周回の計数(1 回に拾うフレーム数・待っていた CQE・時間)\n"
                     "  rocedup [clear|port N]                Ethernet の受信キューへ届いた RoCEv2 の数(port は陽性対照用)\n"
                     "  mcpromisc on|off                      vport の promisc_mc(全マルチキャスト受信)\n"
                     "  qploop [N]                            RC QPの作成/破棄をN回繰り返しFWリソース枯渇を見る\n"

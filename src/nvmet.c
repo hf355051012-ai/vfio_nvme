@@ -17,6 +17,10 @@ int g_nvmet_force_pull = 0;
  * Set Features(Number of Queues)で 1 回だけ合意するため。 */
 volatile uint32_t g_nvmet_io_queues = NVMET_IO_QUEUES;
 
+/* [試験] Identify で広告する in-capsule の上限(`nvmetioccsz <バイト>`、既定 NVMET_IOCCSZ_MAX_BYTES)。
+ * 小さくするとホストはそれを超える書き込みを R2T + H2CData で送る。`nvmet` を立てる前に設定すること。 */
+volatile uint32_t g_nvmet_ioccsz_bytes = NVMET_IOCCSZ_MAX_BYTES;
+
 /*=================================================================
  * このセッションで arm してよい IO キューの本数。
  *
@@ -252,7 +256,7 @@ static void nvmet_build_id_ctrl(nvmet_ctx_t *ctx)
 
     wr16le(&ctx->id_ctrl[514], 128);             /* MAXCMD = 128(READY_RING 256 より小さくする)*/
 
-    wr32le(&ctx->id_ctrl[1792], (64u + NVMET_IOCCSZ_MAX_BYTES) / 16u);
+    wr32le(&ctx->id_ctrl[1792], (64u + g_nvmet_ioccsz_bytes) / 16u);
     wr32le(&ctx->id_ctrl[1796], NVME_CQE_LEN / 16u);                   /* IORCSZ: CQE(16B)分のみ */
     ctx->id_ctrl[1803] = 1;                      /* MSDBD = 1 */
 }
@@ -2073,6 +2077,7 @@ typedef struct {
     /* R2T を出してデータ待ちの write。**キューごとに独立**(cid はキューの
      * 中でしか一意でないので、共有すると別キューの同じ cid と衝突する)。 */
     nvmet_pending_write_t pending_writes[NVMET_MAX_PENDING_WRITES];
+    unsigned          pw_next;   /* 次に空きを探し始める枠(確保のたびに 1 つ先へ)*/
     uint16_t          port;
     uint64_t          wait_started_ticks;  /* ARM〜ICRESP_SEND段階での待ち開始時刻(NVMET_ACCEPT_TIMEOUT_MS、timeout_ms()で判定) */
     nvmet_tcp_xfer_t  xfer;
@@ -2181,26 +2186,38 @@ static nvmet_ctx_t *s_instance_owner[NVMET_MAX_INSTANCES];
  * ===============================================================*/
 static int nvmet_pending_write_alloc(nvmet_io_job_ctx_t *jc)
 {
-    for (unsigned i = 0; i < NVMET_MAX_PENDING_WRITES; i++) {
-        if (!jc->pending_writes[i].in_use) return (int)i;
+    /* 前に確保した枠の次から探す。枠は確保した順に近い順で空くので、たいてい 1〜2 個目で見つかる。 */
+    unsigned s = jc->pw_next;
+    for (unsigned n = 0; n < NVMET_MAX_PENDING_WRITES; n++) {
+        unsigned i = (s + n) % NVMET_MAX_PENDING_WRITES;
+        if (!jc->pending_writes[i].in_use) {
+            jc->pw_next = (i + 1u) % NVMET_MAX_PENDING_WRITES;
+            return (int)i;
+        }
     }
     return -1;
 }
 
 /*=================================================================
  * 進行中の write コマンドから cid が一致するスロットを探す(受信した
- * H2CData をどのコマンドのものか対応付けるのに使う)。
+ * H2CData をどのコマンドのものか対応付けるのに使う)。R2T の TTAG に枠の番号を
+ * 入れているので、まず ttag の枠を見る(当たれば探さずに済む)。
  *
  * 引数:
- *   jc  - IO ジョブ状態
- *   cid - 探すコマンド id
+ *   jc   - IO ジョブ状態
+ *   cid  - 探すコマンド id(H2CData の cccid)
+ *   ttag - H2CData の転送タグ
  * 戻り値:
  *   スロット番号。見つからなければ -1
  * コール元:
  *   nvmet_io_job_h2c_validate(), nvmet_io_rx_upcall()
  * ===============================================================*/
-static int nvmet_pending_write_find(nvmet_io_job_ctx_t *jc, uint16_t cid)
+static int nvmet_pending_write_find(nvmet_io_job_ctx_t *jc, uint16_t cid, uint16_t ttag)
 {
+    if (ttag < NVMET_MAX_PENDING_WRITES && jc->pending_writes[ttag].in_use &&
+        jc->pending_writes[ttag].cid == cid) {
+        return (int)ttag;
+    }
     for (unsigned i = 0; i < NVMET_MAX_PENDING_WRITES; i++) {
         if (jc->pending_writes[i].in_use && jc->pending_writes[i].cid == cid) return (int)i;
     }
@@ -2368,7 +2385,7 @@ static job_result_t nvmet_io_job_recv_fail(job_t *self, nvmet_io_job_ctx_t *jc, 
  * ===============================================================*/
 static job_result_t nvmet_io_job_h2c_validate(job_t *self, nvmet_io_job_ctx_t *jc)
 {
-    int slot = nvmet_pending_write_find(jc, jc->cccid);
+    int slot = nvmet_pending_write_find(jc, jc->cccid, jc->ttag);
     if (slot < 0) {
         uart_printf("[!] nvmet: 未知のcccid=%uのH2CDataを受信\n", jc->cccid);
         nvmet_io_debug_desync(jc, "未知のcccid");
@@ -2581,7 +2598,7 @@ static void nvmet_io_dispatch_cmd(nvmet_io_job_ctx_t *jc, const uint8_t *hdr_buf
 
                 uint32_t max_h2c = nvmet_tcp_max_h2c_data(&jc->io);
                 uint32_t round   = (write_len > max_h2c) ? max_h2c : write_len;
-                if (nvmet_tcp_send_r2t(&jc->io, cid, 0, round) != 0) {
+                if (nvmet_tcp_send_r2t(&jc->io, cid, (uint16_t)slot, 0, round) != 0) {
                     uart_printf("[!] nvmet: R2T送信失敗 (cid=%u)\n", cid);
                     jc->pending_writes[slot].in_use = 0;
                     nvmet_build_cqe(ctx, &cqe, cid, 0u, (uint16_t)NVMET_SC_GENERIC_ERROR);
@@ -2671,7 +2688,7 @@ static void nvmet_io_dispatch_h2c(nvmet_io_job_ctx_t *jc, int h2c_slot,
         uint32_t remain  = pw->write_len - pw->received;
         uint32_t max_h2c = nvmet_tcp_max_h2c_data(&jc->io);
         uint32_t round   = (remain > max_h2c) ? max_h2c : remain;
-        if (nvmet_tcp_send_r2t(&jc->io, pw->cid, pw->received, round) != 0) {
+        if (nvmet_tcp_send_r2t(&jc->io, pw->cid, (uint16_t)h2c_slot, pw->received, round) != 0) {
             uart_printf("[!] nvmet: R2T送信失敗 (cid=%u)\n", pw->cid);
             nvme_cqe_t cqe;
             nvmet_build_cqe(ctx, &cqe, pw->cid, 0u, (uint16_t)NVMET_SC_GENERIC_ERROR);
@@ -2825,7 +2842,7 @@ static void nvmet_prx_dispatch(nvmet_io_job_ctx_t *jc, nvmet_ctx_t *ctx)
         jc->prx_datao = rd32le(&jc->prx_psh[4]);
         jc->prx_datal = rd32le(&jc->prx_psh[8]);
         jc->prx_data_need = jc->prx_datal;
-        int slot = nvmet_pending_write_find(jc, jc->prx_cccid);
+        int slot = nvmet_pending_write_find(jc, jc->prx_cccid, jc->prx_ttag);
         if (slot < 0) { jc->prx_error = 1; return; }
         nvmet_pending_write_t *pw = &jc->pending_writes[slot];
         if (jc->prx_datao != pw->received ||

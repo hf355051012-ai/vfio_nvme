@@ -43,7 +43,7 @@ extern volatile uint32_t g_nvmet_tcp_batch;
 
 void nvmet_tcp_accept_arm(nvmet_tcp_conn_t *c, int listener);
 
-int nvmet_tcp_send_r2t(nvmet_tcp_conn_t *c, uint16_t cid,
+int nvmet_tcp_send_r2t(nvmet_tcp_conn_t *c, uint16_t cid, uint16_t ttag,
                         uint32_t r2to, uint32_t r2tl);
 
 uint32_t nvmet_tcp_max_h2c_data(const nvmet_tcp_conn_t *c);

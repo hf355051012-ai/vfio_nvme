@@ -23,6 +23,8 @@ extern volatile uint32_t g_tcp_rx_nospace[SMP_MAX_CORES];
 extern volatile uint32_t g_tcp_rx_csum_drop[SMP_MAX_CORES];
 extern volatile uint32_t g_tcp_rx_paws_drop[SMP_MAX_CORES];
 extern volatile uint32_t g_tcp_ack_threshold;
+extern volatile uint32_t g_tcp_rwin_cap;
+extern volatile uint8_t  g_tcp_rcv_wscale;
 /* ACK を間引く対象とする受信セグメントの最小長(0 = MSS/8)。`ackminseg`。 */
 extern volatile uint32_t g_tcp_ack_min_seg;
 

@@ -1157,6 +1157,29 @@ static net_buf_t *mlx5_net_poll_recv(void *priv)
     return out;
 }
 
+/*=================================================================
+ * nic_ops_t.rx_pending() の実体(`rxstat` の溜まり具合)。このコアの受信 CQ で、いま見ている位置から
+ * 31 / 63 / 127 / 191 個先の CQE がもう完了しているかを見て、待っている数のおおよそを返す。
+ * 戻り値:
+ *   0 / 32 / 64 / 128 / 192(それ以上待っている)
+ * コール元:
+ *   net_poll_all_and_dispatch()(g_rxstat_on のときだけ)
+ * ===============================================================*/
+static unsigned mlx5_net_rx_pending(void *priv)
+{
+    mlx5_net_state_t *st = (mlx5_net_state_t *)priv;
+    unsigned q = mlx5_net_rxq_index();
+    uint64_t cq_buf = (uint64_t)st->dev->rxq[q].cq_buf_cpu;
+    static const unsigned off[4] = { 31u, 63u, 127u, 191u };
+    static const unsigned val[4] = { 32u, 64u, 128u, 192u };
+    unsigned r = 0;
+    for (unsigned i = 0; i < 4u; i++) {
+        if (!mlx5_net_cqe_if_ready(cq_buf, st->rq_cc[q] + off[i])) break;
+        r = val[i];
+    }
+    return r;
+}
+
 static const nic_ops_t s_mlx5_net_ops = {
     .send_frags        = mlx5_net_send_frags,
     .send_frags_async  = mlx5_net_send_frags_async,
@@ -1164,6 +1187,7 @@ static const nic_ops_t s_mlx5_net_ops = {
     .tx_wait_free_slot = mlx5_net_tx_wait_free_slot,
     .tx_room           = mlx5_net_tx_room,
     .poll_recv         = mlx5_net_poll_recv,
+    .rx_pending        = mlx5_net_rx_pending,
 };
 
 /*=================================================================

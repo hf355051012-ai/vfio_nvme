@@ -136,7 +136,14 @@ typedef struct {
     /* 送信キュー(このコアのもの)の空き枠の数。終わった送信を**待たずに**刈り取ってから数える。
      * NULL なら「いつでも空いている」と見なす。 */
     unsigned (*tx_room)(void *priv);
+    /* [計数] このコアの受信キューに、いま完了して待っている CQE がおおよそ何個あるか
+     * (`rxstat` の溜まり具合。0 / 32 / 64 / 128 / 192 以上のどれか)。NULL なら数えない。 */
+    unsigned (*rx_pending)(void *priv);
 } nic_ops_t;
+
+/* [計数] 受信の周回(`rxstat`)。g_rxstat_on のときだけ数える。 */
+extern volatile uint32_t g_rxstat_on;
+void netif_rxstat_show(int clear);
 
 typedef struct netif {
     const char *name;   /* ログ/`net use`コマンド用の識別子("rp1","mlx5-pf0"等) */

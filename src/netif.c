@@ -668,6 +668,77 @@ int net_dup_addr_detect(netif_t *ctx)
 
 #define NET_POLL_BATCH_MAX 64u
 
+/* [計数] 受信の周回(`rxstat`)。コアごとに 1 つ(他のコアと行を共有しない)。
+ * 1 回の net_poll_all_and_dispatch() の中で、インターフェース 1 つから拾ったフレームの数を
+ * 0 / 1 / 2-3 / 4-7 / 8-15 / 16-31 / 32-63 / 64(上限)に分けて数え、拾う前に待っていた CQE の
+ * おおよその数(rx_pending)と、周回の中で使った時間(TSC)も数える。 */
+volatile uint32_t g_rxstat_on;
+typedef struct {
+    uint64_t polls;            /* インターフェース 1 つを見た回数 */
+    uint64_t frames;
+    uint64_t hist[8];
+    uint64_t pend[5];          /* 拾う前に待っていた CQE: 0 / >=32 / >=64 / >=128 / >=192 */
+    uint64_t tsc_in;           /* net_poll_all_and_dispatch() の中にいた TSC */
+    uint64_t calls;
+    uint64_t tsc_first, tsc_last;
+} __attribute__((aligned(64))) rxstat_t;
+static rxstat_t s_rxstat[SMP_MAX_CORES];
+static uint64_t s_rxstat_t0_ns;
+
+static inline uint64_t rxstat_tsc(void) { return __builtin_ia32_rdtsc(); }
+
+static inline unsigned rxstat_bucket(unsigned k)
+{
+    if (k == 0u) return 0u;
+    if (k >= NET_POLL_BATCH_MAX) return 7u;
+    unsigned b = 1u;
+    while ((2u << (b - 1u)) <= k && b < 6u) b++;
+    return b;   /* 1:1 2:2-3 3:4-7 4:8-15 5:16-31 6:32-63 */
+}
+
+/*=================================================================
+ * シェルの `rxstat`。受信の周回の計数をコアごとに出す。
+ * 引数:
+ *   clear - 非 0 なら 0 に戻して数え直す
+ * コール元:
+ *   shell_dispatch()
+ * ===============================================================*/
+void netif_rxstat_show(int clear)
+{
+    if (clear) {
+        for (unsigned c = 0; c < SMP_MAX_CORES; c++) {
+            volatile uint8_t *p = (volatile uint8_t *)&s_rxstat[c];
+            for (unsigned i = 0; i < sizeof(rxstat_t); i++) p[i] = 0;
+        }
+        s_rxstat_t0_ns = timer_now();
+        uart_printf("rxstat: 0 に戻しました(計数は %s)\n", g_rxstat_on ? "on" : "off");
+        return;
+    }
+    uint64_t ns = timer_now() - s_rxstat_t0_ns;
+    uart_printf("rxstat: 計数 %s、基準から %llu ms\n", g_rxstat_on ? "on" : "off", (unsigned long long)(ns / 1000000u));
+    for (unsigned c = 0; c < SMP_MAX_CORES; c++) {
+        rxstat_t *s = &s_rxstat[c];
+        if (!s->polls) continue;
+        uint64_t span = s->tsc_last - s->tsc_first;
+        uart_printf("  core%u: 周回 %llu(インターフェースを見た回数 %llu)/ フレーム %llu(1 回あたり %llu.%02llu)\n",
+                    c, (unsigned long long)s->calls, (unsigned long long)s->polls, (unsigned long long)s->frames,
+                    (unsigned long long)(s->frames / s->polls), (unsigned long long)(s->frames * 100u / s->polls % 100u));
+        uart_printf("    拾った数の分布(0 / 1 / 2-3 / 4-7 / 8-15 / 16-31 / 32-63 / 64=上限): %llu / %llu / %llu / %llu / %llu / %llu / %llu / %llu\n",
+                    (unsigned long long)s->hist[0], (unsigned long long)s->hist[1], (unsigned long long)s->hist[2],
+                    (unsigned long long)s->hist[3], (unsigned long long)s->hist[4], (unsigned long long)s->hist[5],
+                    (unsigned long long)s->hist[6], (unsigned long long)s->hist[7]);
+        uart_printf("    拾う前に待っていた CQE(<32 / >=32 / >=64 / >=128 / >=192): %llu / %llu / %llu / %llu / %llu\n",
+                    (unsigned long long)s->pend[0], (unsigned long long)s->pend[1], (unsigned long long)s->pend[2],
+                    (unsigned long long)s->pend[3], (unsigned long long)s->pend[4]);
+        if (span) {
+            uart_printf("    周回の中の時間 %llu%%(TSC %llu / %llu)、周回 1 回 %llu TSC、フレーム 1 個 %llu TSC(中の時間)\n",
+                        (unsigned long long)(s->tsc_in * 100u / span), (unsigned long long)s->tsc_in, (unsigned long long)span,
+                        (unsigned long long)(span / (s->calls ? s->calls : 1u)),
+                        (unsigned long long)(s->tsc_in / (s->frames ? s->frames : 1u)));
+        }
+    }
+}
+
 /* ---- 受信フレームのコア間配送(マルチコア分散) --------------------------
  *
  * **NIC の受信キューは PF に 1 本しか無い**ので、RQ を見るのは常に
@@ -722,6 +793,8 @@ int net_poll_all_and_dispatch(void)
      * 「分散が遅い」と誤読しかけた。**診断カウンタの代金は、診断したい
      * 効果と同じ桁になりうる。** */
     unsigned consumed = 0;
+    const int rs_on = (int)g_rxstat_on;
+    uint64_t rs_t0 = rs_on ? rxstat_tsc() : 0u;
 
     /* **前の巡回で応答へ相乗りできなかった ACK をここで返す。**
      * 借りが無ければ何もしない(コアごとの旗 1 個を見るだけ)。 */
@@ -739,7 +812,12 @@ int net_poll_all_and_dispatch(void)
             continue;   /* 単一コア: 持ち主だけ */
         }
         netif_activate(ctx);
-        for (unsigned k = 0; k < NET_POLL_BATCH_MAX; k++) {
+        if (rs_on && ctx->nic->rx_pending) {
+            unsigned pv = ctx->nic->rx_pending(ctx->nic_priv);
+            s_rxstat[core].pend[pv >= 192u ? 4u : pv >= 128u ? 3u : pv >= 64u ? 2u : pv >= 32u ? 1u : 0u]++;
+        }
+        unsigned k;
+        for (k = 0; k < NET_POLL_BATCH_MAX; k++) {
             net_buf_t *nb = ctx->nic->poll_recv(ctx->nic_priv); // -> rp1_poll_recv / mlx5_net_poll_recv
             if (!nb) {
                 break;
@@ -756,6 +834,19 @@ int net_poll_all_and_dispatch(void)
                 netif_activate(ctx);
             }
         }
+        if (rs_on) {
+            s_rxstat[core].polls++;
+            s_rxstat[core].frames += k;
+            s_rxstat[core].hist[rxstat_bucket(k)]++;
+        }
+    }
+    if (rs_on) {
+        uint64_t t1 = rxstat_tsc();
+        rxstat_t *s = &s_rxstat[core];
+        if (!s->tsc_first) s->tsc_first = rs_t0;
+        s->tsc_last = t1;
+        s->tsc_in += t1 - rs_t0;
+        s->calls++;
     }
 
     if (n > 1u && consumed != 0u) {

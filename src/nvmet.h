@@ -82,6 +82,7 @@ _Static_assert(sizeof(nvmet_core_stat_t) == 64, "nvmet_core_stat_t は 1 キャ�
 #define NVMET_MAX_TRANSFER_BYTES 262144u
 
 #define NVMET_IOCCSZ_MAX_BYTES 262144u
+extern volatile uint32_t g_nvmet_ioccsz_bytes;
 
 /* 2 = PF ごとに 1 つ(2 ポートで受けるとき。同じサブシステムの別のコントローラで、
  * RAM ディスクは 1 つ目のものを共有する)。 */
@@ -125,7 +126,10 @@ extern volatile uint32_t g_nvmet_tls_split;
  * ACK が送信のペーシングに効いているため)。 */
 #define NVMET_ACKPIGGY_MIN_QUEUES 4u
 
-#define NVMET_MAX_PENDING_WRITES 8u
+/* R2T を出してデータを待つ書き込みの枠(IO キューごと)。**ホストへ広告する MAXCMD(128)と同じ数**にする。
+ * 少ないと、in-capsule に収まらない書き込みを深く積まれたときに枠が尽き、正常なコマンドを断ることになる。
+ * R2T の TTAG に枠の番号を入れるので、H2CData から枠を直接引ける(数を増やしても探す費用は増えない)。 */
+#define NVMET_MAX_PENDING_WRITES 128u
 
 /* push 型受信の ready-ring の段数(`nvmet.c` が使う)。**Dataset Management の
  * 範囲リストを ring のスロットと 1 対 1 で置くためにここに出してある。** */

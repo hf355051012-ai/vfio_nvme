@@ -481,13 +481,14 @@ int nvmet_tcp_send_icresp(nvmet_tcp_conn_t *c, const uint8_t icreq_buf[NVME_TCP_
  * 引数:
  *   c           - 対象コネクション
  *   cid / ttag  - 対応するコマンド id と転送タグ
+ *   ttag        - 転送タグ(H2CData で返ってくる。呼ぶ側の書き込みの枠の番号)
  *   r2to / r2tl - 要求する範囲
  * 戻り値:
  *   0=送信成功、-1=失敗
  * コール元:
  *   nvmet_io_dispatch_cmd(), nvmet_io_dispatch_h2c()
  * ===============================================================*/
-int nvmet_tcp_send_r2t(nvmet_tcp_conn_t *c, uint16_t cid,
+int nvmet_tcp_send_r2t(nvmet_tcp_conn_t *c, uint16_t cid, uint16_t ttag,
                         uint32_t r2to, uint32_t r2tl)
 {
     /* **コアごとに持つ**(2 ポートで受けるとき、別々のコアで動く 2 つの実体が同時に応答を
@@ -504,7 +505,7 @@ int nvmet_tcp_send_r2t(nvmet_tcp_conn_t *c, uint16_t cid,
     s_r2t_buf[3] = 0;
     wr32le(&s_r2t_buf[4], total);
     wr16le(&s_r2t_buf[8],  cid);   /* cccid */
-    wr16le(&s_r2t_buf[10], 0);
+    wr16le(&s_r2t_buf[10], ttag);  /* ttag: ホストは H2CData にそのまま入れて返す(書き込みの枠の番号)*/
     wr32le(&s_r2t_buf[12], r2to);
     wr32le(&s_r2t_buf[16], r2tl);
     wr32le(&s_r2t_buf[20], 0);     /* reserved */
