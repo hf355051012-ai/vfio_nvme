@@ -13,6 +13,7 @@
 #include "smp.h"
 #include "ib_mad.h"
 #include "platform.h"
+#include <string.h>
 
 extern job_result_t nvme_rdma_connect_job_step(job_t *self);
 extern volatile int g_nvmet_multi_ctrl;   /* nvmet.c(2 ポートで受けるとき 1)*/
@@ -71,7 +72,37 @@ static void nvmetr_spawn_io_queue(nvmet_rdma_ctx_t *admin_ctx, unsigned idx);
 static void nvmetr_on_io_established(nvmet_rdma_ctx_t *self);
 static void nvmetr_requeue_io(nvmet_rdma_ctx_t *ctx, job_t *self);
 static void nvmetr_after_auth(nvmet_rdma_ctx_t *ctx);
+static void nvmetr_parse_admin(nvmet_rdma_ctx_t *ctx, const volatile uint8_t *rb, nvmet_rdma_pl_pending_t *p);
+static void nvmetr_parse_io(nvmet_rdma_ctx_t *ctx, const volatile uint8_t *rb, nvmet_rdma_pl_pending_t *p,
+                            int split);
 
+
+/* CQE の status(nvmet.c の NVMET_SC_* と同じ作り)。 */
+#define NVMETR_SC_INVALID_FIELD   0x8004u   /* SC=0x02 Invalid Field in Command + DNR */
+#define NVMETR_SC_ABORT_REQ       0x000Eu   /* SC=0x07 Command Abort Requested */
+#define NVMETR_SC_CMD_SEQ_ERROR   0x8018u   /* SC=0x0C Command Sequence Error + DNR */
+#define NVMETR_SC_INVALID_NS      0x8016u   /* SC=0x0B Invalid Namespace or Format + DNR */
+#define NVMETR_SC_SGL_LEN_INVALID 0x801Eu   /* SC=0x0F Data SGL Length Invalid + DNR */
+#define NVMETR_SC_LBA_RANGE       0x8100u   /* SC=0x80 LBA Out of Range + DNR */
+#define NVMETR_SC_ASYNC_LIMIT     0x820Au   /* SCT=1 SC=0x05 Async Event Request Limit Exceeded + DNR */
+#define NVMETR_SC_NOT_SAVEABLE    0x821Au   /* SCT=1 SC=0x0D Feature Identifier Not Saveable + DNR */
+#define NVMETR_SC_CMD_SIZE_LIMIT  0x8306u   /* SCT=1 SC=0x83 Command Size Limit Exceeded + DNR */
+#define NVMETR_SC_COMPARE_FAILED  0x850Au   /* SCT=2 SC=0x85 Compare Failure + DNR */
+
+/* Identify の応答の出どころ(pending.id_sel)。 */
+#define NVMETR_ID_CTRL 0u
+#define NVMETR_ID_NS   1u
+#define NVMETR_ID_LIST 2u
+#define NVMETR_ID_DESC 3u
+#define NVMETR_ID_NVM  4u
+#define NVMETR_ID_ZERO 5u
+
+/* DSM / Write Zeroes / Copy の上限(TCP の nvmet.c と同じ値)。範囲の一覧は置き場(4096 バイト)に受ける。 */
+#define NVMETR_DSM_MAX_RANGES  64u
+#define NVMETR_MAX_RANGE_LBAS  65536u
+#define NVMETR_COPY_MSSRL      32768u
+#define NVMETR_COPY_MCL        65536u
+#define NVMETR_COPY_MAX_RANGES (NVMET_RDMA_INLINE_MAX / NVME_COPY_RANGE_LEN)
 
 #define CM_DREQ_ATTR_ID 0x0015u
 #define CM_DREP_ATTR_ID 0x0016u
@@ -167,6 +198,17 @@ static void nvmetr_build_id_ctrl(nvmet_rdma_ctx_t *ctx)
     nvmetr_copy_padded(&ctx->ctrl->id_ctrl[24], "RPi5 Bare-Metal NVMe-oF RDMA Target", 40);
     nvmetr_copy_padded(&ctx->ctrl->id_ctrl[64], "1.0", 8);
     ctx->ctrl->id_ctrl[77] = 0;                          /* MDTS = 0 (無制限) */
+    wr32le(&ctx->ctrl->id_ctrl[80], NVME_VS_1_3_0);       /* VER: Property Get の VS と同じ値を名乗る */
+    /* OAES: 名前空間の変化を通知できる、と名乗る(TCP と同じ)。**立てないと Linux は Asynchronous Event
+     * Request を送ってこない**ので、予約の通知も届かない。AERL = 0(0's based で同時 1 件)。 */
+    wr32le(&ctx->ctrl->id_ctrl[NVME_ID_CTRL_OFF_OAES], NVME_AEN_CFG_NS_ATTR);
+    ctx->ctrl->id_ctrl[NVME_ID_CTRL_OFF_AERL] = 0;
+    ctx->ctrl->id_ctrl[NVME_ID_CTRL_OFF_ACL]  = 3;      /* Abort は受けたその場で答えるので溜まらない */
+    /* ONCS: Compare / DSM / Write Zeroes / 予約 / Copy。OCFS: Copy の範囲の書式は Format 0 だけ。 */
+    wr16le(&ctx->ctrl->id_ctrl[NVME_ID_CTRL_OFF_ONCS],
+           NVME_CTRL_ONCS_COMPARE | NVME_CTRL_ONCS_DSM | NVME_CTRL_ONCS_WRITE_ZEROES |
+           NVME_CTRL_ONCS_RESERVATIONS | NVME_CTRL_ONCS_COPY);
+    wr16le(&ctx->ctrl->id_ctrl[NVME_ID_CTRL_OFF_OCFS], 0x0001u);
     if (g_nvmet_multi_ctrl) ctx->ctrl->id_ctrl[76] |= 0x02u;   /* CMIC: 複数コントローラ(2 ポートのとき)*/
     wr16le(&ctx->ctrl->id_ctrl[78], ctx->ctrl->ctrlr_id);       /* CNTLID */
     ctx->ctrl->id_ctrl[111] = 1;                          /* CNTRLTYPE = 1 (I/O controller) */
@@ -212,19 +254,186 @@ static void nvmetr_build_id_ns(nvmet_rdma_ctx_t *ctx)
     wr64le(&ctx->ctrl->id_ns[16], 0);                        /* NUSE */
     ctx->ctrl->id_ns[26]  = 0;                                /* FLBAS: LBA Format Index = 0 */
     ctx->ctrl->id_ns[130] = 9;                                /* LBAF[0].ds = 9 (512B = 2^9) */
-    if (g_nvmet_multi_ctrl) {
-        /* 2 ポートのとき: NMIC の「共有」と、名前空間の識別子(NGUID / EUI-64)。Linux は 2 つの
-         * コントローラから見える名前空間を識別子で同じものと判断する。値は TCP のターゲット
-         * (nvmet.c)と重ならないよう 2 バイト目を 'R' にし、末尾に nsid(1)を置く。 */
-        ctx->ctrl->id_ns[30] |= 0x01u;
-        ctx->ctrl->id_ns[NVME_ID_NS_OFF_NGUID + 0]  = 0x02u;
-        ctx->ctrl->id_ns[NVME_ID_NS_OFF_NGUID + 1]  = 'R';
-        ctx->ctrl->id_ns[NVME_ID_NS_OFF_NGUID + 15] = 1u;
-        ctx->ctrl->id_ns[NVME_ID_NS_OFF_EUI64 + 0]  = 0x02u;
-        ctx->ctrl->id_ns[NVME_ID_NS_OFF_EUI64 + 1]  = 'R';
-        ctx->ctrl->id_ns[NVME_ID_NS_OFF_EUI64 + 7]  = 1u;
-    }
+    /* DLFEAT = 001b: Deallocate した領域を読むと 0 が返る(ゼロで埋める実装と揃える)。 */
+    ctx->ctrl->id_ns[NVME_ID_NS_OFF_DLFEAT] = 0x01u;
+    /* NMIC の「共有」は 2 ポートのときだけ(1 ポートで名乗るとホストがマルチパスの装置名で見せる)。 */
+    if (g_nvmet_multi_ctrl) ctx->ctrl->id_ns[NVME_ID_NS_OFF_NMIC] |= 0x01u;
+    /* 名前空間の識別子(NGUID / EUI-64)。Linux は 2 つのコントローラから見える名前空間を識別子で
+     * 同じものと判断する。値は TCP のターゲット(nvmet.c)と重ならないよう 2 バイト目を 'R' にし、
+     * 末尾に nsid(1)を置く。CNS=0x03 の記述子リストにも同じ値を載せる。 */
+    ctx->ctrl->id_ns[NVME_ID_NS_OFF_NGUID + 0]  = 0x02u;
+    ctx->ctrl->id_ns[NVME_ID_NS_OFF_NGUID + 1]  = 'R';
+    ctx->ctrl->id_ns[NVME_ID_NS_OFF_NGUID + 15] = 1u;
+    ctx->ctrl->id_ns[NVME_ID_NS_OFF_EUI64 + 0]  = 0x02u;
+    ctx->ctrl->id_ns[NVME_ID_NS_OFF_EUI64 + 1]  = 'R';
+    ctx->ctrl->id_ns[NVME_ID_NS_OFF_EUI64 + 7]  = 1u;
+    /* RESCAP(予約の 6 種類と IEKEY)と Copy の上限(MSRC は 0's based)。 */
+    ctx->ctrl->id_ns[NVME_ID_NS_OFF_RESCAP] = NVMET_PR_RESCAP;
+    wr16le(&ctx->ctrl->id_ns[NVME_ID_NS_OFF_MSSRL], NVMETR_COPY_MSSRL);
+    wr32le(&ctx->ctrl->id_ns[NVME_ID_NS_OFF_MCL],   NVMETR_COPY_MCL);
+    ctx->ctrl->id_ns[NVME_ID_NS_OFF_MSRC] = (uint8_t)(NVMETR_COPY_MAX_RANGES - 1u);
     dcache_clean_range((const void *)(uintptr_t)ctx->ctrl->id_ns, sizeof(ctx->ctrl->id_ns));
+
+    /* CNS=0x02: 有効な名前空間は nsid=1 だけ。 */
+    nvmetr_zero_v(ctx->ctrl->id_list, sizeof(ctx->ctrl->id_list));
+    wr32le(&ctx->ctrl->id_list[0], 1u);
+    /* CNS=0x03: EUI-64(NIDT=1、8 バイト)と NGUID(NIDT=2、16 バイト)を詰めて並べ、NIDT=0 で終わる。 */
+    nvmetr_zero_v(ctx->ctrl->id_desc, sizeof(ctx->ctrl->id_desc));
+    ctx->ctrl->id_desc[0] = NVME_NIDT_EUI64;
+    ctx->ctrl->id_desc[1] = 8u;
+    for (unsigned i = 0; i < 8u; i++) ctx->ctrl->id_desc[4 + i] = ctx->ctrl->id_ns[NVME_ID_NS_OFF_EUI64 + i];
+    ctx->ctrl->id_desc[12] = NVME_NIDT_NGUID;
+    ctx->ctrl->id_desc[13] = 16u;
+    for (unsigned i = 0; i < 16u; i++) ctx->ctrl->id_desc[16 + i] = ctx->ctrl->id_ns[NVME_ID_NS_OFF_NGUID + i];
+    /* CNS=0x06(CSI=NVM): DSM の上限。**広告しないと Linux は 1 コマンドで名前空間全体を消しに来る**
+     * (RAM ディスクをゼロで埋めるあいだ、そのキューのポーリングが止まる)。 */
+    nvmetr_zero_v(ctx->ctrl->id_nvm, sizeof(ctx->ctrl->id_nvm));
+    ctx->ctrl->id_nvm[NVME_ID_CTRL_NVM_OFF_DMRL] = (uint8_t)NVMETR_DSM_MAX_RANGES;
+    wr32le(&ctx->ctrl->id_nvm[NVME_ID_CTRL_NVM_OFF_DMRSL], NVMETR_MAX_RANGE_LBAS);
+    wr64le(&ctx->ctrl->id_nvm[NVME_ID_CTRL_NVM_OFF_DMSL],  NVMETR_MAX_RANGE_LBAS);
+    nvmetr_zero_v(ctx->ctrl->id_zero, sizeof(ctx->ctrl->id_zero));
+}
+
+/* Identify の応答の出どころ。 */
+static const volatile uint8_t *nvmetr_id_buf(const nvmet_rdma_ctrl_t *c, uint8_t sel)
+{
+    switch (sel) {
+    case NVMETR_ID_CTRL: return c->id_ctrl;
+    case NVMETR_ID_NS:   return c->id_ns;
+    case NVMETR_ID_LIST: return c->id_list;
+    case NVMETR_ID_DESC: return c->id_desc;
+    case NVMETR_ID_NVM:  return c->id_nvm;
+    default:             return c->id_zero;
+    }
+}
+
+/*=================================================================
+ * SMART / Health Information ログ(512 バイト)。カウンタはこの組の全キューの合計。
+ * 温度はケルビン、data_units は 512 バイト x 1000 単位で切り上げ(TCP の nvmet.c と同じ)。
+ * ===============================================================*/
+static void nvmetr_build_smart(nvmet_rdma_ctx_t *ctx, uint8_t *buf)
+{
+    for (unsigned i = 0; i < NVME_SMART_LOG_LEN; i++) buf[i] = 0;
+    uint64_t rc = ctx->st_rd_cmds, wc = ctx->st_wr_cmds, rb = ctx->st_rd_bytes, wb = ctx->st_wr_bytes;
+    for (unsigned k = 0; k < NVMET_RDMA_IO_QUEUES; k++) {
+        if (s_standalone_io_ctx[k].ctrl != ctx->ctrl) continue;
+        rc += s_standalone_io_ctx[k].st_rd_cmds;
+        wc += s_standalone_io_ctx[k].st_wr_cmds;
+        rb += s_standalone_io_ctx[k].st_rd_bytes;
+        wb += s_standalone_io_ctx[k].st_wr_bytes;
+    }
+    wr16le(&buf[NVME_SMART_OFF_TEMP], 300u);   /* 300 K */
+    buf[NVME_SMART_OFF_AVAIL_SPARE]  = 100;
+    buf[NVME_SMART_OFF_SPARE_THRESH] = 10;
+    wr64le(&buf[NVME_SMART_OFF_DATA_UNITS_READ], (rb + 511999ull) / 512000ull);
+    wr64le(&buf[NVME_SMART_OFF_DATA_UNITS_WRIT], (wb + 511999ull) / 512000ull);
+    wr64le(&buf[NVME_SMART_OFF_HOST_READS],  rc);
+    wr64le(&buf[NVME_SMART_OFF_HOST_WRITES], wc);
+    wr64le(&buf[NVME_SMART_OFF_POWER_CYCLES], 1u);
+    wr64le(&buf[NVME_SMART_OFF_POWER_ON_HOURS],
+           (timer_now() - ctx->ctrl->start_tick) / (3600ull * 1000000000ull));
+}
+
+/* 範囲を 1 つゼロで埋める(Write Zeroes と Deallocate)。nlb は 0's based ではない実数。 */
+static int nvmetr_zero_lbas(nvmet_rdma_ctx_t *ctx, uint64_t slba, uint64_t nlb)
+{
+    if (nlb == 0) return 0;
+    if (slba > NVMET_RDMA_NS_LBA_COUNT || nlb > NVMET_RDMA_NS_LBA_COUNT - slba) return -1;
+    volatile_fast_zero(&ctx->ctrl->ram_disk[slba * NVMET_RDMA_LBA_SIZE], (size_t)nlb * NVMET_RDMA_LBA_SIZE);
+    return 0;
+}
+
+/*=================================================================
+ * 置き場に届いたデータ(または in-capsule のデータ)で、コマンドを実行して
+ * 応答の status を決める。DSM / Copy / Compare(in-capsule の全部)/ 予約の 3 つ。
+ *
+ * 引数:
+ *   ctx  - ターゲットコンテキスト
+ *   p    - コマンド
+ *   data - データ(置き場か受信 capsule の中)、len - その長さ
+ * コール元:
+ *   nvmet_rdma_job_step()
+ * ===============================================================*/
+static void nvmetr_exec_staged(nvmet_rdma_ctx_t *ctx, nvmet_rdma_pl_pending_t *p,
+                               const volatile uint8_t *vdata, uint32_t len)
+{
+    const uint8_t *data = (const uint8_t *)(uintptr_t)vdata;
+    switch (p->opcode) {
+    case NVME_IO_CMD_DSM: {
+        const uint32_t nr = (p->cdw10 & 0xFFu) + 1u;   /* 0's based */
+        if (len < nr * NVME_DSM_RANGE_LEN) { p->resp_status = NVMETR_SC_SGL_LEN_INVALID; return; }
+        if (!(p->cdw11 & NVME_DSMGMT_AD)) return;      /* IDR / IDW はヒントなので何もしない */
+        for (uint32_t i = 0; i < nr; i++) {
+            const uint8_t *r = &data[i * NVME_DSM_RANGE_LEN];
+            /* **範囲の NLB は 0's based ではない**(nvme_types.h)。 */
+            if (nvmetr_zero_lbas(ctx, rd64le(&r[NVME_DSM_OFF_SLBA]), rd32le(&r[NVME_DSM_OFF_NLB])) != 0) {
+                p->resp_status = NVMETR_SC_LBA_RANGE;
+                return;
+            }
+        }
+        return;
+    }
+    case NVME_IO_CMD_COPY: {
+        /* TCP の nvmet_copy_apply() と同じ: 全部の範囲を検査してから写し始める。 */
+        const uint64_t sdlba = (uint64_t)p->cdw10 | ((uint64_t)p->cdw11 << 32);
+        const uint32_t nr    = (p->cdw12 & 0xFFu) + 1u;
+        if (((p->cdw12 >> 8) & 0xFu) != 0u) { p->resp_status = NVMETR_SC_INVALID_FIELD; return; }
+        if (nr > NVMETR_COPY_MAX_RANGES)    { p->resp_status = NVMETR_SC_CMD_SIZE_LIMIT; return; }
+        if (len < nr * NVME_COPY_RANGE_LEN) { p->resp_status = NVMETR_SC_SGL_LEN_INVALID; return; }
+        uint64_t sum = 0;
+        for (uint32_t i = 0; i < nr; i++) {
+            const uint8_t *r = &data[i * NVME_COPY_RANGE_LEN];
+            const uint64_t slba = rd64le(&r[NVME_COPY_OFF_SLBA]);
+            const uint32_t nlb  = (uint32_t)rd16le(&r[NVME_COPY_OFF_NLB]) + 1u;
+            if (nlb > NVMETR_COPY_MSSRL) { p->resp_status = NVMETR_SC_CMD_SIZE_LIMIT; return; }
+            if (slba > NVMET_RDMA_NS_LBA_COUNT || nlb > NVMET_RDMA_NS_LBA_COUNT - slba) {
+                p->resp_status = NVMETR_SC_LBA_RANGE;
+                return;
+            }
+            sum += nlb;
+        }
+        if (sum > NVMETR_COPY_MCL) { p->resp_status = NVMETR_SC_CMD_SIZE_LIMIT; return; }
+        if (sdlba > NVMET_RDMA_NS_LBA_COUNT || sum > NVMET_RDMA_NS_LBA_COUNT - sdlba) {
+            p->resp_status = NVMETR_SC_LBA_RANGE;
+            return;
+        }
+        uint8_t *disk = (uint8_t *)(uintptr_t)ctx->ctrl->ram_disk;
+        uint64_t dst = sdlba;
+        for (uint32_t i = 0; i < nr; i++) {
+            const uint8_t *r = &data[i * NVME_COPY_RANGE_LEN];
+            const uint64_t slba = rd64le(&r[NVME_COPY_OFF_SLBA]);
+            const uint32_t nlb  = (uint32_t)rd16le(&r[NVME_COPY_OFF_NLB]) + 1u;
+            memmove(&disk[dst * NVMET_RDMA_LBA_SIZE], &disk[slba * NVMET_RDMA_LBA_SIZE],
+                    (size_t)nlb * NVMET_RDMA_LBA_SIZE);
+            dst += nlb;
+        }
+        ctx->st_wr_cmds++;
+        ctx->st_wr_bytes += sum * NVMET_RDMA_LBA_SIZE;
+        return;
+    }
+    case NVME_IO_CMD_COMPARE: {
+        const uint8_t *disk = (const uint8_t *)(uintptr_t)ctx->ctrl->ram_disk;
+        if (memcmp(&disk[p->io_slba * NVMET_RDMA_LBA_SIZE + p->cmp_off], data, len) != 0) {
+            p->resp_status = NVMETR_SC_COMPARE_FAILED;
+        }
+        return;
+    }
+    case NVME_IO_CMD_RESV_REGISTER:
+    case NVME_IO_CMD_RESV_ACQUIRE:
+    case NVME_IO_CMD_RESV_RELEASE: {
+        uint32_t olen = 0;
+        p->resp_status = nvmet_pr_execute(&ctx->ctrl->pr, p->nsid, p->opcode, p->cdw10, p->cdw11,
+                                          data, len, NULL, 0, &olen);
+        if (p->resp_status != 0) {
+            uart_printf("[nvmet-rdma] 予約のコマンド (opcode=0x%x cdw10=0x%x) -> status=0x%x\n",
+                        p->opcode, p->cdw10, p->resp_status);
+        }
+        return;
+    }
+    default:
+        p->resp_status = NVMET_RDMA_SC_ERROR;
+        return;
+    }
 }
 
 /*=================================================================
@@ -361,6 +570,10 @@ static void nvmetr_parse_command(nvmet_rdma_ctx_t *ctx, const volatile uint8_t *
                               ((ctx->ctrl->cc & NVME_CC_SHN_MASK) ? NVME_CSTS_SHST_CMPLT : 0u);
             } else if (offset == NVME_REG_CC) {
                 p->resp_dw0 = ctx->ctrl->cc;
+            } else if (offset == NVME_REG_VS) {
+                /* **0 のままだとホストは「1.1 未満」と見なし、CNS=0x02 / 0x03 / 0x06 を問い合わせない**
+                 * (Linux の nvme_ctrl_limited_cns())。DSM の上限(CNS=0x06)を読ませるために名乗る。 */
+                p->resp_dw0 = NVME_VS_1_3_0;
             }
         } else {
             p->resp_status = NVMET_RDMA_SC_ERROR;
@@ -373,11 +586,67 @@ static void nvmetr_parse_command(nvmet_rdma_ctx_t *ctx, const volatile uint8_t *
         return;
     }
 
+    /* **admin と IO はオペコードの表が別**(02h は admin では Get Log Page、IO では Read。09h は
+     * Set Features と Dataset Management)。常駐ターゲットは admin と IO キューが別の QP なので
+     * queue_id で分ける。1 つの QP で両方を受ける古いループバック用の構成(enable_io_queue = 0 かつ
+     * queue_id = 0)だけは、従来どおり admin の 4 つ(Identify / Set Features / Get Features /
+     * Keep Alive)とそれ以外で分ける。 */
+    const int split = ctx->enable_io_queue || ctx->queue_id != 0;
+    const int as_admin = split ? (ctx->queue_id == 0)
+                               : (p->opcode == NVME_ADM_CMD_IDENTIFY || p->opcode == NVME_ADM_CMD_SET_FEATURES ||
+                                  p->opcode == NVME_ADM_CMD_GET_FEATURES || p->opcode == NVME_ADM_CMD_KEEP_ALIVE);
+    if (as_admin) {
+        nvmetr_parse_admin(ctx, rb, p);
+    } else {
+        nvmetr_parse_io(ctx, rb, p, split);
+    }
+}
+
+/*=================================================================
+ * admin キューのコマンドを解釈する(nvmetr_parse_command() から)。
+ * 応答のデータを返すもの(Identify 以外)は、受信バッファの置き場に組み立てて
+ * RDMA_WRITE で返す(stage)。Asynchronous Event Request と Abort の
+ * 保留の扱いはパイプラインのループ(nvmetr_admin_post_parse())。
+ * ===============================================================*/
+static void nvmetr_parse_admin(nvmet_rdma_ctx_t *ctx, const volatile uint8_t *rb,
+                               nvmet_rdma_pl_pending_t *p)
+{
+    volatile uint8_t *stg = (volatile uint8_t *)(uintptr_t)&rb[NVMET_RDMA_STAGE_OFF];
     if (p->opcode == NVME_ADM_CMD_IDENTIFY) {
         nvmetr_parse_ksgl_into(rb, &p->ksgl_addr, &p->ksgl_len, &p->ksgl_key,
                                &p->inval_rkey);
+        /* **CNS ごとに応答を分ける。** 名前空間は nsid=1 の 1 つだけ(NN=1)。 */
+        const uint8_t cns = (uint8_t)(p->cdw10 & 0xFFu);
+        if (cns == NVME_IDENTIFY_CNS_CONTROLLER) {
+            p->id_sel = NVMETR_ID_CTRL;
+        } else if (cns == NVME_IDENTIFY_CNS_NAMESPACE || cns == NVME_IDENTIFY_CNS_NS_DESC_LIST ||
+                   cns == NVME_IDENTIFY_CNS_CS_NAMESPACE) {
+            if (p->nsid != 1u) { p->resp_status = NVMETR_SC_INVALID_NS; return; }
+            p->id_sel = (cns == NVME_IDENTIFY_CNS_NAMESPACE) ? NVMETR_ID_NS
+                      : (cns == NVME_IDENTIFY_CNS_NS_DESC_LIST) ? NVMETR_ID_DESC : NVMETR_ID_ZERO;
+        } else if (cns == NVME_IDENTIFY_CNS_NS_ACTIVE_LIST) {
+            /* nsid は「この値より大きい NSID を並べよ」の意味。 */
+            if (p->nsid >= 0xFFFFFFFEu) { p->resp_status = NVMETR_SC_INVALID_NS; return; }
+            p->id_sel = (p->nsid < 1u) ? NVMETR_ID_LIST : NVMETR_ID_ZERO;
+        } else if (cns == NVME_IDENTIFY_CNS_CS_CONTROLLER) {
+            if (((p->cdw11 >> 24) & 0xFFu) != NVME_CSI_NVM) { p->resp_status = NVMETR_SC_INVALID_FIELD; return; }
+            p->id_sel = NVMETR_ID_NVM;
+        } else {
+            p->resp_status = NVMETR_SC_INVALID_FIELD;
+            return;
+        }
         p->need_data_move = 1;
         p->data_move_is_write = 1; // ターゲット->ホストへRDMA_WRITEで押し込む
+    } else if (p->opcode == NVME_ADM_CMD_SET_FEATURES &&
+               ((p->cdw10 & 0xFFu) == NVME_FEAT_HOST_ID || (p->cdw10 & 0xFFu) == NVME_FEAT_RESV_MASK)) {
+        /* Host Identifier(0x81)と Reservation Notification Mask(0x82)。TCP の nvmet.c と同じ扱い。 */
+        if ((p->cdw10 >> 31) & 1u) {
+            p->resp_status = NVMETR_SC_NOT_SAVEABLE;
+        } else if ((p->cdw10 & 0xFFu) == NVME_FEAT_HOST_ID) {
+            p->resp_status = NVMETR_SC_CMD_SEQ_ERROR;   /* Fabrics ではホスト識別子は Connect で決まる */
+        } else {
+            p->resp_status = nvmet_pr_set_notify_mask(&ctx->ctrl->pr, p->nsid, p->cdw11, &p->resp_dw0);
+        }
     } else if (p->opcode == NVME_ADM_CMD_SET_FEATURES) {
         /* **Number of Queues(FID=0x07)に本数を返す。** 以前は全 FID に
          * dw0=0 を返しており、0's based なので**ホストには「IO キュー
@@ -408,6 +677,28 @@ static void nvmetr_parse_command(nvmet_rdma_ctx_t *ctx, const volatile uint8_t *
         const uint32_t sel = (p->cdw10 >> 8) & 0x7u;
         uint32_t v = 0;
         int ok = 1;
+        if (fid == NVME_FEAT_HOST_ID || fid == NVME_FEAT_RESV_MASK) {
+            if (sel == NVME_FEAT_SEL_SAVED || sel > NVME_FEAT_SEL_SUPPORTED) {
+                p->resp_status = NVMETR_SC_INVALID_FIELD;
+            } else if (sel == NVME_FEAT_SEL_SUPPORTED) {
+                p->resp_dw0 = (fid == NVME_FEAT_RESV_MASK) ? (NVME_FEAT_CAP_NS_SPECIFIC | NVME_FEAT_CAP_CHANGEABLE) : 0u;
+            } else if (fid == NVME_FEAT_RESV_MASK) {
+                p->resp_status = nvmet_pr_get_notify_mask(&ctx->ctrl->pr, p->nsid, &p->resp_dw0);
+            } else if (!(p->cdw11 & 1u)) {
+                p->resp_status = NVMETR_SC_INVALID_FIELD;   /* 128 ビットの形(EXHID)でしか返せない */
+            } else {
+                /* ホスト識別子 16 バイトを置き場から RDMA_WRITE で返す。 */
+                nvmetr_parse_ksgl_into(rb, &p->ksgl_addr, &p->ksgl_len, &p->ksgl_key, &p->inval_rkey);
+                for (unsigned k = 0; k < 16u; k++) stg[k] = ctx->ctrl->pr.hostid[k];
+                if (p->ksgl_len > 16u) p->ksgl_len = 16u;
+                if (p->ksgl_len != 0) {
+                    p->stage = 1;
+                    p->need_data_move = 1;
+                    p->data_move_is_write = 1;
+                }
+            }
+            return;
+        }
         if (fid == NVME_FEAT_NUM_QUEUES) {
             uint32_t n = ctx->ctrl->io_queues_granted ? ctx->ctrl->io_queues_granted : 1u;
             v = (n - 1u) | ((n - 1u) << 16);
@@ -429,7 +720,96 @@ static void nvmetr_parse_command(nvmet_rdma_ctx_t *ctx, const volatile uint8_t *
         }
     } else if (p->opcode == NVME_ADM_CMD_KEEP_ALIVE) {
         /* 応答するだけ(need_data_move=0 のまま成功 CQE を返す)。 */
-    } else if (p->opcode == NVME_IO_CMD_FLUSH) {
+    } else if (p->opcode == NVME_ADM_CMD_GET_LOG_PAGE) {
+        /* NUMD は 0's based の dword 数(cdw10 の上位 16 ビット + cdw11 の下位 16 ビット)、LPO は cdw12。
+         * ページを置き場に組み立て、LPO から要求の長さだけ RDMA_WRITE で返す。 */
+        const uint32_t lid   = p->cdw10 & 0xFFu;
+        const uint32_t bytes = ((((p->cdw11 & 0xFFFFu) << 16) | ((p->cdw10 >> 16) & 0xFFFFu)) + 1u) * 4u;
+        const uint32_t lpo   = p->cdw12;
+        uint8_t *buf = (uint8_t *)(uintptr_t)stg;
+        uint32_t log_len;
+        for (uint32_t i = 0; i < NVMET_RDMA_INLINE_MAX; i++) buf[i] = 0;
+        if (lid == NVME_LOG_LID_SMART) {
+            nvmetr_build_smart(ctx, buf);
+            log_len = NVME_SMART_LOG_LEN;
+        } else if (lid == NVME_LOG_LID_ERROR) {
+            log_len = NVME_ERROR_SLOT_LEN;   /* エラーは記録していない(ELPE=0 の 1 エントリが空)*/
+        } else if (lid == NVME_LOG_LID_RESERVATION) {
+            nvmet_pr_build_log(&ctx->ctrl->pr, buf);   /* 読むたびに 1 件取り出す */
+            log_len = 64u;
+        } else {
+            log_len = NVMET_RDMA_INLINE_MAX;   /* 持っていないログはゼロ埋め(Changed Namespace List も空)*/
+        }
+        nvmetr_parse_ksgl_into(rb, &p->ksgl_addr, &p->ksgl_len, &p->ksgl_key, &p->inval_rkey);
+        uint32_t send = (lpo < log_len) ? (log_len - lpo) : 0u;
+        if (send > bytes) send = bytes;
+        if (send > p->ksgl_len) send = p->ksgl_len;
+        if (lpo != 0u && send != 0u) memmove(buf, &buf[lpo], send);
+        if (send != 0u) {
+            p->ksgl_len = send;
+            p->stage = 1;
+            p->need_data_move = 1;
+            p->data_move_is_write = 1;
+        }
+    } else if (p->opcode == NVME_ADM_CMD_ASYNC_EVENT) {
+        /* イベントが起きるまで完了させない(パイプラインのループが保留にする)。 */
+        p->defer = 1;
+    } else if (p->opcode == NVME_ADM_CMD_ABORT) {
+        /* 既定は「取り消さなかった」(DW0 bit0 = 1)。保留中の AER を指していればループが取り消す。 */
+        p->resp_dw0 = 1u;
+    } else {
+        p->resp_status = NVMET_RDMA_SC_ERROR;
+    }
+}
+
+/* in-capsule(Data Block + Offset、型 0x01)か keyed SGL かを見てデータの在りかを取り出す。 */
+static void nvmetr_parse_data_sgl(const volatile uint8_t *rb, nvmet_rdma_pl_pending_t *p)
+{
+    const volatile uint8_t *dptr = &rb[24];
+    if (dptr[15] == 0x01u) {
+        p->data_inline = 1;
+        p->inline_off  = (uint32_t)rd64le(&dptr[0]);
+        p->ksgl_len    = rd32le(&dptr[8]);
+    } else {
+        nvmetr_parse_ksgl_into(rb, &p->ksgl_addr, &p->ksgl_len, &p->ksgl_key, &p->inval_rkey);
+    }
+}
+
+/* ホストから受け取るデータを置き場で扱うと決める。in-capsule ならそのまま、keyed なら RDMA_READ で
+ * 置き場へ引く。置き場は 4096 バイト(Compare だけはこれを超えてもよく、4096 バイトずつ引いて比べる)。 */
+static void nvmetr_stage_in(nvmet_rdma_pl_pending_t *p)
+{
+    if (p->ksgl_len == 0) { p->resp_status = NVMETR_SC_INVALID_FIELD; return; }
+    if (p->ksgl_len > NVMET_RDMA_INLINE_MAX && (p->data_inline || p->opcode != NVME_IO_CMD_COMPARE)) {
+        p->resp_status = NVMETR_SC_SGL_LEN_INVALID;
+        return;
+    }
+    p->stage = 1;
+    if (!p->data_inline) {
+        p->need_data_move = 1;
+        p->data_move_is_write = 0;
+    }
+}
+
+/*=================================================================
+ * IO キューのコマンドを解釈する(nvmetr_parse_command() から)。
+ * split が 0(ループバック用の古い構成)のときは Flush / Read / Write だけ扱う。
+ * ===============================================================*/
+static void nvmetr_parse_io(nvmet_rdma_ctx_t *ctx, const volatile uint8_t *rb,
+                            nvmet_rdma_pl_pending_t *p, int split)
+{
+    volatile uint8_t *stg = (volatile uint8_t *)(uintptr_t)&rb[NVMET_RDMA_STAGE_OFF];
+    /* **予約を持つホストがいるときだけ判定する**(いなければ 1 バイト読むだけ)。名前空間は 1 つ。
+     * 予約のコマンド自身は nvmet_pr_execute() の中で判定する。 */
+    if (split && g_nvmet_pr_held[NVMET_PR_DOM_RDMA][0]) {
+        const uint16_t pst = nvmet_pr_check_access(&ctx->ctrl->pr, 1u, p->opcode);
+        if (pst != 0) {
+            uart_printf("[nvmet-rdma] 予約と衝突 (opcode=0x%x)\n", p->opcode);
+            p->resp_status = pst;
+            return;
+        }
+    }
+    if (p->opcode == NVME_IO_CMD_FLUSH) {
         /* RAM ディスクなので揮発性キャッシュが無く、成功を返すだけでよい。 */
     } else if (p->opcode == NVME_IO_CMD_READ) {
         nvmetr_parse_ksgl_into(rb, &p->ksgl_addr, &p->ksgl_len, &p->ksgl_key,
@@ -443,6 +823,8 @@ static void nvmetr_parse_command(nvmet_rdma_ctx_t *ctx, const volatile uint8_t *
             p->resp_status = NVMET_RDMA_SC_ERROR;
             return;
         }
+        ctx->st_rd_cmds++;
+        ctx->st_rd_bytes += (uint64_t)nlb * NVMET_RDMA_LBA_SIZE;
         p->need_data_move = 1;
         p->data_move_is_write = 1;
     } else if (p->opcode == NVME_IO_CMD_WRITE) {
@@ -474,11 +856,59 @@ static void nvmetr_parse_command(nvmet_rdma_ctx_t *ctx, const volatile uint8_t *
                 return;
             }
             /* データは既に受信バッファにある。RDMA_READ は要らない。 */
+            ctx->st_wr_cmds++;
+            ctx->st_wr_bytes += (uint64_t)nlb * NVMET_RDMA_LBA_SIZE;
             p->need_data_move = 0;
             return;
         }
+        ctx->st_wr_cmds++;
+        ctx->st_wr_bytes += (uint64_t)nlb * NVMET_RDMA_LBA_SIZE;
         p->need_data_move = 1;
         p->data_move_is_write = 0; // ホストからRDMA_READで引き込む
+    } else if (!split) {
+        p->resp_status = NVMET_RDMA_SC_ERROR;
+    } else if (p->nsid != 1u) {
+        /* ここから下は 1 つの名前空間を指すコマンド。 */
+        p->resp_status = NVMETR_SC_INVALID_NS;
+    } else if (p->opcode == NVME_IO_CMD_WRITE_ZEROES) {
+        /* cdw12 の NLB は 0's based(DSM の範囲の NLB とは違う)。データは送られてこない。 */
+        const uint64_t slba = (uint64_t)p->cdw10 | ((uint64_t)p->cdw11 << 32);
+        if (nvmetr_zero_lbas(ctx, slba, (p->cdw12 & 0xFFFFu) + 1u) != 0) p->resp_status = NVMETR_SC_LBA_RANGE;
+    } else if (p->opcode == NVME_IO_CMD_DSM || p->opcode == NVME_IO_CMD_COPY ||
+               p->opcode == NVME_IO_CMD_RESV_REGISTER || p->opcode == NVME_IO_CMD_RESV_ACQUIRE ||
+               p->opcode == NVME_IO_CMD_RESV_RELEASE) {
+        /* 範囲の一覧・鍵を受け取ってから実行する(nvmetr_exec_staged())。 */
+        nvmetr_parse_data_sgl(rb, p);
+        nvmetr_stage_in(p);
+    } else if (p->opcode == NVME_IO_CMD_COMPARE) {
+        p->io_slba = (uint64_t)p->cdw10 | ((uint64_t)p->cdw11 << 32);
+        const uint32_t nlb = (p->cdw12 & 0xFFFFu) + 1u;
+        if (p->io_slba > NVMET_RDMA_NS_LBA_COUNT || nlb > NVMET_RDMA_NS_LBA_COUNT - p->io_slba) {
+            p->resp_status = NVMETR_SC_LBA_RANGE;
+            return;
+        }
+        nvmetr_parse_data_sgl(rb, p);
+        if (p->ksgl_len < nlb * NVMET_RDMA_LBA_SIZE) { p->resp_status = NVMETR_SC_SGL_LEN_INVALID; return; }
+        p->ksgl_len = nlb * NVMET_RDMA_LBA_SIZE;   /* 比べるのはこの長さ(4096 を超えれば分けて引く)*/
+        nvmetr_stage_in(p);
+        if (p->resp_status == 0) ctx->st_rd_cmds++;
+    } else if (p->opcode == NVME_IO_CMD_RESV_REPORT) {
+        /* 応答は置き場に組み立てて RDMA_WRITE で返す。 */
+        nvmetr_parse_ksgl_into(rb, &p->ksgl_addr, &p->ksgl_len, &p->ksgl_key, &p->inval_rkey);
+        uint32_t olen = 0;
+        p->resp_status = nvmet_pr_execute(&ctx->ctrl->pr, p->nsid, p->opcode, p->cdw10, p->cdw11, NULL, 0,
+                                          (uint8_t *)(uintptr_t)stg, NVMET_RDMA_INLINE_MAX, &olen);
+        if (p->resp_status != 0) {
+            uart_printf("[nvmet-rdma] Reservation Report -> status=0x%x\n", p->resp_status);
+            return;
+        }
+        if (olen > p->ksgl_len) olen = p->ksgl_len;
+        if (olen != 0) {
+            p->ksgl_len = olen;
+            p->stage = 1;
+            p->need_data_move = 1;
+            p->data_move_is_write = 1;
+        }
     } else {
         p->resp_status = NVMET_RDMA_SC_ERROR;
     }
@@ -539,6 +969,16 @@ static void nvmetr_dispatch(nvmet_rdma_ctx_t *ctx)
     ctx->resp_dw0 = p.resp_dw0;
     ctx->resp_dw1 = p.resp_dw1;
     ctx->resp_status = p.resp_status;
+    ctx->stage = p.stage;
+    ctx->id_sel = p.id_sel;
+    if (p.stage || p.defer) {
+        /* 置き場と保留はパイプラインの経路でしか扱わない(常駐ターゲットはすべてパイプライン)。 */
+        uart_printf("[!] nvmet-rdma: opcode=0x%x は非パイプライン経路では未対応\n", p.opcode);
+        ctx->stage = 0;
+        ctx->need_data_move = 0;
+        ctx->data_inline = 0;
+        ctx->resp_status = NVMET_RDMA_SC_ERROR;
+    }
 }
 
 /*=================================================================
@@ -780,8 +1220,19 @@ static int nvmetr_pl_issue_rdma_read(nvmet_rdma_ctx_t *ctx, unsigned slot)
     nvmet_rdma_pl_pending_t *p = &ctx->pl.pending[slot];
     volatile uint8_t *dst = p->fab_data ? ctx->ctrl->fab_buf
                                         : &ctx->ctrl->ram_disk[p->io_slba * NVMET_RDMA_LBA_SIZE];
+    uint32_t len   = p->ksgl_len;
+    uint64_t raddr = p->ksgl_addr;
+    if (p->stage) {
+        /* 置き場へ引く。Compare は 4096 バイトずつ(cmp_off から)。 */
+        dst = &ctx->pl.recv_bufs[slot][NVMET_RDMA_STAGE_OFF];
+        if (p->opcode == NVME_IO_CMD_COMPARE) {
+            len = p->ksgl_len - p->cmp_off;
+            if (len > NVMET_RDMA_INLINE_MAX) len = NVMET_RDMA_INLINE_MAX;
+            raddr += p->cmp_off;
+        }
+    }
     if (mlx5_qp_post_rdma_read(ctx->cm.dev, &ctx->cm.rc_qp, (void *)(uintptr_t)dst,
-                                p->ksgl_len, p->ksgl_addr, p->ksgl_key) != 0) {
+                                len, raddr, p->ksgl_key) != 0) {
         return -1;
     }
     ctx->pl.sq_ops[ctx->pl.sq_tail % (NVMET_RDMA_MAX_PENDING * 2u)].is_resp_send = 0;
@@ -814,9 +1265,10 @@ static int nvmetr_pl_start_data_move(nvmet_rdma_ctx_t *ctx, unsigned slot)
         uint32_t len = p->ksgl_len;
         if (p->fab_data) {   /* Authentication Receive の応答(長さは解析時に決めてある)*/
             src = ctx->ctrl->fab_buf;
+        } else if (p->stage) {   /* Get Log Page / Get Features / Reservation Report の応答 */
+            src = &ctx->pl.recv_bufs[slot][NVMET_RDMA_STAGE_OFF];
         } else if (p->opcode == NVME_ADM_CMD_IDENTIFY) {
-            uint8_t cns = (uint8_t)(p->cdw10 & 0xFFu);
-            src = (cns == NVME_IDENTIFY_CNS_CONTROLLER) ? ctx->ctrl->id_ctrl : ctx->ctrl->id_ns;
+            src = nvmetr_id_buf(ctx->ctrl, p->id_sel);
             if (len > NVMET_RDMA_ID_BUF_LEN) len = NVMET_RDMA_ID_BUF_LEN;
         } else { // READ
             src = &ctx->ctrl->ram_disk[p->io_slba * NVMET_RDMA_LBA_SIZE];
@@ -874,6 +1326,58 @@ static int nvmetr_pl_send_response(nvmet_rdma_ctx_t *ctx, unsigned slot)
     ctx->pl.sq_ops[ctx->pl.sq_tail % (NVMET_RDMA_MAX_PENDING * 2u)].is_resp_send = 1;
     ctx->pl.sq_ops[ctx->pl.sq_tail % (NVMET_RDMA_MAX_PENDING * 2u)].slot = slot;
     ctx->pl.sq_tail++;
+    return 0;
+}
+
+/* 保留中の Asynchronous Event Request を完了させる(dw0 = イベント、status は Abort のときだけ非 0)。 */
+static int nvmetr_aer_complete(nvmet_rdma_ctx_t *ctx, uint32_t dw0, uint16_t status)
+{
+    nvmet_rdma_ctrl_t *c = ctx->ctrl;
+    if (!c->aer_pending) return 0;
+    nvmet_rdma_pl_pending_t *ap = &ctx->pl.pending[c->aer_slot];
+    ap->resp_dw0    = dw0;
+    ap->resp_dw1    = 0;
+    ap->resp_status = status;
+    ap->inval_rkey  = 0;
+    c->aer_pending  = 0;
+    uart_printf("[nvmet-rdma] 非同期イベント通知 (dw0=0x%x status=0x%x cid=%u)\n", dw0, status, c->aer_cid);
+    return nvmetr_pl_send_response(ctx, c->aer_slot);
+}
+
+/*=================================================================
+ * admin キューで解析した直後の保留の扱い(パイプラインのループから)。
+ * Asynchronous Event Request は応答を送らずにスロットを握る(AERL=0 なので 1 件まで)。
+ * Abort は、保留中の AER を指していれば Command Abort Requested で完了させ、
+ * Abort 自身には DW0 = 0 で答える。それ以外は「取り消さなかった」(DW0 = 1)のまま。
+ *
+ * 戻り値:
+ *   1 = このスロットの応答は今は送らない、0 = いつもどおり送る
+ * ===============================================================*/
+static int nvmetr_admin_post_parse(nvmet_rdma_ctx_t *ctx, unsigned slot)
+{
+    nvmet_rdma_pl_pending_t *p = &ctx->pl.pending[slot];
+    nvmet_rdma_ctrl_t *c = ctx->ctrl;
+    if (p->opcode == NVME_ADM_CMD_ASYNC_EVENT && p->defer && p->resp_status == 0) {
+        if (c->aer_pending) {
+            p->defer = 0;
+            p->resp_status = NVMETR_SC_ASYNC_LIMIT;   /* 黙って捨てるとホストは永久に待つ */
+            return 0;
+        }
+        c->aer_pending = 1;
+        c->aer_slot    = slot;
+        c->aer_cid     = p->cid;
+        uart_printf("[nvmet-rdma] Async Event Request を受理 (cid=%u、イベント発生まで保留)\n", p->cid);
+        return 1;
+    }
+    if (p->opcode == NVME_ADM_CMD_ABORT && p->resp_status == 0) {
+        const uint16_t sqid = (uint16_t)(p->cdw10 & 0xFFFFu);
+        const uint16_t cid  = (uint16_t)(p->cdw10 >> 16);
+        if (sqid == 0u && c->aer_pending && c->aer_cid == cid) {
+            if (nvmetr_aer_complete(ctx, 0u, NVMETR_SC_ABORT_REQ) == 0) p->resp_dw0 = 0u;
+        }
+        uart_printf("[nvmet-rdma] Abort (sqid=%u cid=%u) -> %s\n", sqid, cid,
+                    p->resp_dw0 ? "取り消さなかった" : "保留中の AER を取り消した");
+    }
     return 0;
 }
 
@@ -1038,8 +1542,7 @@ job_result_t nvmet_rdma_job_step(job_t *self)
             const volatile uint8_t *src;
             uint32_t len = ctx->ksgl_len;
             if (ctx->opcode == NVME_ADM_CMD_IDENTIFY) {
-                uint8_t cns = (uint8_t)(ctx->cdw10 & 0xFFu);
-                src = (cns == NVME_IDENTIFY_CNS_CONTROLLER) ? ctx->ctrl->id_ctrl : ctx->ctrl->id_ns;
+                src = nvmetr_id_buf(ctx->ctrl, ctx->id_sel);
                 if (len > NVMET_RDMA_ID_BUF_LEN) len = NVMET_RDMA_ID_BUF_LEN;
             } else { // READ
                 src = &ctx->ctrl->ram_disk[ctx->io_slba * NVMET_RDMA_LBA_SIZE];
@@ -1072,6 +1575,7 @@ job_result_t nvmet_rdma_job_step(job_t *self)
                 const uint8_t *d = (const uint8_t *)(uintptr_t)ctx->ctrl->fab_buf;
                 if (ctx->fctype == NVME_FABRIC_FCTYPE_CONNECT) {
                     uint32_t atr = 0;
+                    nvmet_pr_connect(&ctx->ctrl->pr, d, ctx->ctrl->ctrlr_id);   /* 先頭 16 バイトがホスト識別子 */
                     const uint16_t st = nvmet_auth_on_connect(&ctx->ctrl->auth, d + 512, &atr);
                     if (st != 0) {
                         ctx->resp_status = st;
@@ -1180,6 +1684,16 @@ job_result_t nvmet_rdma_job_step(job_t *self)
         if (nvmetr_check_gsi_disconnect(ctx, self)) {
             return ctx->failed ? JOB_DONE : JOB_WAITING;
         }
+        /* **予約の通知はここで AER を完了させて知らせる。** 旗を立てるのは予約のコマンドを処理した
+         * IO キューのジョブ(別のコア)で、admin の QP へ送るのはこのジョブだけ。 */
+        if (ctx->queue_id == 0 && ctx->ctrl->aer_pending && ctx->ctrl->pr.aer_notify) {
+            ctx->ctrl->pr.aer_notify = 0;
+            if (nvmetr_aer_complete(ctx, NVME_AER_CSS | (NVME_AEN_RESV_LOG_AVAIL << 8) |
+                                         (NVME_LOG_LID_RESERVATION << 16), 0) != 0) {
+                ctx->failed = 1;
+                return JOB_DONE;
+            }
+        }
 
         unsigned qi_stat = (ctx->queue_id <= NVMET_RDMA_IO_QUEUES)
                            ? (unsigned)ctx->queue_id : NVMET_RDMA_IO_QUEUES;
@@ -1242,7 +1756,18 @@ job_result_t nvmet_rdma_job_step(job_t *self)
                     ts_cmd.len = ctx->pl.pending[slot].ksgl_len;
                     ts_log_rdma(TS_MK(TS_FILE_NVMET_RDMA, TS_FUNC_nvmet_rdma_job_step, 0), &ts_cmd);
                 }
-                if (ctx->pl.pending[slot].data_inline &&
+                if (ctx->pl.pending[slot].data_inline && ctx->pl.pending[slot].stage &&
+                    ctx->pl.pending[slot].resp_status == 0) {
+                    /* in-capsule で届いた範囲の一覧・鍵・比較データ。その場で実行する。 */
+                    nvmet_rdma_pl_pending_t *ip = &ctx->pl.pending[slot];
+                    uint32_t need = 64u + ip->inline_off + ip->ksgl_len;
+                    if (need > recv_len || 64u + ip->inline_off + ip->ksgl_len > NVMET_RDMA_MSG_MAX) {
+                        uart_printf("[!] nvmet-rdma: in-capsuleデータが足りない(%u > %u)\n", need, recv_len);
+                        ip->resp_status = NVMETR_SC_SGL_LEN_INVALID;
+                    } else {
+                        nvmetr_exec_staged(ctx, ip, &ctx->pl.recv_bufs[slot][64u + ip->inline_off], ip->ksgl_len);
+                    }
+                } else if (ctx->pl.pending[slot].data_inline &&
                     ctx->pl.pending[slot].resp_status == 0) {
                     /* データが capsule に載っている場合、RDMA_READ を挟まずに
                      * ここで RAM ディスクへ写して即座に応答できる。**これが
@@ -1263,7 +1788,9 @@ job_result_t nvmet_rdma_job_step(job_t *self)
                                                ip->ksgl_len);
                     }
                 }
-                if (ctx->pl.pending[slot].need_data_move) {
+                if (ctx->queue_id == 0 && nvmetr_admin_post_parse(ctx, slot)) {
+                    /* Asynchronous Event Request を保留した(応答は送らない)。 */
+                } else if (ctx->pl.pending[slot].need_data_move) {
                     int dm_rc = nvmetr_pl_start_data_move(ctx, slot);
                     if (dm_rc == -2) {
                         /* RDMA_WRITE は SQ に載ったのに応答 SEND を積めなかった。
@@ -1308,6 +1835,7 @@ job_result_t nvmet_rdma_job_step(job_t *self)
                         const uint8_t *d = (const uint8_t *)(uintptr_t)ctx->ctrl->fab_buf;
                         if (fp->fctype == NVME_FABRIC_FCTYPE_CONNECT) {
                             uint32_t atr = 0;
+                            nvmet_pr_connect(&ctx->ctrl->pr, d, ctx->ctrl->ctrlr_id);   /* 先頭 16 バイトがホスト識別子 */
                             const uint16_t st = nvmet_auth_on_connect(&ctx->ctrl->auth, d + 512, &atr);
                             if (st != 0) {
                                 fp->resp_status = st;
@@ -1323,6 +1851,26 @@ job_result_t nvmet_rdma_job_step(job_t *self)
                             fp->resp_status = nvmet_auth_send(&ctx->ctrl->auth, fp->cdw10, fp->cdw11, d,
                                                               fp->ksgl_len, NVMET_RDMA_SUBNQN);
                             nvmetr_after_auth(ctx);
+                        }
+                    }
+                    if (ctx->pl.pending[op.slot].stage) {
+                        /* 置き場にデータが届いた。Compare は引いた分を比べ、残りがあれば続きを引く
+                         * (いま空いた RDMA_READ の枠をそのまま使う)。それ以外はここで実行する。 */
+                        nvmet_rdma_pl_pending_t *sp = &ctx->pl.pending[op.slot];
+                        const volatile uint8_t *sd = &ctx->pl.recv_bufs[op.slot][NVMET_RDMA_STAGE_OFF];
+                        if (sp->opcode == NVME_IO_CMD_COMPARE) {
+                            uint32_t chunk = sp->ksgl_len - sp->cmp_off;
+                            if (chunk > NVMET_RDMA_INLINE_MAX) chunk = NVMET_RDMA_INLINE_MAX;
+                            nvmetr_exec_staged(ctx, sp, sd, chunk);
+                            sp->cmp_off += chunk;
+                            if (sp->resp_status == 0 && sp->cmp_off < sp->ksgl_len) {
+                                ctx->pl.rra_inflight--;
+                                if (nvmetr_pl_issue_rdma_read(ctx, op.slot) == 0) continue;
+                                ctx->pl.rra_inflight++;   /* 下で 1 つ返すので数を合わせる */
+                                sp->resp_status = NVMET_RDMA_SC_ERROR;
+                            }
+                        } else {
+                            nvmetr_exec_staged(ctx, sp, sd, sp->ksgl_len);
                         }
                     }
                     {
@@ -1547,7 +2095,9 @@ static void nvmetr_after_auth(nvmet_rdma_ctx_t *ctx)
  * ===============================================================*/
 static void nvmetr_on_admin_disconnected(nvmet_rdma_ctx_t *admin_ctx)
 {
-    (void)admin_ctx;
+    /* 保留中の AER はセッションと一緒に捨て、予約の通知先から外す(登録はホストに付くので残す)。 */
+    admin_ctx->ctrl->aer_pending = 0;
+    nvmet_pr_session_reset(&admin_ctx->ctrl->pr);
     if (!s_standalone_io_spawned) return;
     for (int k = 0; k < s_standalone_io_spawned; k++) {
         /* まだ REQ を待っている IO キューの受け皿(ホストが張る前に切った等)も止める。残すと
@@ -1621,6 +2171,9 @@ void nvmet_rdma_run_standalone(mlx5_dev_t *dev, const char *self_label, const ui
      * サブシステムで cntlid が重なると 2 本目を拒む)。記憶域(RAM ディスク)は共有する。 */
     s_standalone_ctrl.cntlid_cfg      = (uint16_t)(inst + 1u);
     s_standalone_ctrl.ram_disk        = nvmetr_ramdisk_slot0();
+    s_standalone_ctrl.start_tick      = timer_now();
+    /* 予約は 2 つの組で共有する(RAM ディスクが同じ)。TCP の nvmet.c とは別のドメイン。 */
+    nvmet_pr_attach(&s_standalone_ctrl.pr, NVMET_PR_DOM_RDMA);
     s_standalone_ctx.pipeline_enabled = 1;
     s_standalone_ctx.enable_io_queue  = 1;
     s_standalone_ctx.on_established   = nvmetr_on_admin_established;

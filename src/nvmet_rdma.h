@@ -7,6 +7,7 @@
 #include "job.h"
 #include "nvme_types.h"
 #include "nvmet_auth.h"
+#include "nvmet_pr.h"
 
 #define NVMET_RDMA_LBA_SIZE      512u
 #define NVMET_RDMA_NS_LBA_COUNT (NVMET_RDMA_RAMDISK_SLOT_SIZE / NVMET_RDMA_LBA_SIZE)
@@ -84,6 +85,22 @@ typedef struct {
 
     volatile uint8_t id_ctrl[NVMET_RDMA_ID_BUF_LEN] __attribute__((aligned(64)));
     volatile uint8_t id_ns[NVMET_RDMA_ID_BUF_LEN] __attribute__((aligned(64)));
+    /* Identify の CNS=0x02(Active Namespace ID List)/ 0x03(記述子リスト)/ 0x06(NVM の
+     * Identify Controller、DSM の上限)/ 0x05 と未使用の名前空間(ゼロ埋め)。起動時に組み立てる。 */
+    volatile uint8_t id_list[NVMET_RDMA_ID_BUF_LEN] __attribute__((aligned(64)));
+    volatile uint8_t id_desc[NVMET_RDMA_ID_BUF_LEN] __attribute__((aligned(64)));
+    volatile uint8_t id_nvm[NVMET_RDMA_ID_BUF_LEN] __attribute__((aligned(64)));
+    volatile uint8_t id_zero[NVMET_RDMA_ID_BUF_LEN] __attribute__((aligned(64)));
+
+    /* 予約(nvmet_pr.c、ドメインは NVMET_PR_DOM_RDMA)。ホスト識別子は admin の Connect のデータの
+     * 先頭 16 バイト。 */
+    nvmet_pr_ctrl_t pr;
+    /* 保留中の Asynchronous Event Request(AERL=0 = 同時 1 個)。**応答を送らずに admin の
+     * パイプラインのスロットを 1 つ握ったままにする**(そのスロットの受信は応答を送るまで投稿し直さない)。 */
+    volatile int aer_pending;
+    unsigned     aer_slot;
+    uint16_t     aer_cid;
+    uint64_t     start_tick;   /* SMART の power_on_hours の起点 */
 
     volatile uint8_t *ram_disk;
 
@@ -119,7 +136,17 @@ typedef struct {
     uint32_t resp_dw0;
     uint32_t resp_dw1;
     uint16_t resp_status;
+    /* 1 = データの相手はこのスロットの受信バッファの SQE の後ろ(NVMET_RDMA_STAGE_OFF から
+     * NVMET_RDMA_INLINE_MAX バイト)。範囲の一覧・予約の鍵・Compare の比較データを受け取り、
+     * Report / Get Log Page / Get Features の応答を組み立てる置き場。**受信バッファは応答の SEND が
+     * 終わるまで投稿し直さない**ので、RDMA_READ / RDMA_WRITE が終わるまでほかに使われない。 */
+    uint8_t  stage;
+    uint8_t  defer;     /* 1 = 応答を今は送らない(Asynchronous Event Request)*/
+    uint8_t  id_sel;    /* Identify の応答の出どころ(nvmet_rdma.c の NVMETR_ID_*)*/
+    uint32_t cmp_off;   /* Compare: 比べ終えたバイト数(置き場 4096 バイトずつ RDMA_READ で引く)*/
 } nvmet_rdma_pl_pending_t;
+
+#define NVMET_RDMA_STAGE_OFF 64u
 
 /* SQ(RDMA_WRITE/READ+応答SEND)の完了を先入れ先出しで追跡する。 */
 typedef struct {
@@ -176,6 +203,11 @@ struct nvmet_rdma_ctx {
     int      data_move_is_write;
     int      fab_data;            /* 1ならデータの相手は ctrl->fab_buf */
     uint64_t io_slba;             /* Write時、RDMA_READ完了後にram_diskへコミットする位置 */
+    uint8_t  stage;               /* 1 なら置き場を使うコマンド(非パイプライン経路では扱わない)*/
+    uint8_t  id_sel;
+
+    /* SMART のカウンタ(このキューが処理した数。ログを作るときに足し合わせる)。 */
+    uint64_t st_rd_cmds, st_wr_cmds, st_rd_bytes, st_wr_bytes;
 
     uint64_t deadline;
     int      failed;

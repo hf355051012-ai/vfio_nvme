@@ -495,6 +495,7 @@ static int nvmet_nsid_in_range(uint32_t nsid)
 /*=================================================================
  * SMART の 128bit カウンタを 1 つ書く。上位 8 バイトは 0。
  * ===============================================================*/
+_Static_assert(NVMET_PR_NSID_MAX == NVMET_NSID_MAX, "予約の名前空間の数は NVMET_NSID_MAX と合わせること");
 _Static_assert(NVMET_STAT_CORES == SMP_MAX_CORES,
                "統計スロットの本数は SMP_MAX_CORES と合わせること");
 
@@ -945,14 +946,19 @@ static int nvmet_admin_dispatch(nvmet_ctx_t *ctx, const nvme_sqe_t *sqe,
                     nvmet_auth_reset(&ctx->auth);   /* Discovery は認証しない(Linux も同じ)*/
                 }
                 ctx->ctrlr_id = ctx->cntlid_cfg ? ctx->cntlid_cfg : 1u;
-                /* Connect のデータの先頭 16 バイトがホスト識別子。予約の登録者を見分ける。 */
-                for (unsigned k = 0; k < 16u; k++) ctx->hostid[k] = (data != NULL && dlen >= 16u) ? data[k] : 0u;
                 /* Connect のデータは struct nvmf_connect_data(1024 バイト)で、
                  * offset 256 から subsysnqn[256]。ここが Discovery NQN なら
                  * このセッションは Discovery コントローラになる。 */
                 ctx->is_discovery = 0;
                 if (data != NULL && dlen >= 512u) {
                     ctx->is_discovery = nvmet_nqn_is_discovery(&data[256]);
+                }
+                /* Connect のデータの先頭 16 バイトがホスト識別子。予約の登録者を見分ける
+                 * (Discovery コントローラは名前空間を持たないので通知先にしない)。 */
+                if (!ctx->is_discovery) {
+                    nvmet_pr_connect(&ctx->pr, (data != NULL && dlen >= 16u) ? data : NULL, ctx->ctrlr_id);
+                } else {
+                    nvmet_pr_session_reset(&ctx->pr);
                 }
                 /* **KATO は Connect の cdw12(ミリ秒)。** これまで読み捨てて
                  * いたが、Get Features(FID=0x0F)が返す値なので保存する。
@@ -1230,7 +1236,7 @@ static int nvmet_admin_dispatch(nvmet_ctx_t *ctx, const nvme_sqe_t *sqe,
                 /* Fabrics ではホスト識別子は Connect で決まる(Linux も Command Sequence Error)。 */
                 st = (uint16_t)NVMET_SC_CMD_SEQ_ERROR;
             } else {
-                st = nvmet_pr_set_notify_mask(ctx, nsid, rd32le(&sqe->cdw11), &result);
+                st = nvmet_pr_set_notify_mask(&ctx->pr, nsid, rd32le(&sqe->cdw11), &result);
             }
         } else if (sel == NVME_FEAT_SEL_SAVED) {
             st = (uint16_t)NVMET_SC_FEAT_NOT_SAVEABLE;
@@ -1245,11 +1251,11 @@ static int nvmet_admin_dispatch(nvmet_ctx_t *ctx, const nvme_sqe_t *sqe,
                 st = (uint16_t)NVMET_SC_INVALID_FIELD;
             } else {
                 nvmet_build_cqe(ctx, &cqe, ctx->admin.last_cid, 0u, 0);
-                nvmet_tcp_send_c2h(&ctx->admin, ctx->admin.last_cid, &cqe, ctx->hostid, 16u, 1);
+                nvmet_tcp_send_c2h(&ctx->admin, ctx->admin.last_cid, &cqe, ctx->pr.hostid, 16u, 1);
                 return 0;
             }
         } else {
-            st = nvmet_pr_get_notify_mask(ctx, nsid, &result);
+            st = nvmet_pr_get_notify_mask(&ctx->pr, nsid, &result);
         }
         nvmet_build_cqe(ctx, &cqe, ctx->admin.last_cid, st ? 0u : result, st);
         nvmet_tcp_send_resp(&ctx->admin, &cqe);
@@ -1438,7 +1444,7 @@ static int nvmet_admin_dispatch(nvmet_ctx_t *ctx, const nvme_sqe_t *sqe,
 
         if (lid == NVME_LOG_LID_RESERVATION && !ctx->is_discovery) {
             /* 予約の通知(64 バイト)。**読むたびに 1 件取り出す**(nvmet_pr.c)。 */
-            nvmet_pr_build_log(ctx, ctx->log_page);
+            nvmet_pr_build_log(&ctx->pr, ctx->log_page);
             uint32_t avail = (lpo < 64u) ? (64u - lpo) : 0u;
             uint32_t send  = (bytes < avail) ? bytes : avail;
             nvmet_build_cqe(ctx, &cqe, ctx->admin.last_cid, 0u, 0);
@@ -1629,8 +1635,7 @@ static job_result_t nvmet_admin_session_finish(job_t *self, nvmet_admin_job_ctx_
     ctx->aer_pending       = 0;
     ctx->aer_notify_ns     = 0;
     /* 予約の通知もこのコントローラの分は捨てる(登録そのものはホストに付くので残す)。 */
-    nvmet_pr_session_reset(ctx);
-    for (unsigned k = 0; k < 16u; k++) ctx->hostid[k] = 0;
+    nvmet_pr_session_reset(&ctx->pr);
     /* **kato_expired はここでリセットしない。** IO ジョブがまだ見ていない
      * (この関数は旗を立てた直後に呼ばれる)。消費するのは IO ジョブ側。 */
     ctx->last_cmd_tick     = 0;
@@ -1725,9 +1730,9 @@ static job_result_t nvmet_admin_job_step(job_t *self)
     /* **予約の通知も同じ。** 旗を立てるのは予約のコマンドを処理した IO ジョブ
      * (別のコア、2 ポートのときは別の実体)。Linux の nvmet と同じく、この通知は
      * Asynchronous Event Configuration では止めない(止めるのは Notification Mask)。 */
-    if (ctx->aer_notify_resv && ctx->aer_pending &&
+    if (ctx->pr.aer_notify && ctx->aer_pending &&
         ctx->admin.tcp.state == TCP_ESTABLISHED) {
-        ctx->aer_notify_resv = 0;
+        ctx->pr.aer_notify = 0;
         (void)nvmet_aer_complete(ctx, NVME_AER_CSS, NVME_AEN_RESV_LOG_AVAIL,
                                  NVME_LOG_LID_RESERVATION, 0u);
     }
@@ -2741,8 +2746,9 @@ static void nvmet_io_dispatch_cmd(nvmet_io_job_ctx_t *jc, const uint8_t *hdr_buf
          * あるので、ここは名前空間の解決より前に置く。** 予約の判定は Linux と
          * 同じく書き込みの組として行う(1 つの名前空間を指すときだけ)。 */
         const uint32_t fnsid = rd32le(&sqe.nsid);
-        const uint16_t fst = (fnsid >= 1u && fnsid <= NVMET_NSID_MAX && g_nvmet_pr_held[fnsid - 1u])
-                                 ? nvmet_pr_check_access(ctx, fnsid, opcode) : 0u;
+        const uint16_t fst = (fnsid >= 1u && fnsid <= NVMET_NSID_MAX &&
+                              g_nvmet_pr_held[NVMET_PR_DOM_TCP][fnsid - 1u])
+                                 ? nvmet_pr_check_access(&ctx->pr, fnsid, opcode) : 0u;
         nvmet_build_cqe(ctx, &cqe, cid, 0u, fst);
         nvmet_tcp_send_resp(&jc->io, &cqe);
     } else if ((ns = nvmet_ns_get(ctx, rd32le(&sqe.nsid))) == NULL) {
@@ -2753,8 +2759,8 @@ static void nvmet_io_dispatch_cmd(nvmet_io_job_ctx_t *jc, const uint8_t *hdr_buf
                     rd32le(&sqe.nsid), opcode);
         nvmet_build_cqe(ctx, &cqe, cid, 0u, (uint16_t)NVMET_SC_INVALID_NS);
         nvmet_tcp_send_resp(&jc->io, &cqe);
-    } else if (g_nvmet_pr_held[rd32le(&sqe.nsid) - 1u] &&
-               (pst = nvmet_pr_check_access(ctx, rd32le(&sqe.nsid), opcode)) != 0) {
+    } else if (g_nvmet_pr_held[NVMET_PR_DOM_TCP][rd32le(&sqe.nsid) - 1u] &&
+               (pst = nvmet_pr_check_access(&ctx->pr, rd32le(&sqe.nsid), opcode)) != 0) {
         /* **予約を持つホストがいる名前空間だけここで判定する**(いなければ 1 バイト
          * 読むだけ)。予約のコマンド自身は nvmet_pr_execute() の中で判定する。 */
         uart_printf("[nvmet] 予約と衝突 (nsid=%u opcode=0x%x)\n", rd32le(&sqe.nsid), opcode);
@@ -2918,7 +2924,8 @@ static void nvmet_io_dispatch_cmd(nvmet_io_job_ctx_t *jc, const uint8_t *hdr_buf
          * 受け取るデータが無いので空いている)。 */
         uint32_t olen = 0;
         uint8_t *out = (uint8_t *)data;
-        uint16_t st = nvmet_pr_execute(ctx, rd32le(&sqe.nsid), &sqe, data, dlen, out, &olen);
+        uint16_t st = nvmet_pr_execute(&ctx->pr, rd32le(&sqe.nsid), opcode, rd32le(&sqe.cdw10),
+                                       rd32le(&sqe.cdw11), data, dlen, out, NVMET_DSM_STAGE_BYTES, &olen);
         if (st != 0) {
             uart_printf("[nvmet] 予約のコマンド (opcode=0x%x cdw10=0x%x) -> status=0x%x\n",
                         opcode, rd32le(&sqe.cdw10), st);
@@ -4012,9 +4019,8 @@ int nvmet_job_start(nvmet_ctx_t *ctx, uint16_t port, netif_t *bound_ctx, const c
     ctx->aer_pending        = 0;
     ctx->aer_notify_ns      = 0;
     ctx->kato_expired       = 0;
-    for (unsigned k = 0; k < 16u; k++) ctx->hostid[k] = 0;
-    nvmet_pr_attach(ctx);
-    nvmet_pr_session_reset(ctx);
+    nvmet_pr_attach(&ctx->pr, NVMET_PR_DOM_TCP);
+    nvmet_pr_session_reset(&ctx->pr);
     ctx->last_cmd_tick      = 0;
     ctx->changed_nsid_count = 0;
 
