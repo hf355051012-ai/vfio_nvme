@@ -88,6 +88,7 @@ _Static_assert(sizeof(nvme_keyed_sgl_desc_t) == 16, "must match nvme_sqe_t.dptr[
 #define NVME_ADM_CMD_DELETE_CQ     0x04u
 #define NVME_ADM_CMD_CREATE_CQ     0x05u
 #define NVME_ADM_CMD_GET_LOG_PAGE  0x02u
+#define NVME_ADM_CMD_ABORT         0x08u
 #define NVME_ADM_CMD_IDENTIFY      0x06u
 #define NVME_ADM_CMD_ASYNC_EVENT   0x0Cu
 #define NVME_ADM_CMD_SET_FEATURES  0x09u
@@ -98,8 +99,21 @@ _Static_assert(sizeof(nvme_keyed_sgl_desc_t) == 16, "must match nvme_sqe_t.dptr[
 #define NVME_IO_CMD_FLUSH         0x00u
 #define NVME_IO_CMD_WRITE         0x01u
 #define NVME_IO_CMD_READ          0x02u
+#define NVME_IO_CMD_COMPARE       0x05u
 #define NVME_IO_CMD_WRITE_ZEROES  0x08u
 #define NVME_IO_CMD_DSM           0x09u
+#define NVME_IO_CMD_RESV_REGISTER 0x0Du
+#define NVME_IO_CMD_RESV_REPORT   0x0Eu
+#define NVME_IO_CMD_RESV_ACQUIRE  0x11u
+#define NVME_IO_CMD_RESV_RELEASE  0x15u
+#define NVME_IO_CMD_COPY          0x19u
+
+/* Copy の Source Range Entry(Descriptor Format 0、32 バイト)。SPDK の
+ * struct spdk_nvme_scc_source_range と同じ配置。**NLB は 0's based**
+ * (Write と同じ。DSM の範囲リストの NLB とは違う)。 */
+#define NVME_COPY_RANGE_LEN    32u
+#define NVME_COPY_OFF_SLBA      8u
+#define NVME_COPY_OFF_NLB      16u
 
 /* Dataset Management の cdw11(属性)。値は Linux の enum { NVME_DSMGMT_* }。 */
 #define NVME_DSMGMT_IDR  0x1u   /* Integral Dataset for Read(ヒント)*/
@@ -130,6 +144,8 @@ _Static_assert(sizeof(nvme_keyed_sgl_desc_t) == 16, "must match nvme_sqe_t.dptr[
 #define NVME_FEAT_NUM_QUEUES   0x07u
 #define NVME_FEAT_ASYNC_EVENT  0x0Bu
 #define NVME_FEAT_KATO         0x0Fu
+#define NVME_FEAT_HOST_ID      0x81u   /* Host Identifier(Get は cdw11 bit0 = EXHID で 16 バイト)*/
+#define NVME_FEAT_RESV_MASK    0x82u   /* Reservation Notification Mask(名前空間ごと)*/
 
 /* Get Features の Select(cdw10 bit 10:8)。Set Features の Save は cdw10 bit31。 */
 #define NVME_FEAT_SEL_CURRENT    0u
@@ -148,6 +164,7 @@ _Static_assert(sizeof(nvme_keyed_sgl_desc_t) == 16, "must match nvme_sqe_t.dptr[
 #define NVME_LOG_LID_SMART      0x02u
 #define NVME_LOG_LID_CHANGED_NS 0x04u
 #define NVME_LOG_LID_DISCOVERY  0x70u
+#define NVME_LOG_LID_RESERVATION 0x80u  /* Reservation Notification(64 バイト、struct nvme_pr_log)*/
 
 /* Changed Namespace List(LID=0x04)は 32bit の NSID を 1024 個。
  * **読み出したらクリアする**のが仕様。 */
@@ -159,6 +176,8 @@ _Static_assert(sizeof(nvme_keyed_sgl_desc_t) == 16, "must match nvme_sqe_t.dptr[
 #define NVME_AER_SMART   1u
 #define NVME_AER_NOTICE  2u
 #define NVME_AER_NOTICE_NS_CHANGED 0x00u
+#define NVME_AER_CSS     6u   /* I/O Command Specific Status。予約の通知はこれ */
+#define NVME_AEN_RESV_LOG_AVAIL 0x00u   /* Event Info: Reservation Log Page Available */
 
 /* Set Features(FID=0x0B)と Identify Controller の OAES(offset 92)で
  * 使うビット。**OAES を立てないと Linux は AEN を有効化せず、
@@ -220,9 +239,14 @@ _Static_assert(sizeof(nvme_keyed_sgl_desc_t) == 16, "must match nvme_sqe_t.dptr[
 #define NVME_ID_CTRL_NVM_OFF_DMSL   8u   /* DSM: 1 コマンド合計の最大論理ブロック数 */
 
 /* Identify Controller の ONCS(offset 520)。値は Linux の NVME_CTRL_ONCS_*。 */
+#define NVME_CTRL_ONCS_COMPARE      (1u << 0)
 #define NVME_CTRL_ONCS_DSM          (1u << 2)
 #define NVME_CTRL_ONCS_WRITE_ZEROES (1u << 3)
+#define NVME_CTRL_ONCS_RESERVATIONS (1u << 5)
+#define NVME_CTRL_ONCS_COPY         (1u << 8)   /* SPDK の oncs.nvmcpys */
 #define NVME_ID_CTRL_OFF_ONCS      520u
+#define NVME_ID_CTRL_OFF_ACL       258u  /* Abort Command Limit、**0's based** */
+#define NVME_ID_CTRL_OFF_OCFS      534u  /* Optional Copy Formats Supported(bit0 = Format 0)*/
 #define NVME_ID_CTRL_OFF_LPA       261u  /* Log Page Attributes */
 #define NVME_ID_CTRL_OFF_ELPE      262u  /* Error Log Page Entries、**0's based** */
 
@@ -236,7 +260,13 @@ _Static_assert(sizeof(nvme_keyed_sgl_desc_t) == 16, "must match nvme_sqe_t.dptr[
 
 #define NVME_ID_NS_OFF_FLBAS   26u   /* offset within the 4096B Identify Namespace buffer */
 #define NVME_ID_NS_OFF_LBAF0   128u  /* LBA Format 0 descriptor offset (4 bytes each) */
+#define NVME_ID_NS_OFF_NMIC     30u  /* struct nvme_id_ns の nmic */
+#define NVME_ID_NS_OFF_RESCAP   31u  /* struct nvme_id_ns の rescap(予約の種類)*/
 #define NVME_ID_NS_OFF_DLFEAT   33u  /* struct nvme_id_ns の dlfeat */
+/* Copy の上限(NVM Command Set。Linux の struct nvme_id_ns では rsvd74[18] の中)。 */
+#define NVME_ID_NS_OFF_MSSRL    74u  /* 1 範囲の最大論理ブロック数(2 バイト)*/
+#define NVME_ID_NS_OFF_MCL      76u  /* 1 コマンド合計の最大論理ブロック数(4 バイト)*/
+#define NVME_ID_NS_OFF_MSRC     80u  /* 1 コマンドの最大範囲数、**0's based** */
 #define NVME_ID_NS_OFF_NGUID   104u  /* struct nvme_id_ns の nguid[16] */
 #define NVME_ID_NS_OFF_EUI64   120u  /* struct nvme_id_ns の eui64[8] */
 

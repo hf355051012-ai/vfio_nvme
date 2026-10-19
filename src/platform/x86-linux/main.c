@@ -22,6 +22,7 @@
 #include "nvme.h"
 #include "nvmet.h"
 #include "nvmet_rdma.h"
+#include "nvmet_pr.h"
 #include "iscsi.h"
 #include "iscsit.h"
 #include "iscsit_iser.h"
@@ -7546,6 +7547,9 @@ static void shell_dispatch(char *line, int s0, int s1)
             return;
         }
         job_park_stats_dump();
+    } else if (strncmp(line, "nvmetpr", 7) == 0) {
+        /* 予約(Reservation)の状態: 名前空間ごとの登録者・保持者・世代。 */
+        nvmet_pr_show();
     } else if (strncmp(line, "nvmens", 6) == 0) {
         /* 名前空間の一覧 / 追加 / 削除。**稼働中に叩くと D6 の AER が発火し、
          * ホストが名前空間を再スキャンする**(D8 と組で確かめる項目)。 */
@@ -7957,6 +7961,7 @@ static void shell_dispatch(char *line, int s0, int s1)
                     "  qploop [N]                            RC QPの作成/破棄をN回繰り返しFWリソース枯渇を見る\n"
                     "  nvmediscover [dump]                   Discovery Log Pageを取得(dumpで16進出力)\n"
                     "  nvmens [add <nsid> | del <nsid>]      名前空間の一覧/追加/削除(AERで通知)\n"
+                    "  nvmetpr                               予約(Reservation)の登録者・保持者・世代\n"
                     "  nvmetqueues [N]                       ターゲットのIOキュー本数(1=従来、最大4。次のセッションから)\n"
                     "  jobpark [on|off|clear]                眠っているジョブをスケジューラが飛ばす(off=陰性対照)\n"
                     "  nvmet [port] | jobs | help | quit    (↑↓で履歴呼び出し)\n"

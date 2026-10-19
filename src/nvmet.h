@@ -172,6 +172,14 @@ typedef struct {
     uint8_t  id_ns[4096] __attribute__((aligned(64)));
 } nvmet_ns_t;
 
+/* Reservation Notification ログの 1 件(nvmet_pr.c が LID=0x80 の 64 バイトに組み立てる)。 */
+#define NVMET_PR_LOG_SLOTS 16u
+typedef struct {
+    uint64_t count;
+    uint32_t nsid;
+    uint8_t  type;   /* 1 = 登録を奪われた / 2 = 予約が解放された / 3 = 予約を奪われた */
+} nvmet_pr_log_t;
+
 typedef struct {
     nvmet_tcp_conn_t admin;
     uint16_t ctrlr_id;   /* cntlid(既定 1)*/
@@ -253,6 +261,18 @@ typedef struct {
      * 仕様なので、溜めておく必要がある。0 = 変更なし。 */
     uint32_t changed_nsid[NVME_MAX_CHANGED_NAMESPACES];
     uint32_t changed_nsid_count;
+
+    /* admin の Connect のデータ(offset 0)で受け取ったホスト識別子(128 ビット)。
+     * 予約(Reservation)の登録者はこれで見分ける(nvmet_pr.c)。 */
+    uint8_t  hostid[16];
+    /* Reservation Notification ログ(LID=0x80)の待ち行列。**予約の状態が変わった
+     * コマンドを処理したコア(IO ジョブ)が積み、admin ジョブが AER で知らせる。**
+     * 積むのも取り出すのも nvmet_pr.c のロックの中。 */
+    nvmet_pr_log_t pr_log[NVMET_PR_LOG_SLOTS];
+    uint32_t pr_log_head, pr_log_tail;
+    uint64_t pr_log_counter;     /* 最後に積んだログの通し番号(0 は使わない)*/
+    uint64_t pr_log_lost;        /* 待ち行列が満杯で捨てた数 */
+    volatile int aer_notify_resv;
 
     /* 名前空間。nsid はこの配列の添字 + 1。 */
     nvmet_ns_t ns[NVMET_NSID_MAX];
