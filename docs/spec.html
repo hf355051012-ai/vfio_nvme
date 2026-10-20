@@ -1492,7 +1492,7 @@ rd32le(p)   /* リトルエンディアン版 */</code></pre></div>
 <h5>ヘッダの構造</h5>
 <p>IPv4 のヘッダは最低 20 バイトで、後ろに可変長のオプションが付きうる。</p>
 <figure class="diagram"><pre class="mermaid">packet-beta
-  0-3: "版(4)"
+  0-3: "バージョン(4)"
   4-7: "ヘッダ長"
   8-15: "TOS"
   16-31: "全体の長さ"
@@ -1507,7 +1507,7 @@ rd32le(p)   /* リトルエンディアン版 */</code></pre></div>
   160-191: "オプション(可変、普通は無い)"</pre></figure>
 <p>IPv6 のヘッダは <strong>40 バイト固定</strong>で、オプションは持たない(拡張ヘッダとして後ろに数珠つなぎにする、下の (4))。</p>
 <figure class="diagram"><pre class="mermaid">packet-beta
-  0-3: "版(6)"
+  0-3: "バージョン(6)"
   4-11: "トラフィッククラス"
   12-31: "フローラベル"
   32-47: "ペイロードの長さ"
@@ -1516,7 +1516,7 @@ rd32le(p)   /* リトルエンディアン版 */</code></pre></div>
   64-191: "送信元アドレス(128 ビット)"
   192-319: "宛先アドレス(128 ビット)"</pre></figure>
 <p>欄ごとの対応は次のとおりである。</p>
-<div class="tablewrap"><table><thead><tr><th>IPv4</th><th>IPv6</th><th>違い</th></tr></thead><tbody><tr><td>版(4)</td><td>版(6)</td><td>値だけ</td></tr><tr><td>ヘッダ長</td><td>—</td><td><strong>削除</strong>。基本ヘッダは 40 バイト固定</td></tr><tr><td>TOS</td><td>トラフィッククラス</td><td>名前が変わっただけ(優先度と輻輳の通知)</td></tr><tr><td>全体の長さ(ヘッダを含む)</td><td>ペイロードの長さ</td><td><strong>基本ヘッダ 40 バイトを含まない</strong>(拡張ヘッダは含む)</td></tr><tr><td>識別子 / フラグ / 断片の位置</td><td>—</td><td><strong>基本ヘッダから外れた</strong>。分割するときだけ Fragment 拡張ヘッダ(8 バイト)を挟む</td></tr><tr><td>TTL</td><td>ホップ数の上限</td><td>名前が変わっただけ(中継のたびに 1 減らし、0 で捨てる)</td></tr><tr><td>プロトコル</td><td>次のヘッダ</td><td>上位のプロトコル(TCP = 6、UDP = 17)に加え、<strong>拡張ヘッダの種別も指す</strong></td></tr><tr><td>ヘッダのチェックサム</td><td>—</td><td><strong>削除</strong>(下の「無くなったもの」)</td></tr><tr><td>送信元 / 宛先アドレス(32 ビット)</td><td>送信元 / 宛先アドレス(128 ビット)</td><td>4 倍の長さ</td></tr><tr><td>オプション(可変長)</td><td>—</td><td><strong>削除</strong>。拡張ヘッダに置き換わった</td></tr><tr><td>—</td><td>フローラベル(20 ビット)</td><td><strong>追加</strong>。同じ流れのパケットに同じ値を付ける(このソフトは 0 を入れる)</td></tr></tbody></table></div>
+<div class="tablewrap"><table><thead><tr><th>IPv4</th><th>IPv6</th><th>違い</th></tr></thead><tbody><tr><td>バージョン(4)</td><td>バージョン(6)</td><td>値だけ</td></tr><tr><td>ヘッダ長</td><td>—</td><td><strong>削除</strong>。基本ヘッダは 40 バイト固定</td></tr><tr><td>TOS</td><td>トラフィッククラス</td><td>名前が変わっただけ(優先度と輻輳の通知)</td></tr><tr><td>全体の長さ(ヘッダを含む)</td><td>ペイロードの長さ</td><td><strong>基本ヘッダ 40 バイトを含まない</strong>(拡張ヘッダは含む)</td></tr><tr><td>識別子 / フラグ / 断片の位置</td><td>—</td><td><strong>基本ヘッダから外れた</strong>。分割するときだけ Fragment 拡張ヘッダ(8 バイト)を挟む</td></tr><tr><td>TTL</td><td>ホップ数の上限</td><td>名前が変わっただけ(中継のたびに 1 減らし、0 で捨てる)</td></tr><tr><td>プロトコル</td><td>次のヘッダ</td><td>上位のプロトコル(TCP = 6、UDP = 17)に加え、<strong>拡張ヘッダの種別も指す</strong></td></tr><tr><td>ヘッダのチェックサム</td><td>—</td><td><strong>削除</strong>(下の「無くなったもの」)</td></tr><tr><td>送信元 / 宛先アドレス(32 ビット)</td><td>送信元 / 宛先アドレス(128 ビット)</td><td>4 倍の長さ</td></tr><tr><td>オプション(可変長)</td><td>—</td><td><strong>削除</strong>。拡張ヘッダに置き換わった</td></tr><tr><td>—</td><td>フローラベル(20 ビット)</td><td><strong>追加</strong>。同じ流れのパケットに同じ値を付ける(このソフトは 0 を入れる)</td></tr></tbody></table></div>
 <h5>IPv6 で加わったもの</h5>
 <p>IPv6 は IPv4 に次の 4 つを加えた。<br>IPv4 にも似た仕組みはあるが、別の規格として後から足されたもので、無くても IPv4 は動く。<br>IPv6 ではこれらが前提になっている。</p>
 <div class="tablewrap"><table><thead><tr><th></th><th>IPv6 で加わったもの</th><th>IPv4 では</th></tr></thead><tbody><tr><td>(1)</td><td>リンクローカルアドレス(常に持つ)</td><td>169.254.0.0/16 があるが、DHCP が無いときだけ使う</td></tr><tr><td>(2)</td><td>SLAAC(アドレスを自分で作る)</td><td>無い。DHCP のサーバに配ってもらう</td></tr><tr><td>(3)</td><td>MLD(マルチキャストの参加表明、ICMPv6 の一部)</td><td>IGMP(別のプロトコル)。IPv4 の ARP はブロードキャストなので、無くても隣を見つけられる</td></tr><tr><td>(4)</td><td>拡張ヘッダ(数珠つなぎの追加情報)</td><td>ヘッダの中のオプション欄(最大 40 バイト)</td></tr></tbody></table></div>
