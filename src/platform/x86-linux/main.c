@@ -2120,6 +2120,7 @@ static void shell_tcpsack(char *args)
  * シェルの `tcprack`。RACK-TLP(RFC 8985)と undo(RFC 3708 / 3522)の切り替えと統計。
  *
  * `tcprack [on|off]` で RACK、`tcprack tlp on|off` で TLP、`tcprack undo on|off` で undo、
+ * `tcprack prr on|off` で PRR、`tcprack minrtt <ms>` で最小の往復時間の窓、`tcprack show` で接続ごとの状態、
  * `tcprack clear` で統計を 0 にする。**どれも既存の接続にもすぐ効く**(接続ごとの合意が無い)。
  * RACK を off にすると重複 ACK 3 個の高速再送と partial ACK の送り直しへ戻る(陰性対照)。
  *
@@ -2134,6 +2135,16 @@ static void shell_tcprack(char *args)
     volatile uint32_t *knob = &g_tcp_rack_enable;
     if (strncmp(args, "tlp", 3) == 0) { knob = &g_tcp_tlp_enable; args += 3; }
     else if (strncmp(args, "undo", 4) == 0) { knob = &g_tcp_undo_enable; args += 4; }
+    else if (strncmp(args, "prr", 3) == 0) { knob = &g_tcp_prr_enable; args += 3; }
+    else if (strncmp(args, "minrtt", 6) == 0) {
+        int v = atoi(args + 6);
+        if (v > 0) g_tcp_rack_minrtt_win_ms = (uint32_t)v;
+        uart_printf("tcprack: 最小の往復時間の窓 = %u ms\n", (unsigned)g_tcp_rack_minrtt_win_ms);
+        return;
+    } else if (strncmp(args, "show", 4) == 0) {
+        tcp_rack_show();
+        return;
+    }
     while (*args == ' ') args++;
     if (strncmp(args, "on", 2) == 0) {
         *knob = 1;
@@ -2144,11 +2155,13 @@ static void shell_tcprack(char *args)
         g_tcp_rack_dup_skip = g_tcp_rack_reord = 0;
         g_tcp_tlp_probes = g_tcp_tlp_recovered = g_tcp_tlp_redundant = 0;
         g_tcp_dsack_rx = g_tcp_undo_armed = g_tcp_undo_dsack = g_tcp_undo_ts = 0;
+        g_tcp_prr_deferred = g_tcp_undo_log_over = g_tcp_undo_dsack_foreign = 0;
+        g_tcp_prr_unstall = 0;
         g_tcp_retransmit_segs = 0;
     }
-    uart_printf("tcprack: RACK %s / TLP %s / undo %s(SACK を合意した接続の非同期送信で働く)\n",
+    uart_printf("tcprack: RACK %s / TLP %s / undo %s / PRR %s(SACK を合意した接続の非同期送信で働く)\n",
                 g_tcp_rack_enable ? "on" : "off", g_tcp_tlp_enable ? "on" : "off",
-                g_tcp_undo_enable ? "on" : "off");
+                g_tcp_undo_enable ? "on" : "off", g_tcp_prr_enable ? "on" : "off");
     uart_printf("tcprack: RACK 失われたと見て送り直し=%u(窓が過ぎるのを待ったもの %u)/ 回復に入った=%u / "
                 "重複ACK 3 個を任された=%u / 入れ替わりを見た接続=%u\n",
                 (unsigned)g_tcp_rack_lost, (unsigned)g_tcp_rack_lost_timer,
@@ -2161,6 +2174,9 @@ static void shell_tcprack(char *args)
                 (unsigned)g_tcp_dsack_rx, (unsigned)g_tcp_undo_armed,
                 (unsigned)g_tcp_undo_dsack, (unsigned)g_tcp_undo_ts,
                 (unsigned)g_tcp_retransmit_segs);
+    uart_printf("tcprack: PRR で送り直しを後回し=%u / 手詰まりで枠を開けた=%u / 控えが溢れた回復=%u / 控えに無い範囲への DSACK=%u\n",
+                (unsigned)g_tcp_prr_deferred, (unsigned)g_tcp_prr_unstall, (unsigned)g_tcp_undo_log_over,
+                (unsigned)g_tcp_undo_dsack_foreign);
 }
 
 /*=================================================================

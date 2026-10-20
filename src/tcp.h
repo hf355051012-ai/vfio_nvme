@@ -98,6 +98,14 @@ extern volatile uint32_t g_tcp_dsack_rx;
 extern volatile uint32_t g_tcp_undo_armed;
 extern volatile uint32_t g_tcp_undo_dsack;
 extern volatile uint32_t g_tcp_undo_ts;
+extern volatile uint32_t g_tcp_prr_enable;        /* PRR(RFC 6937)。既定 1 */
+extern volatile uint32_t g_tcp_prr_deferred;      /* PRR の枠が無くて送り直しを後回しにした回数 */
+extern volatile uint32_t g_tcp_prr_unstall;       /* 回復中に何も届かず PRR の枠を 1 MSS 開けた回数 */
+extern volatile uint32_t g_tcp_undo_log_over;     /* 送り直しの控えが入り切らなかった回復 */
+extern volatile uint32_t g_tcp_undo_dsack_foreign;/* この回復で送り直していない範囲への DSACK */
+extern volatile uint32_t g_tcp_rack_minrtt_win_ms;/* 最小の往復時間の窓(既定 10,000 ms)*/
+/* 接続ごとの RACK / PRR / undo の状態を表示する(`tcprack show`)。 */
+void tcp_rack_show(void);
 
 /* **実際に送り直したセグメント数。** g_tcp_retransmit_count は「再送を始めた
  * 回数」なので、Go-Back-N と SACK の差はこちらでないと見えない。 */
