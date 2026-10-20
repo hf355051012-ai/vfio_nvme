@@ -151,22 +151,60 @@ body{
   color:var(--ink-3);text-decoration:none;
 }
 .navpartlink:hover{color:var(--accent)}
-.navpart > ul > li > a{
-  display:flex;gap:9px;align-items:baseline;
-  padding:5px 10px;border-radius:5px;
+.chrow{display:flex;align-items:stretch}
+.chtog{
+  flex:0 0 18px;width:18px;padding:0;margin:0;border:0;background:none;cursor:pointer;
+  color:var(--ink-3);border-radius:4px;position:relative;
+}
+.chtog::before{
+  content:"";position:absolute;left:6px;top:50%;width:5px;height:5px;margin-top:-4px;
+  border-right:1.5px solid currentColor;border-bottom:1.5px solid currentColor;
+  transform:rotate(-45deg);transition:transform .15s;
+}
+.chtog[aria-expanded="true"]::before{transform:rotate(45deg);margin-top:-5px}
+.chtog:hover{color:var(--accent);background:var(--accent-wash)}
+.chtog:focus-visible{outline:2px solid var(--accent);outline-offset:-1px}
+.chtog.nosec{cursor:default}
+.chtog.nosec::before{display:none}
+.chlink{
+  flex:1;min-width:0;display:flex;gap:9px;align-items:baseline;
+  padding:5px 10px 5px 6px;border-radius:5px;
   color:var(--ink-2);text-decoration:none;font-size:13.2px;line-height:1.5;
   border-left:2px solid transparent;
 }
-.navpart > ul > li > a:hover{background:var(--accent-wash);color:var(--ink)}
-.navpart > ul > li > a.active{
+.chlink:hover{background:var(--accent-wash);color:var(--ink)}
+.chlink.active{
   background:var(--accent-wash);color:var(--accent);font-weight:600;
   border-left-color:var(--accent);
 }
+/* 本文のリンクの下線と箇条書きの間隔をナビでは打ち消す */
+.chlink,.seclink,.navpartlink{border-bottom:0}
+.navchap{margin:0 0 1px}
+.navsecs > li{margin:0}
+.navsecs{display:none;margin:1px 0 6px 26px !important;border-left:1px solid var(--line-2)}
+.navchap.open > .navsecs{display:block}
+.seclink{
+  display:flex;gap:7px;align-items:baseline;
+  padding:3px 8px 3px 10px;margin-left:-1px;
+  color:var(--ink-3);text-decoration:none;font-size:12.3px;line-height:1.45;
+  border-left:2px solid transparent;
+}
+.seclink .num{min-width:2.6em;text-align:left;font-size:10.5px}
+.seclink:hover{color:var(--ink);background:var(--accent-wash)}
+.seclink.active{color:var(--accent);font-weight:600;border-left-color:var(--accent)}
+.seclink.active .num{color:var(--accent)}
+.navtools{display:flex;gap:6px;margin-top:8px}
+.navtools button{
+  flex:1;background:var(--surface);color:var(--ink-2);border:1px solid var(--line-2);border-radius:5px;
+  font:inherit;font-size:12px;padding:3px 0;cursor:pointer;
+}
+.navtools button:hover{color:var(--accent);border-color:var(--accent)}
+.navtools button:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
 .num{
   font-family:"IBM Plex Mono",ui-monospace,monospace;font-size:11px;
   font-variant-numeric:tabular-nums;color:var(--ink-3);min-width:1.6em;text-align:right;flex:0 0 auto;
 }
-.navpart > ul > li > a.active .num{color:var(--accent)}
+.chlink.active .num{color:var(--accent)}
 .lbl{flex:1}
 
 /* ---------- 本文 ---------- */
@@ -319,7 +357,10 @@ try { var w0 = localStorage.getItem('spec-width2');
       <p class="docsub">32 chapters &middot; 4 appendices</p>
     </div>
     <div class="filterwrap">
-      <input id="filter" type="search" placeholder="章を絞り込む" autocomplete="off">
+      <input id="filter" type="search" placeholder="章・節を絞り込む" autocomplete="off">
+      <div class="navtools">
+        <button type="button" id="openall">節をすべて開く</button><button type="button" id="closeall">すべて閉じる</button>
+      </div>
       <div class="widthsel" role="group" aria-label="本文の幅">
         <span>幅</span>
         <div class="seg">
@@ -330,59 +371,419 @@ try { var w0 = localStorage.getItem('spec-width2');
     <div class="navscroll">
       <ul id="navroot">
 <li class="navpart"><a class="navpartlink" href="#part-0">第 I 部 はじめに</a><ul>
-<li><a href="#ch1" data-target="ch1"><span class="num">1</span><span class="lbl">このソフトは何か</span></a></li>
-<li><a href="#ch2" data-target="ch2"><span class="num">2</span><span class="lbl">なぜカーネルを通さないのか</span></a></li>
+<li class="navchap"><div class="chrow"><button type="button" class="chtog" aria-expanded="false" aria-label="節を開閉"></button><a class="chlink" href="#ch1" data-target="ch1"><span class="num">1</span><span class="lbl">このソフトは何か</span></a></div>
+<ul class="navsecs">
+<li><a class="seclink" href="#s1-1" data-target="s1-1"><span class="num">1.1</span><span class="lbl">前提知識</span></a></li>
+<li><a class="seclink" href="#s1-2" data-target="s1-2"><span class="num">1.2</span><span class="lbl">使う機材</span></a></li>
+<li><a class="seclink" href="#s1-3" data-target="s1-3"><span class="num">1.3</span><span class="lbl">このソフトがやること</span></a></li>
+<li><a class="seclink" href="#s1-4" data-target="s1-4"><span class="num">1.4</span><span class="lbl">実際に動かすとこう見える</span></a></li>
+<li><a class="seclink" href="#s1-5" data-target="s1-5"><span class="num">1.5</span><span class="lbl">何をしないか(目的外のこと)</span></a></li>
+</ul>
+</li>
+<li class="navchap"><div class="chrow"><button type="button" class="chtog" aria-expanded="false" aria-label="節を開閉"></button><a class="chlink" href="#ch2" data-target="ch2"><span class="num">2</span><span class="lbl">なぜカーネルを通さないのか</span></a></div>
+<ul class="navsecs">
+<li><a class="seclink" href="#s2-1" data-target="s2-1"><span class="num">2.1</span><span class="lbl">普通のプログラムがデータを送るとき</span></a></li>
+<li><a class="seclink" href="#s2-2" data-target="s2-2"><span class="num">2.2</span><span class="lbl">このソフトのやり方</span></a></li>
+<li><a class="seclink" href="#s2-3" data-target="s2-3"><span class="num">2.3</span><span class="lbl">代償</span></a></li>
+<li><a class="seclink" href="#s2-4" data-target="s2-4"><span class="num">2.4</span><span class="lbl">どのくらい速いのか</span></a></li>
+</ul>
+</li>
 </ul></li>
 <li class="navpart"><a class="navpartlink" href="#part-1">第 II 部 ハードウェアを直接動かす</a><ul>
-<li><a href="#ch3" data-target="ch3"><span class="num">3</span><span class="lbl">PC とデバイスはどう繋がっているか</span></a></li>
-<li><a href="#ch4" data-target="ch4"><span class="num">4</span><span class="lbl">VFIO — ユーザ空間からデバイスを掴む</span></a></li>
-<li><a href="#ch5" data-target="ch5"><span class="num">5</span><span class="lbl">ネットワークカードの動かし方</span></a></li>
+<li class="navchap"><div class="chrow"><button type="button" class="chtog" aria-expanded="false" aria-label="節を開閉"></button><a class="chlink" href="#ch3" data-target="ch3"><span class="num">3</span><span class="lbl">PC とデバイスはどう繋がっているか</span></a></div>
+<ul class="navsecs">
+<li><a class="seclink" href="#s3-1" data-target="s3-1"><span class="num">3.1</span><span class="lbl">PCI Express — 部品を挿す口</span></a></li>
+<li><a class="seclink" href="#s3-2" data-target="s3-2"><span class="num">3.2</span><span class="lbl">レジスタと MMIO — 番地に代入するとハードが動く</span></a></li>
+<li><a class="seclink" href="#s3-3" data-target="s3-3"><span class="num">3.3</span><span class="lbl">3 種類のアドレス</span></a></li>
+<li><a class="seclink" href="#s3-4" data-target="s3-4"><span class="num">3.4</span><span class="lbl">DMA — デバイスがメモリを直接読み書きする</span></a></li>
+<li><a class="seclink" href="#s3-5" data-target="s3-5"><span class="num">3.5</span><span class="lbl">IOMMU — デバイス用の MMU</span></a></li>
+<li><a class="seclink" href="#s3-6" data-target="s3-6"><span class="num">3.6</span><span class="lbl">hugepage — なぜ普通のメモリでは困るのか</span></a></li>
+<li><a class="seclink" href="#s3-7" data-target="s3-7"><span class="num">3.7</span><span class="lbl">割り込みとポーリング</span></a></li>
+</ul>
+</li>
+<li class="navchap"><div class="chrow"><button type="button" class="chtog" aria-expanded="false" aria-label="節を開閉"></button><a class="chlink" href="#ch4" data-target="ch4"><span class="num">4</span><span class="lbl">VFIO — ユーザ空間からデバイスを掴む</span></a></div>
+<ul class="navsecs">
+<li><a class="seclink" href="#s4-1" data-target="s4-1"><span class="num">4.1</span><span class="lbl">VFIO とは</span></a></li>
+<li><a class="seclink" href="#s4-2" data-target="s4-2"><span class="num">4.2</span><span class="lbl">デバイスをカーネルから取り上げる</span></a></li>
+<li><a class="seclink" href="#s4-3" data-target="s4-3"><span class="num">4.3</span><span class="lbl">IOMMU グループ — まとめてしか貸せない</span></a></li>
+<li><a class="seclink" href="#s4-4" data-target="s4-4"><span class="num">4.4</span><span class="lbl">使う手順</span></a></li>
+<li><a class="seclink" href="#s4-5" data-target="s4-5"><span class="num">4.5</span><span class="lbl">このソフトでの実装</span></a></li>
+</ul>
+</li>
+<li class="navchap"><div class="chrow"><button type="button" class="chtog" aria-expanded="false" aria-label="節を開閉"></button><a class="chlink" href="#ch5" data-target="ch5"><span class="num">5</span><span class="lbl">ネットワークカードの動かし方</span></a></div>
+<ul class="navsecs">
+<li><a class="seclink" href="#s5-1" data-target="s5-1"><span class="num">5.1</span><span class="lbl">レジスタを直接叩くだけでは動かない</span></a></li>
+<li><a class="seclink" href="#s5-2" data-target="s5-2"><span class="num">5.2</span><span class="lbl">キューとリングバッファ</span></a></li>
+<li><a class="seclink" href="#s5-3" data-target="s5-3"><span class="num">5.3</span><span class="lbl">WQE と CQE</span></a></li>
+<li><a class="seclink" href="#s5-4" data-target="s5-4"><span class="num">5.4</span><span class="lbl">doorbell — 「置いたよ」の伝え方</span></a></li>
+<li><a class="seclink" href="#s5-5" data-target="s5-5"><span class="num">5.5</span><span class="lbl">bring-up の順序</span></a></li>
+<li><a class="seclink" href="#s5-6" data-target="s5-6"><span class="num">5.6</span><span class="lbl">PD と MKey — メモリの使用許可証</span></a></li>
+<li><a class="seclink" href="#s5-7" data-target="s5-7"><span class="num">5.7</span><span class="lbl">フローステアリング — 届いたフレームをどこへ入れるか</span></a></li>
+<li><a class="seclink" href="#s5-8" data-target="s5-8"><span class="num">5.8</span><span class="lbl">QP — RDMA 用の「通信の口」</span></a></li>
+<li><a class="seclink" href="#s5-9" data-target="s5-9"><span class="num">5.9</span><span class="lbl">このドライバが読み書きするレジスタ</span></a></li>
+</ul>
+</li>
 </ul></li>
 <li class="navpart"><a class="navpartlink" href="#part-2">第 III 部 ネットワークの基礎と、この実装</a><ul>
-<li><a href="#ch6" data-target="ch6"><span class="num">6</span><span class="lbl">パケットは入れ子の箱</span></a></li>
-<li><a href="#ch7" data-target="ch7"><span class="num">7</span><span class="lbl">隣の機器を見つける(ARP / NDP)</span></a></li>
-<li><a href="#ch8" data-target="ch8"><span class="num">8</span><span class="lbl">IP — 住所と道案内</span></a></li>
-<li><a href="#ch9" data-target="ch9"><span class="num">9</span><span class="lbl">ICMP — 「届かなかった」を伝える</span></a></li>
-<li><a href="#ch10" data-target="ch10"><span class="num">10</span><span class="lbl">TCP — 信頼できるバイトの流れを作る</span></a></li>
-<li><a href="#ch11" data-target="ch11"><span class="num">11</span><span class="lbl">UDP と IPv6</span></a></li>
+<li class="navchap"><div class="chrow"><button type="button" class="chtog" aria-expanded="false" aria-label="節を開閉"></button><a class="chlink" href="#ch6" data-target="ch6"><span class="num">6</span><span class="lbl">パケットは入れ子の箱</span></a></div>
+<ul class="navsecs">
+<li><a class="seclink" href="#s6-1" data-target="s6-1"><span class="num">6.1</span><span class="lbl">一番大事な図</span></a></li>
+<li><a class="seclink" href="#s6-2" data-target="s6-2"><span class="num">6.2</span><span class="lbl">バイトオーダー — 数値の並べ方</span></a></li>
+<li><a class="seclink" href="#s6-3" data-target="s6-3"><span class="num">6.3</span><span class="lbl">チェックサム — 壊れていないことの確認</span></a></li>
+<li><a class="seclink" href="#s6-4" data-target="s6-4"><span class="num">6.4</span><span class="lbl">MTU — 1 個のフレームに入る大きさの上限</span></a></li>
+<li><a class="seclink" href="#s6-5" data-target="s6-5"><span class="num">6.5</span><span class="lbl">このソフトでの受信の入口</span></a></li>
+</ul>
+</li>
+<li class="navchap"><div class="chrow"><button type="button" class="chtog" aria-expanded="false" aria-label="節を開閉"></button><a class="chlink" href="#ch7" data-target="ch7"><span class="num">7</span><span class="lbl">隣の機器を見つける(ARP / NDP)</span></a></div>
+<ul class="navsecs">
+<li><a class="seclink" href="#s7-1" data-target="s7-1"><span class="num">7.1</span><span class="lbl">なぜ 2 種類のアドレスが要るのか</span></a></li>
+<li><a class="seclink" href="#s7-2" data-target="s7-2"><span class="num">7.2</span><span class="lbl">ARP のやりとり</span></a></li>
+<li><a class="seclink" href="#s7-3" data-target="s7-3"><span class="num">7.3</span><span class="lbl">近隣キャッシュを永久に持ってはいけない</span></a></li>
+<li><a class="seclink" href="#s7-4" data-target="s7-4"><span class="num">7.4</span><span class="lbl">到達不能検出(NUD)</span></a></li>
+<li><a class="seclink" href="#s7-5" data-target="s7-5"><span class="num">7.5</span><span class="lbl">重複アドレス検出</span></a></li>
+<li><a class="seclink" href="#s7-6" data-target="s7-6"><span class="num">7.6</span><span class="lbl">状態遷移(近隣キャッシュのエントリ)</span></a></li>
+</ul>
+</li>
+<li class="navchap"><div class="chrow"><button type="button" class="chtog" aria-expanded="false" aria-label="節を開閉"></button><a class="chlink" href="#ch8" data-target="ch8"><span class="num">8</span><span class="lbl">IP — 住所と道案内</span></a></div>
+<ul class="navsecs">
+<li><a class="seclink" href="#s8-1" data-target="s8-1"><span class="num">8.1</span><span class="lbl">IP の役割</span></a></li>
+<li><a class="seclink" href="#s8-2" data-target="s8-2"><span class="num">8.2</span><span class="lbl">サブネット — 「同じケーブル上か」の判定</span></a></li>
+<li><a class="seclink" href="#s8-3" data-target="s8-3"><span class="num">8.3</span><span class="lbl">断片化(フラグメント)</span></a></li>
+<li><a class="seclink" href="#s8-4" data-target="s8-4"><span class="num">8.4</span><span class="lbl">経路 MTU 探索(PMTUD)</span></a></li>
+<li><a class="seclink" href="#s8-5" data-target="s8-5"><span class="num">8.5</span><span class="lbl">状態遷移(断片の組み立て枠)</span></a></li>
+</ul>
+</li>
+<li class="navchap"><div class="chrow"><button type="button" class="chtog" aria-expanded="false" aria-label="節を開閉"></button><a class="chlink" href="#ch9" data-target="ch9"><span class="num">9</span><span class="lbl">ICMP — 「届かなかった」を伝える</span></a></div>
+<ul class="navsecs">
+<li><a class="seclink" href="#s9-1" data-target="s9-1"><span class="num">9.1</span><span class="lbl">ICMP の役割</span></a></li>
+<li><a class="seclink" href="#s9-2" data-target="s9-2"><span class="num">9.2</span><span class="lbl">このソフトが返すもの</span></a></li>
+<li><a class="seclink" href="#s9-3" data-target="s9-3"><span class="num">9.3</span><span class="lbl">RoCEv2 のフレームには ICMP のエラーを返さない</span></a></li>
+</ul>
+</li>
+<li class="navchap"><div class="chrow"><button type="button" class="chtog" aria-expanded="false" aria-label="節を開閉"></button><a class="chlink" href="#ch10" data-target="ch10"><span class="num">10</span><span class="lbl">TCP — 信頼できるバイトの流れを作る</span></a></div>
+<ul class="navsecs">
+<li><a class="seclink" href="#s10-1" data-target="s10-1"><span class="num">10.1</span><span class="lbl">IP は何も保証しない</span></a></li>
+<li><a class="seclink" href="#s10-2" data-target="s10-2"><span class="num">10.2</span><span class="lbl">シーケンス番号 — 全バイトに通し番号を振る</span></a></li>
+<li><a class="seclink" href="#s10-3" data-target="s10-3"><span class="num">10.3</span><span class="lbl">接続の確立と切断</span></a></li>
+<li><a class="seclink" href="#s10-4" data-target="s10-4"><span class="num">10.4</span><span class="lbl">ウィンドウ — 相手の受け入れ余地</span></a></li>
+<li><a class="seclink" href="#s10-5" data-target="s10-5"><span class="num">10.5</span><span class="lbl">再送 — 失われたものをどうやって送り直すか</span></a></li>
+<li><a class="seclink" href="#s10-6" data-target="s10-6"><span class="num">10.6</span><span class="lbl">再送の 3 つの抑制</span></a></li>
+<li><a class="seclink" href="#s10-7" data-target="s10-7"><span class="num">10.7</span><span class="lbl">閉じたポートへの RST</span></a></li>
+<li><a class="seclink" href="#s10-8" data-target="s10-8"><span class="num">10.8</span><span class="lbl">待ち受けキュー(backlog)</span></a></li>
+<li><a class="seclink" href="#s10-9" data-target="s10-9"><span class="num">10.9</span><span class="lbl">タイムスタンプ — 再送中でも往復時間を測る</span></a></li>
+<li><a class="seclink" href="#s10-10" data-target="s10-10"><span class="num">10.10</span><span class="lbl">SACK — 「どこが欠けたか」を正確に伝える</span></a></li>
+<li><a class="seclink" href="#s10-11" data-target="s10-11"><span class="num">10.11</span><span class="lbl">キープアライブ — 黙って消えた相手を見つける</span></a></li>
+<li><a class="seclink" href="#s10-12" data-target="s10-12"><span class="num">10.12</span><span class="lbl">この実装が持っていないもの</span></a></li>
+<li><a class="seclink" href="#s10-13" data-target="s10-13"><span class="num">10.13</span><span class="lbl">状態遷移(接続)</span></a></li>
+</ul>
+</li>
+<li class="navchap"><div class="chrow"><button type="button" class="chtog" aria-expanded="false" aria-label="節を開閉"></button><a class="chlink" href="#ch11" data-target="ch11"><span class="num">11</span><span class="lbl">UDP と IPv6</span></a></div>
+<ul class="navsecs">
+<li><a class="seclink" href="#s11-1" data-target="s11-1"><span class="num">11.1</span><span class="lbl">UDP — 何も保証しない代わりに軽い</span></a></li>
+<li><a class="seclink" href="#s11-2" data-target="s11-2"><span class="num">11.2</span><span class="lbl">IPv6 で追加されること</span></a></li>
+<li><a class="seclink" href="#s11-3" data-target="s11-3"><span class="num">11.3</span><span class="lbl">外部の機器と IPv6 で話すための要件</span></a></li>
+<li><a class="seclink" href="#s11-4" data-target="s11-4"><span class="num">11.4</span><span class="lbl">HW オフロードは IPv6 でもそのまま使える</span></a></li>
+<li><a class="seclink" href="#s11-5" data-target="s11-5"><span class="num">11.5</span><span class="lbl">状態遷移(MLD の版と、アドレス自動設定)</span></a></li>
+</ul>
+</li>
 </ul></li>
 <li class="navpart"><a class="navpartlink" href="#part-3">第 IV 部 NVMe と NVMe over Fabrics</a><ul>
-<li><a href="#ch12" data-target="ch12"><span class="num">12</span><span class="lbl">NVMe の考え方</span></a></li>
-<li><a href="#ch13" data-target="ch13"><span class="num">13</span><span class="lbl">ネットワーク越しの NVMe</span></a></li>
-<li><a href="#ch14" data-target="ch14"><span class="num">14</span><span class="lbl">NVMe/TCP</span></a></li>
-<li><a href="#ch15" data-target="ch15"><span class="num">15</span><span class="lbl">RDMA と RoCEv2</span></a></li>
-<li><a href="#ch16" data-target="ch16"><span class="num">16</span><span class="lbl">認証と暗号(DH-HMAC-CHAP と TLS 1.3)</span></a></li>
-<li><a href="#ch17" data-target="ch17"><span class="num">17</span><span class="lbl">iSCSI</span></a></li>
-<li><a href="#ch18" data-target="ch18"><span class="num">18</span><span class="lbl">このターゲットが答えるコマンド</span></a></li>
+<li class="navchap"><div class="chrow"><button type="button" class="chtog" aria-expanded="false" aria-label="節を開閉"></button><a class="chlink" href="#ch12" data-target="ch12"><span class="num">12</span><span class="lbl">NVMe の考え方</span></a></div>
+<ul class="navsecs">
+<li><a class="seclink" href="#s12-1" data-target="s12-1"><span class="num">12.1</span><span class="lbl">SSD との会話はキューで行う</span></a></li>
+<li><a class="seclink" href="#s12-2" data-target="s12-2"><span class="num">12.2</span><span class="lbl">コントローラと名前空間</span></a></li>
+<li><a class="seclink" href="#s12-3" data-target="s12-3"><span class="num">12.3</span><span class="lbl">admin キューと IO キュー</span></a></li>
+<li><a class="seclink" href="#s12-4" data-target="s12-4"><span class="num">12.4</span><span class="lbl">コントローラのレジスタと、動かす・止める手順</span></a></li>
+<li><a class="seclink" href="#s12-5" data-target="s12-5"><span class="num">12.5</span><span class="lbl">コマンドの一覧</span></a></li>
+<li><a class="seclink" href="#s12-6" data-target="s12-6"><span class="num">12.6</span><span class="lbl">非同期イベント要求という変わったコマンド</span></a></li>
+<li><a class="seclink" href="#s12-7" data-target="s12-7"><span class="num">12.7</span><span class="lbl">コマンドと完了の形</span></a></li>
+</ul>
+</li>
+<li class="navchap"><div class="chrow"><button type="button" class="chtog" aria-expanded="false" aria-label="節を開閉"></button><a class="chlink" href="#ch13" data-target="ch13"><span class="num">13</span><span class="lbl">ネットワーク越しの NVMe</span></a></div>
+<ul class="navsecs">
+<li><a class="seclink" href="#s13-1" data-target="s13-1"><span class="num">13.1</span><span class="lbl">発想の転換</span></a></li>
+<li><a class="seclink" href="#s13-2" data-target="s13-2"><span class="num">13.2</span><span class="lbl">Fabrics コマンド</span></a></li>
+<li><a class="seclink" href="#s13-3" data-target="s13-3"><span class="num">13.3</span><span class="lbl">Connect の形</span></a></li>
+<li><a class="seclink" href="#s13-4" data-target="s13-4"><span class="num">13.4</span><span class="lbl">接続の手順(NVMe/TCP)</span></a></li>
+<li><a class="seclink" href="#s13-5" data-target="s13-5"><span class="num">13.5</span><span class="lbl">Discovery — 何が繋がっているかを尋ねる</span></a></li>
+</ul>
+</li>
+<li class="navchap"><div class="chrow"><button type="button" class="chtog" aria-expanded="false" aria-label="節を開閉"></button><a class="chlink" href="#ch14" data-target="ch14"><span class="num">14</span><span class="lbl">NVMe/TCP</span></a></div>
+<ul class="navsecs">
+<li><a class="seclink" href="#s14-1" data-target="s14-1"><span class="num">14.1</span><span class="lbl">PDU — TCP の上に区切りを作る</span></a></li>
+<li><a class="seclink" href="#s14-2" data-target="s14-2"><span class="num">14.2</span><span class="lbl">データの運び方が 2 通りある</span></a></li>
+<li><a class="seclink" href="#s14-3" data-target="s14-3"><span class="num">14.3</span><span class="lbl">ダイジェスト(CRC32C)</span></a></li>
+<li><a class="seclink" href="#s14-4" data-target="s14-4"><span class="num">14.4</span><span class="lbl">「もう続けられない」を伝える</span></a></li>
+<li><a class="seclink" href="#s14-5" data-target="s14-5"><span class="num">14.5</span><span class="lbl">SQ / RQ / CQ の使われ方(NVMe の Write と Read)</span></a></li>
+<li><a class="seclink" href="#s14-6" data-target="s14-6"><span class="num">14.6</span><span class="lbl">状態遷移(ターゲット側)</span></a></li>
+<li><a class="seclink" href="#s14-7" data-target="s14-7"><span class="num">14.7</span><span class="lbl">状態遷移(イニシエータ側)</span></a></li>
+</ul>
+</li>
+<li class="navchap"><div class="chrow"><button type="button" class="chtog" aria-expanded="false" aria-label="節を開閉"></button><a class="chlink" href="#ch15" data-target="ch15"><span class="num">15</span><span class="lbl">RDMA と RoCEv2</span></a></div>
+<ul class="navsecs">
+<li><a class="seclink" href="#s15-1" data-target="s15-1"><span class="num">15.1</span><span class="lbl">RDMA とは何か</span></a></li>
+<li><a class="seclink" href="#s15-2" data-target="s15-2"><span class="num">15.2</span><span class="lbl">RDMA の操作</span></a></li>
+<li><a class="seclink" href="#s15-3" data-target="s15-3"><span class="num">15.3</span><span class="lbl">NVMe の Read / Write と RDMA の操作の対応</span></a></li>
+<li><a class="seclink" href="#s15-4" data-target="s15-4"><span class="num">15.4</span><span class="lbl">RoCEv2 — Ethernet の上で RDMA をやる</span></a></li>
+<li><a class="seclink" href="#s15-5" data-target="s15-5"><span class="num">15.5</span><span class="lbl">SQ / RQ / CQ の使われ方(NVMe の Write と Read)</span></a></li>
+<li><a class="seclink" href="#s15-6" data-target="s15-6"><span class="num">15.6</span><span class="lbl">実ホストとつなぐための要件</span></a></li>
+<li><a class="seclink" href="#s15-7" data-target="s15-7"><span class="num">15.7</span><span class="lbl">ターゲット側の切断の作法(TCP 側との対応)</span></a></li>
+<li><a class="seclink" href="#s15-8" data-target="s15-8"><span class="num">15.8</span><span class="lbl">状態遷移(接続管理と QP)</span></a></li>
+<li><a class="seclink" href="#s15-9" data-target="s15-9"><span class="num">15.9</span><span class="lbl">1〜32 バイトの短い転送を最速で出す(`rshort`)</span></a></li>
+</ul>
+</li>
+<li class="navchap"><div class="chrow"><button type="button" class="chtog" aria-expanded="false" aria-label="節を開閉"></button><a class="chlink" href="#ch16" data-target="ch16"><span class="num">16</span><span class="lbl">認証と暗号(DH-HMAC-CHAP と TLS 1.3)</span></a></div>
+<ul class="navsecs">
+<li><a class="seclink" href="#s16-1" data-target="s16-1"><span class="num">16.1</span><span class="lbl">何を守るのか</span></a></li>
+<li><a class="seclink" href="#s16-2" data-target="s16-2"><span class="num">16.2</span><span class="lbl">鍵の文字列と配り方</span></a></li>
+<li><a class="seclink" href="#s16-3" data-target="s16-3"><span class="num">16.3</span><span class="lbl">DH-HMAC-CHAP のやりとり</span></a></li>
+<li><a class="seclink" href="#s16-4" data-target="s16-4"><span class="num">16.4</span><span class="lbl">DH 群 — 認証の鍵が漏れても過去の接続を守る</span></a></li>
+<li><a class="seclink" href="#s16-5" data-target="s16-5"><span class="num">16.5</span><span class="lbl">RDMA での認証</span></a></li>
+<li><a class="seclink" href="#s16-6" data-target="s16-6"><span class="num">16.6</span><span class="lbl">TLS 1.3 の握手</span></a></li>
+<li><a class="seclink" href="#s16-7" data-target="s16-7"><span class="num">16.7</span><span class="lbl">PSK の作り方と身元</span></a></li>
+<li><a class="seclink" href="#s16-8" data-target="s16-8"><span class="num">16.8</span><span class="lbl">レコード層 — 暗号化した PDU の送り方</span></a></li>
+<li><a class="seclink" href="#s16-9" data-target="s16-9"><span class="num">16.9</span><span class="lbl">認証から TLS へつなぐ(secure channel concatenation)</span></a></li>
+<li><a class="seclink" href="#s16-10" data-target="s16-10"><span class="num">16.10</span><span class="lbl">暗号の部品</span></a></li>
+<li><a class="seclink" href="#s16-11" data-target="s16-11"><span class="num">16.11</span><span class="lbl">コードとの対応</span></a></li>
+<li><a class="seclink" href="#s16-12" data-target="s16-12"><span class="num">16.12</span><span class="lbl">CNSA 2.0 — 量子計算機に備えた暗号の組</span></a></li>
+</ul>
+</li>
+<li class="navchap"><div class="chrow"><button type="button" class="chtog" aria-expanded="false" aria-label="節を開閉"></button><a class="chlink" href="#ch17" data-target="ch17"><span class="num">17</span><span class="lbl">iSCSI</span></a></div>
+<ul class="navsecs">
+<li><a class="seclink" href="#s17-1" data-target="s17-1"><span class="num">17.1</span><span class="lbl">NVMe/TCP との対応</span></a></li>
+<li><a class="seclink" href="#s17-2" data-target="s17-2"><span class="num">17.2</span><span class="lbl">PDU の形</span></a></li>
+<li><a class="seclink" href="#s17-3" data-target="s17-3"><span class="num">17.3</span><span class="lbl">ログイン</span></a></li>
+<li><a class="seclink" href="#s17-4" data-target="s17-4"><span class="num">17.4</span><span class="lbl">コマンドのウィンドウ</span></a></li>
+<li><a class="seclink" href="#s17-5" data-target="s17-5"><span class="num">17.5</span><span class="lbl">読み出しと書き込み</span></a></li>
+<li><a class="seclink" href="#s17-6" data-target="s17-6"><span class="num">17.6</span><span class="lbl">SQ / RQ / CQ の使われ方(書き込みと読み出し)</span></a></li>
+<li><a class="seclink" href="#s17-7" data-target="s17-7"><span class="num">17.7</span><span class="lbl">SCSI の層</span></a></li>
+<li><a class="seclink" href="#s17-8" data-target="s17-8"><span class="num">17.8</span><span class="lbl">例外系</span></a></li>
+<li><a class="seclink" href="#s17-9" data-target="s17-9"><span class="num">17.9</span><span class="lbl">CHAP</span></a></li>
+<li><a class="seclink" href="#s17-10" data-target="s17-10"><span class="num">17.10</span><span class="lbl">イニシエータ</span></a></li>
+<li><a class="seclink" href="#s17-11" data-target="s17-11"><span class="num">17.11</span><span class="lbl">送信の経路</span></a></li>
+<li><a class="seclink" href="#s17-12" data-target="s17-12"><span class="num">17.12</span><span class="lbl">確かめ方</span></a></li>
+<li><a class="seclink" href="#s17-13" data-target="s17-13"><span class="num">17.13</span><span class="lbl">性能</span></a></li>
+<li><a class="seclink" href="#s17-14" data-target="s17-14"><span class="num">17.14</span><span class="lbl">iSER — iSCSI を RDMA で運ぶ</span></a></li>
+<li><a class="seclink" href="#s17-15" data-target="s17-15"><span class="num">17.15</span><span class="lbl">IPsec — iSCSI の通信を ESP で守る</span></a></li>
+</ul>
+</li>
+<li class="navchap"><div class="chrow"><button type="button" class="chtog" aria-expanded="false" aria-label="節を開閉"></button><a class="chlink" href="#ch18" data-target="ch18"><span class="num">18</span><span class="lbl">このターゲットが答えるコマンド</span></a></div>
+<ul class="navsecs">
+<li><a class="seclink" href="#s18-1" data-target="s18-1"><span class="num">18.1</span><span class="lbl">対応しているコマンド</span></a></li>
+<li><a class="seclink" href="#s18-2" data-target="s18-2"><span class="num">18.2</span><span class="lbl">機能は広告して初めて使われる</span></a></li>
+<li><a class="seclink" href="#s18-3" data-target="s18-3"><span class="num">18.3</span><span class="lbl">切断の作法 — 相手の手順に合わせる</span></a></li>
+<li><a class="seclink" href="#s18-4" data-target="s18-4"><span class="num">18.4</span><span class="lbl">畳む順序が逆になっても後始末が成り立つこと</span></a></li>
+<li><a class="seclink" href="#s18-5" data-target="s18-5"><span class="num">18.5</span><span class="lbl">0's based という落とし穴</span></a></li>
+<li><a class="seclink" href="#s18-6" data-target="s18-6"><span class="num">18.6</span><span class="lbl">予約(Reservation)</span></a></li>
+<li><a class="seclink" href="#s18-7" data-target="s18-7"><span class="num">18.7</span><span class="lbl">Compare と Copy</span></a></li>
+<li><a class="seclink" href="#s18-8" data-target="s18-8"><span class="num">18.8</span><span class="lbl">Abort</span></a></li>
+<li><a class="seclink" href="#s18-9" data-target="s18-9"><span class="num">18.9</span><span class="lbl">RDMA ターゲットでのデータの受け渡し</span></a></li>
+</ul>
+</li>
 </ul></li>
 <li class="navpart"><a class="navpartlink" href="#part-4">第 V 部 ソフトウェアの構造</a><ul>
-<li><a href="#ch19" data-target="ch19"><span class="num">19</span><span class="lbl">全体アーキテクチャ</span></a></li>
-<li><a href="#ch20" data-target="ch20"><span class="num">20</span><span class="lbl">協調ジョブスケジューラ</span></a></li>
-<li><a href="#ch21" data-target="ch21"><span class="num">21</span><span class="lbl">主要なデータ構造</span></a></li>
-<li><a href="#ch22" data-target="ch22"><span class="num">22</span><span class="lbl">1 つの I/O を最後まで追う</span></a></li>
-<li><a href="#ch23" data-target="ch23"><span class="num">23</span><span class="lbl">マルチコアの使い方</span></a></li>
+<li class="navchap"><div class="chrow"><button type="button" class="chtog" aria-expanded="false" aria-label="節を開閉"></button><a class="chlink" href="#ch19" data-target="ch19"><span class="num">19</span><span class="lbl">全体アーキテクチャ</span></a></div>
+<ul class="navsecs">
+<li><a class="seclink" href="#s19-1" data-target="s19-1"><span class="num">19.1</span><span class="lbl">レイヤ図</span></a></li>
+<li><a class="seclink" href="#s19-2" data-target="s19-2"><span class="num">19.2</span><span class="lbl">3 つの重要な境界</span></a></li>
+<li><a class="seclink" href="#s19-3" data-target="s19-3"><span class="num">19.3</span><span class="lbl">メモリは全部静的に確保する</span></a></li>
+</ul>
+</li>
+<li class="navchap"><div class="chrow"><button type="button" class="chtog" aria-expanded="false" aria-label="節を開閉"></button><a class="chlink" href="#ch20" data-target="ch20"><span class="num">20</span><span class="lbl">協調ジョブスケジューラ</span></a></div>
+<ul class="navsecs">
+<li><a class="seclink" href="#s20-1" data-target="s20-1"><span class="num">20.1</span><span class="lbl">なぜスレッドを使わないのか</span></a></li>
+<li><a class="seclink" href="#s20-2" data-target="s20-2"><span class="num">20.2</span><span class="lbl">ジョブとは「1 tick 進むステートマシン」</span></a></li>
+<li><a class="seclink" href="#s20-3" data-target="s20-3"><span class="num">20.3</span><span class="lbl">何がジョブになっているか</span></a></li>
+<li><a class="seclink" href="#s20-4" data-target="s20-4"><span class="num">20.4</span><span class="lbl">この構造の弱点</span></a></li>
+<li><a class="seclink" href="#s20-5" data-target="s20-5"><span class="num">20.5</span><span class="lbl">ジョブの後始末は難しい</span></a></li>
+<li><a class="seclink" href="#s20-6" data-target="s20-6"><span class="num">20.6</span><span class="lbl">状態遷移(ジョブそのもの)</span></a></li>
+<li><a class="seclink" href="#s20-7" data-target="s20-7"><span class="num">20.7</span><span class="lbl">眠っているジョブを飛ばす(park)</span></a></li>
+</ul>
+</li>
+<li class="navchap"><div class="chrow"><button type="button" class="chtog" aria-expanded="false" aria-label="節を開閉"></button><a class="chlink" href="#ch21" data-target="ch21"><span class="num">21</span><span class="lbl">主要なデータ構造</span></a></div>
+<ul class="navsecs">
+<li><a class="seclink" href="#s21-1" data-target="s21-1"><span class="num">21.1</span><span class="lbl">`tcp_conn_t` — TCP の接続 1 本</span></a></li>
+<li><a class="seclink" href="#s21-2" data-target="s21-2"><span class="num">21.2</span><span class="lbl">`netaddr_t` — IPv4 と IPv6 を同じ型で持つ</span></a></li>
+<li><a class="seclink" href="#s21-3" data-target="s21-3"><span class="num">21.3</span><span class="lbl">`nvmet_ctx_t` — ターゲットの全状態</span></a></li>
+<li><a class="seclink" href="#s21-4" data-target="s21-4"><span class="num">21.4</span><span class="lbl">`nvmet_ns_t` — 名前空間</span></a></li>
+<li><a class="seclink" href="#s21-5" data-target="s21-5"><span class="num">21.5</span><span class="lbl">受信用のリング</span></a></li>
+</ul>
+</li>
+<li class="navchap"><div class="chrow"><button type="button" class="chtog" aria-expanded="false" aria-label="節を開閉"></button><a class="chlink" href="#ch22" data-target="ch22"><span class="num">22</span><span class="lbl">1 つの I/O を最後まで追う</span></a></div>
+<ul class="navsecs">
+<li><a class="seclink" href="#s22-1" data-target="s22-1"><span class="num">22.1</span><span class="lbl">全体の流れ</span></a></li>
+<li><a class="seclink" href="#s22-2" data-target="s22-2"><span class="num">22.2</span><span class="lbl">push 型受信 — 呼びに行くのではなく呼ばれる</span></a></li>
+<li><a class="seclink" href="#s22-3" data-target="s22-3"><span class="num">22.3</span><span class="lbl">ゼロコピー — 最初から目的地へ書く</span></a></li>
+<li><a class="seclink" href="#s22-4" data-target="s22-4"><span class="num">22.4</span><span class="lbl">データの検査値もその場で計算する</span></a></li>
+<li><a class="seclink" href="#s22-5" data-target="s22-5"><span class="num">22.5</span><span class="lbl">送信担当と受信担当を分ける</span></a></li>
+<li><a class="seclink" href="#s22-6" data-target="s22-6"><span class="num">22.6</span><span class="lbl">書き込みの 2 つの経路</span></a></li>
+<li><a class="seclink" href="#s22-7" data-target="s22-7"><span class="num">22.7</span><span class="lbl">読み出しの流れ</span></a></li>
+</ul>
+</li>
+<li class="navchap"><div class="chrow"><button type="button" class="chtog" aria-expanded="false" aria-label="節を開閉"></button><a class="chlink" href="#ch23" data-target="ch23"><span class="num">23</span><span class="lbl">マルチコアの使い方</span></a></div>
+<ul class="navsecs">
+<li><a class="seclink" href="#s23-1" data-target="s23-1"><span class="num">23.1</span><span class="lbl">コアの割り当て</span></a></li>
+<li><a class="seclink" href="#s23-2" data-target="s23-2"><span class="num">23.2</span><span class="lbl">コアをまたぐときの約束</span></a></li>
+<li><a class="seclink" href="#s23-3" data-target="s23-3"><span class="num">23.3</span><span class="lbl">旗を使うときの注意</span></a></li>
+<li><a class="seclink" href="#s23-4" data-target="s23-4"><span class="num">23.4</span><span class="lbl">使っていないコアの準備</span></a></li>
+</ul>
+</li>
 </ul></li>
 <li class="navpart"><a class="navpartlink" href="#part-5">第 VI 部 性能</a><ul>
-<li><a href="#ch24" data-target="ch24"><span class="num">24</span><span class="lbl">何をどう測っているか</span></a></li>
-<li><a href="#ch25" data-target="ch25"><span class="num">25</span><span class="lbl">速い理由</span></a></li>
-<li><a href="#ch26" data-target="ch26"><span class="num">26</span><span class="lbl">測り方の原則</span></a></li>
-<li><a href="#ch27" data-target="ch27"><span class="num">27</span><span class="lbl">ターゲットの性能</span></a></li>
-<li><a href="#ch28" data-target="ch28"><span class="num">28</span><span class="lbl">イニシエータの性能</span></a></li>
+<li class="navchap"><div class="chrow"><button type="button" class="chtog" aria-expanded="false" aria-label="節を開閉"></button><a class="chlink" href="#ch24" data-target="ch24"><span class="num">24</span><span class="lbl">何をどう測っているか</span></a></div>
+<ul class="navsecs">
+<li><a class="seclink" href="#s24-1" data-target="s24-1"><span class="num">24.1</span><span class="lbl">測っているもの</span></a></li>
+<li><a class="seclink" href="#s24-2" data-target="s24-2"><span class="num">24.2</span><span class="lbl">数字を読むときの注意</span></a></li>
+<li><a class="seclink" href="#s24-3" data-target="s24-3"><span class="num">24.3</span><span class="lbl">比較対象</span></a></li>
+<li><a class="seclink" href="#s24-4" data-target="s24-4"><span class="num">24.4</span><span class="lbl">性能に触る変更をするときの手順</span></a></li>
+</ul>
+</li>
+<li class="navchap"><div class="chrow"><button type="button" class="chtog" aria-expanded="false" aria-label="節を開閉"></button><a class="chlink" href="#ch25" data-target="ch25"><span class="num">25</span><span class="lbl">速い理由</span></a></div>
+<ul class="navsecs">
+<li><a class="seclink" href="#s25-1" data-target="s25-1"><span class="num">25.1</span><span class="lbl">ゼロコピー</span></a></li>
+<li><a class="seclink" href="#s25-2" data-target="s25-2"><span class="num">25.2</span><span class="lbl">ポーリング</span></a></li>
+<li><a class="seclink" href="#s25-3" data-target="s25-3"><span class="num">25.3</span><span class="lbl">NIC へのオフロード</span></a></li>
+<li><a class="seclink" href="#s25-4" data-target="s25-4"><span class="num">25.4</span><span class="lbl">CRC32C の実装</span></a></li>
+<li><a class="seclink" href="#s25-5" data-target="s25-5"><span class="num">25.5</span><span class="lbl">無駄なパケットを出さない</span></a></li>
+<li><a class="seclink" href="#s25-6" data-target="s25-6"><span class="num">25.6</span><span class="lbl">同時 RDMA_READ の本数</span></a></li>
+<li><a class="seclink" href="#s25-7" data-target="s25-7"><span class="num">25.7</span><span class="lbl">データ構造の配置</span></a></li>
+<li><a class="seclink" href="#s25-8" data-target="s25-8"><span class="num">25.8</span><span class="lbl">iSCSI と iSER の工夫</span></a></li>
+</ul>
+</li>
+<li class="navchap"><div class="chrow"><button type="button" class="chtog" aria-expanded="false" aria-label="節を開閉"></button><a class="chlink" href="#ch26" data-target="ch26"><span class="num">26</span><span class="lbl">測り方の原則</span></a></div>
+<ul class="navsecs">
+<li><a class="seclink" href="#s26-1" data-target="s26-1"><span class="num">26.1</span><span class="lbl">実装が実際に呼ばれる形で測る</span></a></li>
+<li><a class="seclink" href="#s26-2" data-target="s26-2"><span class="num">26.2</span><span class="lbl">コストの所在は「無効化して測る」と分かる</span></a></li>
+<li><a class="seclink" href="#s26-3" data-target="s26-3"><span class="num">26.3</span><span class="lbl">受信側で確かめられない送信機能は、両側を揃えて確かめる</span></a></li>
+<li><a class="seclink" href="#s26-4" data-target="s26-4"><span class="num">26.4</span><span class="lbl">機能を切る前に、一度有効にして測る</span></a></li>
+<li><a class="seclink" href="#s26-5" data-target="s26-5"><span class="num">26.5</span><span class="lbl">数えていないものは見えない</span></a></li>
+<li><a class="seclink" href="#s26-6" data-target="s26-6"><span class="num">26.6</span><span class="lbl">測定道具の注意</span></a></li>
+</ul>
+</li>
+<li class="navchap"><div class="chrow"><button type="button" class="chtog" aria-expanded="false" aria-label="節を開閉"></button><a class="chlink" href="#ch27" data-target="ch27"><span class="num">27</span><span class="lbl">ターゲットの性能</span></a></div>
+<ul class="navsecs">
+<li><a class="seclink" href="#s27-1" data-target="s27-1"><span class="num">27.1</span><span class="lbl">測り方</span></a></li>
+<li><a class="seclink" href="#s27-2" data-target="s27-2"><span class="num">27.2</span><span class="lbl">まとめ</span></a></li>
+<li><a class="seclink" href="#s27-3" data-target="s27-3"><span class="num">27.3</span><span class="lbl">NVMe/TCP</span></a></li>
+<li><a class="seclink" href="#s27-4" data-target="s27-4"><span class="num">27.4</span><span class="lbl">NVMe/TCP + TLS</span></a></li>
+<li><a class="seclink" href="#s27-5" data-target="s27-5"><span class="num">27.5</span><span class="lbl">NVMe-oF RDMA</span></a></li>
+<li><a class="seclink" href="#s27-6" data-target="s27-6"><span class="num">27.6</span><span class="lbl">iSCSI</span></a></li>
+<li><a class="seclink" href="#s27-7" data-target="s27-7"><span class="num">27.7</span><span class="lbl">iSCSI + IPsec</span></a></li>
+<li><a class="seclink" href="#s27-8" data-target="s27-8"><span class="num">27.8</span><span class="lbl">iSER</span></a></li>
+<li><a class="seclink" href="#s27-9" data-target="s27-9"><span class="num">27.9</span><span class="lbl">測れなかったもの・注意</span></a></li>
+<li><a class="seclink" href="#s27-10" data-target="s27-10"><span class="num">27.10</span><span class="lbl">8 コアのターゲットに合わせたイニシエータの調整</span></a></li>
+<li><a class="seclink" href="#s27-11" data-target="s27-11"><span class="num">27.11</span><span class="lbl">256KiB が 64KiB より遅い理由</span></a></li>
+</ul>
+</li>
+<li class="navchap"><div class="chrow"><button type="button" class="chtog" aria-expanded="false" aria-label="節を開閉"></button><a class="chlink" href="#ch28" data-target="ch28"><span class="num">28</span><span class="lbl">イニシエータの性能</span></a></div>
+<ul class="navsecs">
+<li><a class="seclink" href="#s28-1" data-target="s28-1"><span class="num">28.1</span><span class="lbl">測り方</span></a></li>
+<li><a class="seclink" href="#s28-2" data-target="s28-2"><span class="num">28.2</span><span class="lbl">まとめ</span></a></li>
+<li><a class="seclink" href="#s28-3" data-target="s28-3"><span class="num">28.3</span><span class="lbl">NVMe/TCP</span></a></li>
+<li><a class="seclink" href="#s28-4" data-target="s28-4"><span class="num">28.4</span><span class="lbl">NVMe/TCP + TLS</span></a></li>
+<li><a class="seclink" href="#s28-5" data-target="s28-5"><span class="num">28.5</span><span class="lbl">NVMe-oF RDMA</span></a></li>
+<li><a class="seclink" href="#s28-6" data-target="s28-6"><span class="num">28.6</span><span class="lbl">認証(DH-HMAC-CHAP)・4KiB</span></a></li>
+<li><a class="seclink" href="#s28-7" data-target="s28-7"><span class="num">28.7</span><span class="lbl">iSCSI</span></a></li>
+<li><a class="seclink" href="#s28-8" data-target="s28-8"><span class="num">28.8</span><span class="lbl">iSER</span></a></li>
+<li><a class="seclink" href="#s28-9" data-target="s28-9"><span class="num">28.9</span><span class="lbl">測れなかったもの・注意</span></a></li>
+</ul>
+</li>
 </ul></li>
 <li class="navpart"><a class="navpartlink" href="#part-6">第 VII 部 使い方</a><ul>
-<li><a href="#ch29" data-target="ch29"><span class="num">29</span><span class="lbl">ビルドと起動</span></a></li>
-<li><a href="#ch30" data-target="ch30"><span class="num">30</span><span class="lbl">シェルコマンド一覧</span></a></li>
-<li><a href="#ch31" data-target="ch31"><span class="num">31</span><span class="lbl">自己検査コマンド</span></a></li>
+<li class="navchap"><div class="chrow"><button type="button" class="chtog" aria-expanded="false" aria-label="節を開閉"></button><a class="chlink" href="#ch29" data-target="ch29"><span class="num">29</span><span class="lbl">ビルドと起動</span></a></div>
+<ul class="navsecs">
+<li><a class="seclink" href="#s29-1" data-target="s29-1"><span class="num">29.1</span><span class="lbl">必要なもの</span></a></li>
+<li><a class="seclink" href="#s29-2" data-target="s29-2"><span class="num">29.2</span><span class="lbl">ビルド</span></a></li>
+<li><a class="seclink" href="#s29-3" data-target="s29-3"><span class="num">29.3</span><span class="lbl">起動の準備</span></a></li>
+<li><a class="seclink" href="#s29-4" data-target="s29-4"><span class="num">29.4</span><span class="lbl">実機を扱うときの注意</span></a></li>
+</ul>
+</li>
+<li class="navchap"><div class="chrow"><button type="button" class="chtog" aria-expanded="false" aria-label="節を開閉"></button><a class="chlink" href="#ch30" data-target="ch30"><span class="num">30</span><span class="lbl">シェルコマンド一覧</span></a></div>
+<ul class="navsecs">
+<li><a class="seclink" href="#s30-1" data-target="s30-1"><span class="num">30.1</span><span class="lbl">ベンチマーク</span></a></li>
+<li><a class="seclink" href="#s30-2" data-target="s30-2"><span class="num">30.2</span><span class="lbl">NVMe-oF ターゲットの操作</span></a></li>
+<li><a class="seclink" href="#s30-3" data-target="s30-3"><span class="num">30.3</span><span class="lbl">ネットワークの設定と確認</span></a></li>
+<li><a class="seclink" href="#s30-4" data-target="s30-4"><span class="num">30.4</span><span class="lbl">自己検査(詳しくは [第 31 章](#ch31))</span></a></li>
+<li><a class="seclink" href="#s30-5" data-target="s30-5"><span class="num">30.5</span><span class="lbl">診断・計測</span></a></li>
+<li><a class="seclink" href="#s30-6" data-target="s30-6"><span class="num">30.6</span><span class="lbl">ハードウェアの調査用</span></a></li>
+<li><a class="seclink" href="#s30-7" data-target="s30-7"><span class="num">30.7</span><span class="lbl">その他</span></a></li>
+<li><a class="seclink" href="#s30-8" data-target="s30-8"><span class="num">30.8</span><span class="lbl">使うときの注意</span></a></li>
+</ul>
+</li>
+<li class="navchap"><div class="chrow"><button type="button" class="chtog" aria-expanded="false" aria-label="節を開閉"></button><a class="chlink" href="#ch31" data-target="ch31"><span class="num">31</span><span class="lbl">自己検査コマンド</span></a></div>
+<ul class="navsecs">
+<li><a class="seclink" href="#s31-1" data-target="s31-1"><span class="num">31.1</span><span class="lbl">なぜ自己検査が要るのか</span></a></li>
+<li><a class="seclink" href="#s31-2" data-target="s31-2"><span class="num">31.2</span><span class="lbl">陰性対照と陽性対照</span></a></li>
+<li><a class="seclink" href="#s31-3" data-target="s31-3"><span class="num">31.3</span><span class="lbl">主な検査コマンドの中身</span></a></li>
+<li><a class="seclink" href="#s31-4" data-target="s31-4"><span class="num">31.4</span><span class="lbl">状態を変える検査は必ず元に戻す</span></a></li>
+<li><a class="seclink" href="#s31-5" data-target="s31-5"><span class="num">31.5</span><span class="lbl">検査は、その前に何をしたかに引きずられる</span></a></li>
+</ul>
+</li>
 </ul></li>
 <li class="navpart"><a class="navpartlink" href="#part-7">第 VIII 部 実装状況</a><ul>
-<li><a href="#ch32" data-target="ch32"><span class="num">32</span><span class="lbl">何がどこまで確かめられているか</span></a></li>
-<li><a href="#ch33" data-target="ch33"><span class="num">33</span><span class="lbl">検証の考え方</span></a></li>
+<li class="navchap"><div class="chrow"><button type="button" class="chtog" aria-expanded="false" aria-label="節を開閉"></button><a class="chlink" href="#ch32" data-target="ch32"><span class="num">32</span><span class="lbl">何がどこまで確かめられているか</span></a></div>
+<ul class="navsecs">
+<li><a class="seclink" href="#s32-1" data-target="s32-1"><span class="num">32.1</span><span class="lbl">ハードウェア層</span></a></li>
+<li><a class="seclink" href="#s32-2" data-target="s32-2"><span class="num">32.2</span><span class="lbl">ネットワーク層</span></a></li>
+<li><a class="seclink" href="#s32-3" data-target="s32-3"><span class="num">32.3</span><span class="lbl">NVMe/TCP</span></a></li>
+<li><a class="seclink" href="#s32-4" data-target="s32-4"><span class="num">32.4</span><span class="lbl">NVMe-oF RDMA / RoCEv2</span></a></li>
+<li><a class="seclink" href="#s32-5" data-target="s32-5"><span class="num">32.5</span><span class="lbl">認証と暗号</span></a></li>
+<li><a class="seclink" href="#s32-6" data-target="s32-6"><span class="num">32.6</span><span class="lbl">iSCSI</span></a></li>
+<li><a class="seclink" href="#s32-7" data-target="s32-7"><span class="num">32.7</span><span class="lbl">この表の使い方</span></a></li>
+</ul>
+</li>
+<li class="navchap"><div class="chrow"><button type="button" class="chtog" aria-expanded="false" aria-label="節を開閉"></button><a class="chlink" href="#ch33" data-target="ch33"><span class="num">33</span><span class="lbl">検証の考え方</span></a></div>
+<ul class="navsecs">
+<li><a class="seclink" href="#s33-1" data-target="s33-1"><span class="num">33.1</span><span class="lbl">根本の問題 — 自作どうしでは検出できない</span></a></li>
+<li><a class="seclink" href="#s33-2" data-target="s33-2"><span class="num">33.2</span><span class="lbl">手法 1: 相手側の構造体でパースさせる</span></a></li>
+<li><a class="seclink" href="#s33-3" data-target="s33-3"><span class="num">33.3</span><span class="lbl">手法 2: 本物のホストに読ませる</span></a></li>
+<li><a class="seclink" href="#s33-4" data-target="s33-4"><span class="num">33.4</span><span class="lbl">手法 3: 相手側の状態を相手側のツールで読む</span></a></li>
+<li><a class="seclink" href="#s33-5" data-target="s33-5"><span class="num">33.5</span><span class="lbl">手法 4: 陰性対照と陽性対照</span></a></li>
+<li><a class="seclink" href="#s33-6" data-target="s33-6"><span class="num">33.6</span><span class="lbl">手法 5: 届かないメッセージを自分で注入する</span></a></li>
+<li><a class="seclink" href="#s33-7" data-target="s33-7"><span class="num">33.7</span><span class="lbl">手法 6: 相手側に「自作でない送り手」を書く</span></a></li>
+<li><a class="seclink" href="#s33-8" data-target="s33-8"><span class="num">33.8</span><span class="lbl">手法 7: 途中の姿が見たいなら、通り道にフックを挟む</span></a></li>
+<li><a class="seclink" href="#s33-9" data-target="s33-9"><span class="num">33.9</span><span class="lbl">検証を設計するときの注意</span></a></li>
+</ul>
+</li>
 </ul></li>
 <li class="navpart"><a class="navpartlink" href="#part-8">付録</a><ul>
-<li><a href="#appendix-a" data-target="appendix-a"><span class="num">A</span><span class="lbl">用語集</span></a></li>
-<li><a href="#appendix-b" data-target="appendix-b"><span class="num">B</span><span class="lbl">ファイル索引</span></a></li>
-<li><a href="#appendix-c" data-target="appendix-c"><span class="num">C</span><span class="lbl">参考にした仕様と実装</span></a></li>
-<li><a href="#appendix-d" data-target="appendix-d"><span class="num"></span><span class="lbl">付録 D ドライバが読み書きするレジスタ</span></a></li>
+<li class="navchap"><div class="chrow"><button type="button" class="chtog" aria-expanded="false" aria-label="節を開閉"></button><a class="chlink" href="#appendix-a" data-target="appendix-a"><span class="num">A</span><span class="lbl">用語集</span></a></div>
+<ul class="navsecs">
+<li><a class="seclink" href="#sA-1" data-target="sA-1"><span class="num">A.1</span><span class="lbl">英字・略語</span></a></li>
+<li><a class="seclink" href="#sA-2" data-target="sA-2"><span class="num">A.2</span><span class="lbl">日本語の用語</span></a></li>
+</ul>
+</li>
+<li class="navchap"><div class="chrow"><button type="button" class="chtog" aria-expanded="false" aria-label="節を開閉"></button><a class="chlink" href="#appendix-b" data-target="appendix-b"><span class="num">B</span><span class="lbl">ファイル索引</span></a></div>
+<ul class="navsecs">
+<li><a class="seclink" href="#sB-1" data-target="sB-1"><span class="num">B.1</span><span class="lbl">エントリとプラットフォーム依存部</span></a></li>
+<li><a class="seclink" href="#sB-2" data-target="sB-2"><span class="num">B.2</span><span class="lbl">NIC ドライバ</span></a></li>
+<li><a class="seclink" href="#sB-3" data-target="sB-3"><span class="num">B.3</span><span class="lbl">ネットワーク層</span></a></li>
+<li><a class="seclink" href="#sB-4" data-target="sB-4"><span class="num">B.4</span><span class="lbl">RDMA</span></a></li>
+<li><a class="seclink" href="#sB-5" data-target="sB-5"><span class="num">B.5</span><span class="lbl">NVMe / NVMe-oF</span></a></li>
+<li><a class="seclink" href="#sB-6" data-target="sB-6"><span class="num">B.6</span><span class="lbl">基盤</span></a></li>
+<li><a class="seclink" href="#sB-7" data-target="sB-7"><span class="num">B.7</span><span class="lbl">検証用の道具(`tools/`)</span></a></li>
+</ul>
+</li>
+<li class="navchap"><div class="chrow"><button type="button" class="chtog" aria-expanded="false" aria-label="節を開閉"></button><a class="chlink" href="#appendix-c" data-target="appendix-c"><span class="num">C</span><span class="lbl">参考にした仕様と実装</span></a></div>
+<ul class="navsecs">
+<li><a class="seclink" href="#sC-1" data-target="sC-1"><span class="num">C.1</span><span class="lbl">Linux カーネルのヘッダ</span></a></li>
+<li><a class="seclink" href="#sC-2" data-target="sC-2"><span class="num">C.2</span><span class="lbl">SPDK のソース</span></a></li>
+<li><a class="seclink" href="#sC-3" data-target="sC-3"><span class="num">C.3</span><span class="lbl">標準規格</span></a></li>
+<li><a class="seclink" href="#sC-4" data-target="sC-4"><span class="num">C.4</span><span class="lbl">この文書を書いた時点の状態</span></a></li>
+</ul>
+</li>
+<li class="navchap"><div class="chrow"><button type="button" class="chtog" aria-expanded="false" aria-label="節を開閉"></button><a class="chlink" href="#appendix-d" data-target="appendix-d"><span class="num">D</span><span class="lbl">ドライバが読み書きするレジスタ</span></a></div>
+<ul class="navsecs">
+<li><a class="seclink" href="#sD-1" data-target="sD-1"><span class="num">D.1</span><span class="lbl">PCI コンフィグ空間</span></a></li>
+<li><a class="seclink" href="#sD-2" data-target="sD-2"><span class="num">D.2</span><span class="lbl">初期化セグメント(BAR0 の先頭)</span></a></li>
+<li><a class="seclink" href="#sD-3" data-target="sD-3"><span class="num">D.3</span><span class="lbl">UAR と doorbell record</span></a></li>
+<li><a class="seclink" href="#sD-4" data-target="sD-4"><span class="num">D.4</span><span class="lbl">ACCESS_REG 経由の PRM レジスタ</span></a></li>
+<li><a class="seclink" href="#sD-5" data-target="sD-5"><span class="num">D.5</span><span class="lbl">オブジェクトを作る / 壊すコマンド</span></a></li>
+<li><a class="seclink" href="#sD-6" data-target="sD-6"><span class="num">D.6</span><span class="lbl">QP コンテキスト(QPC)で設定するフィールド</span></a></li>
+<li><a class="seclink" href="#sD-7" data-target="sD-7"><span class="num">D.7</span><span class="lbl">仮想ポートの設定(NIC vport context)</span></a></li>
+<li><a class="seclink" href="#sD-8" data-target="sD-8"><span class="num">D.8</span><span class="lbl">NVMe コントローラのプロパティ</span></a></li>
+</ul>
+</li>
 </ul></li>
       </ul>
     </div>
@@ -3739,32 +4140,92 @@ tools/udp6_echo.py   … 断片化した UDP を組み立てさせる</code></pr
 
 <script>
 (function(){
-  var links = Array.prototype.slice.call(document.querySelectorAll('.navpart > ul > li > a'));
-  var map = {};
+  var links = Array.prototype.slice.call(document.querySelectorAll('a.chlink'));
+  var slinks = Array.prototype.slice.call(document.querySelectorAll('a.seclink'));
+  var map = {}, smap = {};
   links.forEach(function(a){ map[a.getAttribute('data-target')] = a; });
+  slinks.forEach(function(a){ smap[a.getAttribute('data-target')] = a; });
+  var navbox = document.querySelector('.navscroll');
+  // ナビの欄の中だけを動かす(scrollIntoView はページ本体まで動かし、読んでいる位置がずれる)
+  function intoView(a){
+    var r = a.getBoundingClientRect(), box = navbox.getBoundingClientRect();
+    if(r.top < box.top + 8 || r.bottom > box.bottom - 8)
+      navbox.scrollTop += (r.top - box.top) - (box.height - r.height) / 2;
+  }
 
-  // 現在読んでいる章をハイライトする
+  // 章の開閉。読んでいる章は自動で開き、離れたら閉じる(自分で開いた章は開いたまま)。
+  function setOpen(li, open){
+    li.classList.toggle('open', open);
+    var b = li.querySelector(':scope > .chrow > .chtog');
+    if(b && b.tagName === 'BUTTON') b.setAttribute('aria-expanded', open ? 'true' : 'false');
+  }
+  document.querySelectorAll('button.chtog').forEach(function(b){
+    b.addEventListener('click', function(){
+      var li = b.closest('.navchap'), open = !li.classList.contains('open');
+      setOpen(li, open);
+      li.dataset.user = open ? '1' : '0';   // 自分で開いた / 閉じた
+    });
+  });
+  document.getElementById('openall').addEventListener('click', function(){
+    document.querySelectorAll('.navchap').forEach(function(li){
+      if(li.querySelector('.navsecs')){ setOpen(li, true); li.dataset.user = '1'; }
+    });
+  });
+  document.getElementById('closeall').addEventListener('click', function(){
+    // 全部閉じる。読んでいる章だけは、その章を離れるまで閉じたままにする(離れた後はまた自動で開く)。
+    document.querySelectorAll('.navchap').forEach(function(li){ setOpen(li, false); delete li.dataset.user; });
+    var a = current && map[current], li = a && a.closest('.navchap');
+    if(li) li.dataset.user = '0';
+    autoLi = null;
+  });
+
+  // 現在読んでいる章と節をハイライトする
   var heads = Array.prototype.slice.call(document.querySelectorAll('.chaphead[id]'));
-  var current = null;
+  var sheads = slinks.map(function(a){ return document.getElementById(a.getAttribute('data-target')); })
+                     .filter(function(h){ return h; });
+  var current = null, scurrent = null, autoLi = null;
   function mark(id){
     if(current === id) return;
+    // 自分で閉じた章も、離れたら自動の開閉に戻す
+    var pa = current && map[current], pli = pa && pa.closest('.navchap');
+    if(pli && pli.dataset.user === '0') delete pli.dataset.user;
     current = id;
     links.forEach(function(a){ a.classList.remove('active'); });
     var a = map[id];
+    if(autoLi && autoLi.dataset.user !== '1' && !filtering) setOpen(autoLi, false);
+    autoLi = null;
     if(a){
       a.classList.add('active');
-      var r = a.getBoundingClientRect(), box = document.querySelector('.navscroll').getBoundingClientRect();
-      if(r.top < box.top + 8 || r.bottom > box.bottom - 8) a.scrollIntoView({block:'center'});
+      var li = a.closest('.navchap');
+      if(li && li.querySelector('.navsecs') && !li.classList.contains('open') && li.dataset.user !== '0'){
+        setOpen(li, true); autoLi = li;
+      }
+      intoView(a);
     }
   }
-  function onScroll(){
+  function smark(id){
+    if(scurrent === id) return;
+    scurrent = id;
+    slinks.forEach(function(a){ a.classList.remove('active'); });
+    var a = id && smap[id];
+    if(a){ a.classList.add('active'); if(a.offsetParent) intoView(a); }
+  }
+  function lastAbove(list){
     var best = null, bestTop = -Infinity;
-    for(var i=0;i<heads.length;i++){
-      var t = heads[i].getBoundingClientRect().top;
-      if(t <= 120 && t > bestTop){ bestTop = t; best = heads[i]; }
+    for(var i=0;i<list.length;i++){
+      var t = list[i].getBoundingClientRect().top;
+      if(t <= 120 && t > bestTop){ bestTop = t; best = list[i]; }
     }
+    return best;
+  }
+  function onScroll(){
+    var best = lastAbove(heads);
     if(!best && heads.length) best = heads[0];
     if(best) mark(best.id);
+    // 節は今の章の中のものだけ(章の見出しより上にある節は前の章のもの)
+    var sb = lastAbove(sheads);
+    if(sb && best && (best.compareDocumentPosition(sb) & Node.DOCUMENT_POSITION_FOLLOWING)) smark(sb.id);
+    else smark(null);
 
     var doc = document.documentElement;
     var max = doc.scrollHeight - doc.clientHeight;
@@ -3773,16 +4234,26 @@ tools/udp6_echo.py   … 断片化した UDP を組み立てさせる</code></pr
   document.addEventListener('scroll', onScroll, {passive:true});
   onScroll();
 
-  // 絞り込み
+  // 絞り込み。章の名前に当たれば章とその節を全部、節の名前に当たればその節だけを(章を開いて)出す。
   var filter = document.getElementById('filter');
+  var filtering = false;
   filter.addEventListener('input', function(){
     var q = filter.value.trim().toLowerCase();
+    filtering = !!q;
     document.querySelectorAll('.navpart').forEach(function(part){
       var any = false;
-      part.querySelectorAll('li').forEach(function(li){
-        var hit = !q || li.textContent.toLowerCase().indexOf(q) >= 0;
-        li.style.display = hit ? '' : 'none';
-        if(hit) any = true;
+      part.querySelectorAll('.navchap').forEach(function(li){
+        var chit = !q || li.querySelector('.chrow').textContent.toLowerCase().indexOf(q) >= 0;
+        var shit = false;
+        li.querySelectorAll('.navsecs > li').forEach(function(sl){
+          var h = !q || chit || sl.textContent.toLowerCase().indexOf(q) >= 0;
+          sl.style.display = h ? '' : 'none';
+          if(q && !chit && h) shit = true;
+        });
+        li.style.display = (chit || shit) ? '' : 'none';
+        if(q) li.classList.toggle('open', shit);
+        else setOpen(li, li.dataset.user === '1' || li === autoLi);
+        if(chit || shit) any = true;
       });
       part.style.display = any ? '' : 'none';
     });
