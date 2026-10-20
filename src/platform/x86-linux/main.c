@@ -2117,6 +2117,53 @@ static void shell_tcpsack(char *args)
 }
 
 /*=================================================================
+ * シェルの `tcprack`。RACK-TLP(RFC 8985)と undo(RFC 3708 / 3522)の切り替えと統計。
+ *
+ * `tcprack [on|off]` で RACK、`tcprack tlp on|off` で TLP、`tcprack undo on|off` で undo、
+ * `tcprack clear` で統計を 0 にする。**どれも既存の接続にもすぐ効く**(接続ごとの合意が無い)。
+ * RACK を off にすると重複 ACK 3 個の高速再送と partial ACK の送り直しへ戻る(陰性対照)。
+ *
+ * 引数:
+ *   args - 上の通り。省略時は現在値と統計を表示
+ * コール元:
+ *   shell_dispatch()
+ * ===============================================================*/
+static void shell_tcprack(char *args)
+{
+    while (*args == ' ') args++;
+    volatile uint32_t *knob = &g_tcp_rack_enable;
+    if (strncmp(args, "tlp", 3) == 0) { knob = &g_tcp_tlp_enable; args += 3; }
+    else if (strncmp(args, "undo", 4) == 0) { knob = &g_tcp_undo_enable; args += 4; }
+    while (*args == ' ') args++;
+    if (strncmp(args, "on", 2) == 0) {
+        *knob = 1;
+    } else if (strncmp(args, "off", 3) == 0) {
+        *knob = 0;
+    } else if (strncmp(args, "clear", 5) == 0) {
+        g_tcp_rack_lost = g_tcp_rack_lost_timer = g_tcp_rack_recovery = 0;
+        g_tcp_rack_dup_skip = g_tcp_rack_reord = 0;
+        g_tcp_tlp_probes = g_tcp_tlp_recovered = g_tcp_tlp_redundant = 0;
+        g_tcp_dsack_rx = g_tcp_undo_armed = g_tcp_undo_dsack = g_tcp_undo_ts = 0;
+        g_tcp_retransmit_segs = 0;
+    }
+    uart_printf("tcprack: RACK %s / TLP %s / undo %s(SACK を合意した接続の非同期送信で働く)\n",
+                g_tcp_rack_enable ? "on" : "off", g_tcp_tlp_enable ? "on" : "off",
+                g_tcp_undo_enable ? "on" : "off");
+    uart_printf("tcprack: RACK 失われたと見て送り直し=%u(窓が過ぎるのを待ったもの %u)/ 回復に入った=%u / "
+                "重複ACK 3 個を任された=%u / 入れ替わりを見た接続=%u\n",
+                (unsigned)g_tcp_rack_lost, (unsigned)g_tcp_rack_lost_timer,
+                (unsigned)g_tcp_rack_recovery, (unsigned)g_tcp_rack_dup_skip,
+                (unsigned)g_tcp_rack_reord);
+    uart_printf("tcprack: TLP probe=%u / 損失を直した=%u / 無駄だった(DSACK)=%u\n",
+                (unsigned)g_tcp_tlp_probes, (unsigned)g_tcp_tlp_recovered,
+                (unsigned)g_tcp_tlp_redundant);
+    uart_printf("tcprack: 受けた DSACK=%u / undo 準備=%u / 戻した DSACK=%u Timestamps=%u / 再送セグメント=%u\n",
+                (unsigned)g_tcp_dsack_rx, (unsigned)g_tcp_undo_armed,
+                (unsigned)g_tcp_undo_dsack, (unsigned)g_tcp_undo_ts,
+                (unsigned)g_tcp_retransmit_segs);
+}
+
+/*=================================================================
  * シェルの `tcpts`。TCP Timestamps(RFC 7323)の有効/無効と統計。
  *
  * **コネクション単位で SYN の交換のときに決まる**ので、切り替えても既存の
@@ -7856,6 +7903,8 @@ static void shell_dispatch(char *line, int s0, int s1)
         shell_sacktest(line + 8);
     } else if (strncmp(line, "tcpsack", 7) == 0) {
         shell_tcpsack(line + 7);
+    } else if (strncmp(line, "tcprack", 7) == 0) {
+        shell_tcprack(line + 7);
     } else if (strncmp(line, "keepalivetest", 13) == 0) {
         shell_keepalivetest();
     } else if (strncmp(line, "tcpkeepalive", 12) == 0) {

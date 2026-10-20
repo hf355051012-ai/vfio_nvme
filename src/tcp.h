@@ -81,6 +81,24 @@ extern volatile uint32_t g_tcp_fr_empty;           /* 要求されたのに 0 �
 extern volatile uint32_t g_tcp_sack_use_tx;        /* 0=再送だけ Go-Back-N に戻す */
 extern volatile uint32_t g_tcp_sack_partial_retx;  /* partial ACK で穴を送り直した回数 */
 
+/* RACK-TLP(RFC 8985)と undo(RFC 3708 / 3522)。シェルの `tcprack`。既定はどれも有効。
+ * RACK / TLP は SACK を合意した接続の非同期送信だけで働く(一括送信 tcp_send() は従来どおり)。 */
+extern volatile uint32_t g_tcp_rack_enable;
+extern volatile uint32_t g_tcp_tlp_enable;
+extern volatile uint32_t g_tcp_undo_enable;
+extern volatile uint32_t g_tcp_rack_lost;
+extern volatile uint32_t g_tcp_rack_lost_timer;
+extern volatile uint32_t g_tcp_rack_recovery;
+extern volatile uint32_t g_tcp_rack_dup_skip;
+extern volatile uint32_t g_tcp_rack_reord;
+extern volatile uint32_t g_tcp_tlp_probes;
+extern volatile uint32_t g_tcp_tlp_recovered;
+extern volatile uint32_t g_tcp_tlp_redundant;
+extern volatile uint32_t g_tcp_dsack_rx;
+extern volatile uint32_t g_tcp_undo_armed;
+extern volatile uint32_t g_tcp_undo_dsack;
+extern volatile uint32_t g_tcp_undo_ts;
+
 /* **実際に送り直したセグメント数。** g_tcp_retransmit_count は「再送を始めた
  * 回数」なので、Go-Back-N と SACK の差はこちらでないと見えない。 */
 extern volatile uint32_t g_tcp_retransmit_segs;
