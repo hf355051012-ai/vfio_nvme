@@ -451,7 +451,7 @@ try { var w0 = localStorage.getItem('spec-width2');
 <li><a class="seclink" href="#s8-3" data-target="s8-3"><span class="num">8.3</span><span class="lbl">断片化(フラグメント)</span></a></li>
 <li><a class="seclink" href="#s8-4" data-target="s8-4"><span class="num">8.4</span><span class="lbl">経路 MTU 探索(PMTUD)</span></a></li>
 <li><a class="seclink" href="#s8-5" data-target="s8-5"><span class="num">8.5</span><span class="lbl">状態遷移(断片の組み立て枠)</span></a></li>
-<li><a class="seclink" href="#s8-6" data-target="s8-6"><span class="num">8.6</span><span class="lbl">IPv6 で追加されること</span></a></li>
+<li><a class="seclink" href="#s8-6" data-target="s8-6"><span class="num">8.6</span><span class="lbl">IPv4 と IPv6</span></a></li>
 <li><a class="seclink" href="#s8-7" data-target="s8-7"><span class="num">8.7</span><span class="lbl">外部の機器と IPv6 で話すための要件</span></a></li>
 <li><a class="seclink" href="#s8-8" data-target="s8-8"><span class="num">8.8</span><span class="lbl">HW オフロードは IPv6 でもそのまま使える</span></a></li>
 <li><a class="seclink" href="#s8-9" data-target="s8-9"><span class="num">8.9</span><span class="lbl">状態遷移(MLD の版と、アドレス自動設定)</span></a></li>
@@ -1487,10 +1487,41 @@ rd32le(p)   /* リトルエンディアン版 */</code></pre></div>
 <p><strong>上限で断るのは新しい組み立てを始めるときだけ</strong>である(Linux の <code>inet_frag_create()</code> と同じ)。<br>使用量が上限を超えている間は、未知の鍵の断片を捨てる。<br>組み立て中の枠には、上限を超えていても断片を受け付ける。<br>途中で切ると、そこまで受け取った分が無駄になるためである。<br>そのため使用量は、組み立て中の枠が育つぶんだけ上限をわずかに超えうる。<br>組み立てが終わるか時間切れで枠が空けば、また新しい組み立てを始められる。</p>
 <div class="tablewrap"><table><thead><tr><th>確かめたこと(<code>tools/fraglimit_check.sh</code>、相手 = Linux)</th><th>結果</th></tr></thead><tbody><tr><td>最後の断片を送らない 8KB のデータグラム 200 個を組み立て中のまま、Linux が割った 2 万バイト(IPv4 / IPv6)を組み立てる</td><td>2 つとも総和一致(使用量 1,862,400 バイト)</td></tr><tr><td>同じものを 600 個送る</td><td>451 個で上限に達し、残りと次の完全なデータグラムを断る(使用量の最大 4,199,712 バイト)</td></tr><tr><td>陰性対照: <code>fraglimit 65536</code> で 10 個送る</td><td>7 個で上限に達し、次の完全なデータグラムを断る</td></tr><tr><td>30 秒待つ</td><td>451 個とも時間切れで空き、次のデータグラムを組み立てる</td></tr></tbody></table></div>
 <p><strong>「空いている場所だけ埋める」のが安全上の要点</strong>である。<br>重なった断片で<strong>あとから中身をすり替えられない</strong>(先に来たほうが勝つ)。</p>
-<h4 id="s8-6">8.6 IPv6 で追加されること</h4>
-<p>IPv6 は「IPv4 のアドレスを長くしただけ」ではない。<br>付随する仕組みがいくつかある。<br>このソフトはそれらも実装している。</p>
+<h4 id="s8-6">8.6 IPv4 と IPv6</h4>
+<p>IPv6 は「IPv4 のアドレスを長くしただけ」ではない。<br>ヘッダの形を整理し直したうえで、IPv4 に次の <strong>(1)〜(4) を加え</strong>、いくつかの仕組みを<strong>削った</strong>。<br>このソフトは両方を実装している。</p>
+<h5>ヘッダの構造</h5>
+<p>IPv4 のヘッダは最低 20 バイトで、後ろに可変長のオプションが付きうる。</p>
+<figure class="diagram"><pre class="mermaid">packet-beta
+  0-3: "版(4)"
+  4-7: "ヘッダ長"
+  8-15: "TOS"
+  16-31: "全体の長さ"
+  32-47: "識別子"
+  48-50: "フラグ"
+  51-63: "断片の位置"
+  64-71: "TTL"
+  72-79: "プロトコル"
+  80-95: "ヘッダのチェックサム"
+  96-127: "送信元アドレス(32 ビット)"
+  128-159: "宛先アドレス(32 ビット)"
+  160-191: "オプション(可変、普通は無い)"</pre></figure>
+<p>IPv6 のヘッダは <strong>40 バイト固定</strong>で、オプションは持たない(拡張ヘッダとして後ろに数珠つなぎにする、下の (4))。</p>
+<figure class="diagram"><pre class="mermaid">packet-beta
+  0-3: "版(6)"
+  4-11: "トラフィッククラス"
+  12-31: "フローラベル"
+  32-47: "ペイロードの長さ"
+  48-55: "次のヘッダ"
+  56-63: "ホップ数の上限"
+  64-191: "送信元アドレス(128 ビット)"
+  192-319: "宛先アドレス(128 ビット)"</pre></figure>
+<p>欄ごとの対応は次のとおりである。</p>
+<div class="tablewrap"><table><thead><tr><th>IPv4</th><th>IPv6</th><th>違い</th></tr></thead><tbody><tr><td>版(4)</td><td>版(6)</td><td>値だけ</td></tr><tr><td>ヘッダ長</td><td>—</td><td><strong>削除</strong>。基本ヘッダは 40 バイト固定</td></tr><tr><td>TOS</td><td>トラフィッククラス</td><td>名前が変わっただけ(優先度と輻輳の通知)</td></tr><tr><td>全体の長さ(ヘッダを含む)</td><td>ペイロードの長さ</td><td><strong>基本ヘッダ 40 バイトを含まない</strong>(拡張ヘッダは含む)</td></tr><tr><td>識別子 / フラグ / 断片の位置</td><td>—</td><td><strong>基本ヘッダから外れた</strong>。分割するときだけ Fragment 拡張ヘッダ(8 バイト)を挟む</td></tr><tr><td>TTL</td><td>ホップ数の上限</td><td>名前が変わっただけ(中継のたびに 1 減らし、0 で捨てる)</td></tr><tr><td>プロトコル</td><td>次のヘッダ</td><td>上位のプロトコル(TCP = 6、UDP = 17)に加え、<strong>拡張ヘッダの種別も指す</strong></td></tr><tr><td>ヘッダのチェックサム</td><td>—</td><td><strong>削除</strong>(下の「無くなったもの」)</td></tr><tr><td>送信元 / 宛先アドレス(32 ビット)</td><td>送信元 / 宛先アドレス(128 ビット)</td><td>4 倍の長さ</td></tr><tr><td>オプション(可変長)</td><td>—</td><td><strong>削除</strong>。拡張ヘッダに置き換わった</td></tr><tr><td>—</td><td>フローラベル(20 ビット)</td><td><strong>追加</strong>。同じ流れのパケットに同じ値を付ける(このソフトは 0 を入れる)</td></tr></tbody></table></div>
+<h5>IPv6 で加わったもの</h5>
+<p>IPv6 は IPv4 に次の 4 つを加えた。<br>IPv4 にも似た仕組みはあるが、別の規格として後から足されたもので、無くても IPv4 は動く。<br>IPv6 ではこれらが前提になっている。</p>
+<div class="tablewrap"><table><thead><tr><th></th><th>IPv6 で加わったもの</th><th>IPv4 では</th></tr></thead><tbody><tr><td>(1)</td><td>リンクローカルアドレス(常に持つ)</td><td>169.254.0.0/16 があるが、DHCP が無いときだけ使う</td></tr><tr><td>(2)</td><td>SLAAC(アドレスを自分で作る)</td><td>無い。DHCP のサーバに配ってもらう</td></tr><tr><td>(3)</td><td>MLD(マルチキャストの参加表明、ICMPv6 の一部)</td><td>IGMP(別のプロトコル)。IPv4 の ARP はブロードキャストなので、無くても隣を見つけられる</td></tr><tr><td>(4)</td><td>拡張ヘッダ(数珠つなぎの追加情報)</td><td>ヘッダの中のオプション欄(最大 40 バイト)</td></tr></tbody></table></div>
 <p><strong>(1) <a href="#term-linklocal">リンクローカルアドレス</a></strong></p>
-<p><code>fe80::</code> で始まるアドレスで、<strong>MAC アドレスから自動的に作られる</strong>。<br>設定なしで同じケーブル上の通信ができる。</p>
+<p><code>fe80::</code> で始まるアドレスで、<strong>MAC アドレスから自動的に作られる</strong>。<br>設定なしで同じケーブル上の通信ができる。<br>IPv6 の近隣探索(NDP、<a href="#ch7">第 7 章</a>)やルータとのやりとりは、このアドレスで行う。</p>
 <p><strong>(2) <a href="#term-slaac">SLAAC</a>(アドレスの自動設定)</strong></p>
 <p>ルータに「このネットワークの番号は何か」と尋ね(RS)、返ってきた答え(RA)と自分の MAC を組み合わせて、<strong>世界で通用するアドレスを自分で作る</strong>。<br>DHCP のようなサーバは不要である。</p>
 <p><strong>(3) <a href="#term-mld">MLD</a>(マルチキャストの参加表明)</strong></p>
@@ -1503,7 +1534,11 @@ rd32le(p)   /* リトルエンディアン版 */</code></pre></div>
   FRAG --&gt; TCP["TCP ..."]</pre></figure>
 <p>辿るときの注意点が 4 つある。</p>
 <ul><li>長さの単位は「(記載値 + 1) × 8 バイト」(最初の 8 バイトを含まない)</li><li>Hop-by-Hop の中の項目は {種別, 長さ, 値} の並びだが、<strong>種別 0(パディング 1 バイト)だけは長さの欄を持たない</strong>。<br>一律に読むとそこからずれる。</li><li>知らない項目に出会ったときの扱いは、<strong>種別の上位 2 ビットが決める</strong>。<br>「無視してよい」以外は捨てなければならない。</li><li><strong>上位プロトコルの長さは、全体長から拡張ヘッダぶんを引く</strong>必要がある。<br>忘れるとチェックサムの検証が全部壊れる。</li></ul>
-<p><strong>Fragment(種別 44)だけは辿って終わりにできない。</strong><br>これが挟まっているということは、そこから先が元のパケットの一部でしかないという意味だからである。<br>辿る側はここで止めて、<strong>組み立てる側(<a href="#ch8">第 8 章</a> <a href="#s8-3">8.3</a>)へ渡す</strong>。<br>全部そろってから、Fragment ヘッダが持っていた「本当の次は何か」を使って上位へ渡し直す。</p>
+<p><strong>Fragment(種別 44)だけは辿って終わりにできない。</strong><br>これが挟まっているということは、そこから先が元のパケットの一部でしかないという意味だからである。<br>辿る側はここで止めて、<strong>組み立てる側(<a href="#s8-3">8.3</a>)へ渡す</strong>。<br>全部そろってから、Fragment ヘッダが持っていた「本当の次は何か」を使って上位へ渡し直す。</p>
+<h5>IPv6 で無くなったもの</h5>
+<div class="tablewrap"><table><thead><tr><th>IPv4 にあったもの</th><th>IPv6 では</th><th>理由・影響</th></tr></thead><tbody><tr><td><strong>ヘッダのチェックサム</strong></td><td>無い</td><td>中継のたびに TTL が変わり、チェックサムを計算し直す手間がかかっていた。リンク層(Ethernet の FCS)と上位(TCP / UDP)が守るので要らない。そのぶん <strong>UDP のチェックサムは IPv6 では省略できない</strong>(IPv4 では 0 で「無し」にできる)。TCP / UDP / ICMPv6 のチェックサムは、IPv6 のアドレスを含む疑似ヘッダで計算する</td></tr><tr><td><strong>中継機器による分割</strong></td><td>無い</td><td>IPv4 では途中のルータが大きすぎるパケットを分割できた。IPv6 では<strong>分割できるのは送信元だけ</strong>で、ルータは捨てて「大きすぎる」(ICMPv6 の Packet Too Big)を返す。送信元は経路 MTU 探索(<a href="#s8-4">8.4</a>)で大きさを決め、超えるときは自分で Fragment 拡張ヘッダを付けて割る</td></tr><tr><td><strong>ブロードキャスト</strong></td><td>無い</td><td>「ケーブルの全員」宛はマルチキャスト(全ノード宛 <code>ff02::1</code> など)に置き換わった</td></tr><tr><td><strong>ARP</strong></td><td>無い</td><td>隣の機器の MAC を調べるのは、ICMPv6 の近隣探索(NDP、<a href="#ch7">第 7 章</a>)が担う。宛先はブロードキャストではなく要請ノードマルチキャスト</td></tr><tr><td>ヘッダ長・オプション欄</td><td>無い</td><td>基本ヘッダは 40 バイト固定、追加情報は拡張ヘッダ</td></tr><tr><td>最小 MTU 68 バイト</td><td>最小 MTU 1,280 バイト</td><td>すべてのリンクが 1,280 バイトを通すことが前提になった。経路 MTU の床もこの値にしている(<a href="#s8-4">8.4</a>)</td></tr></tbody></table></div>
+<h5>このソフトで違いが表に出る所</h5>
+<ul><li><strong>TCP ヘッダの位置</strong>: フレームの先頭から IPv4 は 34 バイト目(14 + 20)、IPv6 は 54 バイト目(14 + 40)。<br>フレームは常に送信の作業領域の先頭から置き、TCP ヘッダの位置だけを種別で変える。</li><li><strong>MSS</strong>: IPv6 のヘッダは 20 バイト長いので、IPv6 の MSS は IPv4 より 20 小さい(<a href="#ch6">第 6 章</a>)。</li><li><strong>LSO で埋め込むヘッダ</strong>: IPv6 + タイムスタンプは 86 バイトになり、NIC に埋め込める 82 バイトを超えるので、その組み合わせだけ 1 セグメントずつ送る(<a href="#s10-10">10.10</a>)。</li><li><strong>分割</strong>: IPv6 では 1 つの断片に載るのは MTU − 40 − 8(Fragment 拡張ヘッダ)バイトで、識別子は 32 ビットになる。<br>NIC のチェックサムの手助けは、断片(次のヘッダが 44)には掛けない。<br>掛けると NIC が拡張ヘッダの先を上位のヘッダと見て、断片のデータを書き潰す。</li></ul>
 <h4 id="s8-7">8.7 外部の機器と IPv6 で話すための要件</h4>
 <p>自作どうしでは両側が同じ振る舞いをするので確かめられず、外部の Linux 機と繋いで確かめた点が 3 つある。</p>
 <ol><li><strong>NIC のマルチキャストの受信を有効にする</strong>(<code>MODIFY_NIC_VPORT_CONTEXT</code> の <code>promisc_mc</code>)。<br>NDP の問い合わせは要請ノードマルチキャスト宛で来るので、無効のままだと外部からの IPv6 が 1 フレームも届かない(IPv4 の ARP はブロードキャストなので影響を受けない)。</li><li><strong>NS / NA の対象アドレスは、ICMPv6 メッセージの先頭から 8 バイト目に置く</strong>(RFC 4861)。<br>送る側と受け取る側が同じだけずれていると、自作どうしでは通ってしまう。</li><li><strong>NA の対象アドレスには、問い合わせられたアドレスをそのまま返す。</strong><br>常に自分のリンクローカルアドレスを入れると、グローバルアドレス宛の問い合わせに答えたことにならない。</li></ol>
