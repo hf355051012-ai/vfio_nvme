@@ -34,8 +34,39 @@
 
 /* NDP_OPT_* は ipv6.h(RA のオプションと共用するため)。 */
 
-#define NDP_RESOLVE_TIMEOUT_MS  200u
-#define NDP_RESOLVE_MAX_ATTEMPTS 3u
+/*=================================================================
+ * NDP のオプションの並びが正しいか(RFC 4861 7.1.1 / 7.1.2 / 6.1.2 の
+ * 「含まれるオプションはどれも長さが 0 でない」)。長さ 0 や、途中で切れて
+ * いるオプションがあれば 0 を返す。**中身を使う前に、メッセージ全体で
+ * 確かめる**(途中まで適用してから捨てると、壊れたメッセージの前半だけが
+ * 効いてしまう)。
+ *
+ * 引数:
+ *   in / len - ICMPv6 メッセージ
+ *   off      - 最初のオプションの位置
+ * 戻り値:
+ *   1=正しい、0=壊れている
+ * コール元:
+ *   ipv6_handle_icmpv6(), ipv6_handle_ra()
+ * ===============================================================*/
+static int ndp_opts_valid(const volatile uint8_t *in, size_t len, size_t off)
+{
+    while (off < len) {
+        if (off + 2u > len) return 0;
+        size_t olen = (size_t)in[off + 1u] * 8u;
+        if (olen == 0u || off + olen > len) return 0;
+        off += olen;
+    }
+    return 1;
+}
+
+/* ff02::1:ffXX:XXXX(要請ノードマルチキャスト)なら 1。 */
+static int ipv6_is_solicited_node(const uint8_t a[IPV6_ADDR_LEN])
+{
+    static const uint8_t pfx[13] = { 0xFF, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01, 0xFF };
+    for (unsigned i = 0; i < 13u; i++) if (a[i] != pfx[i]) return 0;
+    return 1;
+}
 
 /* ndp_cache_lookup() が stale なエントリの確認に使う(定義は下の方)。 */
 static int ndp_send_ns(const uint8_t target[IPV6_ADDR_LEN]);
@@ -547,22 +578,19 @@ static int ipv6_send_icmpv6(const uint8_t dst[IPV6_ADDR_LEN], const uint8_t dst_
 }
 
 /*=================================================================
- * 近隣キャッシュへ 1 件登録する(既存エントリがあれば MAC を更新)。空きが
- * 無ければ確認できた時刻がいちばん古いものを潰す。ARP キャッシュと同じく、
- * アクティブなインターフェースのキャッシュに入れる。
+ * addr のエントリを探す。無ければ新しく使う枠(空き、無ければ確かめた時刻が
+ * いちばん古いもの)を返す。arp_cache_slot() の IPv6 版。
  *
  * 引数:
- *   addr - 相手の IPv6 アドレス
- *   mac  - 対応する MAC
+ *   addr  - 相手の IPv6 アドレス
+ *   found - 既存のエントリなら 1、新しく使う枠なら 0 を返す
  * コール元:
- *   ipv6_handle_icmpv6()
+ *   ndp_cache_insert(), ndp_cache_learn(), ndp_cache_update_na()
  * ===============================================================*/
-void ndp_cache_insert(const uint8_t addr[IPV6_ADDR_LEN], const uint8_t mac[ETH_ALEN])
+static ndp_cache_entry_t *ndp_cache_slot(const uint8_t addr[IPV6_ADDR_LEN], int *found)
 {
     ndp_cache_entry_t *cache = g_active_ctx->ndp_cache;
     unsigned free_slot = NDP_CACHE_SIZE;
-    uint64_t expiry = neigh_expiry_from_now();
-
     for (unsigned i = 0; i < NDP_CACHE_SIZE; i++) {
         if (!cache[i].valid) {
             if (free_slot == NDP_CACHE_SIZE) free_slot = i;
@@ -572,28 +600,73 @@ void ndp_cache_insert(const uint8_t addr[IPV6_ADDR_LEN], const uint8_t mac[ETH_A
         for (unsigned j = 0; j < IPV6_ADDR_LEN; j++) {
             if (cache[i].addr[j] != addr[j]) { same = 0; break; }
         }
-        if (same) {
-            for (unsigned j = 0; j < ETH_ALEN; j++) cache[i].mac[j] = mac[j];
-            cache[i].expires_at = expiry;   /* NS/NA を受けるたびに延命する */
-            cache[i].probe_at   = 0;
-            return;
-        }
+        if (same) { *found = 1; return &cache[i]; }
     }
+    *found = 0;
+    if (free_slot < NDP_CACHE_SIZE) return &cache[free_slot];
+    /* 空きが無ければ、確認できた時刻がいちばん古いものを潰す(失効したエントリは
+     * 時間では消えないので、空きが無くなるのは普通に起きる)。 */
+    unsigned slot = 0;
+    for (unsigned i = 1; i < NDP_CACHE_SIZE; i++) {
+        if ((int64_t)(cache[i].expires_at - cache[slot].expires_at) < 0) slot = i;
+    }
+    return &cache[slot];
+}
 
-    /* 空きが無ければ、確認できた時刻がいちばん古いものを潰す(arp_cache_insert()
-     * と同じ。失効したエントリは時間では消えない)。 */
-    unsigned slot = free_slot;
-    if (slot == NDP_CACHE_SIZE) {
-        slot = 0;
-        for (unsigned i = 1; i < NDP_CACHE_SIZE; i++) {
-            if ((int64_t)(cache[i].expires_at - cache[slot].expires_at) < 0) slot = i;
-        }
-    }
-    for (unsigned j = 0; j < IPV6_ADDR_LEN; j++) cache[slot].addr[j] = addr[j];
-    for (unsigned j = 0; j < ETH_ALEN; j++) cache[slot].mac[j] = mac[j];
-    cache[slot].valid      = 1;
-    cache[slot].expires_at = expiry;
-    cache[slot].probe_at   = 0;
+/* エントリへ MAC を書き、fresh(期限を入れ直す)か stale(期限切れ扱い)にする。 */
+static void ndp_cache_store(ndp_cache_entry_t *e, const uint8_t addr[IPV6_ADDR_LEN],
+                            const uint8_t mac[ETH_ALEN], int fresh)
+{
+    for (unsigned j = 0; j < IPV6_ADDR_LEN; j++) e->addr[j] = addr[j];
+    for (unsigned j = 0; j < ETH_ALEN; j++) e->mac[j] = mac[j];
+    e->valid      = 1;
+    e->expires_at = fresh ? neigh_expiry_from_now() : timer_now();
+    e->probe_at   = 0;
+}
+
+static int ndp_mac_eq(const uint8_t a[ETH_ALEN], const uint8_t b[ETH_ALEN])
+{
+    for (unsigned j = 0; j < ETH_ALEN; j++) if (a[j] != b[j]) return 0;
+    return 1;
+}
+
+/*=================================================================
+ * 到達を確かめた対応を近隣キャッシュへ登録する(fresh)。既存エントリがあれば
+ * MAC を更新して延命する。ARP キャッシュと同じく、アクティブなインターフェースの
+ * キャッシュに入れる。
+ *
+ * 引数:
+ *   addr - 相手の IPv6 アドレス
+ *   mac  - 対応する MAC
+ * コール元:
+ *   shell_arptest(), shell_nudtest()
+ * ===============================================================*/
+void ndp_cache_insert(const uint8_t addr[IPV6_ADDR_LEN], const uint8_t mac[ETH_ALEN])
+{
+    int found;
+    ndp_cache_store(ndp_cache_slot(addr, &found), addr, mac, 1);
+}
+
+/*=================================================================
+ * 相手が名乗った対応を覚える(RFC 4861 7.2.3 の NS、6.3.4 の RA の Source
+ * Link-Layer Address)。無ければ stale で作り、あって MAC が違えば書き換えて
+ * stale にする。MAC が同じなら状態は変えない。
+ *
+ * 相手が自分の MAC を名乗っただけで、こちらから届くことは確かめていないので
+ * fresh にはしない(次に使うときに DELAY -> 確認を経る)。
+ *
+ * 引数:
+ *   addr - 相手の IPv6 アドレス
+ *   mac  - 相手が名乗った MAC
+ * コール元:
+ *   ipv6_handle_icmpv6()(NS)、ipv6_handle_ra()
+ * ===============================================================*/
+void ndp_cache_learn(const uint8_t addr[IPV6_ADDR_LEN], const uint8_t mac[ETH_ALEN])
+{
+    int found;
+    ndp_cache_entry_t *e = ndp_cache_slot(addr, &found);
+    if (found && ndp_mac_eq(e->mac, mac)) return;
+    ndp_cache_store(e, addr, mac, 0);
 }
 
 /*=================================================================
@@ -603,11 +676,13 @@ void ndp_cache_insert(const uint8_t addr[IPV6_ADDR_LEN], const uint8_t mac[ETH_A
  * フラグがあり、意味が違う:
  *
  *  - **Solicited=1**: こちらの NS への応答。**到達性が確認できた証拠**なので
- *    延命してよい。非要請の NA(相手がアドレスを変えたときなどに撒く)は
- *    「そこに居るらしい」以上の情報を持たないので、延命の根拠にはならない。
+ *    fresh にする。非要請の NA(相手が MAC を変えたときなどに撒く)は
+ *    「その MAC を名乗った」以上の情報を持たないので、MAC が変わったときに
+ *    stale にするだけで延命はしない。
  *  - **Override=0** で、キャッシュ済みの MAC と違う値を持ってきた NA は
- *    **無視する**。ここを無条件上書きにしていると、**偽の NA を 1 通投げる
- *    だけで他人宛のトラフィックを奪える**(NDP スプーフィング)。
+ *    **MAC を書き換えない**(fresh なら stale へ落として次の使用で確かめさせる)。
+ *    ここを無条件上書きにしていると、**偽の NA を 1 通投げるだけで他人宛の
+ *    トラフィックを奪える**(NDP スプーフィング)。
  *
  * 引数:
  *   addr          - NA の Target Address
@@ -620,43 +695,38 @@ void ndp_cache_insert(const uint8_t addr[IPV6_ADDR_LEN], const uint8_t mac[ETH_A
 void ndp_cache_update_na(const uint8_t addr[IPV6_ADDR_LEN], const uint8_t mac[ETH_ALEN],
                           int solicited, int override_flag)
 {
-    ndp_cache_entry_t *cache = g_active_ctx->ndp_cache;
+    int found;
+    ndp_cache_entry_t *e = ndp_cache_slot(addr, &found);
 
-    for (unsigned i = 0; i < NDP_CACHE_SIZE; i++) {
-        if (!cache[i].valid) continue;
-        int same = 1;
-        for (unsigned j = 0; j < IPV6_ADDR_LEN; j++) {
-            if (cache[i].addr[j] != addr[j]) { same = 0; break; }
-        }
-        if (!same) continue;
-
-        int mac_same = 1;
-        for (unsigned j = 0; j < ETH_ALEN; j++) {
-            if (cache[i].mac[j] != mac[j]) { mac_same = 0; break; }
-        }
-        if (!mac_same && !override_flag) {
-            uart_printf("[NDP] Override 無しの NA が既存と違う MAC を主張 -- 無視"
-                        "(%02x:%02x:%02x:%02x:%02x:%02x)\n",
-                        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-            return;
-        }
-        if (!mac_same) {
-            for (unsigned j = 0; j < ETH_ALEN; j++) cache[i].mac[j] = mac[j];
-        }
-        /* **延命するのは solicited のときだけ。** 非要請 NA は到達性の証拠に
-         * ならない(RFC 4861 7.2.5 は STALE のままにせよと言っている)。 */
-        if (solicited) {
-            cache[i].expires_at = neigh_expiry_from_now();
-            cache[i].probe_at   = 0;
-        }
+    if (!found) {
+        /* RFC 4861 7.2.5 は「エントリが無ければ黙って捨てよ」と言っているが、
+         * **このスタックは INCOMPLETE のエントリを作らない**(ndp_resolve() が
+         * NS を送ってから NA を待つ形)。捨てるとアドレス解決が一切できなく
+         * なるので、ここで登録する(INCOMPLETE のエントリが NA を受けたときと
+         * 同じく、S=1 なら fresh、S=0 なら stale)。意図的な逸脱。 */
+        ndp_cache_store(e, addr, mac, solicited);
         return;
     }
 
-    /* エントリが無い場合、RFC 4861 7.2.5 は「黙って捨てよ」と言っているが、
-     * **このスタックは INCOMPLETE のエントリを作らない**(ndp_resolve() が
-     * NS を送ってから NA を待つ形)。捨てるとアドレス解決が一切できなくなる
-     * ので、ここでは新規登録する。意図的な逸脱。 */
-    ndp_cache_insert(addr, mac);
+    int mac_same = ndp_mac_eq(e->mac, mac);
+    if (!mac_same && !override_flag) {
+        uart_printf("[NDP] Override 無しの NA が既存と違う MAC を主張 -- MAC は書き換えない"
+                    "(%02x:%02x:%02x:%02x:%02x:%02x)\n",
+                    mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+        /* fresh だったものは stale へ落とす(RFC 4861 7.2.5)。 */
+        uint64_t now = timer_now();
+        if ((int64_t)(now - e->expires_at) < 0) {
+            e->expires_at = now;
+            e->probe_at   = 0;
+        }
+        return;
+    }
+    if (solicited) {
+        ndp_cache_store(e, addr, mac, 1);      /* 到達を確かめた */
+    } else if (!mac_same) {
+        ndp_cache_store(e, addr, mac, 0);      /* MAC だけ変わった。確かめていない */
+    }
+    /* S=0 で MAC が同じなら何も変えない。 */
 }
 
 /*=================================================================
@@ -1057,7 +1127,9 @@ int ipv6_slaac_solicit(netif_t *ni, unsigned solicits, uint32_t interval_ms)
 
 /*=================================================================
  * IPv6 アドレスから MAC を得る。キャッシュに無ければ NS を送って NA を待つ。
- * arp_resolve() と同じ「送って待つ」同期解決。
+ * arp_resolve() と同じ「送って待つ」同期解決で、**同じ宛先へ NS を出すのは
+ * RETRANS_TIMER(1 秒)に 1 回まで**(RFC 4861 7.2.2 の MUST)。1 回の呼び出しで
+ * 出すのは 1 個だけで、応答を最大 1 秒待つ。
  *
  * 引数:
  *   addr    - 解決したい相手の IPv6 アドレス
@@ -1071,15 +1143,19 @@ int ndp_resolve(const uint8_t addr[IPV6_ADDR_LEN], uint8_t out_mac[ETH_ALEN])
 {
     if (ndp_cache_lookup(addr, out_mac) == 0) return 0;
 
-    for (unsigned attempt = 0; attempt < NDP_RESOLVE_MAX_ATTEMPTS; attempt++) {
+    netaddr_t a = netaddr_v6(addr);
+    uint64_t *last = neigh_req_stamp(&a);
+    const uint64_t iv = (uint64_t)NEIGH_RETRANS_MS * 1000000ull;
+    uint64_t now = timer_now();
+    if (*last == 0u || now - *last >= iv) {
         if (ndp_send_ns(addr) != 0) return -1;
-
-        uint64_t start = timer_now();
-        do {
-            net_poll_all_and_dispatch();
-            if (ndp_cache_lookup(addr, out_mac) == 0) return 0;
-        } while (!timeout_ms(start, NDP_RESOLVE_TIMEOUT_MS));
+        *last = now;
     }
+    const uint64_t until = *last + iv;
+    do {
+        net_poll_all_and_dispatch();
+        if (ndp_cache_lookup(addr, out_mac) == 0) return 0;
+    } while ((int64_t)(timer_now() - until) < 0);
     return -1;
 }
 
@@ -1603,6 +1679,10 @@ static void ipv6_handle_ra(const volatile uint8_t *in, size_t len,
         uart_printf("[IPv6] RA 長不足 (len=%u)\n", (unsigned)len);
         return;
     }
+    if (!ndp_opts_valid(in, len, RA_OPT_OFF)) {
+        uart_printf("[IPv6] RA: 長さ 0 か途中で切れたオプションがある -- 破棄(RFC 4861 6.1.2)\n");
+        return;
+    }
     /* **RA の送信元はリンクローカルでなければならない**(RFC 4861 6.1.2)。
      * グローバルアドレスから来た RA を受けると、リンク外のノードが経路と
      * プレフィックスを注入できてしまう。 */
@@ -1699,7 +1779,8 @@ static void ipv6_handle_ra(const volatile uint8_t *in, size_t len,
         if (t == NDP_OPT_SRC_LLADDR && olen >= 8u) {
             static uint8_t opt_mac[SMP_MAX_CORES][ETH_ALEN];
             for (unsigned i = 0; i < ETH_ALEN; i++) opt_mac[core][i] = in[off + 2u + i];
-            ndp_cache_insert(src, opt_mac[core]);
+            /* 相手が名乗った MAC。確かめてはいないので stale で覚える(6.3.4)。 */
+            ndp_cache_learn(src, opt_mac[core]);
         } else if (t == NDP_OPT_PREFIX_INFO) {
             if (olen != PIO_LEN) {
                 uart_printf("[IPv6] RA: Prefix Information の長さが %u -- 無視\n",
@@ -1763,6 +1844,15 @@ static void ipv6_handle_icmpv6(const uint8_t *msg, size_t len,
                     type, hop_limit);
         return;
     }
+    /* **NDP の Code は 0 でなければ捨てる**(RFC 4861 6.1.1 / 6.1.2 / 7.1.1 /
+     * 7.1.2 の MUST)。未定義の Code は、規格が後から別の意味を持たせる余地。
+     * 知らない意味のメッセージで表を書き換えないため。 */
+    if ((type == ICMPV6_TYPE_RS || type == ICMPV6_TYPE_RA ||
+         type == ICMPV6_TYPE_NS || type == ICMPV6_TYPE_NA) && in[ICMPV6_OFF_CODE] != 0u) {
+        uart_printf("[IPv6] NDP(type=%u)の Code が %u -- 破棄(0 必須)\n",
+                    type, in[ICMPV6_OFF_CODE]);
+        return;
+    }
 
     if (!eth_rx_hw_csum_ok()) {
         uint16_t verify = ipv6_pseudo_checksum(src, dst, IPV6_NH_ICMPV6, in, (uint16_t)len);
@@ -1803,6 +1893,32 @@ static void ipv6_handle_icmpv6(const uint8_t *msg, size_t len,
         for (unsigned i = 0; i < IPV6_ADDR_LEN; i++) unspec[i] = 0;
         int src_unspec = ipv6_addr_eq(unspec, src);
 
+        /* ---- 妥当性の検査(RFC 4861 7.1.1、満たさないものは黙って捨てる MUST)----
+         * - Target がマルチキャストでない(マルチキャストに MAC の対応は無い)
+         * - オプションの長さがどれも 0 でない
+         * - 送信元が :: (DAD)なら、宛先は要請ノードマルチキャストで、Source
+         *   Link-Layer Address は付いていない(:: は自分のアドレスを持っていない
+         *   印なので、MAC を名乗るのは矛盾している) */
+        if (in[8u + NDP_OFF_TARGET] == 0xFFu) {
+            uart_printf("[IPv6] NS の Target がマルチキャスト -- 破棄(RFC 4861 7.1.1)\n");
+            return;
+        }
+        if (!ndp_opts_valid(in, len, 8u + NDP_BODY_LEN)) {
+            uart_printf("[IPv6] NS: 長さ 0 か途中で切れたオプションがある -- 破棄(RFC 4861 7.1.1)\n");
+            return;
+        }
+        if (src_unspec) {
+            int has_sll = 0;
+            for (size_t o = 8u + NDP_BODY_LEN; o + 2u <= len; o += (size_t)in[o + 1u] * 8u) {
+                if (in[o] == NDP_OPT_SRC_LLADDR) has_sll = 1;
+            }
+            if (!ipv6_is_solicited_node(dst) || has_sll) {
+                uart_printf("[IPv6] 送信元 :: の NS の宛先が要請ノードマルチキャストでないか、"
+                            "Source Link-Layer Address が付いている -- 破棄(RFC 4861 7.1.1)\n");
+                return;
+            }
+        }
+
         /* 自分が DAD 中で、同じアドレスを相手も検査していたら衝突
          * (同時 DAD、RFC 4862 5.4.5)。target が自分のものかを見る前に
          * 判定する -- `dadtest` が自分以外のアドレスを検査することもある。 */
@@ -1838,21 +1954,20 @@ static void ipv6_handle_icmpv6(const uint8_t *msg, size_t len,
             if (loopback) return;
         }
 
-        /* 相手を近隣キャッシュへ入れておく。Source Link-Layer Address
-         * オプションがあればそれを使う(無ければ Ethernet の送信元 MAC)。
-         * これで「NS を受けた側」も相手の MAC を学習でき、以後の応答で
-         * こちらから NS を撃ち直さずに済む。**DAD の NS(送信元 ::)からは
-         * 学習してはいけない** -- :: は正当な送信元アドレスではない。 */
-        if (!src_unspec) {
-            const uint8_t *learn_mac = src_mac;
-            if (len >= 8u + NDP_BODY_LEN + 8u && in[8u + NDP_BODY_LEN] == NDP_OPT_SRC_LLADDR) {
-                static uint8_t opt_mac[SMP_MAX_CORES][ETH_ALEN];
-                for (unsigned i = 0; i < ETH_ALEN; i++) {
-                    opt_mac[core][i] = in[8u + NDP_BODY_LEN + 2u + i];
-                }
-                learn_mac = opt_mac[core];
+        /* 相手を近隣キャッシュへ入れておく(RFC 4861 7.2.3)。これで「NS を
+         * 受けた側」も相手の MAC を学習でき、以後の応答でこちらから NS を
+         * 撃ち直さずに済む。使うのは **Source Link-Layer Address オプションだけ**
+         * (付いていないのはユニキャストの確認の NS で、そのときは表を変えない)。
+         * 相手が名乗っただけで確かめてはいないので stale で覚える。
+         * **DAD の NS(送信元 ::)からは学習してはいけない** -- :: は正当な
+         * 送信元アドレスではない。 */
+        if (!src_unspec && len >= 8u + NDP_BODY_LEN + 8u &&
+            in[8u + NDP_BODY_LEN] == NDP_OPT_SRC_LLADDR) {
+            static uint8_t opt_mac[SMP_MAX_CORES][ETH_ALEN];
+            for (unsigned i = 0; i < ETH_ALEN; i++) {
+                opt_mac[core][i] = in[8u + NDP_BODY_LEN + 2u + i];
             }
-            ndp_cache_insert(src, learn_mac);
+            ndp_cache_learn(src, opt_mac[core]);
         }
 
         /* NA を組み立てる: flags に S(Solicited)|O(Override)、target は自分、
@@ -1983,6 +2098,26 @@ static void ipv6_handle_icmpv6(const uint8_t *msg, size_t len,
          * 別。プロキシ NA では両者が異なる)。 */
         uint8_t target[IPV6_ADDR_LEN];
         for (unsigned i = 0; i < IPV6_ADDR_LEN; i++) target[i] = in[8u + NDP_OFF_TARGET + i];
+        uint8_t na_flags = in[NDP_OFF_FLAGS];
+
+        /* ---- 妥当性の検査(RFC 4861 7.1.2、満たさないものは黙って捨てる MUST)----
+         * - Target がマルチキャストでない
+         * - 宛先がマルチキャストなら Solicited が立っていない(問い合わせへの
+         *   答えは問い合わせた相手へユニキャストで返すもので、全員宛ての答えは
+         *   あり得ない。立っていれば偽物か壊れている)
+         * - オプションの長さがどれも 0 でない */
+        if (target[0] == 0xFFu) {
+            uart_printf("[IPv6] NA の Target がマルチキャスト -- 破棄(RFC 4861 7.1.2)\n");
+            return;
+        }
+        if (dst[0] == 0xFFu && (na_flags & 0x40u)) {
+            uart_printf("[IPv6] マルチキャスト宛ての NA に Solicited が立っている -- 破棄(RFC 4861 7.1.2)\n");
+            return;
+        }
+        if (!ndp_opts_valid(in, len, 8u + NDP_BODY_LEN)) {
+            uart_printf("[IPv6] NA: 長さ 0 か途中で切れたオプションがある -- 破棄(RFC 4861 7.1.2)\n");
+            return;
+        }
 
         const uint8_t *mac = src_mac;
         if (len >= 8u + NDP_BODY_LEN + 8u && in[8u + NDP_BODY_LEN] == NDP_OPT_TGT_LLADDR) {
@@ -2002,10 +2137,25 @@ static void ipv6_handle_icmpv6(const uint8_t *msg, size_t len,
         /* **フラグを見てから更新する**(RFC 4861 7.2.5)。S=1 のときだけ到達確認
          * として延命し、O=0 で既存と違う MAC を主張する NA は無視する。
          * フラグは本文先頭の 32bit の上位 3 ビット(bit31=R bit30=S bit29=O)。 */
-        uint8_t na_flags = in[NDP_OFF_FLAGS];
         ndp_cache_update_na(target, mac,
                             (na_flags & 0x40u) ? 1 : 0,   /* S: Solicited */
                             (na_flags & 0x20u) ? 1 : 0);  /* O: Override */
+
+        /* **ルータをやめた相手をデフォルトルータから外す**(RFC 4861 7.2.5 の
+         * MUST:IsRouter が TRUE から FALSE に変わったら Default Router List から
+         * 外す)。R(Router)の印が 0 の NA を、RA で覚えたデフォルトルータ自身が
+         * 出したなら、その相手はもうルータではない。外さないと、Router Lifetime が
+         * 切れるまで(最大 9000 秒)転送してくれない相手へ送り続ける。
+         * 手動設定のゲートウェイ(`route`)は RA の一覧ではないので触らない。 */
+        netif_t *ni = g_active_ctx;
+        if (!(na_flags & 0x80u) && ni && ni->gateway6_set && ni->gateway6_from_ra &&
+            ipv6_addr_eq(ni->gateway6, target)) {
+            ni->gateway6_set         = 0;
+            ni->gateway6_from_ra     = 0;
+            ni->gateway6_valid_until = 0;
+            uart_printf("[IPv6] RA で覚えたデフォルトルータが R=0 の NA を出した -- "
+                        "ルータでなくなったので外します(RFC 4861 7.2.5)\n");
+        }
         return;
     }
     uart_printf("[IPv6] 未対応の ICMPv6 type=%u 無視\n", type);

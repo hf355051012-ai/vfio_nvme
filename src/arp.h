@@ -41,6 +41,10 @@ int arp_send_request_unicast(uint32_t target_ip, const uint8_t mac[6]);
  * なので既定はずっと短くしてある。**実 LAN へ出すときは RFC の値へ戻すこと。** */
 #define ARP_PROBE_NUM         2u
 #define ARP_PROBE_INTERVAL_MS 50u
+#define ARP_ANNOUNCE_NUM      2u   /* RFC 5227 の ANNOUNCE_NUM */
+
+/* ARP Announcement(送信元 = 宛先 = 自分の IPv4 の request)を 1 個出す(RFC 5227 2.3)。 */
+int arp_announce(void);
 
 int arp_probe(uint32_t ip, unsigned probes, uint32_t interval_ms, uint8_t out_mac[6]);
 

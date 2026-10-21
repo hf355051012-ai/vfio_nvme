@@ -156,6 +156,8 @@ uint16_t ipv6_pseudo_checksum2(const uint8_t src[IPV6_ADDR_LEN],
 
 /* 近隣キャッシュ(NDP)。ARP と役割は同じ。 */
 void ndp_cache_insert(const uint8_t addr[IPV6_ADDR_LEN], const uint8_t mac[6]);
+/* 相手が名乗った対応を stale で覚える(NS / RA の Source Link-Layer Address)。 */
+void ndp_cache_learn(const uint8_t addr[IPV6_ADDR_LEN], const uint8_t mac[6]);
 int  ndp_cache_lookup(const uint8_t addr[IPV6_ADDR_LEN], uint8_t out_mac[6]);
 int  ndp_resolve(const uint8_t addr[IPV6_ADDR_LEN], uint8_t out_mac[6]);
 

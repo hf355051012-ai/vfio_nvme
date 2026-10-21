@@ -4112,6 +4112,48 @@ static void shell_nud_observer(int is_v6, int is_unicast, const uint8_t dst_mac[
 }
 
 /*=================================================================
+ * NS / NA を 1 個、中身を自由に振って組み立てて送る(RFC 4861 7.1 の妥当性の
+ * 検査を確かめるため、Code や、長さ 0 の壊れたオプションも付けられる)。
+ * 送信元はアクティブなインターフェースのリンクローカル。
+ *
+ * 引数:
+ *   type / code   - ICMPv6 の Type と Code
+ *   flags         - 本文先頭のバイト(NA の R/S/O)
+ *   to / to_mac   - 送り先
+ *   target        - Target Address
+ *   opt_type      - 付けるリンク層アドレスのオプション(1=Source、2=Target)
+ *   opt_mac       - そのオプションに入れる MAC
+ *   zero_opt      - 1 なら、後ろに長さ 0 のオプションを付ける(壊れたメッセージ)
+ * 戻り値:
+ *   0=送信完了、-1=失敗
+ * コール元:
+ *   shell_inject_na(), shell_inject_ns(), shell_nudtest()
+ * ===============================================================*/
+static int shell_inject_ndp(uint8_t type, uint8_t code, uint8_t flags,
+                            const uint8_t to[16], const uint8_t to_mac[6],
+                            const uint8_t target[16], uint8_t opt_type,
+                            const uint8_t opt_mac[6], int zero_opt)
+{
+    static uint8_t msg[8u + 16u + 8u + 8u];
+    for (unsigned i = 0; i < sizeof(msg); i++) msg[i] = 0;
+    msg[0] = type;
+    msg[1] = code;
+    msg[4] = flags;
+    for (unsigned i = 0; i < 16u; i++) msg[8u + i] = target[i];
+    msg[24] = opt_type;
+    msg[25] = 1u;
+    for (unsigned i = 0; i < 6u; i++) msg[26u + i] = opt_mac[i];
+    uint16_t len = zero_opt ? (uint16_t)sizeof(msg) : (uint16_t)(sizeof(msg) - 8u);
+    /* zero_opt のときは msg[32] = 種類 1、msg[33] = 長さ 0 のオプション。 */
+    if (zero_opt) msg[32] = 1u;
+
+    uint8_t src[16];
+    ipv6_link_local_addr(src);
+    wr16be(msg + 2, ipv6_pseudo_checksum(src, to, IPV6_NH_ICMPV6, msg, len));
+    return ipv6_send(to, to_mac, IPV6_NH_ICMPV6, msg, len);
+}
+
+/*=================================================================
  * Neighbor Advertisement を 1 個組み立てて送る。**フラグ(Solicited /
  * Override)を自由に振れる**ことが要点で、これが無いと RFC 4861 7.2.5 の
  * 「Override 無しの NA は既存の MAC を書き換えない」を確かめられない。
@@ -4130,22 +4172,64 @@ static int shell_inject_na(const uint8_t to[16], const uint8_t to_mac[6],
                             const uint8_t target[16], const uint8_t tgt_mac[6],
                             int solicited, int override_flag)
 {
-    static uint8_t msg[8u + 16u + 8u];
-    for (unsigned i = 0; i < sizeof(msg); i++) msg[i] = 0;
+    /* 本文先頭のバイトの上位 3 ビットが R/S/O。 */
+    uint8_t flags = (uint8_t)((solicited ? 0x40u : 0u) | (override_flag ? 0x20u : 0u));
+    return shell_inject_ndp(ICMPV6_TYPE_NA, 0u, flags, to, to_mac, target, 2u, tgt_mac, 0);
+}
 
-    msg[0] = ICMPV6_TYPE_NA;
-    msg[1] = 0;
-    /* msg[2..3] はチェックサム。msg[4] の上位 3 ビットが R/S/O。 */
-    msg[4] = (uint8_t)((solicited ? 0x40u : 0u) | (override_flag ? 0x20u : 0u));
-    for (unsigned i = 0; i < 16u; i++) msg[8u + i] = target[i];
-    msg[24] = 2u;   /* Target Link-Layer Address */
-    msg[25] = 1u;
-    for (unsigned i = 0; i < 6u; i++) msg[26u + i] = tgt_mac[i];
+/*=================================================================
+ * Neighbor Solicitation を 1 個組み立てて送る。**Source Link-Layer Address を
+ * 自由に振れる**ことが要点で、RFC 4861 7.2.3(NS で覚える MAC が変わったら
+ * stale にする)を確かめるのに使う。送信元はアクティブなインターフェースの
+ * リンクローカル。
+ *
+ * 引数:
+ *   to / to_mac - 送り先(NS を受け取る側。Target Address もこれ)
+ *   sll         - Source Link-Layer Address オプションに入れる MAC
+ * 戻り値:
+ *   0=送信完了、-1=失敗
+ * コール元:
+ *   shell_nudtest()
+ * ===============================================================*/
+static int shell_inject_ns(const uint8_t to[16], const uint8_t to_mac[6], const uint8_t sll[6])
+{
+    return shell_inject_ndp(ICMPV6_TYPE_NS, 0u, 0u, to, to_mac, to, 1u, sll, 0);
+}
 
-    uint8_t src[16];
-    ipv6_link_local_addr(src);
-    wr16be(msg + 2, ipv6_pseudo_checksum(src, to, IPV6_NH_ICMPV6, msg, (uint16_t)sizeof(msg)));
-    return ipv6_send(to, to_mac, IPV6_NH_ICMPV6, msg, (uint16_t)sizeof(msg));
+/*=================================================================
+ * ARP を 1 個、中身を自由に振って組み立てて送る(RFC 826 の受信手順の検査用)。
+ * Ethernet の送信元はアクティブなインターフェースの MAC。
+ *
+ * 引数:
+ *   oper     - 1=request、2=reply
+ *   sha/spa  - 送信元として名乗る MAC と IPv4(ホストバイトオーダー)
+ *   tpa/tha  - 宛先の IPv4 と MAC
+ *   dst_mac  - Ethernet の宛先
+ * 戻り値:
+ *   0=送信完了、-1=失敗
+ * コール元:
+ *   shell_nudtest()
+ * ===============================================================*/
+static int shell_inject_arp(uint16_t oper, const uint8_t sha[6], uint32_t spa, uint32_t tpa,
+                            const uint8_t tha[6], const uint8_t dst_mac[6])
+{
+    net_buf_t *nb = net_buf_alloc();
+    if (!nb) return -1;
+    uint8_t self_mac[6];
+    eth_get_mac(self_mac);
+    volatile uint8_t *o = nb->data;
+    for (unsigned i = 0; i < 6u; i++) { o[i] = dst_mac[i]; o[6u + i] = self_mac[i]; }
+    o[12] = 0x08; o[13] = 0x06;
+    volatile uint8_t *a = o + ETH_HDR_LEN;
+    wr16be(a + 0, 1u);        /* Ethernet */
+    wr16be(a + 2, 0x0800u);   /* IPv4 */
+    a[4] = 6u; a[5] = 4u;
+    wr16be(a + 6, oper);
+    for (unsigned i = 0; i < 6u; i++) { a[8u + i] = sha[i]; a[18u + i] = tha[i]; }
+    wr32be(a + 14, spa);
+    wr32be(a + 24, tpa);
+    nb->len = ETH_HDR_LEN + 28u;
+    return eth_send(nb);
 }
 
 /*=================================================================
@@ -4331,12 +4415,15 @@ static void shell_nudtest(void)
         netif_activate(self);
         for (uint64_t t0 = timer_now(); !timeout_ms(t0, 150u); ) net_poll_all_and_dispatch();
         netif_activate(self);
+        /* fresh だったので stale へ落ちる(RFC 4861 7.2.5)。MAC は変えない。 */
+        int st6 = ndp_cache_peek(fake, NULL);
         ndp_cache_lookup(fake, mac);
         int kept = 1;
         for (unsigned i = 0; i < 6u; i++) if (mac[i] != real[i]) kept = 0;
         uart_printf("nudtest: %s [6] 陰性対照 -- Override 無しの NA は既存の MAC を"
-                    "書き換えない\n", kept ? "OK" : "NG");
-        if (!kept) ok = 0;
+                    "書き換えない(%d)、fresh は stale へ落とす(%d)\n",
+                    (kept && st6 == 1) ? "OK" : "NG", kept, st6);
+        if (!kept || st6 != 1) ok = 0;
 
         /* [7] Override 有りなら書き換わる(陽性対照)。 */
         netif_activate(peer);
@@ -4379,6 +4466,273 @@ static void shell_nudtest(void)
                     (before == 1 && still_stale && refreshed) ? "OK" : "NG",
                     before, still_stale, refreshed);
         if (before != 1 || !still_stale || !refreshed) ok = 0;
+
+        /* [9] 非要請 NA(S=0、O=1)で MAC が変わったら、書き換えて stale にする
+         * (RFC 4861 7.2.5。到達は確かめていないので延命はしない)。 */
+        netif_activate(peer);
+        shell_inject_na(self_ll, self_mac, fake, real, 0, 1);
+        netif_activate(self);
+        for (uint64_t t0 = timer_now(); !timeout_ms(t0, 40u); ) net_poll_all_and_dispatch();
+        netif_activate(self);
+        int st9 = ndp_cache_peek(fake, NULL);
+        ndp_cache_lookup(fake, mac);
+        int is_real = 1;
+        for (unsigned i = 0; i < 6u; i++) if (mac[i] != real[i]) is_real = 0;
+        uart_printf("nudtest: %s [9] 非要請 NA で MAC が変わる -- 書き換え=%d、stale(%d)\n",
+                    (st9 == 1 && is_real) ? "OK" : "NG", is_real, st9);
+        if (st9 != 1 || !is_real) ok = 0;
+    }
+
+    /* ---- [10] 相手の NS の Source Link-Layer Address(RFC 4861 7.2.3)----
+     * 同じ MAC を名乗る NS では fresh のまま、違う MAC を名乗る NS では書き換えて
+     * stale にする。対向 PF のエントリを使うので、終わったら必ず入れ直す。 */
+    {
+        uint8_t bogus6[6] = { 0x02, 0x00, 0x00, 0x00, 0xCC, 0xCC };
+        netif_activate(self);
+        ndp_cache_insert(peer_ll, peer->mac);
+        netif_activate(peer);
+        shell_inject_ns(self_ll, self_mac, peer->mac);
+        netif_activate(self);
+        for (uint64_t t0 = timer_now(); !timeout_ms(t0, 40u); ) net_poll_all_and_dispatch();
+        netif_activate(self);
+        int same_fresh = (ndp_cache_peek(peer_ll, NULL) == 0);
+        netif_activate(peer);
+        shell_inject_ns(self_ll, self_mac, bogus6);
+        netif_activate(self);
+        for (uint64_t t0 = timer_now(); !timeout_ms(t0, 40u); ) net_poll_all_and_dispatch();
+        netif_activate(self);
+        int st10 = ndp_cache_peek(peer_ll, NULL);
+        ndp_cache_lookup(peer_ll, mac);
+        int is_bogus = 1;
+        for (unsigned i = 0; i < 6u; i++) if (mac[i] != bogus6[i]) is_bogus = 0;
+        ndp_cache_insert(peer_ll, peer->mac);
+        uart_printf("nudtest: %s [10] NS -- 同じ MAC なら fresh のまま(%d)、違う MAC なら"
+                    "書き換え(%d)て stale(%d)\n",
+                    (same_fresh && is_bogus && st10 == 1) ? "OK" : "NG",
+                    same_fresh, is_bogus, st10);
+        if (!same_fresh || !is_bogus || st10 != 1) ok = 0;
+    }
+
+    /* ---- [11]〜[13] ARP の受信で表を書き換える(RFC 826 の merge)----
+     * 対向 PF に任意の ARP を出させる。 */
+    {
+        const uint8_t bcast[6] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
+        const uint8_t zero[6]  = { 0 };
+        uint8_t bogus4[6] = { 0x02, 0x00, 0x00, 0x00, 0xDD, 0xDD };
+        const uint32_t new_ip   = ip_from_octets(192, 168, 101, 98);
+        const uint32_t other_ip = ip_from_octets(192, 168, 101, 97);
+        const uint32_t other_tg = ip_from_octets(192, 168, 101, 96);
+
+        /* [11] gratuitous ARP(送信元 = 宛先 = 名乗る IP)。同じ MAC なら fresh の
+         * まま、違う MAC なら書き換えて stale。**誰も使っていない IP(.94)で試す。**
+         * 対向 PF の IP で試すと、その ARP が対向 PF 自身にも届き、自分の IP を
+         * 他人が名乗ったとして防御の Announcement を出すので、表が正しい MAC へ
+         * 戻る(RFC 5227 2.4。それは [11b] で確かめる)。 */
+        const uint32_t moved_ip = ip_from_octets(192, 168, 101, 94);
+        uint8_t old4[6] = { 0x02, 0x00, 0x00, 0x00, 0x94, 0x94 };
+        netif_activate(self);
+        arp_cache_insert(moved_ip, old4);
+        netif_activate(peer);
+        shell_inject_arp(1u, old4, moved_ip, moved_ip, zero, bcast);
+        netif_activate(self);
+        for (uint64_t t0 = timer_now(); !timeout_ms(t0, 40u); ) net_poll_all_and_dispatch();
+        netif_activate(self);
+        int same_fresh4 = (arp_cache_peek(moved_ip, NULL) == 0);
+        netif_activate(peer);
+        shell_inject_arp(1u, bogus4, moved_ip, moved_ip, zero, bcast);
+        netif_activate(self);
+        for (uint64_t t0 = timer_now(); !timeout_ms(t0, 40u); ) net_poll_all_and_dispatch();
+        netif_activate(self);
+        int st11 = arp_cache_peek(moved_ip, NULL);
+        arp_cache_lookup(moved_ip, mac);
+        int is_bogus4 = 1;
+        for (unsigned i = 0; i < 6u; i++) if (mac[i] != bogus4[i]) is_bogus4 = 0;
+        uart_printf("nudtest: %s [11] gratuitous ARP -- 同じ MAC なら fresh のまま(%d)、"
+                    "違う MAC なら書き換え(%d)て stale(%d)\n",
+                    (same_fresh4 && is_bogus4 && st11 == 1) ? "OK" : "NG",
+                    same_fresh4, is_bogus4, st11);
+        if (!same_fresh4 || !is_bogus4 || st11 != 1) ok = 0;
+
+        /* [11b] 対向 PF の IP を偽の MAC で名乗る ARP -> 対向 PF が防御の
+         * Announcement を出し、こちらの表は対向 PF の本当の MAC に戻る。 */
+        netif_activate(self);
+        arp_cache_insert(peer->ip, peer->mac);
+        netif_activate(peer);
+        peer->arp_defend_at = 0;
+        shell_inject_arp(1u, bogus4, peer->ip, peer->ip, zero, bcast);
+        netif_activate(self);
+        for (uint64_t t0 = timer_now(); !timeout_ms(t0, 40u); ) net_poll_all_and_dispatch();
+        netif_activate(self);
+        arp_cache_lookup(peer->ip, mac);
+        int restored = 1;
+        for (unsigned i = 0; i < 6u; i++) if (mac[i] != peer->mac[i]) restored = 0;
+        arp_cache_insert(peer->ip, peer->mac);
+        uart_printf("nudtest: %s [11b] 対向 PF の IP を騙る ARP -- 対向 PF の防御で本当の MAC に"
+                    "戻る(%d)\n", restored ? "OK" : "NG", restored);
+        if (!restored) ok = 0;
+
+        /* [12] 表に無い相手からの、自分宛ての request -> stale で作る。
+         * [13] 表に無い相手からの、他人宛ての request -> 作らない(陰性対照)。 */
+        netif_activate(peer);
+        shell_inject_arp(1u, bogus4, new_ip, self->ip, zero, bcast);
+        shell_inject_arp(1u, bogus4, other_ip, other_tg, zero, bcast);
+        netif_activate(self);
+        for (uint64_t t0 = timer_now(); !timeout_ms(t0, 40u); ) net_poll_all_and_dispatch();
+        netif_activate(self);
+        int st12 = arp_cache_peek(new_ip, NULL);
+        int st13 = arp_cache_peek(other_ip, NULL);
+        uart_printf("nudtest: %s [12] 自分宛ての request の送信元を stale で覚える(%d)\n",
+                    st12 == 1 ? "OK" : "NG", st12);
+        uart_printf("nudtest: %s [13] 陰性対照 -- 他人宛ての request の送信元は覚えない(%d)\n",
+                    st13 == -1 ? "OK" : "NG", st13);
+        if (st12 != 1 || st13 != -1) ok = 0;
+    }
+
+    /* ---- [14][15] 同じ宛先への問い合わせは 1 秒に 1 回まで(RFC 1122 2.3.2.1 /
+     * RFC 4861 7.2.2)----
+     * 誰も名乗っていないアドレスを解決させ、ブロードキャストの問い合わせの数と、
+     * 1 回の呼び出しが止まる時間を見る。続けてもう 1 回呼ぶと、前の問い合わせから
+     * 1 秒たっているので 1 個出る。最後に「たった今出した」ことにしてから呼び、
+     * 1 個も出さないことを見る(1 秒以内の再送の抑止)。 */
+    {
+        const uint32_t absent4 = ip_from_octets(192, 168, 101, 95);
+        uint8_t absent6[16] = { 0xFE, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xBE, 0xEF };
+        for (int v6 = 0; v6 <= 1; v6++) {
+            netif_activate(self);
+            netaddr_t a = v6 ? netaddr_v6(absent6) : netaddr_v4(absent4);
+            unsigned sent[3];
+            uint32_t ms[3];
+            int failed = 1;
+            for (unsigned k = 0; k < 3u; k++) {
+                s_nud_uni = 0; s_nud_multi = 0;
+                if (k == 2u) *neigh_req_stamp(&a) = timer_now();   /* たった今出したことにする */
+                uint64_t t0 = timer_now();
+                int rc = v6 ? ndp_resolve(absent6, mac) : arp_resolve(absent4, mac);
+                ms[k] = (uint32_t)((timer_now() - t0) / 1000000ull);
+                sent[k] = s_nud_multi;
+                if (rc == 0) failed = 0;
+                netif_activate(self);
+            }
+            int good = failed && sent[0] == 1u && sent[1] == 1u && sent[2] == 0u &&
+                       ms[0] >= 950u && ms[0] <= 1100u && ms[2] <= 1100u;
+            uart_printf("nudtest: %s [%u] %s の問い合わせ -- 1 回目 %u 個 / %ums、続けて %u 個 / %ums、"
+                        "直前に出していれば %u 個 / %ums(期待 1 / 1 / 0 個、各 1 秒以内)\n",
+                        good ? "OK" : "NG", v6 ? 15u : 14u, v6 ? "NS" : "ARP",
+                        sent[0], ms[0], sent[1], ms[1], sent[2], ms[2]);
+            if (!good) ok = 0;
+        }
+    }
+
+    /* ---- [16]〜[18] 壊れた NS / NA は捨てる(RFC 4861 7.1.1 / 7.1.2)----
+     * どれも、壊れていなければ表を書き換えるメッセージにしてある(陽性対照は
+     * [7] と [10])。 */
+    {
+        uint8_t fake[16], real[6] = { 0x02, 0x00, 0x00, 0x00, 0xAA, 0xAA };
+        uint8_t bogus[6] = { 0x02, 0x00, 0x00, 0x00, 0xEE, 0xEE };
+        uint8_t all_nodes[16] = { 0xFF, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01 };
+        const uint8_t all_nodes_mac[6] = { 0x33, 0x33, 0x00, 0x00, 0x00, 0x01 };
+        for (unsigned i = 0; i < 16u; i++) fake[i] = 0;
+        fake[0] = 0xFE; fake[1] = 0x80; fake[14] = 0xDE; fake[15] = 0xAD;
+
+        /* [16] Code が 0 でない NA(S=1、O=1)。 */
+        netif_activate(self);
+        ndp_cache_insert(fake, real);
+        netif_activate(peer);
+        shell_inject_ndp(ICMPV6_TYPE_NA, 1u, 0x60u, self_ll, self_mac, fake, 2u, bogus, 0);
+        /* [17] マルチキャスト宛てで Solicited が立った NA。 */
+        shell_inject_ndp(ICMPV6_TYPE_NA, 0u, 0x60u, all_nodes, all_nodes_mac, fake, 2u, bogus, 0);
+        netif_activate(self);
+        for (uint64_t t0 = timer_now(); !timeout_ms(t0, 40u); ) net_poll_all_and_dispatch();
+        netif_activate(self);
+        ndp_cache_lookup(fake, mac);
+        int kept16 = 1;
+        for (unsigned i = 0; i < 6u; i++) if (mac[i] != real[i]) kept16 = 0;
+        uart_printf("nudtest: %s [16][17] Code が 0 でない NA と、マルチキャスト宛てで Solicited の"
+                    "立った NA は捨てる(MAC が変わらない=%d)\n", kept16 ? "OK" : "NG", kept16);
+        if (!kept16) ok = 0;
+
+        /* [18] 長さ 0 のオプションが付いた NS。 */
+        netif_activate(self);
+        ndp_cache_insert(peer_ll, peer->mac);
+        netif_activate(peer);
+        shell_inject_ndp(ICMPV6_TYPE_NS, 0u, 0u, self_ll, self_mac, self_ll, 1u, bogus, 1);
+        netif_activate(self);
+        for (uint64_t t0 = timer_now(); !timeout_ms(t0, 40u); ) net_poll_all_and_dispatch();
+        netif_activate(self);
+        int st18 = ndp_cache_peek(peer_ll, NULL);
+        ndp_cache_lookup(peer_ll, mac);
+        int kept18 = 1;
+        for (unsigned i = 0; i < 6u; i++) if (mac[i] != peer->mac[i]) kept18 = 0;
+        ndp_cache_insert(peer_ll, peer->mac);
+        uart_printf("nudtest: %s [18] 長さ 0 のオプションが付いた NS は捨てる(MAC が変わらない=%d、"
+                    "fresh のまま=%d)\n", (kept18 && st18 == 0) ? "OK" : "NG", kept18, st18 == 0);
+        if (!kept18 || st18 != 0) ok = 0;
+
+        /* ---- [19] ルータをやめた相手をデフォルトルータから外す(RFC 4861 7.2.5)----
+         * RA で覚えたデフォルトルータを fake にしておき、R=1 の NA では残り、
+         * R=0 の NA で外れることを見る。終わったら元に戻す。 */
+        netif_activate(self);
+        uint8_t sv_gw6[16], sv_set = self->gateway6_set, sv_ra = self->gateway6_from_ra;
+        uint64_t sv_until = self->gateway6_valid_until;
+        for (unsigned i = 0; i < 16u; i++) { sv_gw6[i] = self->gateway6[i]; self->gateway6[i] = fake[i]; }
+        self->gateway6_set = 1; self->gateway6_from_ra = 1; self->gateway6_valid_until = 0;
+        netif_activate(peer);
+        shell_inject_ndp(ICMPV6_TYPE_NA, 0u, 0x80u, self_ll, self_mac, fake, 2u, real, 0);
+        netif_activate(self);
+        for (uint64_t t0 = timer_now(); !timeout_ms(t0, 40u); ) net_poll_all_and_dispatch();
+        int kept19 = self->gateway6_set;
+        netif_activate(peer);
+        shell_inject_ndp(ICMPV6_TYPE_NA, 0u, 0x00u, self_ll, self_mac, fake, 2u, real, 0);
+        netif_activate(self);
+        for (uint64_t t0 = timer_now(); !timeout_ms(t0, 40u); ) net_poll_all_and_dispatch();
+        int removed19 = !self->gateway6_set;
+        for (unsigned i = 0; i < 16u; i++) self->gateway6[i] = sv_gw6[i];
+        self->gateway6_set = sv_set; self->gateway6_from_ra = sv_ra;
+        self->gateway6_valid_until = sv_until;
+        uart_printf("nudtest: %s [19] R=1 の NA ではデフォルトルータのまま(%d)、R=0 の NA で外す(%d)\n",
+                    (kept19 && removed19) ? "OK" : "NG", kept19, removed19);
+        if (!kept19 || !removed19) ok = 0;
+    }
+
+    /* ---- [20][21] 使用中の IPv4 アドレスの衝突(RFC 5227 2.4)と Announcement(2.3)----
+     * 対向 PF に「自分の IPv4 を名乗る ARP」を出させる。1 回目は Announcement で
+     * 守り、10 秒以内の 2 回目は出さない。自分の IP は表に入れない。
+     * 続けて自分の IPv4 を検査し、検査が通ったら Announcement を 2 回出すことを見る。 */
+    {
+        const uint8_t bcast[6] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
+        const uint8_t zero[6]  = { 0 };
+        uint8_t thief[6] = { 0x02, 0x00, 0x00, 0x00, 0xFE, 0xFE };
+        netif_activate(self);
+        uint8_t sv_dup = self->ipv4_dup;
+        uint32_t c0 = self->arp_conflicts;
+        self->arp_defend_at = 0;
+        unsigned ann[2];
+        for (unsigned k = 0; k < 2u; k++) {
+            s_nud_uni = 0; s_nud_multi = 0;
+            netif_activate(peer);
+            shell_inject_arp(1u, thief, self->ip, self->ip, zero, bcast);
+            netif_activate(self);
+            for (uint64_t t0 = timer_now(); !timeout_ms(t0, 40u); ) net_poll_all_and_dispatch();
+            ann[k] = s_nud_multi;
+        }
+        netif_activate(self);
+        uint32_t seen = self->arp_conflicts - c0;
+        int self_cached = (arp_cache_peek(self->ip, NULL) != -1);
+        self->ipv4_dup = sv_dup;
+        uart_printf("nudtest: %s [20] 自分の IPv4 を名乗る ARP -- 衝突 %u 回、Announcement は 1 回目 %u 個 /"
+                    " 10 秒以内の 2 回目 %u 個(期待 1 / 0)、自分の IP を表に入れない=%d\n",
+                    (seen == 2u && ann[0] == 1u && ann[1] == 0u && !self_cached) ? "OK" : "NG",
+                    seen, ann[0], ann[1], !self_cached);
+        if (seen != 2u || ann[0] != 1u || ann[1] != 0u || self_cached) ok = 0;
+
+        s_nud_uni = 0; s_nud_multi = 0;
+        netif_activate(self);
+        int pr = arp_probe(self->ip, 1u, 50u, NULL);
+        netif_activate(self);
+        uart_printf("nudtest: %s [21] 自分の IPv4 の検査(結果 %d)-- probe 1 個 + Announcement で %u 個"
+                    "(期待 %u)\n", (pr == 0 && s_nud_multi == 1u + ARP_ANNOUNCE_NUM) ? "OK" : "NG",
+                    pr, s_nud_multi, 1u + ARP_ANNOUNCE_NUM);
+        if (pr != 0 || s_nud_multi != 1u + ARP_ANNOUNCE_NUM) ok = 0;
     }
 
     neigh_set_probe_observer(NULL);

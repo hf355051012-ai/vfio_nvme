@@ -21,8 +21,6 @@
 /* IP->MAC 簡易キャッシュ                                                */
 /* ------------------------------------------------------------------ */
 
-#define ARP_RESOLVE_TIMEOUT_MS 300u /* 1回のrequestあたりのポーリング待ち */
-#define ARP_RESOLVE_MAX_ATTEMPTS 3u /* requestを再送する最大回数(合計最大約900ms) */
 
 /* ---- 重複アドレス検出(ARP Probe、RFC 5227)の実行中状態 ----
  *
@@ -40,29 +38,20 @@ static uint8_t           s_probe_conflict_mac[ETH_ALEN];
 static uint8_t           s_probe_self_mac[ETH_ALEN];
 
 /*=================================================================
- * 解決済みの IP -> MAC 対応をアクティブインターフェースの ARP キャッシュへ
- * 登録する。同じ IP のエントリがあれば上書き(= 延命)、空きが無ければ
- * 先頭を潰す。ARP reply が届くたびに呼ばれるので、これが stale なエントリを
- * fresh へ戻す唯一の経路でもある。
+ * ip のエントリを探す。無ければ新しく使う枠(空き、無ければ確かめた時刻が
+ * いちばん古いもの)を返す。
  *
  * 引数:
- *   ip  - 対象の IPv4 アドレス(ホストバイトオーダー)
- *   mac - その IP の MAC アドレス(6 バイト)
+ *   ip    - 対象の IPv4 アドレス(ホストバイトオーダー)
+ *   found - 既存のエントリなら 1、新しく使う枠なら 0 を返す
  * コール元:
- *   arp_handle_frame(), shell_arptest()
+ *   arp_cache_insert(), arp_cache_learn()
  * ===============================================================*/
-void arp_cache_insert(uint32_t ip, const uint8_t mac[ETH_ALEN])
+static arp_cache_entry_t *arp_cache_slot(uint32_t ip, int *found)
 {
     arp_cache_entry_t *cache = g_active_ctx->arp_cache;
-    uint64_t expiry = neigh_expiry_from_now();
-
     for (unsigned i = 0; i < ARP_CACHE_SIZE; i++) {
-        if (cache[i].valid && cache[i].ip == ip) {
-            for (int j = 0; j < ETH_ALEN; j++) cache[i].mac[j] = mac[j];
-            cache[i].expires_at = expiry;
-            cache[i].probe_at   = 0;
-            return;
-        }
+        if (cache[i].valid && cache[i].ip == ip) { *found = 1; return &cache[i]; }
     }
     /* 空きが無ければ、確認できた時刻がいちばん古いもの(期限がいちばん早い
      * もの)を潰す。失効したエントリは時間では消えないので、空きが無くなるのは
@@ -72,11 +61,68 @@ void arp_cache_insert(uint32_t ip, const uint8_t mac[ETH_ALEN])
         if (!cache[i].valid) { slot = i; break; }
         if ((int64_t)(cache[i].expires_at - cache[slot].expires_at) < 0) slot = i;
     }
-    cache[slot].ip = ip;
-    for (int j = 0; j < ETH_ALEN; j++) cache[slot].mac[j] = mac[j];
-    cache[slot].valid      = 1;
-    cache[slot].expires_at = expiry;
-    cache[slot].probe_at   = 0;
+    *found = 0;
+    return &cache[slot];
+}
+
+/*=================================================================
+ * 到達を確かめた IP -> MAC 対応をアクティブインターフェースの ARP キャッシュへ
+ * 登録する(fresh)。同じ IP のエントリがあれば上書き(= 延命)する。
+ * 自分の request への reply が届いたときに呼ばれ、stale なエントリを fresh へ
+ * 戻す経路でもある。
+ *
+ * 引数:
+ *   ip  - 対象の IPv4 アドレス(ホストバイトオーダー)
+ *   mac - その IP の MAC アドレス(6 バイト)
+ * コール元:
+ *   arp_handle_frame(), shell_arptest(), shell_nudtest()
+ * ===============================================================*/
+void arp_cache_insert(uint32_t ip, const uint8_t mac[ETH_ALEN])
+{
+    int found;
+    arp_cache_entry_t *e = arp_cache_slot(ip, &found);
+    e->ip = ip;
+    for (int j = 0; j < ETH_ALEN; j++) e->mac[j] = mac[j];
+    e->valid      = 1;
+    e->expires_at = neigh_expiry_from_now();
+    e->probe_at   = 0;
+}
+
+/*=================================================================
+ * 到達を確かめていない対応を覚える(RFC 826 の受信手順の merge)。
+ * 相手が出した ARP の送信元の組を見て、既存のエントリなら MAC を書き換え、
+ * create のときは無ければ新しく作る。
+ *
+ * 「相手がその MAC を名乗った」ことは分かるが、こちらから届くことは確かめて
+ * いないので fresh にはせず stale にする(RFC 4861 7.2.3 の NS の扱い、Linux の
+ * ARP と同じ)。MAC が同じなら状態は変えない(fresh を stale へ落とさない)。
+ *
+ * 引数:
+ *   ip     - 相手の IPv4 アドレス(ホストバイトオーダー)
+ *   mac    - 相手が名乗った MAC
+ *   create - 1=無ければ作る(自分宛ての request)、0=あるときだけ書き換える
+ * コール元:
+ *   arp_handle_frame()
+ * ===============================================================*/
+static void arp_cache_learn(uint32_t ip, const uint8_t mac[ETH_ALEN], int create)
+{
+    int found;
+    arp_cache_entry_t *e = arp_cache_slot(ip, &found);
+    if (!found && !create) return;
+    if (found) {
+        int same = 1;
+        for (int j = 0; j < ETH_ALEN; j++) if (e->mac[j] != mac[j]) { same = 0; break; }
+        if (same) return;
+        uart_printf("[ARP] %u.%u.%u.%u の MAC が %02x:%02x:%02x:%02x:%02x:%02x へ変わった"
+                    "(stale にして次の送信で確かめる)\n",
+                    (ip >> 24) & 0xFFu, (ip >> 16) & 0xFFu, (ip >> 8) & 0xFFu, ip & 0xFFu,
+                    mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    }
+    e->ip = ip;
+    for (int j = 0; j < ETH_ALEN; j++) e->mac[j] = mac[j];
+    e->valid      = 1;
+    e->expires_at = timer_now();   /* もう期限切れ = stale */
+    e->probe_at   = 0;             /* 次に使われたら DELAY から */
 }
 
 /*=================================================================
@@ -233,32 +279,77 @@ void arp_handle_frame(const uint8_t *payload, size_t len, const uint8_t *src_mac
         }
     }
 
-    if (oper == ARP_OP_REPLY) {
-        uint8_t sender_mac[ETH_ALEN];
-        for (int i = 0; i < ETH_ALEN; i++) sender_mac[i] = in[ARP_OFF_SHA + i];
-        arp_cache_insert(sender_ip, sender_mac);
-        return;
-    }
-
     uint32_t target_ip = rd32be(in + ARP_OFF_TPA);
-
-    if (oper != ARP_OP_REQUEST || target_ip != NET_SELF_IP) {
-        return;
-    }
+    uint8_t sender_mac[ETH_ALEN];
+    for (int i = 0; i < ETH_ALEN; i++) sender_mac[i] = in[ARP_OFF_SHA + i];
 
     /* この装置はマルチキャスト/ブロードキャストを送信元へループバックする
      * (ping6 の「Echo Request 受信」が 1 回の送信で 2 行出るのが同じ現象)。
-     * 自分が出したブロードキャスト request が自分に戻ってくるので、送信元
-     * ハードウェアアドレスが自分なら応答しない。返しても相手は自分だけで、
-     * 重複アドレス検出に無駄なフレームを混ぜるだけになる。 */
-    {
-        uint8_t self_mac_now[ETH_ALEN];
-        eth_get_mac(self_mac_now);
-        int loopback = 1;
-        for (int i = 0; i < ETH_ALEN; i++) {
-            if (in[ARP_OFF_SHA + i] != self_mac_now[i]) { loopback = 0; break; }
+     * 自分が出したフレームが自分に戻ってくるので、送信元ハードウェアアドレスが
+     * 自分なら表にも入れず応答もしない。 */
+    uint8_t self_mac_now[ETH_ALEN];
+    eth_get_mac(self_mac_now);
+    int loopback = 1;
+    for (int i = 0; i < ETH_ALEN; i++) {
+        if (sender_mac[i] != self_mac_now[i]) { loopback = 0; break; }
+    }
+    if (loopback) return;
+
+    /* ---- 使用中のアドレスの衝突(RFC 5227 2.4)----
+     * **自分の IPv4 を送信元として名乗る、他人の ARP**(request でも reply でも)は、
+     * 別の機器が同じアドレスを使っている印。RFC 5227 は (a) 使うのをやめる /
+     * (b) 1 回だけ守り、続けて来たらやめる / (c) 守り続ける のどれかを MUST とする。
+     * このソフトはアドレスを手放さない方針(起動時の検査で衝突しても使い続ける。
+     * 2 つのポートを 1 つのプロセスで動かしているため)なので (c) を取る:
+     * 自分の対応を知らせる Announcement を出す。ただし DEFEND_INTERVAL(10 秒)の
+     * うちに出していれば出さない(相手も守り続けると、互いに撒き合う嵐になる)。 */
+    if (sender_ip != 0u && sender_ip == NET_SELF_IP && sender_ip != s_probe_target) {
+        netif_t *ni = g_active_ctx;
+        ni->arp_conflicts++;
+        ni->ipv4_dup = NETIF_DAD_CONFLICT;
+        for (int i = 0; i < ETH_ALEN; i++) ni->dup_mac4[i] = sender_mac[i];
+        uint64_t now = timer_now();
+        int defend = (ni->arp_defend_at == 0u) ||
+                     (now - ni->arp_defend_at >= (uint64_t)ARP_DEFEND_INTERVAL_MS * 1000000ull);
+        uart_printf("[!!] %s: 自分の IPv4 アドレスを %02x:%02x:%02x:%02x:%02x:%02x も名乗っている"
+                    "(RFC 5227 2.4)-- %s\n",
+                    ni->name ? ni->name : "?",
+                    sender_mac[0], sender_mac[1], sender_mac[2],
+                    sender_mac[3], sender_mac[4], sender_mac[5],
+                    defend ? "Announcement で守る" : "10 秒以内に守ったので今回は出さない");
+        if (defend) {
+            ni->arp_defend_at = now;
+            arp_announce();
         }
-        if (loopback) return;
+        return;
+    }
+
+    /* ---- 表の更新(RFC 826 の受信手順)----
+     * **request でも reply でも、送信元の組を見て表を書き換える。** 相手の機器が
+     * 入れ替わったとき、新しい機器が出す ARP(誰かを解決する request や
+     * gratuitous ARP)で、確認を待たずに新しい MAC へ切り替わる。新しく作るのは
+     * 自分宛て(target が自分)のときだけ(RFC 826 の「Am I the target?」の後)。
+     * 送信元 0.0.0.0(RFC 5227 の probe)と自分のアドレスを名乗るもの(重複)は
+     * 覚えない。
+     *
+     * 到達を確かめた(fresh にする)と言えるのは、**自分の request への reply**
+     * だけ。target が自分の IP と MAC の reply がそれにあたる。それ以外
+     * (request、自分宛てでない reply = gratuitous ARP)は stale で覚える。 */
+    if (sender_ip != 0u && sender_ip != NET_SELF_IP) {
+        int to_me = (target_ip == NET_SELF_IP);
+        int solicited_reply = 0;
+        if (oper == ARP_OP_REPLY && to_me) {
+            solicited_reply = 1;
+            for (int i = 0; i < ETH_ALEN; i++) {
+                if (in[ARP_OFF_THA + i] != self_mac_now[i]) { solicited_reply = 0; break; }
+            }
+        }
+        if (solicited_reply) arp_cache_insert(sender_ip, sender_mac);
+        else arp_cache_learn(sender_ip, sender_mac, to_me);
+    }
+
+    if (oper != ARP_OP_REQUEST || target_ip != NET_SELF_IP) {
+        return;
     }
 
     net_buf_t *nb = net_buf_alloc();
@@ -390,6 +481,21 @@ int arp_send_request(uint32_t target_ip)
 }
 
 /*=================================================================
+ * ARP Announcement(RFC 5227 2.3)を 1 個出す。送信元と宛先の IP をどちらも
+ * 自分にした request をブロードキャストし、「この IP はこの MAC が使っている」と
+ * リンク上の全員に知らせる(受けた側は RFC 826 の手順で表を書き換える)。
+ *
+ * 戻り値:
+ *   0=送信成功、-1=失敗
+ * コール元:
+ *   arp_probe()(検査が通った後)、arp_handle_frame()(衝突の防御)
+ * ===============================================================*/
+int arp_announce(void)
+{
+    return arp_send_request_from(NET_SELF_IP, NET_SELF_IP, NULL);
+}
+
+/*=================================================================
  * 到達確認(NUD)用のユニキャスト ARP request。**MAC を既に知っている相手に
  * 「まだそこに居るか」を聞く**ので、ブロードキャストにする理由が無い。
  *
@@ -453,13 +559,33 @@ int arp_probe(uint32_t ip, unsigned probes, uint32_t interval_ms, uint8_t out_ma
         }
         return 1;
     }
+    /* **使い始めることを Announcement で知らせる**(RFC 5227 2.3 の MUST。
+     * ANNOUNCE_NUM = 2 回)。間隔は probe と同じく interval_ms に縮めてある
+     * (RFC は ANNOUNCE_INTERVAL = 2 秒。起動時間に乗るため)。検査したのが
+     * 自分のアドレスのときだけ出す(`dadtest` は他人のアドレスも検査する)。 */
+    if (ip == NET_SELF_IP) {
+        for (unsigned k = 0; k < ARP_ANNOUNCE_NUM; k++) {
+            if (k != 0u) {
+                uint64_t start = timer_now();
+                while (!timeout_ms(start, interval_ms)) net_poll_all_and_dispatch();
+            }
+            arp_announce();
+        }
+    }
     return 0;
 }
 
 /*=================================================================
- * IP から MAC を解決する。まずキャッシュを引き、無ければ request を送って
- * ARP_RESOLVE_TIMEOUT_MS ずつ最大 ARP_RESOLVE_MAX_ATTEMPTS 回待つ
+ * IP から MAC を解決する。まずキャッシュを引き、無ければ request を
+ * ブロードキャストして、最大 NEIGH_RETRANS_MS(1 秒)応答を待つ
  * (待っている間も net_poll_all_and_dispatch() で受信を回す)。
+ *
+ * **同じ宛先へ request を出すのは 1 秒に 1 回まで**(RFC 1122 2.3.2.1 の
+ * ARP の連発防止。推奨は 1 宛先につき毎秒 1 回)。1 回の呼び出しで出すのは
+ * 1 個だけで、再送は次の呼び出し(TCP の再送など)に任せる。前の request から
+ * 1 秒たっていなければ出さずに、その残りの時間だけ応答を待つ。これで、答えない
+ * 相手へ送り続けても request は毎秒 1 回を超えず、1 回の呼び出しが止まるのも
+ * 最大 1 秒で済む。
  *
  * 引数:
  *   ip      - 解決したい IPv4 アドレス(ホストバイトオーダー)
@@ -475,19 +601,18 @@ int arp_resolve(uint32_t ip, uint8_t out_mac[ETH_ALEN])
         return 0;
     }
 
-    for (unsigned attempt = 0; attempt < ARP_RESOLVE_MAX_ATTEMPTS; attempt++) {
-        if (arp_send_request(ip) != 0) {
-            return -1;
-        }
-
-        uint64_t start = timer_now();
-        do {
-            net_poll_all_and_dispatch();
-            if (arp_cache_lookup(ip, out_mac) == 0) {
-                return 0;
-            }
-        } while (!timeout_ms(start, ARP_RESOLVE_TIMEOUT_MS));
+    netaddr_t a = netaddr_v4(ip);
+    uint64_t *last = neigh_req_stamp(&a);
+    const uint64_t iv = (uint64_t)NEIGH_RETRANS_MS * 1000000ull;
+    uint64_t now = timer_now();
+    if (*last == 0u || now - *last >= iv) {
+        if (arp_send_request(ip) != 0) return -1;
+        *last = now;
     }
-
+    const uint64_t until = *last + iv;
+    do {
+        net_poll_all_and_dispatch();
+        if (arp_cache_lookup(ip, out_mac) == 0) return 0;
+    } while ((int64_t)(timer_now() - until) < 0);
     return -1;
 }

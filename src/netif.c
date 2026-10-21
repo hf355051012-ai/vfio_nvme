@@ -111,6 +111,34 @@ int neigh_peek_state(uint64_t now, uint64_t expires_at, uint64_t probe_at,
     return 1;
 }
 
+/*=================================================================
+ * 宛先 addr へ最後に問い合わせ(ブロードキャストの ARP request / マルチキャストの
+ * NS)を出した時刻の置き場を返す(アクティブなインターフェースの表)。無ければ
+ * いちばん古い枠を addr 用に空けて返す(時刻 0 = まだ出していない)。
+ *
+ * 解決は同期で 1 つずつ行うので、8 枠で足りる。古い枠を潰しても、その宛先へ
+ * 1 秒以内にもう一度出すおそれがあるだけで、動作は壊れない。
+ *
+ * 引数:
+ *   addr - 解決したい宛先(次ホップ)
+ * 戻り値:
+ *   時刻の置き場(timer_now() と同じ ns)
+ * コール元:
+ *   arp_resolve(), ndp_resolve()
+ * ===============================================================*/
+uint64_t *neigh_req_stamp(const netaddr_t *addr)
+{
+    neigh_req_t *t = g_active_ctx->neigh_req;
+    unsigned slot = 0;
+    for (unsigned i = 0; i < NEIGH_REQ_SLOTS; i++) {
+        if (t[i].at != 0u && netaddr_eq(&t[i].addr, addr)) return &t[i].at;
+        if (t[i].at < t[slot].at) slot = i;
+    }
+    t[slot].addr = *addr;
+    t[slot].at   = 0;
+    return &t[slot].at;
+}
+
 /* ---- 確認要求の観測フック(`nudtest` 用)---- */
 volatile uint32_t g_neigh_confirm_count;
 

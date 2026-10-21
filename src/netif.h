@@ -138,6 +138,7 @@ unsigned neigh_delay_ms(void);
 int neigh_peek_state(uint64_t now, uint64_t expires_at, uint64_t probe_at,
                      uint8_t probes, uint32_t *remain_ms);
 uint64_t neigh_expiry_from_now(void);
+uint64_t *neigh_req_stamp(const netaddr_t *addr);
 
 typedef struct {
     int (*send_frags)(void *priv, const eth_frag_t *frags, unsigned frag_count);
@@ -157,6 +158,20 @@ typedef struct {
 /* [計数] 受信の周回(`rxstat`)。g_rxstat_on のときだけ数える。 */
 extern volatile uint32_t g_rxstat_on;
 void netif_rxstat_show(int clear);
+
+/* 問い合わせ(ブロードキャストの ARP request / マルチキャストの NS)を最後に出した時刻を、
+ * 宛先ごとに覚える表。**同じ宛先へは RETRANS_TIMER(1 秒)に 1 回までしか出さない**
+ * (RFC 4861 7.2.2 の MUST、RFC 1122 2.3.2.1 の ARP の連発防止)。 */
+#define NEIGH_REQ_SLOTS   8u
+#define NEIGH_RETRANS_MS  1000u   /* RFC 4861 の RETRANS_TIMER */
+typedef struct {
+    netaddr_t addr;
+    uint64_t  at;      /* timer_now() と同じ ns。0=空き */
+} neigh_req_t;
+
+/* RFC 5227 の DEFEND_INTERVAL。自分の IPv4 を名乗る他人の ARP を受けてから、次に
+ * 防御の Announcement を出すまでの最短間隔。 */
+#define ARP_DEFEND_INTERVAL_MS 10000u
 
 typedef struct netif {
     const char *name;   /* ログ/`net use`コマンド用の識別子("rp1","mlx5-pf0"等) */
@@ -195,6 +210,10 @@ typedef struct netif {
     void       *nic_priv;
     arp_cache_entry_t arp_cache[ARP_CACHE_SIZE];
     ndp_cache_entry_t ndp_cache[NDP_CACHE_SIZE];
+    neigh_req_t       neigh_req[NEIGH_REQ_SLOTS];
+    /* 使用中の IPv4 アドレスの衝突(RFC 5227 2.4)。最後に防御した時刻と、衝突を見た回数。 */
+    uint64_t    arp_defend_at;
+    uint32_t    arp_conflicts;
     uint16_t    mss_cap;
     /* IPv4 の total_length として送ってよい上限(= L3 の MTU)。IP 送信側の
      * 断片化がこの値を基準に分割する。mss_cap(TCP ペイロードの上限)+ TCP
