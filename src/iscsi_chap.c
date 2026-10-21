@@ -83,6 +83,34 @@ int iscsi_chap_decode(const char *v, uint32_t vl, uint8_t *out, uint32_t cap)
     return -1;
 }
 
+int iscsi_chap_cfg_check(const iscsi_chap_cfg_t *cfg, const char **why, const char **warn)
+{
+    *why = NULL;
+    if (warn) *warn = NULL;
+    if (!cfg || !cfg->set) return 0;
+    if (cfg->slen == 0) { *why = "秘密が空"; return -1; }
+    if (cfg->mutual) {
+        if (cfg->mlen == 0) { *why = "双方向の秘密が空"; return -1; }
+        /* 両方向に同じ秘密(RFC 7143 12.1.3 の MUST NOT)。 */
+        if (cfg->mlen == cfg->slen && memcmp(cfg->secret, cfg->msecret, cfg->slen) == 0) {
+            *why = "相手を確かめる秘密と自分が答える秘密が同じ(RFC 7143 12.1.3 で禁止)";
+            return -1;
+        }
+    }
+    if (warn && (cfg->slen < ISCSI_CHAP_SECRET_MIN || (cfg->mutual && cfg->mlen < ISCSI_CHAP_SECRET_MIN)))
+        *warn = "秘密が 96 ビット(12 バイト)未満(RFC 7143 12.1.3 は 96 ビット以上を勧める)";
+    return 0;
+}
+
+int iscsi_chap_is_own_response(int alg, uint8_t id, const uint8_t *own_secret, uint32_t slen,
+                               const uint8_t *chal, uint32_t clen, const uint8_t *got, uint32_t gl)
+{
+    if (!own_secret || slen == 0) return 0;
+    uint8_t mine[64];
+    const uint32_t ml = iscsi_chap_response(alg, id, own_secret, slen, chal, clen, mine);
+    return ml != 0 && ml == gl && crypto_equal(mine, got, ml);
+}
+
 void iscsi_chap_hex(const uint8_t *b, uint32_t n, char *out)
 {
     static const char H[] = "0123456789abcdef";

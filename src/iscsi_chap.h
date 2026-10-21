@@ -39,4 +39,20 @@ void iscsi_chap_hex(const uint8_t *b, uint32_t n, char *out);
 /* 10 進(CHAP_I / CHAP_A)。-1 = 数でない。 */
 int  iscsi_chap_num(const char *v, uint32_t vl);
 
+/* 秘密の下限の目安(RFC 7143 12.1.3: 96 ビット以上にすべき = SHOULD)。 */
+#define ISCSI_CHAP_SECRET_MIN 12u
+
+/* 設定を確かめる(RFC 7143 12.1.3)。戻り値 0 = よい / -1 = 断る(*why)。
+ *   - 双方向で、相手を確かめる秘密と自分が答える秘密が同じ -> 断る(MUST NOT。同じ秘密を両方向に
+ *     使えると、相手の挑戦をそのまま投げ返す反射で認証を通せる)。
+ *   - 秘密が 96 ビット(12 バイト)未満 -> 断らずに *warn に理由(SHOULD)。
+ * cfg が NULL / set=0(解除)は常によい。warn は NULL でよい。 */
+int  iscsi_chap_cfg_check(const iscsi_chap_cfg_t *cfg, const char **why, const char **warn);
+
+/* 受けた CHAP_R(got / gl)が、自分が同じ挑戦(id / chal)に own_secret で答えたときの値と等しいか。
+ * 等しければ 1(**認証失敗として扱う**。RFC 7143 12.1.3: 同じ秘密が両方向に使われていることを
+ * 受け手が見つけるための規則)。own_secret が無ければ(slen = 0)0。 */
+int  iscsi_chap_is_own_response(int alg, uint8_t id, const uint8_t *own_secret, uint32_t slen,
+                                const uint8_t *chal, uint32_t clen, const uint8_t *got, uint32_t gl);
+
 #endif /* ISCSI_CHAP_H */

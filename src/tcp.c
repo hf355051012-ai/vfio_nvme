@@ -14,6 +14,7 @@
 #include "job.h"
 #include "smp.h"
 #include "pmtu.h"
+#include "crypto.h"   /* ISN と一時ポートの鍵付きハッシュ(RFC 6528 / RFC 6056)*/
 
 uint64_t g_tcp_copy2_ns = 0, g_tcp_copy2_bytes = 0;
 uint64_t g_tcp_copy3_ns = 0, g_tcp_copy3_bytes = 0;
@@ -79,7 +80,33 @@ void tcp_copy_stats_get(uint64_t *c2_ns, uint64_t *c2_by,
 #define TCP_SACK_TX_MAX        4u
 
 #define TCP_MSS_LOCAL           10182u
-#define TCP_MSS_DEFAULT_RFC879   536u  /* 相手がMSSオプションを付けなかった場合の既定値 */
+/* 相手が MSS オプションを付けなかった場合の既定値(RFC 9293 3.7.1 の MUST-15)。
+ * IPv4 は 576 - 20 - 20 = 536、IPv6 は最小 MTU 1280 - 40 - 20 = 1220(RFC 8200 / RFC 9293)。 */
+#define TCP_MSS_DEFAULT_RFC879   536u
+#define TCP_MSS_DEFAULT_V6      1220u
+/* 相手が名乗る MSS の下限。**0 や極端に小さい値をそのまま使うと、MSS で割る所(LSO のセグメント数、
+ * cwnd の増分)が 0 除算になり、1 バイトずつ送る送信ループが事実上止まる。** Linux の TCP_MIN_MSS と同じ 88
+ * (IPv4 の最小 MTU 576 から余裕を見た値)。 */
+#define TCP_MSS_MIN               88u
+
+/* 再送を諦めるまでの時間(RFC 1122 4.2.3.5 の R2)。**回数ではなく時間で決める** -- RTO の最大値
+ * (TCP_MAX_RTO_MS = 8 秒)は性能のための意図的な値なので、回数だけで決めると 23 秒ほどで切れてしまう。
+ *   データ: 100 秒以上(RFC 1122 4.2.3.5)
+ *   SYN  : 3 分以上(同 MUST-23)。アプリはそれより早く諦めてよい(呼び出し側の時間切れ)。 */
+#define TCP_R2_DATA_MS      100000u
+#define TCP_R2_SYN_MS       180000u
+
+/* 返していない ACK を返すまでの時間の上限(RFC 1122 4.2.3.2 の MUST-40 は 500 ms 未満)。
+ * 普段は受信の周回数(ackhold)で返すので、これはポーリングが止まりがちなときの保険。Linux の
+ * 遅延 ACK の上限(200 ms)に揃えた。 */
+#define TCP_DELACK_MAX_MS     200u
+
+/* 窓外のセグメントへの ACK と challenge ACK の頻度の上限(RFC 5961 7)。
+ * 接続ごとに 500 ms に 1 回(Linux の tcp_invalid_ratelimit)、challenge ACK はさらにコアごとに 1 秒 1000 回
+ * (Linux の tcp_challenge_ack_limit)。**データを運ぶセグメントへの ACK は絞らない**(DSACK を運ぶため。
+ * Linux の tcp_oow_rate_limited() も同じ)。 */
+#define TCP_OOW_ACK_GAP_MS    500u
+#define TCP_CHALLENGE_PER_SEC 1000u
 
 /* コアごとのコネクション数の上限。1 セッションで admin 1 + IO
  * NVMET_IO_QUEUES(16)本を握り、さらに listen backlog(4)と内蔵
@@ -112,7 +139,7 @@ void tcp_copy_stats_get(uint64_t *c2_ns, uint64_t *c2_by,
  * 単なる順序入れ替えを損失と誤検出して無駄な再送が増える。 */
 #define TCP_DUP_ACK_THRESHOLD      3u
 
-#define TCP_SEND_OVERALL_TIMEOUT_MS 30000u  /* tcp_send()全体(複数セグメント/再送込み)の上限 */
+/* tcp_send() の全体の打ち切りは「相手から何も届かない時間」= TCP_R2_DATA_MS(MUST-37。以前は送り始めて 30 秒)。 */
 #define TCP_CLOSE_FIN_WAIT_MS        2000u  /* 自分のFINがACKされた後、相手のFINを待つ時間 */
 
 /* 陰性対照(`tcpooo legacy`)のときだけ使う、接続ごとの順序外のセグメント数の上限と窓の上限
@@ -361,10 +388,12 @@ volatile uint32_t g_tcp_rack_minrtt_win_ms = 10000u;  /* 最小の往復時間�
  * 短くすると「無通信だが生きている」正常な接続を切ってしまうので、
  * 検証のとき以外は縮めないこと(`keepalivetest` は必ず元へ戻す)。
  *
- * ソケット API のある OS では SO_KEEPALIVE で個別に有効化する慣例だが、
- * このスタックにはソケットオプションが無いので既定で有効にしてある
- * (2 時間の無通信を検出するだけなので実害が無い)。 */
-volatile uint32_t g_tcp_keepalive_enable   = 1u;
+ * **g_tcp_keepalive_enable は「これから張る接続の既定」で、既定は 0(使わない)。**
+ * RFC 1122 4.2.3.6 は「Keepalive を使うかはアプリが接続ごとに選べ(MUST-24)、既定は無効
+ * (MUST-25)」と決めている。以前はソケットオプションが無いので全接続で有効にしていた。
+ * 上位はどれも自分の生存確認を持っている(NVMe/TCP は Keep Alive Timer = KATO、iSCSI は
+ * NOP-In)ので、TCP の Keepalive に頼っている接続は無い。接続ごとには tcp_set_keepalive()。 */
+volatile uint32_t g_tcp_keepalive_enable   = 0u;
 volatile uint32_t g_tcp_keepalive_idle_ms  = 7200000u;  /* 2 時間 */
 volatile uint32_t g_tcp_keepalive_intvl_ms = 75000u;    /* probe の間隔 */
 volatile uint32_t g_tcp_keepalive_probes   = 9u;        /* 諦めるまでの probe 数 */
@@ -389,6 +418,21 @@ volatile uint32_t g_tcp_rst_challenge_count;
  * 始めた回数」なので、Go-Back-N と SACK の差(穴の後ろまで送り直すか)は
  * こちらでないと見えない。 */
 volatile uint32_t g_tcp_retransmit_segs;
+
+/* RFC に合わせて足した検査の計数(tcp.h の説明を参照)。どれも冷たい経路でだけ増える。 */
+volatile uint32_t g_tcp_ack_unsent_drop;
+volatile uint32_t g_tcp_rx_oow_drop;
+volatile uint32_t g_tcp_syn_challenge;
+volatile uint32_t g_tcp_oow_ack_limited;
+volatile uint32_t g_tcp_noack_drop;
+volatile uint32_t g_tcp_listen_rst;
+volatile uint32_t g_tcp_ts_missing_drop;
+volatile uint32_t g_tcp_retx_abort;
+volatile uint32_t g_tcp_ack_time_flush;
+volatile uint32_t g_tcp_urg_rx;
+volatile uint32_t g_tcp_synsent_rst;
+volatile uint32_t g_tcp_icmp_soft_count, g_tcp_icmp_hard_count, g_tcp_icmp_pmtu_ok;
+volatile uint32_t g_tcp_icmp_bogus_count, g_tcp_icmp_hard_abort;
 
 /*=================================================================
  * Timestamps オプションに入れる自分の時刻を返す。
@@ -621,10 +665,60 @@ typedef struct {
      * **D7 の「既にあるカウンタを冷たい経路から観測する」手はここでは使えない。**
      * probe への応答は**データを運ばない純 ACK**なので、rcv_seq も snd_una も
      * 進まない -- 既存のどのカウンタにも痕跡が残らない。スナップショット方式で
-     * 作ったところ、**応答が返っているのに接続を切った**(陰性対照で判明)。 */
-    volatile uint8_t  ka_seen;         /* 何か受け取った(冷たい経路が消費する) */
+     * 作ったところ、**応答が返っているのに接続を切った**(陰性対照で判明)。
+     *
+     * 印は「受け取ったセグメントの数」(rx_segs)にしてある。以前の 1 バイトの旗(ka_seen)は
+     * Keepalive の確認が消費してしまうので、ほかの用途(tcp_send() の「相手から何か来ているか」=
+     * 窓 0 の間も相手が応えているなら切らない、MUST-37)と共有できなかった。数なら各自が
+     * 前回の値と比べるだけで済み、ホットパスの費用は 1 バイトの store が 4 バイトの加算に変わるだけ。 */
+    volatile uint32_t rx_segs;         /* この接続で受け取ったセグメントの数(ホットパスで加算) */
+    uint32_t          ka_rx_snap;      /* Keepalive が最後に見た rx_segs */
+    uint8_t           ka_enabled;      /* この接続で Keepalive を使う(MUST-24、既定は張ったときの g_tcp_keepalive_enable)*/
     uint64_t          ka_idle_since;   /* 無通信になった時刻(0=まだ初期化前) */
     uint32_t          ka_probes;       /* 応答が無いまま送った probe の数 */
+
+    /* ---- RFC 9293 に合わせて足した送受信の状態 ----
+     * snd_max  : 送った最大の seq + 1(SND.NXT)。conn->snd_seq は tcp_send() の再送中や高速再送の間は
+     *            巻き戻っているので、「まだ送っていないものへの ACK」の判定には使えない(3.10.7.4)。
+     *            tcp_send_segment() / _lso() で SYN / FIN のぶんも含めて進める。
+     * snd_wl1/2: 送信窓を最後に更新したセグメントの seq / ack(3.10.7.4 の SND.WL1 / WL2)。古い
+     *            セグメントが後から届いても窓を古い値へ戻さない。
+     * rcv_wnd_edge: 最後に広告した受信窓の右端(RCV.NXT + RCV.WND)。受信窓の外のセグメントの判定
+     *            (first check)と、窓を縮めない(SHLD-14)・小さく広げない(MUST-39、受け手の SWS 回避)
+     *            の基準。rcv_wnd_valid は ACK 付きで一度でも広告したか。 */
+    uint32_t          snd_max;
+    uint32_t          snd_wl1, snd_wl2;
+    uint32_t          rcv_wnd_edge;
+    uint8_t           rcv_wnd_valid;
+    /* 順序外の FIN(RFC 9293 3.10.7.4 eighth)。穴があるうちに届いた FIN の位置を覚え、穴が埋まって
+     * rcv_seq がそこへ届いたときに処理する。 */
+    uint8_t           fin_pend;
+    uint32_t          fin_pend_seq;
+    /* 緊急ポインタ(RFC 9293 3.8.5)。rcv_up = 緊急データの終わりの seq(RFC 6093)。 */
+    uint8_t           urg_valid;
+    uint32_t          rcv_up;
+    /* 窓外への ACK / challenge ACK を最後に送った時刻(RFC 5961 7 の頻度の上限)。 */
+    uint64_t          oow_last_at;
+    /* 再送の時間切れ(R2)。RTO で送り直し始めた時刻(0 = いまは再送していない)。累積 ACK で
+     * スロットを返したら 0 に戻す。 */
+    uint64_t          rto_since;
+    /* 能動 open を始めた時刻(SYN の R2 = 3 分の起点)。 */
+    uint64_t          connect_start;
+    /* ICMP エラー(RFC 5927)。HARD を別のコアで受けたときは旗だけ立て、持ち主のコアが畳む。 */
+    volatile uint8_t  icmp_hard;
+    uint32_t          icmp_soft_err;
+    /* TS.Recent の 24 日の失効(RFC 7323 5.5)。冷たい経路で ts_recent が動いたかを見張り、
+     * 24 日動かなければ ts_recent_stale を立てる(PAWS で 1 回だけ素通しする)。ホットパスには
+     * 時刻を置かない(PAWS で捨てる側の枝で旗を 1 つ見るだけ)。 */
+    uint32_t          ts_recent_snap;
+    uint64_t          ts_recent_snap_at;
+    uint8_t           ts_recent_stale;
+    /* 返していない ACK に冷たい経路が最初に気付いた時刻(時間の上限、MUST-40)。0 = 借りが無い。
+     * ack_owed_mark はそのときの last_ack_sent(その後 ACK を送っていれば測り直す)。 */
+    uint64_t          ack_owed_since;
+    uint32_t          ack_owed_mark;
+    /* 窓 0 の確認の後退(SHLD-29/30)。最初は RTO 後、以後は倍々(TCP_MAX_RTO_MS で頭打ち)。 */
+    uint32_t          zwp_interval_ms;
 
     uint32_t          unacked_full_segments;
 
@@ -673,8 +767,22 @@ typedef struct {
 static tcp_conn_t *s_conns[SMP_MAX_CORES][TCP_MAX_CONNS];
 static tcp_priv_t  s_priv[SMP_MAX_CORES][TCP_MAX_CONNS];
 
-#define TCP_TIMEWAIT_MAX 4u
-#define TCP_TIMEWAIT_MS  4000u  /* TCP_CLOSE_FIN_WAIT_MSより十分長い安全マージン */
+/* TIME_WAIT の表(全コア共有、ロック 1 本)。
+ *
+ * **2MSL は 60 秒**(Linux の TCP_TIMEWAIT_LEN と同じ。RFC 9293 の MSL 2 分 x 2 = 4 分より短いが、
+ * 自分側の一時ポートは RFC 6056 で散らしており、Timestamps の PAWS も効くので、Linux と同じ判断を採る)。
+ * 以前は 4 秒・コアごとに 4 個だったので、能動クローズした直後に相手の FIN の再送が来ても、
+ * 表が既に消えていて RST を返すことがあった。
+ *
+ * 大きさは 256(1 エントリ約 64 バイト)。**満杯なら一番古いもの(最も早く期限が来るもの)を
+ * 置き換える**(以前は「先頭」を置き換えていて、それが一番古いとは限らなかった)。Linux は満杯なら
+ * TIME_WAIT を作らずに閉じる(tw bucket overflow)が、こちらは古いものを捨てる方を選ぶ -- どちらも
+ * 失うのは「期限切れ間近の 1 本の保護」だけで、新しく閉じた接続の保護のほうが役に立つ。
+ *
+ * 掃除は冷たい経路(ポーリング 256 回に 1 回)で行う。以前は受信のポーリングのたびに全コアが
+ * 同じロックを取って表を舐めていた。 */
+#define TCP_TIMEWAIT_TOTAL 256u
+#define TCP_TIMEWAIT_MS  60000u
 
 typedef struct {
     int       in_use;
@@ -683,38 +791,64 @@ typedef struct {
     netaddr_t remote_ip;
     uint16_t  remote_port;
     uint32_t local_seq;      /* 応答ACKのSEQフィールドに使う自分のFIN後のseq(不変) */
-    uint64_t started_ticks;  /* TIME_WAIT開始時刻(TCP_TIMEWAIT_MS、timeout_ms()で判定) */
+    uint64_t started_ticks;  /* TIME_WAIT開始時刻(相手の FIN の再送が来たら測り直す、RFC 9293 3.10.7.4) */
+    /* Timestamps を合意していた接続か(RFC 7323)。合意していたなら応答の ACK にも TS を載せる
+     * (載せないと、相手の TS 必須の検査で捨てられ、相手は LAST_ACK から抜けられない)。 */
+    uint8_t  ts_ok;
+    uint32_t ts_recent;
 } tcp_timewait_t;
 
-#define TCP_TIMEWAIT_TOTAL (TCP_TIMEWAIT_MAX * SMP_MAX_CORES)
 static tcp_timewait_t s_timewait[TCP_TIMEWAIT_TOTAL];
 static smp_spinlock_t s_timewait_lock;
 
 /*=================================================================
  * TIME_WAIT テーブルから 4-tuple が一致するエントリを探す。閉じた直後の
- * コネクション宛に届いた再送セグメントへ ACK を返すために使う。
+ * コネクション宛に届いた再送セグメントへ ACK を返すため、と、一時ポートを
+ * 選ぶとき(tcp_pick_port())に使う。
  *
  * 引数:
  *   remote_ip / remote_port / local_port - 探す 4-tuple
+ *   out - 見つかったエントリの写し(NULL 可。ロックの外で使うので写しを返す)
  * 戻り値:
- *   見つかったエントリ。無ければ NULL
+ *   1=見つかった、0=無い
  * コール元:
- *   tcp_input()
+ *   tcp_input_addr(), tcp_pick_port()
  * ===============================================================*/
-static tcp_timewait_t *tcp_timewait_find(const netaddr_t *remote_ip, uint16_t remote_port, uint16_t local_port)
+static int tcp_timewait_find(const netaddr_t *remote_ip, uint16_t remote_port, uint16_t local_port,
+                             tcp_timewait_t *out)
 {
     smp_spin_lock(&s_timewait_lock);
     for (unsigned i = 0; i < TCP_TIMEWAIT_TOTAL; i++) {
         if (s_timewait[i].in_use &&
-            netaddr_eq(&s_timewait[i].remote_ip, remote_ip) &&
             s_timewait[i].remote_port == remote_port &&
-            s_timewait[i].local_port == local_port) {
+            s_timewait[i].local_port == local_port &&
+            netaddr_eq(&s_timewait[i].remote_ip, remote_ip)) {
+            if (out) *out = s_timewait[i];
             smp_spin_unlock(&s_timewait_lock);
-            return &s_timewait[i];
+            return 1;
         }
     }
     smp_spin_unlock(&s_timewait_lock);
-    return NULL;
+    return 0;
+}
+
+/*=================================================================
+ * 相手の FIN の再送が来た TIME_WAIT の期限を測り直す(RFC 9293 3.10.7.4: TIME-WAIT で FIN を
+ * 受けたら ACK を返し、2MSL を測り直す)。
+ * ===============================================================*/
+static void tcp_timewait_restart(const netaddr_t *remote_ip, uint16_t remote_port, uint16_t local_port)
+{
+    smp_spin_lock(&s_timewait_lock);
+    for (unsigned i = 0; i < TCP_TIMEWAIT_TOTAL; i++) {
+        if (s_timewait[i].in_use &&
+            s_timewait[i].remote_port == remote_port &&
+            s_timewait[i].local_port == local_port &&
+            netaddr_eq(&s_timewait[i].remote_ip, remote_ip)) {
+            s_timewait[i].started_ticks = timer_now();
+            break;
+        }
+    }
+    smp_spin_unlock(&s_timewait_lock);
 }
 
 /*=================================================================
@@ -723,41 +857,60 @@ static tcp_timewait_t *tcp_timewait_find(const netaddr_t *remote_ip, uint16_t re
  *
  * 引数:
  *   local_ip / local_port / remote_ip / remote_port - 4-tuple
- *   snd_seq / rcv_seq - 応答 ACK に使うシーケンス番号
+ *   local_seq - 応答 ACK に使う自分の seq(FIN の後)
+ *   ts_ok / ts_recent - Timestamps を合意していたか、相手の最後の TSval
  * コール元:
  *   tcp_close()
  * ===============================================================*/
 static void tcp_timewait_register(const netaddr_t *local_ip, uint16_t local_port,
                                    const netaddr_t *remote_ip, uint16_t remote_port,
-                                   uint32_t local_seq)
+                                   uint32_t local_seq, uint8_t ts_ok, uint32_t ts_recent)
 {
+    const uint64_t now = timer_now();
     smp_spin_lock(&s_timewait_lock);
     int slot = -1;
     for (unsigned i = 0; i < TCP_TIMEWAIT_TOTAL; i++) {
-        if (!s_timewait[i].in_use) { slot = (int)i; break; }
+        /* 同じ 4-tuple が既にあれば上書きする(二重に持たない)。 */
+        if (s_timewait[i].in_use && s_timewait[i].remote_port == remote_port &&
+            s_timewait[i].local_port == local_port &&
+            netaddr_eq(&s_timewait[i].remote_ip, remote_ip)) { slot = (int)i; break; }
     }
-    if (slot < 0) slot = 0;  /* 空きが無ければ一番古い(先頭)のエントリを再利用する */
+    if (slot < 0) {
+        for (unsigned i = 0; i < TCP_TIMEWAIT_TOTAL; i++) {
+            if (!s_timewait[i].in_use) { slot = (int)i; break; }
+        }
+    }
+    if (slot < 0) {
+        /* 満杯: 一番古いもの(最も早く期限が来るもの)を置き換える。 */
+        slot = 0;
+        for (unsigned i = 1; i < TCP_TIMEWAIT_TOTAL; i++) {
+            if (s_timewait[i].started_ticks < s_timewait[slot].started_ticks) slot = (int)i;
+        }
+    }
     s_timewait[slot].in_use       = 1;
     s_timewait[slot].local_ip     = *local_ip;
     s_timewait[slot].local_port   = local_port;
     s_timewait[slot].remote_ip    = *remote_ip;
     s_timewait[slot].remote_port  = remote_port;
     s_timewait[slot].local_seq    = local_seq;
-    s_timewait[slot].started_ticks = timer_now();
+    s_timewait[slot].started_ticks = now;
+    s_timewait[slot].ts_ok        = ts_ok;
+    s_timewait[slot].ts_recent    = ts_recent;
     smp_spin_unlock(&s_timewait_lock);
 }
 
 /*=================================================================
- * 期限切れの TIME_WAIT エントリを掃除する(ポーリングのたびに呼ぶ軽量処理)。
+ * 期限切れの TIME_WAIT エントリを掃除する(冷たい経路。時刻は呼び出し側が 1 回だけ読む)。
  *
  * コール元:
- *   tcp_poll_once_ex()
+ *   tcp_poll_once_ex()(ポーリング 256 回に 1 回)
  * ===============================================================*/
-static void tcp_timewait_reap(void)
+static void tcp_timewait_reap(uint64_t now)
 {
+    const uint64_t life = (uint64_t)TCP_TIMEWAIT_MS * 1000000u;
     smp_spin_lock(&s_timewait_lock);
     for (unsigned i = 0; i < TCP_TIMEWAIT_TOTAL; i++) {
-        if (s_timewait[i].in_use && timeout_ms(s_timewait[i].started_ticks, TCP_TIMEWAIT_MS)) {
+        if (s_timewait[i].in_use && now - s_timewait[i].started_ticks >= life) {
             s_timewait[i].in_use = 0;
         }
     }
@@ -894,6 +1047,9 @@ static void tcp_backlog_release(tcp_listener_slot_t *l, unsigned p)
  * ===============================================================*/
 static void tcp_backlog_reap(void)
 {
+    /* 冷たい経路は各コアが回すので、同じエントリを 2 つのコアが同時に回収しないようロックを取る
+     * (引き渡し tcp_backlog_handoff() と tcp_unlisten() も同じロックの中で触る)。 */
+    smp_spin_lock(&s_listener_lock);
     for (unsigned li = 0; li < TCP_LISTENER_TOTAL; li++) {
         tcp_listener_slot_t *l = &s_listeners[li];
         if (!l->in_use) continue;
@@ -912,6 +1068,7 @@ static void tcp_backlog_reap(void)
             }
         }
     }
+    smp_spin_unlock(&s_listener_lock);
 }
 
 /*=================================================================
@@ -1296,25 +1453,35 @@ volatile uint32_t g_tcp_win_over_last_off, g_tcp_win_over_last_len, g_tcp_win_ov
  * コール元:
  *   tcp_send(), tcp_short_wait(), tcp_send_async_ex()
  * ===============================================================*/
-#define TCP_ZWP_INTERVAL_MS 200u
+/* **間隔は RTO から始めて倍々にする**(RFC 9293 3.8.6.1 の SHLD-29/30: 持続タイマは
+ * RTO で始め、指数で後退する)。以前は 200 ms 固定で、相手が長く窓を閉じていると
+ * 200 ms ごとに確認を送り続けていた。上限は TCP_MAX_RTO_MS(8 秒)。窓が開いたら
+ * (stuck = 0 で呼ばれたら)RTO へ戻す。
+ * **窓 0 の間に送るものが溜まっているのは、送り手が窓待ちで止まっている間だけ**
+ * (この実装の送信は窓が足りないとその場で待つ。キューに積んだまま放っておく経路は無い)。
+ * 待っている送り手が毎回ここを呼ぶので、確認を送る役が居なくなることは無い。 */
 volatile uint64_t g_tcp_zwp_count;
 
 static void tcp_window_probe(tcp_conn_t *conn, tcp_priv_t *priv, uint64_t *since, int stuck)
 {
     if (!stuck) {
         *since = 0;
+        priv->zwp_interval_ms = 0;
         return;
     }
+    if (priv->zwp_interval_ms == 0u) priv->zwp_interval_ms = priv->rto_ms ? priv->rto_ms : TCP_INITIAL_RTO_MS;
     if (*since == 0) {
         *since = timer_now();
         return;
     }
-    if (!timeout_ms(*since, TCP_ZWP_INTERVAL_MS)) return;
+    if (!timeout_ms(*since, priv->zwp_interval_ms)) return;
     uint32_t saved = conn->snd_seq;
     conn->snd_seq = priv->snd_una - 1u;
     tcp_send_segment(conn, priv, TCP_FLAG_ACK, NULL, 0);
     conn->snd_seq = saved;
     g_tcp_zwp_count++;
+    priv->zwp_interval_ms *= 2u;
+    if (priv->zwp_interval_ms > TCP_MAX_RTO_MS) priv->zwp_interval_ms = TCP_MAX_RTO_MS;
     *since = timer_now();
 }
 
@@ -1648,6 +1815,9 @@ void tcp_pmtu_update(const netaddr_t *dst, uint16_t pmtu)
     uint16_t overhead = (uint16_t)(tcp_l3_hdr_len(dst) + TCP_HDR_LEN);
     if (pmtu <= overhead) return;
     uint16_t mss = (uint16_t)(pmtu - overhead);
+    /* 呼ぶ側(icmp.c / ipv6.c)は tcp_icmp_error(..., TCP_ICMP_PMTU) が 1 を返した(引用の seq が
+     * 送った範囲に入っていた)ときだけ pmtu_learn() に進む(RFC 5927 の検査)。ここでは下限だけ守る。 */
+    if (mss < TCP_MSS_MIN) mss = TCP_MSS_MIN;
 
     for (unsigned c = 0; c < SMP_MAX_CORES; c++) {
         for (unsigned i = 0; i < TCP_MAX_CONNS; i++) {
@@ -1825,14 +1995,86 @@ static uint32_t tcp_rcv_window_bytes(const tcp_conn_t *conn, const tcp_priv_t *p
     return cap;
 }
 
-static uint16_t tcp_wire_window(tcp_conn_t *conn, tcp_priv_t *priv, uint8_t flags)
+/*=================================================================
+ * 広告する受信窓のワイヤ上の値と、その右端(RCV.NXT + RCV.WND)を計算する。**記録はしない**
+ * (送ったときだけ呼び出し側が rcv_wnd_edge に入れる。送らずに捨てる窓の更新 ACK で右端だけ
+ * 進めると、相手が知らない右端を基準に受信窓の外を判定してしまう)。
+ *
+ * 右端の決め方(RFC 9293 3.8.6.2.2 / RFC 1122 4.2.3.3):
+ *   - **縮めない**(SHLD-14)。前回広告した右端より手前には戻さない。**ただし pull 型(rx_buf)の
+ *     接続は例外**で、rx_buf の実際の空きより先は約束しない(下の Window Scale の枝の説明)。
+ *   - **小さく広げない**(MUST-39、受け手の SWS 回避)。右端を進めるのは、増やせる量が
+ *     min(受信の余地の半分, MSS) 以上になったときだけ。少しずつ広げると、相手は小さな
+ *     セグメントを送り続ける(silly window)。upcall の接続は窓がほぼ一定なので、MSS 未満の
+ *     受信のぶん広告が少し小さく見えるだけ(既定の窓 1.15MB に対して高々 1 MSS)。
+ *   - Window Scale のときは切り上げる(切り捨てると、rcv_seq が 2^shift の倍数でないぶん
+ *     右端が毎回少し縮む。Linux も切り上げる)。
+ * 同じ ack・同じ右端なら同じ値になるので、相手が数える重複 ACK も崩さない。
+ *
+ * 引数:
+ *   conn / priv - 対象コネクションとプライベート状態
+ *   flags       - 送出するフラグ(SYN のときはスケールを掛けない、RFC 7323 2.2)
+ *   edge_out    - 広告する右端(NULL 可)
+ * 戻り値:
+ *   TCP ヘッダの window フィールドに書く 16bit 値
+ * コール元:
+ *   tcp_send_segment(), tcp_send_segment_lso(), tcp_send_window_update()
+ * ===============================================================*/
+static uint16_t tcp_wire_window(const tcp_conn_t *conn, const tcp_priv_t *priv, uint8_t flags,
+                                uint32_t *edge_out)
 {
     uint32_t actual_window = tcp_rcv_window_bytes(conn, priv);
+    const uint32_t rcv = conn->rcv_seq;
     if ((flags & TCP_FLAG_SYN) || !priv->wscale_enabled) {
-        return (actual_window > 0xFFFFu) ? 0xFFFFu : (uint16_t)actual_window;
+        if (actual_window > 0xFFFFu) actual_window = 0xFFFFu;
+        if (!(flags & TCP_FLAG_SYN) && priv->rcv_wnd_valid) {
+            const uint32_t old = priv->rcv_wnd_edge;
+            const uint32_t ne  = rcv + actual_window;
+            uint32_t thr = conn->snd_mss;
+            if (thr > actual_window / 2u) thr = actual_window / 2u;
+            if (!tcp_seq_gt(ne, old) || (ne - old) < thr) {
+                /* 縮めない / 小さく広げない: 前回の右端のまま(rcv がそれを越えていれば 0)。 */
+                actual_window = tcp_seq_gt(old, rcv) ? old - rcv : 0u;
+                if (actual_window > 0xFFFFu) actual_window = 0xFFFFu;
+            }
+        }
+        if (priv->recv_upcall == NULL) {
+            /* pull 型は rx_buf の実際の空きより先を約束しない(下の Window Scale の枝と同じ理由)。 */
+            uint32_t room = TCP_RX_BUF_SIZE - priv->rx_count;
+            if (actual_window > room) actual_window = room;
+        }
+        if (edge_out) *edge_out = rcv + actual_window;
+        return (uint16_t)actual_window;
     }
-    uint32_t scaled = actual_window >> priv->rcv_wscale;
-    return (scaled > 0xFFFFu) ? 0xFFFFu : (uint16_t)scaled;
+    const uint8_t sc = priv->rcv_wscale;
+    const uint32_t maxw = (uint32_t)0xFFFFu << sc;
+    if (actual_window > maxw) actual_window = maxw;
+    if (priv->rcv_wnd_valid) {
+        const uint32_t old = priv->rcv_wnd_edge;
+        const uint32_t ne  = rcv + actual_window;
+        uint32_t thr = conn->snd_mss;
+        if (thr > actual_window / 2u) thr = actual_window / 2u;
+        if (!tcp_seq_gt(ne, old) || (ne - old) < thr) {
+            actual_window = tcp_seq_gt(old, rcv) ? old - rcv : 0u;
+        }
+    }
+    uint32_t scaled;
+    if (priv->recv_upcall == NULL) {
+        /* **pull 型(rx_buf に積む)の接続は、rx_buf の実際の空きより先を約束しない。**
+         * 縮めない規則(SHLD-14)をここでは破る:読み出しが遅れて空きが減ったときに右端を
+         * 据え置くと、約束したぶんが置けずに捨てることになり、相手は高速再送と RTO で
+         * cwnd を下げる(2 ポートを 1 コアで受ける ESP 越しの iSCSI の書き込みで、捨てが
+         * 10 秒に約 600 回起き、書き込みが 13% 落ちた)。Window Scale も同じ理由で切り捨てる
+         * (切り上げると空きより最大 2^shift - 1 バイト多く約束する)。 */
+        uint32_t room = TCP_RX_BUF_SIZE - priv->rx_count;
+        if (actual_window > room) actual_window = room;
+        scaled = actual_window >> sc;                                /* 切り捨て */
+    } else {
+        scaled = (actual_window + ((1u << sc) - 1u)) >> sc;          /* 切り上げ */
+    }
+    if (scaled > 0xFFFFu) scaled = 0xFFFFu;
+    if (edge_out) *edge_out = rcv + (scaled << sc);
+    return (uint16_t)scaled;
 }
 
 typedef struct { uint32_t start, end; } tcp_sack_range_t;
@@ -2098,13 +2340,19 @@ static inline uint8_t tcp_options_len(const tcp_conn_t *conn, const tcp_priv_t *
         return len;
     }
     if (priv->ts_enabled) len = TCP_TS_OPT_LEN;
-    /* **SACK ブロックはデータを運ばないセグメントにだけ載せる。**
-     * conn->snd_mss は SYN のときに決めた固定値なので、データを積んだ
-     * セグメントでオプションを増やすとリンク MTU を超えてしまう
-     * (Linux は毎回 MSS を計算し直すが、この実装はそうしていない)。
-     * ロスがあるときの受信側は純 ACK を出しているので実用上これで足りる。 */
-    if (priv->sack_enabled && data_len == 0u && (flags & TCP_FLAG_ACK)) {
+    /* **SACK ブロックは、データを運ぶセグメントにも MSS に収まるぶんだけ載せる**(RFC 2018 4:
+     * 受け手のキューの最大の seq を ACK しない ACK にはすべて SACK を載せるべき)。
+     * conn->snd_mss は Timestamps のぶんを引いた固定値なので、データ + SACK が snd_mss を超えると
+     * リンク MTU を超えて NIC に無言で捨てられる。超えるならブロックを減らし、0 なら載せない
+     * (フルサイズのデータには載らない。そのときは穴を見つけた時点ですぐ純 ACK を返しているので
+     * 相手は最新の SACK を受け取れる、tcp_input_addr())。
+     * LSO はヘッダを WQE に写す長さに上限があるので、呼び出し側が data_len に大きな値を渡して載せない。
+     * ロスが無ければ sack_tx_count も dsack_valid も 0 なので、ホットパスは OR 1 つで抜ける。 */
+    if (priv->sack_enabled && (flags & TCP_FLAG_ACK) && (priv->sack_tx_count | priv->dsack_valid)) {
         unsigned n = tcp_sack_block_count(priv, conn);
+        if (data_len != 0u) {
+            while (n > 0u && (uint32_t)data_len + 4u + 8u * n > (uint32_t)conn->snd_mss) n--;
+        }
         if (n > 0) len = (uint8_t)(len + 4u + 8u * n);
     }
     return len;
@@ -2173,10 +2421,15 @@ static void tcp_build_options(tcp_conn_t *conn, tcp_priv_t *priv, uint8_t flags,
         }
         return;
     }
-    if (o < end && priv->sack_enabled && data_len == 0u && (flags & TCP_FLAG_ACK)) {
+    (void)data_len;
+    if (end - o >= 12u && priv->sack_enabled && (flags & TCP_FLAG_ACK)) {
+        /* 載せるブロックの数は tcp_options_len() が決めた長さから逆算する(データに相乗りさせるときは
+         * MSS に収まるぶんへ減らしてある。ここで数え直すと長さと中身が食い違う)。 */
         tcp_sack_range_t blk[TCP_SACK_MAX_BLOCKS];
         unsigned n = tcp_sack_collect(priv, conn, blk);
-        if (priv->dsack_valid) {    /* DSACK は 1 回だけ知らせる */
+        unsigned room = (end - o - 4u) / 8u;
+        if (n > room) n = room;
+        if (priv->dsack_valid && n > 0u) {    /* DSACK(先頭のブロック)は 1 回だけ知らせる */
             priv->dsack_valid = 0;
             g_tcp_dsack_sent_count++;
         }
@@ -2202,6 +2455,13 @@ static int tcp_send_segment(tcp_conn_t *conn, tcp_priv_t *priv, uint8_t flags,
     unsigned core = smp_core_index();
     tcp_win_check(conn, priv, data_len, 0u);
     if (priv->prr_active) priv->prr_out += data_len;   /* 回復中に送った量(PRR) */
+    /* SND.NXT(送った最大)を進める。SYN と FIN は 1 つずつ seq を使う。SYN は ISN から数え直す
+     * (SYN|ACK の送り直しで snd_seq を一時的に ISN へ戻すので、その時点の値で決めてよい)。
+     * 窓の確認や Keepalive(snd_seq - 1、長さ 0)では進まない。比較 1 つと store 1 つ。 */
+    {
+        const uint32_t e = conn->snd_seq + data_len + ((flags & (TCP_FLAG_SYN | TCP_FLAG_FIN)) ? 1u : 0u);
+        if ((flags & TCP_FLAG_SYN) || tcp_seq_gt(e, priv->snd_max)) priv->snd_max = e;
+    }
 
     /* **確立後のセグメントは必ず ACK ビットを立てて現在の rcv_seq を運ぶ**
      * ので、借りていた ACK はこれで返せる(相乗り)。 */
@@ -2255,8 +2515,12 @@ static int tcp_send_segment(tcp_conn_t *conn, tcp_priv_t *priv, uint8_t flags,
     wr32be(tcph + TCP_OFF_ACK, (flags & TCP_FLAG_ACK) ? conn->rcv_seq : 0u);
     tcph[TCP_OFF_DATA_OFFSET] = (uint8_t)((hdr_total / 4u) << 4);
     tcph[TCP_OFF_FLAGS] = flags;
-    uint16_t wire_window = tcp_wire_window(conn, priv, flags);
+    uint32_t wnd_edge;
+    uint16_t wire_window = tcp_wire_window(conn, priv, flags, &wnd_edge);
     wr16be(tcph + TCP_OFF_WINDOW, wire_window);
+    /* 広告した右端を覚える(受信窓の外の判定と、窓を縮めない基準)。ACK を運ぶものだけ --
+     * 能動 open の SYN はまだ rcv_seq が決まっていない。 */
+    if (flags & TCP_FLAG_ACK) { priv->rcv_wnd_edge = wnd_edge; priv->rcv_wnd_valid = 1; }
     /* 直近に広告した (ack, window) を覚えておく。ウィンドウ更新目的の純 ACK が
      * 「どちらも前回と同じ」なら送らずに済ませるため(tcp_recv_internal())。 */
     priv->last_ack_sent = (flags & TCP_FLAG_ACK) ? conn->rcv_seq : 0u;
@@ -2368,6 +2632,7 @@ static int tcp_send_segment_lso(tcp_conn_t *conn, tcp_priv_t *priv,
     unsigned core = smp_core_index();
     tcp_win_check(conn, priv, data_len, 1u);
     if (priv->prr_active) priv->prr_out += data_len;
+    if (tcp_seq_gt(conn->snd_seq + data_len, priv->snd_max)) priv->snd_max = conn->snd_seq + data_len;
 
     if (g_tcp_tx_drop_every != 0u && tcp_tx_should_drop(data_len)) {
         return 0;  /* 送ったことにして捨てる(ロス注入、txdrop) */
@@ -2387,7 +2652,9 @@ static int tcp_send_segment_lso(tcp_conn_t *conn, tcp_priv_t *priv,
     /* LSO でも Timestamps は要る(RFC 7323 は RST 以外の全セグメントに求める)。
      * NIC はヘッダをそのまま各セグメントへ複製するので、オプションも一緒に
      * 複製される(TSval が同じ値で並ぶのは正常)。 */
-    uint8_t  opt_len = tcp_options_len(conn, priv, TCP_FLAG_PSH | TCP_FLAG_ACK, 1u);
+    /* data_len に TCP_MSS_LOCAL を渡すのは「SACK ブロックを載せない」の意味(LSO のヘッダは WQE へ
+     * 写す長さに上限がある。tcp_options_len() の説明)。 */
+    uint8_t  opt_len = tcp_options_len(conn, priv, TCP_FLAG_PSH | TCP_FLAG_ACK, (uint16_t)TCP_MSS_LOCAL);
     uint16_t hdr_total = (uint16_t)(TCP_HDR_LEN + opt_len);
 
     unsigned l4_off = tcp_l4_off((const netaddr_t *)&conn->remote_ip);
@@ -2424,18 +2691,22 @@ static int tcp_send_segment_lso(tcp_conn_t *conn, tcp_priv_t *priv,
     tcph[TCP_OFF_FLAGS] = TCP_FLAG_PSH | TCP_FLAG_ACK;
     priv->ts_last_ack_sent = conn->rcv_seq;
 
-    uint32_t actual_window = tcp_rcv_window_bytes(conn, priv);
-    uint16_t wire_window;
-    if (!priv->wscale_enabled) {
-        wire_window = (actual_window > 0xFFFFu) ? 0xFFFFu : (uint16_t)actual_window;
-    } else {
-        uint32_t scaled = actual_window >> priv->rcv_wscale;
-        wire_window = (scaled > 0xFFFFu) ? 0xFFFFu : (uint16_t)scaled;
-    }
+    /* 窓は tcp_send_segment() と同じ決め方(縮めない・小さく広げない)。 */
+    uint32_t wnd_edge;
+    uint16_t wire_window = tcp_wire_window(conn, priv, TCP_FLAG_PSH | TCP_FLAG_ACK, &wnd_edge);
+    priv->rcv_wnd_edge  = wnd_edge;
+    priv->rcv_wnd_valid = 1;
+    priv->last_ack_sent = conn->rcv_seq;   /* 最後に広告した (ack, 窓)(tcp_send_segment() と同じ)*/
+    priv->last_win_sent = wire_window;
+    /* LSO のセグメントも全部 ACK と現在の rcv_seq を運ぶので、借りている ACK はこれで返せる
+     * (tcp_send_segment() と同じ)。 */
+    priv->ack_deferred = 0;
+    priv->unacked_full_segments = 0;
+    priv->ack_hold_thin = 0;
     wr16be(tcph + TCP_OFF_WINDOW, wire_window);
     wr16be(tcph + TCP_OFF_URGENT, 0);
     wr16be(tcph + TCP_OFF_CHECKSUM, 0);  /* チェックサム計算前に0クリア */
-    tcp_build_options(conn, priv, TCP_FLAG_PSH | TCP_FLAG_ACK, tcph, opt_len, 1u);
+    tcp_build_options(conn, priv, TCP_FLAG_PSH | TCP_FLAG_ACK, tcph, opt_len, (uint16_t)TCP_MSS_LOCAL);
 
     /* LSO は NIC が IPv4 ヘッダの total_length/ID を書き換える前提の機能で、
      * 現在の実装は IPv4 でしか使わない(v6 の呼び出し元は tcp_can_use_lso()
@@ -2467,9 +2738,19 @@ static int tcp_send_segment_lso(tcp_conn_t *conn, tcp_priv_t *priv,
  * コール元:
  *   tcp_send_bare_ack(), tcp_send_bare_rst()
  * ===============================================================*/
-static void tcp_send_bare(const netaddr_t *local_ip, uint16_t local_port,
-                           const netaddr_t *remote_ip, uint16_t remote_port,
-                           uint8_t flags, uint32_t seq, uint32_t ack)
+/* tcp_send_bare_ex() の任意のオプション。 */
+typedef struct {
+    uint16_t    window;     /* window フィールドにそのまま書く値 */
+    uint8_t     ts_on;      /* 1 = Timestamps(NOP NOP TS)を付ける */
+    uint32_t    tsval, tsecr;
+    int         mss;        /* >= 0 なら MSS オプション(試験用) */
+    const void *data;       /* ペイロード(試験用、NULL 可) */
+    uint16_t    dlen;
+} tcp_bare_opt_t;
+
+static void tcp_send_bare_ex(const netaddr_t *local_ip, uint16_t local_port,
+                             const netaddr_t *remote_ip, uint16_t remote_port,
+                             uint8_t flags, uint32_t seq, uint32_t ack, const tcp_bare_opt_t *opt)
 {
     unsigned core = smp_core_index();
 
@@ -2483,32 +2764,61 @@ static void tcp_send_bare(const netaddr_t *local_ip, uint16_t local_port,
         return;
     }
 
+    unsigned olen = 0;
+    if (opt && opt->mss >= 0) olen += 4u;
+    if (opt && opt->ts_on)    olen += TCP_TS_OPT_LEN;
+    const uint16_t hdr = (uint16_t)(TCP_HDR_LEN + olen);
+    uint16_t dlen = (opt && opt->data) ? opt->dlen : 0u;
+    if (dlen > TCP_MSS_LOCAL) dlen = 0;
+
     unsigned slot = eth_tx_wait_free_slot();
     uint8_t *seg_buf = s_seg_bufs[core][netif_active_txq()][slot];
 
     unsigned l4_off = tcp_l4_off(remote_ip);
-    tcp_build_l3(seg_buf, local_ip, remote_ip, dst_mac, TCP_HDR_LEN);
+    tcp_build_l3(seg_buf, local_ip, remote_ip, dst_mac, (uint16_t)(hdr + dlen));
 
     volatile uint8_t *tcph = seg_buf + l4_off;
     wr16be(tcph + TCP_OFF_SRC_PORT, local_port);
     wr16be(tcph + TCP_OFF_DST_PORT, remote_port);
     wr32be(tcph + TCP_OFF_SEQ, seq);
     wr32be(tcph + TCP_OFF_ACK, ack);
-    tcph[TCP_OFF_DATA_OFFSET] = (uint8_t)((TCP_HDR_LEN / 4u) << 4);
+    tcph[TCP_OFF_DATA_OFFSET] = (uint8_t)((hdr / 4u) << 4);
     tcph[TCP_OFF_FLAGS] = flags;
-    wr16be(tcph + TCP_OFF_WINDOW, 0);
+    wr16be(tcph + TCP_OFF_WINDOW, opt ? opt->window : 0u);
     wr16be(tcph + TCP_OFF_CHECKSUM, 0);
     wr16be(tcph + TCP_OFF_URGENT, 0);
+    unsigned o = TCP_HDR_LEN;
+    if (opt && opt->mss >= 0) {
+        tcph[o] = TCP_OPT_KIND_MSS; tcph[o + 1] = 4;
+        wr16be(tcph + o + 2, (uint16_t)opt->mss);
+        o += 4u;
+    }
+    if (opt && opt->ts_on) {
+        tcph[o] = TCP_OPT_KIND_NOP; tcph[o + 1] = TCP_OPT_KIND_NOP;
+        tcph[o + 2] = TCP_OPT_KIND_TS; tcph[o + 3] = 10;
+        wr32be(tcph + o + 4, opt->tsval);
+        wr32be(tcph + o + 8, opt->tsecr);
+        o += TCP_TS_OPT_LEN;
+    }
+    if (dlen) volatile_fast_copy(tcph + hdr, (const volatile uint8_t *)opt->data, dlen);
 
-    uint16_t csum = tcp_checksum(local_ip, remote_ip, tcph, TCP_HDR_LEN, NULL, 0, 0);
+    uint16_t csum = tcp_checksum(local_ip, remote_ip, tcph, hdr,
+                                 dlen ? opt->data : NULL, dlen, 0);
     wr16be(tcph + TCP_OFF_CHECKSUM, csum);
 
     eth_frag_t frag;
     frag.data = seg_buf;
-    frag.len  = (uint16_t)(l4_off + TCP_HDR_LEN);
+    frag.len  = (uint16_t)(l4_off + hdr + dlen);
 
     dcache_clean_range(seg_buf, frag.len);
     eth_send_frags_async(&frag, 1u);
+}
+
+static void tcp_send_bare(const netaddr_t *local_ip, uint16_t local_port,
+                           const netaddr_t *remote_ip, uint16_t remote_port,
+                           uint8_t flags, uint32_t seq, uint32_t ack)
+{
+    tcp_send_bare_ex(local_ip, local_port, remote_ip, remote_port, flags, seq, ack, NULL);
 }
 
 /*=================================================================
@@ -2522,10 +2832,16 @@ static void tcp_send_bare(const netaddr_t *local_ip, uint16_t local_port,
  * ===============================================================*/
 static void tcp_send_bare_ack(const netaddr_t *local_ip, uint16_t local_port,
                                const netaddr_t *remote_ip, uint16_t remote_port,
-                               uint32_t seq, uint32_t ack)
+                               uint32_t seq, uint32_t ack, uint8_t ts_on, uint32_t tsecr)
 {
-    tcp_send_bare(local_ip, local_port, remote_ip, remote_port,
-                   TCP_FLAG_ACK, seq, ack);
+    /* Timestamps を合意していた接続なら TS を載せる(RFC 7323 3.2。載せないと、相手は
+     * 「TS の無いセグメント」として捨て、LAST_ACK から抜けられない)。 */
+    tcp_bare_opt_t o = { 0 };
+    o.mss   = -1;
+    o.ts_on = ts_on;
+    o.tsval = tcp_ts_now();
+    o.tsecr = tsecr;
+    tcp_send_bare_ex(local_ip, local_port, remote_ip, remote_port, TCP_FLAG_ACK, seq, ack, &o);
 }
 
 /*=================================================================
@@ -2584,6 +2900,50 @@ void tcp_debug_inject_rst(const tcp_conn_t *victim, uint32_t seq)
 }
 
 /*=================================================================
+ * 指定コネクション宛に、相手を騙って任意のセグメントを 1 つ撃ち込む(`rfctest tcp`)。
+ * 正しい相手は送ってこない形(まだ送っていないものへの ACK、窓の外のデータ、確立済みの
+ * 4-tuple への SYN など)を作るため。victim が Timestamps を合意していれば TS を付ける
+ * (TSval は今の時刻 = 相手も同じプロセスの時計なので PAWS で捨てられない)。
+ *
+ * 引数:
+ *   victim      - 撃ち込む先のコネクション
+ *   flags / seq / ack / window - TCP ヘッダの値
+ *   data / len  - ペイロード(NULL / 0 可)
+ * コール元:
+ *   rfctest_tcp()
+ * ===============================================================*/
+void tcp_debug_inject(const tcp_conn_t *victim, uint8_t flags, uint32_t seq, uint32_t ack,
+                      uint16_t window, const void *data, uint16_t len)
+{
+    tcp_priv_t *vp = tcp_priv_for((tcp_conn_t *)victim);
+    tcp_bare_opt_t o = { 0 };
+    o.window = window;
+    o.mss    = -1;
+    o.ts_on  = (vp && vp->ts_enabled) ? 1u : 0u;
+    o.tsval  = tcp_ts_now();
+    o.tsecr  = vp ? vp->ts_last_sent : 0u;
+    o.data   = data;
+    o.dlen   = data ? len : 0u;
+    tcp_send_bare_ex((const netaddr_t *)&victim->remote_ip, victim->remote_port,
+                     (const netaddr_t *)&victim->local_ip, victim->local_port,
+                     flags, seq, ack, &o);
+}
+
+/*=================================================================
+ * 接続を持たない 4-tuple から任意のセグメントを撃ち込む(`rfctest tcp`。待ち受けへの ACK、
+ * MSS 0 の SYN|ACK など)。Timestamps は付けない。
+ * ===============================================================*/
+void tcp_debug_inject_to(const netaddr_t *from, uint16_t from_port,
+                         const netaddr_t *to, uint16_t to_port,
+                         uint8_t flags, uint32_t seq, uint32_t ack, int mss)
+{
+    tcp_bare_opt_t o = { 0 };
+    o.window = 65535u;
+    o.mss    = mss;
+    tcp_send_bare_ex(from, from_port, to, to_port, flags, seq, ack, &o);
+}
+
+/*=================================================================
  * 指定ポートで待ち受けているリスナが 1 つでもあるか。
  *
  * 受動 open のマッチ条件(accept_conn が用意済みで CLOSED)より緩く、
@@ -2636,6 +2996,296 @@ static int tcp_conn_exists_any_core(const netaddr_t *src, uint16_t src_port, uin
         }
     }
     return 0;
+}
+
+/* ---- ISN と一時ポート(RFC 6528 / RFC 6056)---- */
+
+/* 起動後に 1 回だけ作る秘密の鍵(32 バイト)。ISN と一時ポートの鍵付きハッシュに使う。 */
+static uint8_t          s_tcp_secret[32];
+static volatile uint8_t s_tcp_secret_ready;
+static smp_spinlock_t   s_tcp_secret_lock;
+/* RFC 6056 Algorithm 3 の next_ephemeral(全コア共有、試すたびに進める)。 */
+static volatile uint32_t s_tcp_next_ephemeral;
+
+/*=================================================================
+ * 秘密の鍵を初めて使うときに作る(getrandom)。乱数が取れなければ時刻から作る(推測は
+ * されうるが、時計をそのまま使うよりはまし。起動時に一度表示して気付けるようにする)。
+ * 複数のコアが同時に初めて接続を張ることがあるのでロックで守る(冷たい経路)。
+ * ===============================================================*/
+static void tcp_secret_init(void)
+{
+    if (__atomic_load_n(&s_tcp_secret_ready, __ATOMIC_ACQUIRE)) return;
+    smp_spin_lock(&s_tcp_secret_lock);
+    if (!s_tcp_secret_ready) {
+        if (crypto_random(s_tcp_secret, sizeof(s_tcp_secret)) != 0) {
+            const uint64_t t = timer_now();
+            for (unsigned i = 0; i < sizeof(s_tcp_secret); i++) {
+                s_tcp_secret[i] = (uint8_t)((t >> ((i % 8u) * 8u)) ^ (i * 0x9Du));
+            }
+            uart_printf("[!] TCP: 乱数が取れないので ISN / 一時ポートの鍵を時刻から作りました\n");
+        }
+        s_tcp_next_ephemeral = (uint32_t)s_tcp_secret[0] | ((uint32_t)s_tcp_secret[1] << 8);
+        __atomic_store_n(&s_tcp_secret_ready, 1u, __ATOMIC_RELEASE);
+    }
+    smp_spin_unlock(&s_tcp_secret_lock);
+}
+
+/* アドレスの意味のあるバイトだけを並べる(IPv4 の a[4..15] は未初期化のことがある、netaddr.h)。 */
+static unsigned tcp_addr_bytes(const netaddr_t *a, uint8_t *out)
+{
+    const unsigned n = (a->family == NETADDR_V6) ? 16u : 4u;
+    out[0] = a->family;
+    for (unsigned i = 0; i < n; i++) out[1 + i] = a->a[i];
+    return 1u + n;
+}
+
+/*=================================================================
+ * 秘密の鍵付きのハッシュ F(tag, 自分, 自分のポート, 相手, 相手のポート)の上位 32 ビット。
+ * SHA-256(secret || tag || ...)。接続を張るときにしか呼ばない(冷たい経路)。
+ * ===============================================================*/
+static uint32_t tcp_keyed_hash(uint8_t tag, const netaddr_t *l, uint16_t lport,
+                               const netaddr_t *r, uint16_t rport)
+{
+    uint8_t buf[32 + 1 + 17 + 2 + 17 + 2];
+    unsigned n = 0;
+    for (unsigned i = 0; i < sizeof(s_tcp_secret); i++) buf[n++] = s_tcp_secret[i];
+    buf[n++] = tag;
+    n += tcp_addr_bytes(l, buf + n);
+    buf[n++] = (uint8_t)(lport >> 8); buf[n++] = (uint8_t)lport;
+    n += tcp_addr_bytes(r, buf + n);
+    buf[n++] = (uint8_t)(rport >> 8); buf[n++] = (uint8_t)rport;
+    uint8_t h[32];
+    crypto_hash(CRYPTO_SHA256, buf, n, h);
+    return ((uint32_t)h[0] << 24) | ((uint32_t)h[1] << 16) | ((uint32_t)h[2] << 8) | h[3];
+}
+
+/*=================================================================
+ * ISN を決める(RFC 6528)。ISN = M + F(4-tuple, 秘密)。M は約 4 マイクロ秒で 1 進む時計
+ * (timer_now() の ns を 4096 で割る。RFC 793 の 4 us 刻みと同じ速さ)。
+ *
+ * **以前は timer_now() の下位 32 ビットそのものだった。** 相手から見て次の ISN が推測でき、
+ * 経路の外から接続へデータや RST を差し込む攻撃(RFC 6528 の動機)に弱い。4-tuple ごとに鍵付きの
+ * ずらしを足すと、同じ 4-tuple の中では時計どおりに単調に進む(古い重複セグメントと混ざらない、
+ * RFC 793 の性質)まま、ほかの 4-tuple からは推測できない。
+ *
+ * コール元:
+ *   tcp_connect_begin_addr(), tcp_input_addr()(受動 open)
+ * ===============================================================*/
+static uint32_t tcp_isn_gen(const netaddr_t *local, uint16_t lport,
+                            const netaddr_t *remote, uint16_t rport)
+{
+    tcp_secret_init();
+    return (uint32_t)(timer_now() >> 12) + tcp_keyed_hash('I', local, lport, remote, rport);
+}
+
+/*=================================================================
+ * 能動 open の自分側のポートを選ぶ(RFC 6056 Algorithm 3「Simple Hash-Based」)。
+ * port = 49152 + (F(自分, 相手, 相手のポート, 秘密) + next_ephemeral + k) mod 16384。
+ * 相手ごとに出発点が変わるので外から推測しにくく、同じ相手には順に使っていくので重なりにくい。
+ *
+ * 次のものは飛ばす:
+ *   - 同じ (相手, 相手のポート, 自分のポート) の接続が(どのコアにでも)ある
+ *   - TIME_WAIT の表にある(閉じた直後の 4-tuple を使い回すと、遅れて届く古いセグメントと混ざる)
+ *   - そのポートで誰かが待ち受けている
+ *   - RSS で受信を散らしているとき、相手からの受信が自分のコアに来ない(TCP の接続は張った
+ *     コアの表にしか載らない。tcp_connect_begin_addr() の説明)
+ * **以前は ISN(= 時計)の下位 14 ビットそのもの**で、既存の接続や TIME_WAIT と重なるかを
+ * 確かめていなかった。
+ *
+ * 戻り値: ポート番号。全部使えなければ 0
+ * コール元: tcp_connect_begin_addr()
+ * ===============================================================*/
+#define TCP_EPHEMERAL_BASE 49152u
+#define TCP_EPHEMERAL_NUM  16384u
+
+static uint16_t tcp_pick_port(unsigned core, const netaddr_t *local, const netaddr_t *dst, uint16_t dport)
+{
+    tcp_secret_init();
+    const uint32_t off = tcp_keyed_hash('P', local, 0u, dst, dport);
+    int      rss = 0;
+    uint32_t rip = 0, lip = 0;
+    if (dst->family == NETADDR_V4 && core >= 1u) {
+        rip = ((uint32_t)dst->a[0] << 24) | ((uint32_t)dst->a[1] << 16) |
+              ((uint32_t)dst->a[2] << 8) | dst->a[3];
+        lip = ((uint32_t)local->a[0] << 24) | ((uint32_t)local->a[1] << 16) |
+              ((uint32_t)local->a[2] << 8) | local->a[3];
+        rss = (net_rss_core_v4(rip, lip, dport, (uint16_t)TCP_EPHEMERAL_BASE) >= 0);
+    }
+    const uint32_t next = __atomic_load_n(&s_tcp_next_ephemeral, __ATOMIC_RELAXED);
+    for (uint32_t k = 0; k < TCP_EPHEMERAL_NUM; k++) {
+        const uint16_t p = (uint16_t)(TCP_EPHEMERAL_BASE + ((off + next + k) % TCP_EPHEMERAL_NUM));
+        if (rss && net_rss_core_v4(rip, lip, dport, p) != (int)core) continue;
+        if (tcp_port_has_listener(p)) continue;
+        if (tcp_conn_exists_any_core(dst, dport, p)) continue;
+        if (tcp_timewait_find(dst, dport, p, NULL)) continue;
+        (void)__atomic_add_fetch(&s_tcp_next_ephemeral, k + 1u, __ATOMIC_RELAXED);
+        return p;
+    }
+    return 0;
+}
+
+/* ---- 接続を閉じる共通の手続き ---- */
+
+/* conn を持ち主のコアの表から外す(以後、受信は「接続の無い 4-tuple」として扱う)。 */
+static void tcp_conn_unregister(tcp_conn_t *conn)
+{
+    const unsigned core = conn->owner_core;
+    if (core >= SMP_MAX_CORES) return;
+    for (unsigned i = 0; i < TCP_MAX_CONNS; i++) {
+        if (s_conns[core][i] == conn) { s_conns[core][i] = NULL; break; }
+    }
+}
+
+/*=================================================================
+ * 接続を諦めて閉じる(RFC 9293 3.10.4 の ABORT と同じ形)。RST(seq = SND.NXT)を送り、
+ * 状態を CLOSED にして表から外す。上位は state が CLOSED になったこと(tcp_send_async() などが
+ * -1 を返す)で知る -- 相手から RST を受けたときと同じ見え方にしてある。
+ *
+ * **再送の上限で諦めたときに seq を巻き戻して続けてはいけない**(RFC 9293 3.8.3 の MUST-20:
+ * 上限に達したら接続を閉じて上位へ知らせる)。以前は snd_seq = snd_una に戻して送信キューを
+ * 空にしていたので、上位はデータが失われたことを知らないまま、相手とずれたストリームで続けていた。
+ *
+ * 引数:
+ *   conn / priv - 対象
+ *   why         - 表示する理由
+ * コール元:
+ *   tcp_async_poll(), tcp_async_short_poll(), tcp_send(), tcp_close(), tcp_keepalive_check()
+ * ===============================================================*/
+static void tcp_abort_conn(tcp_conn_t *conn, tcp_priv_t *priv, const char *why)
+{
+    uart_printf("[TCP] %s: RST を送って接続を閉じます (local_port=%u remote_port=%u)\n",
+                why, (unsigned)conn->local_port, (unsigned)conn->remote_port);
+    if (conn->state != TCP_SYN_SENT && conn->state != TCP_CLOSED) {
+        tcp_send_bare((const netaddr_t *)&conn->local_ip, conn->local_port,
+                      (const netaddr_t *)&conn->remote_ip, conn->remote_port,
+                      TCP_FLAG_RST, priv->snd_max, 0u);
+    }
+    conn->state = TCP_CLOSED;
+    priv->async_head = 0;        priv->async_count = 0;
+    priv->async_short_head = 0;  priv->async_short_count = 0;
+    priv->lost_bytes = 0;
+    priv->ack_deferred = 0;
+    priv->unacked_full_segments = 0;
+    tcp_conn_unregister(conn);
+}
+
+/* challenge ACK の頻度(コアごと、1 秒の窓)。1 コア 1 キャッシュライン。 */
+static struct { uint64_t start; uint32_t n; } __attribute__((aligned(64))) s_challenge[SMP_MAX_CORES];
+
+/*=================================================================
+ * 受け入れられないセグメントへの ACK(RFC 9293 3.10.7.4)と challenge ACK(RFC 5961 3〜5)。
+ * **頻度に上限を付ける**(RFC 5961 7)。付けないと、偽のセグメントを撃ち込むだけでこちらに
+ * 同じ数の ACK を送らせられる(反射と、challenge ACK の数から窓を推測する攻撃)。
+ *   - データを運ばないセグメントへの ACK: 接続ごとに 500 ms に 1 回
+ *   - challenge ACK: さらにコアごとに 1 秒に 1000 回
+ *   - データを運ぶセグメント(相手の無駄な再送)への ACK は絞らない。DSACK を運ぶため(Linux の
+ *     tcp_oow_rate_limited() も同じ)
+ * 時刻を読むのは絞る場合だけ(受け入れられないセグメントは冷たい経路)。
+ *
+ * 引数:
+ *   conn / priv - 対象
+ *   limited     - 1 = 頻度の上限をかける
+ *   challenge   - 1 = challenge ACK(コアごとの上限もかける)
+ * 戻り値: 1 = 送った、0 = 上限で省いた
+ * ===============================================================*/
+static int tcp_send_oow_ack(tcp_conn_t *conn, tcp_priv_t *priv, int limited, int challenge)
+{
+    if (limited || challenge) {
+        const uint64_t now = timer_now();
+        if (priv->oow_last_at != 0u && now - priv->oow_last_at < (uint64_t)TCP_OOW_ACK_GAP_MS * 1000000u) {
+            g_tcp_oow_ack_limited++;
+            return 0;
+        }
+        if (challenge) {
+            const unsigned c = smp_core_index();
+            if (now - s_challenge[c].start >= 1000000000u) { s_challenge[c].start = now; s_challenge[c].n = 0; }
+            if (++s_challenge[c].n > TCP_CHALLENGE_PER_SEC) { g_tcp_oow_ack_limited++; return 0; }
+        }
+        priv->oow_last_at = now;
+    }
+    tcp_send_segment(conn, priv, TCP_FLAG_ACK, NULL, 0);
+    return 1;
+}
+
+/*=================================================================
+ * 握手の途中の接続を ICMP の HARD エラーで失敗させる(持ち主のコアから呼ぶ)。
+ * SYN_SENT は tcp_connect_poll() が CLOSED(または表に無い)を見て -1 を返す。SYN_RCVD は
+ * 表から外す(受け皿へ直接受理していたものは CLOSED に戻るので次の SYN を受けられる、待ち行列の
+ * ものは tcp_backlog_reap() が回収する)。
+ * ===============================================================*/
+static void tcp_icmp_hard_close(tcp_conn_t *cn, tcp_priv_t *priv)
+{
+    priv->icmp_hard = 0;
+    if (cn->state != TCP_SYN_SENT && cn->state != TCP_SYN_RCVD) return;
+    g_tcp_icmp_hard_abort++;
+    uart_printf("[TCP] ICMP(相手にその口が無い)を受けたので接続の途中で諦めます "
+                "(local_port=%u remote_port=%u)\n", (unsigned)cn->local_port, (unsigned)cn->remote_port);
+    cn->state = TCP_CLOSED;
+    tcp_conn_unregister(cn);
+}
+
+/*=================================================================
+ * ICMP / ICMPv6 のエラーを TCP へ伝える(tcp.h の説明を参照)。
+ *
+ * **引用の seq が「送ったがまだ ACK されていない範囲」に入っているかを確かめる**(RFC 5927 4.1)。
+ * 4-tuple だけで信じると、経路の外から偽の ICMP を送るだけで接続を切ったり(HARD)、MSS を
+ * 下げたり(PMTU)できる。
+ *   範囲: SYN_SENT / SYN_RCVD は [ISN, SND.NXT)、それ以外は [SND.UNA, SND.NXT)
+ * HARD は握手の途中だけ接続を失敗させる(RFC 1122 4.2.3.9 / RFC 5461: 確立した後の Port
+ * Unreachable などは一時的な経路の乱れでも起きるので切らない)。**SYN_SENT ならすぐ失敗させる**
+ * -- 相手にその口が無いと分かっているのに 3 分 SYN を送り続けない。
+ * 別のコアの接続なら旗だけ立てて、持ち主のコアが畳む(tcp_connect_poll() と冷たい経路)。
+ *
+ * コール元: icmp.c / ipv6.c(ICMP エラーの受信)
+ * ===============================================================*/
+int tcp_icmp_error(const netaddr_t *local, const netaddr_t *remote,
+                   const uint8_t *quoted_tcp, size_t qlen, int kind)
+{
+    if (remote == NULL || quoted_tcp == NULL || qlen < 8u) { g_tcp_icmp_bogus_count++; return 0; }
+    const uint16_t sport = rd16be(quoted_tcp);       /* 引用は自分が送ったもの: 送信元 = 自分 */
+    const uint16_t dport = rd16be(quoted_tcp + 2);
+    const uint32_t qseq  = rd32be(quoted_tcp + 4);
+
+    tcp_conn_t *cn = NULL;
+    tcp_priv_t *priv = NULL;
+    unsigned    owner = 0;
+    for (unsigned c = 0; c < SMP_MAX_CORES && !cn; c++) {
+        for (unsigned i = 0; i < TCP_MAX_CONNS; i++) {
+            tcp_conn_t *x = s_conns[c][i];
+            if (x == NULL || x->state == TCP_CLOSED) continue;
+            if (x->local_port != sport || x->remote_port != dport) continue;
+            if (!netaddr_eq(remote, (const netaddr_t *)&x->remote_ip)) continue;
+            if (local && !netaddr_eq(local, (const netaddr_t *)&x->local_ip)) continue;
+            cn = x; priv = &s_priv[c][i]; owner = c;
+            break;
+        }
+    }
+    if (cn == NULL) { g_tcp_icmp_bogus_count++; return 0; }
+
+    const int handshake = (cn->state == TCP_SYN_SENT || cn->state == TCP_SYN_RCVD);
+    const uint32_t una = handshake ? priv->expected_ack - 1u : priv->snd_una;
+    if (tcp_seq_lt(qseq, una) || !tcp_seq_lt(qseq, priv->snd_max)) {
+        g_tcp_icmp_bogus_count++;
+        return 0;
+    }
+
+    if (kind == TCP_ICMP_PMTU) {
+        g_tcp_icmp_pmtu_ok++;
+        return 1;
+    }
+    if (kind == TCP_ICMP_HARD) {
+        g_tcp_icmp_hard_count++;
+        if (handshake) {
+            if (owner == smp_core_index()) tcp_icmp_hard_close(cn, priv);
+            else priv->icmp_hard = 1;
+        } else {
+            priv->icmp_soft_err++;   /* 確立後は記録だけ(RFC 5461)*/
+        }
+        return 1;
+    }
+    g_tcp_icmp_soft_count++;
+    priv->icmp_soft_err++;
+    return 1;
 }
 
 static volatile int s_abort_requested;
@@ -3141,7 +3791,9 @@ static void tcp_rack_detect(tcp_conn_t *conn, tcp_priv_t *priv, uint64_t now, in
  * 送るか ACK が進んでから PTO(2 x SRTT。飛んでいるのが 1 セグメントだけなら相手の遅延 ACK のぶん
  * 200 ms 足す、それ以外は 2 ms 足す)が過ぎたら、一番後ろのスロットを 1 つ送り直す。
  * **PTO が RTO の残りより長ければ送らない**(RTO に任せる。Linux は PTO を RTO の残りに縮めて
- * RTO の代わりに probe を出すが、こちらの非同期送信の RTO は cwnd を下げないので差が無い)。
+ * RTO の代わりに probe を出す。こちらの非同期送信の RTO も今は cwnd を 1 MSS へ下げる
+ * (tcp_rto_fire()、RFC 5681)ので、probe で済むなら済ませる Linux の形のほうが得な場面はあるが、
+ * 1 セグメントだけ飛んでいるときの PTO は RTO 以上になるので差は小さい)。
  * ===============================================================*/
 static void tcp_tlp_check(tcp_conn_t *conn, tcp_priv_t *priv, uint64_t now)
 {
@@ -3303,6 +3955,52 @@ static void tcp_rack_tlp_poll(tcp_conn_t *conn, tcp_priv_t *priv, int timed)
  * コール元:
  *   tcp_poll_once_ex()
  * ===============================================================*/
+/*=================================================================
+ * 非同期送信のスロットで RTO が切れたときの共通の手続き(送り直す前に呼ぶ)。
+ *
+ * (1) **再送の時間切れ(R2)**: RTO で送り直し始めてから TCP_R2_DATA_MS(100 秒)たっても
+ *     累積 ACK が進まなければ、接続を RST で閉じる(RFC 1122 4.2.3.5 / RFC 9293 3.8.3)。
+ *     以前は回数(5 回、RTO 倍々で約 23 秒)で諦め、seq を巻き戻して続けていた。
+ * (2) **輻輳ウィンドウを下げる**(RFC 5681 3.1 の式 4 と「LW」)。そのセグメントを RTO で
+ *     初めて送り直すときだけ ssthresh = max(飛んでいる量 / 2, 2 MSS)、毎回 cwnd = 1 MSS。
+ *     以前は非同期送信の RTO では cwnd を下げておらず、一括送信(tcp_send())だけが下げていた。
+ *     回復中でなければ undo の準備をする(RTO が無駄だったと Timestamps / DSACK で分かれば戻す)。
+ * 時刻を読むのは RTO が切れたとき(冷たい経路)だけ。
+ *
+ * 引数:
+ *   conn / priv - 対象
+ *   retries     - そのスロットの RTO の回数(1 = 初めて)
+ *   what        - 表示する経路名
+ * 戻り値: 1 = 諦めて接続を閉じた(呼び出し側はすぐ戻ること)、0 = 送り直してよい
+ * コール元: tcp_async_poll(), tcp_async_short_poll()
+ * ===============================================================*/
+static int tcp_rto_fire(tcp_conn_t *conn, tcp_priv_t *priv, int retries, const char *what)
+{
+    const uint64_t now = timer_now();
+    if (priv->rto_since == 0u) {
+        priv->rto_since = now;
+    } else if (now - priv->rto_since >= (uint64_t)TCP_R2_DATA_MS * 1000000u) {
+        g_tcp_retx_abort++;
+        uart_printf("[!] TCP: %s の再送が %u 秒たっても確認されない\n", what, (unsigned)(TCP_R2_DATA_MS / 1000u));
+        tcp_abort_conn(conn, priv, "再送の上限(R2)");
+        return 1;
+    }
+    const uint32_t mss = conn->snd_mss;
+    if (retries == 1) {
+        if (!priv->in_fast_recovery) tcp_undo_arm(priv, conn->snd_seq);
+        const uint32_t flight = conn->snd_seq - priv->snd_una;
+        const uint32_t half = flight / 2u;
+        priv->ssthresh = (half > 2u * mss) ? half : 2u * mss;
+    }
+    priv->cwnd = mss;
+    priv->in_fast_recovery = 0;
+    priv->prr_active       = 0;
+    priv->dup_ack_count    = 0;
+    /* RTO の後は、ここまで送ったものが ACK されるまで重複 ACK で回復に入らない(RFC 6582 4)。 */
+    priv->recover          = conn->snd_seq;
+    return 0;
+}
+
 static void tcp_async_poll(tcp_conn_t *conn, tcp_priv_t *priv)
 {
     if (priv->ack_advanced && !priv->in_bulk_send) {
@@ -3323,6 +4021,7 @@ static void tcp_async_poll(tcp_conn_t *conn, tcp_priv_t *priv)
             tcp_lost_drop(priv, &s->lost, s->len);
             priv->async_head = (priv->async_head + 1u) % priv->async_cap;
             priv->async_count--;
+            priv->rto_since = 0;   /* 進んだので再送の時間切れ(R2)を測り直す */
             if(ts_log_mode()&0x1) ts_log(TS_MK(TS_FILE_TCP, TS_FUNC_tcp_async_poll, 1), tcp_conn_arg(conn, s->len));
             continue;
         }
@@ -3409,17 +4108,7 @@ static void tcp_async_poll(tcp_conn_t *conn, tcp_priv_t *priv)
         }
 
         s->retries++;
-        if (s->retries > TCP_MAX_RETRIES) {
-            uart_printf("[!] TCP: tcp_send_async再送上限到達、ACK確認できず (seq=%u len=%u)\n",
-                        s->seq, (unsigned)s->len);
-            conn->snd_seq = priv->snd_una;
-            priv->async_head  = 0;
-            priv->async_count = 0;
-            priv->async_short_head  = 0;
-            priv->async_short_count = 0;
-            priv->lost_bytes = 0;
-            return;
-        }
+        if (tcp_rto_fire(conn, priv, s->retries, "tcp_send_async")) return;   /* R2 で諦めた */
         g_tcp_retransmit_count[smp_core_index()]++;
         if(ts_log_mode()&0x1) ts_log(TS_MK(TS_FILE_TCP, TS_FUNC_tcp_async_poll, 2), tcp_conn_arg(conn, (uint32_t)s->retries));
 
@@ -3448,6 +4137,9 @@ static void tcp_async_poll(tcp_conn_t *conn, tcp_priv_t *priv)
         priv->tlp_tx_at = s->sent_at;   /* 送り直した直後に TLP が同じものを送らないように */
         s->rto_ms *= 2;
         if (s->rto_ms > TCP_MAX_RTO_MS) s->rto_ms = TCP_MAX_RTO_MS;
+        /* 後退した RTO を接続の RTO にも引き継ぐ(RFC 6298 5.5)。これから積むスロットは
+         * この値から始まる。次に RTT を測れたら tcp_rtt_update() が計算し直す。 */
+        if (s->rto_ms > priv->rto_ms) priv->rto_ms = s->rto_ms;
         return;
     }
 }
@@ -3473,6 +4165,7 @@ static void tcp_async_short_poll(tcp_conn_t *conn, tcp_priv_t *priv)
             tcp_lost_drop(priv, &s->lost, s->len);
             priv->async_short_head = (priv->async_short_head + 1u) % g_tcp_async_short_cap;
             priv->async_short_count--;
+            priv->rto_since = 0;   /* 進んだので再送の時間切れ(R2)を測り直す */
             if(ts_log_mode()&0x1) ts_log(TS_MK(TS_FILE_TCP, TS_FUNC_tcp_async_short_poll, 0), tcp_conn_arg(conn, s->len));
             continue;
         }
@@ -3518,17 +4211,7 @@ static void tcp_async_short_poll(tcp_conn_t *conn, tcp_priv_t *priv)
         }
 
         s->retries++;
-        if (s->retries > TCP_MAX_RETRIES) {
-            uart_printf("[!] TCP: tcp_send_async(short)再送上限到達、ACK確認できず (seq=%u len=%u)\n",
-                        s->seq, (unsigned)s->len);
-            conn->snd_seq = priv->snd_una;
-            priv->async_short_head  = 0;
-            priv->async_short_count = 0;
-            priv->lost_bytes = 0;
-            priv->async_head  = 0;
-            priv->async_count = 0;
-            return;
-        }
+        if (tcp_rto_fire(conn, priv, s->retries, "tcp_send_async(short)")) return;   /* R2 で諦めた */
         g_tcp_retransmit_count[smp_core_index()]++;
         if(ts_log_mode()&0x1) ts_log(TS_MK(TS_FILE_TCP, TS_FUNC_tcp_async_short_poll, 1), tcp_conn_arg(conn, (uint32_t)s->retries));
 
@@ -3546,6 +4229,7 @@ static void tcp_async_short_poll(tcp_conn_t *conn, tcp_priv_t *priv)
         priv->tlp_tx_at = s->sent_at;   /* 送り直した直後に TLP が同じものを送らないように */
         s->rto_ms *= 2;
         if (s->rto_ms > TCP_MAX_RTO_MS) s->rto_ms = TCP_MAX_RTO_MS;
+        if (s->rto_ms > priv->rto_ms) priv->rto_ms = s->rto_ms;   /* RFC 6298 5.5(上と同じ)*/
         return;
     }
 }
@@ -3563,66 +4247,118 @@ static void tcp_async_short_poll(tcp_conn_t *conn, tcp_priv_t *priv)
 /*=================================================================
  * Keepalive(RFC 1122 4.2.3.6)。無通信のまま相手が消えた接続を検出する。
  *
- * 「相手が生きているか」は **rcv_seq(データが届いた)と snd_una(ACK が
- * 届いた)が進んだか**で判定する -- 受信のたびに時刻を書くとホットパスに
- * 時計が乗るため(A2 / D7 と同じ方針)。進まなくなってから idle_ms が
- * 過ぎたら probe を送り、intvl_ms ごとに繰り返して probes 回で諦める。
+ * 「相手が生きているか」は **受け取ったセグメントの数(rx_segs)が増えたか**で判定する
+ * -- 受信のたびに時刻を書くとホットパスに時計が乗るため(A2 / D7 と同じ方針)。
+ * 増えなくなってから idle_ms が過ぎたら probe を送り、intvl_ms ごとに繰り返して
+ * probes 回で諦める。
  *
+ * **Keepalive を使うのは ka_enabled の接続だけ**(既定は無効、RFC 1122 の MUST-24/25)。
  * **未確認データがある接続には probe を送らない。** そちらは RTO の担当で、
  * 重ねて叩いても意味が無い(相手の ACK を重複 ACK と数える経路にも触れる)。
+ * 諦めたら RST を送って閉じる(Linux も Keepalive の時間切れで RST を送る)。
+ *
+ * 引数:
+ *   cn / priv - 対象(ESTABLISHED、ka_enabled)
+ *   now       - 今の時刻
+ * コール元:
+ *   tcp_cold_check()
+ * ===============================================================*/
+static void tcp_keepalive_one(tcp_conn_t *cn, tcp_priv_t *priv, uint64_t now)
+{
+    /* 相手から何か来ていれば「生きている」。**probe への応答は純 ACK
+     * なので、データや累積 ACK の進みでは検出できない**(数を使う理由)。 */
+    const uint32_t rs = priv->rx_segs;
+    if (rs != priv->ka_rx_snap || priv->ka_idle_since == 0) {
+        priv->ka_rx_snap    = rs;
+        priv->ka_idle_since = now;
+        priv->ka_probes     = 0;
+        return;
+    }
+    /* 未確認データがあるなら RTO の担当。 */
+    if (tcp_seq_gt(cn->snd_seq, priv->snd_una)) return;
+
+    uint32_t wait_ms = (priv->ka_probes == 0) ? g_tcp_keepalive_idle_ms
+                                              : g_tcp_keepalive_intvl_ms;
+    if (now - priv->ka_idle_since < (uint64_t)wait_ms * 1000000u) return;
+
+    if (priv->ka_probes >= g_tcp_keepalive_probes) {
+        g_tcp_keepalive_drop_count++;
+        tcp_abort_conn(cn, priv, "keepalive の応答が無い");
+        return;
+    }
+
+    /* probe は「**1 バイト過去の seq を持つ 0 バイトのセグメント**」。
+     * 相手は既に受け取った範囲なので、必ず ACK を返す(RFC 1122)。 */
+    uint32_t saved = cn->snd_seq;
+    cn->snd_seq = saved - 1u;
+    tcp_send_segment(cn, priv, TCP_FLAG_ACK, NULL, 0);
+    cn->snd_seq = saved;
+
+    priv->ka_probes++;
+    priv->ka_idle_since = now;
+    g_tcp_keepalive_probe_count++;
+}
+
+/* TS.Recent を無効とみなすまでの時間(RFC 7323 5.5 の 24 日)。 */
+#define TCP_TS_RECENT_LIFE_NS (24ull * 24u * 3600u * 1000000000ull)
+
+/*=================================================================
+ * 接続ごとの、時間で動く冷たい検査(ポーリング 256 回に 1 回、時刻は 1 回だけ読む)。
+ *   - 返していない ACK の時間の上限(TCP_DELACK_MAX_MS、MUST-40)。普段は受信の周回数
+ *     (ackhold)で返るので、ここに来るのは周回が止まりがちなときか ackhold 0 のときだけ。
+ *   - 別のコアで受けた ICMP の HARD(握手の途中なら畳む)
+ *   - TS.Recent の 24 日(動かなければ PAWS で 1 回素通しする印を立てる)
+ *   - Keepalive(ka_enabled の接続だけ)
  *
  * 引数:
  *   core - 対象コア(自分のコネクションスロットだけ見る)
  * コール元:
  *   tcp_poll_once_ex()
  * ===============================================================*/
-static void tcp_keepalive_check(unsigned core)
+static void tcp_cold_check(unsigned core, uint64_t now)
 {
-    uint64_t now = timer_now();
     for (unsigned i = 0; i < TCP_MAX_CONNS; i++) {
         tcp_conn_t *cn = s_conns[core][i];
-        if (cn == NULL || cn->state != TCP_ESTABLISHED) continue;
+        if (cn == NULL) continue;
         tcp_priv_t *priv = &s_priv[core][i];
 
-        /* 相手から何か来ていれば「生きている」。**probe への応答は純 ACK
-         * なので、データや累積 ACK の進みでは検出できない**(旗を使う理由)。 */
-        if (priv->ka_seen || priv->ka_idle_since == 0) {
-            priv->ka_seen       = 0;
-            priv->ka_idle_since = now;
-            priv->ka_probes     = 0;
-            continue;
-        }
-        /* 未確認データがあるなら RTO の担当。 */
-        if (tcp_seq_gt(cn->snd_seq, priv->snd_una)) continue;
-
-        uint32_t wait_ms = (priv->ka_probes == 0) ? g_tcp_keepalive_idle_ms
-                                                  : g_tcp_keepalive_intvl_ms;
-        if (!timeout_ms(priv->ka_idle_since, wait_ms)) continue;
-
-        if (priv->ka_probes >= g_tcp_keepalive_probes) {
-            uart_printf("[TCP] keepalive: 応答が %u 回無いのでコネクションを畳みます "
-                        "(local_port=%u remote_port=%u)\n",
-                        (unsigned)priv->ka_probes, cn->local_port, cn->remote_port);
-            g_tcp_keepalive_drop_count++;
-            cn->state = TCP_CLOSED;
-            s_conns[core][i] = NULL;
-            continue;
+        if (priv->icmp_hard) {
+            tcp_icmp_hard_close(cn, priv);
+            if (s_conns[core][i] != cn) continue;
         }
 
-        /* probe は「**1 バイト過去の seq を持つ 0 バイトのセグメント**」。
-         * 相手は既に受け取った範囲なので、必ず ACK を返す(RFC 1122)。 */
-        uint32_t saved = cn->snd_seq;
-        cn->snd_seq = saved - 1u;
-        tcp_send_segment(cn, priv, TCP_FLAG_ACK, NULL, 0);
-        cn->snd_seq = saved;
+        /* 「受け取った所(rcv_seq)まで ACK していない」状態が、ACK を 1 つも送らないまま続いたか。
+         * 間引きで 4 セグメントごとに返している間は last_ack_sent が動くので測り直しになり、
+         * 余計な ACK は出さない。 */
+        if (priv->rcv_wnd_valid && cn->rcv_seq != priv->last_ack_sent &&
+            (cn->state == TCP_ESTABLISHED || cn->state == TCP_FIN_WAIT_1 || cn->state == TCP_FIN_WAIT_2)) {
+            if (priv->ack_owed_since == 0u || priv->ack_owed_mark != priv->last_ack_sent) {
+                priv->ack_owed_since = now;
+                priv->ack_owed_mark  = priv->last_ack_sent;
+            } else if (now - priv->ack_owed_since >= (uint64_t)TCP_DELACK_MAX_MS * 1000000u) {
+                g_tcp_ack_time_flush++;
+                tcp_send_segment(cn, priv, TCP_FLAG_ACK, NULL, 0);
+                priv->ack_owed_since = 0;
+            }
+        } else {
+            priv->ack_owed_since = 0;
+        }
 
-        priv->ka_probes++;
-        priv->ka_idle_since = now;
-        g_tcp_keepalive_probe_count++;
+        if (priv->ts_enabled) {
+            if (priv->ts_recent != priv->ts_recent_snap || priv->ts_recent_snap_at == 0u) {
+                priv->ts_recent_snap    = priv->ts_recent;
+                priv->ts_recent_snap_at = now;
+                priv->ts_recent_stale   = 0;
+            } else if (now - priv->ts_recent_snap_at >= TCP_TS_RECENT_LIFE_NS) {
+                priv->ts_recent_stale = 1;
+            }
+        }
+
+        if (priv->ka_enabled && cn->state == TCP_ESTABLISHED) tcp_keepalive_one(cn, priv, now);
     }
 }
 
-/* コアごとのポーリング回数(RACK / TLP の時刻の確認を間引く)。1 コア 1 キャッシュライン。 */
+/* コアごとのポーリング回数(RACK / TLP の時刻の確認と、冷たい検査を間引く)。1 コア 1 キャッシュライン。 */
 static struct { unsigned v; } __attribute__((aligned(64))) s_rack_tick[SMP_MAX_CORES];
 
 static void tcp_poll_once_ex(int check_ctrl_c)
@@ -3639,24 +4375,30 @@ static void tcp_poll_once_ex(int check_ctrl_c)
     net_poll_all_and_dispatch();
 
     /* RACK の入れ替わりの窓と TLP の PTO(どちらも ms 前後)は 64 回に 1 回だけ時刻で見る。 */
-    const int rack_timed = ((++s_rack_tick[core].v & 63u) == 0u);
+    const unsigned tick = ++s_rack_tick[core].v;
+    const int rack_timed = ((tick & 63u) == 0u);
     for (unsigned i = 0; i < TCP_MAX_CONNS; i++) {
-        if (s_conns[core][i] != NULL) {
-            tcp_async_poll(s_conns[core][i], &s_priv[core][i]);
-            tcp_async_short_poll(s_conns[core][i], &s_priv[core][i]);
-            tcp_rack_tlp_poll(s_conns[core][i], &s_priv[core][i], rack_timed);
-        }
+        /* **各段の後で表を見直す。** 再送の上限で諦めると(tcp_abort_conn())その場で表から
+         * 外れるので、外れた接続を次の段へ渡さない。 */
+        tcp_conn_t *c = s_conns[core][i];
+        if (c == NULL) continue;
+        tcp_async_poll(c, &s_priv[core][i]);
+        if (s_conns[core][i] != c) continue;
+        tcp_async_short_poll(c, &s_priv[core][i]);
+        if (s_conns[core][i] != c) continue;
+        tcp_rack_tlp_poll(c, &s_priv[core][i], rack_timed);
     }
 
-    tcp_timewait_reap();
-
-    /* 待ち行列の掃除と Keepalive は秒〜時間単位の話なので、ポーリング 1 回
-     * ごとに走査する必要はない(この関数は受信ポーリングのたびに通る)。
-     * 時刻の読み出しもこの中に閉じ込める。 */
-    static unsigned s_cold_tick;
-    if ((++s_cold_tick & 0xFFu) == 0u) {
+    /* TIME_WAIT の掃除・待ち行列の掃除・時間で動く接続ごとの検査は、秒〜時間単位の話なので
+     * ポーリング 1 回ごとに走査する必要はない(この関数は受信ポーリングのたびに通る)。
+     * 時刻の読み出しもこの中に閉じ込める。**以前は TIME_WAIT の掃除だけ毎回、全コアが
+     * 同じロックを取って表を舐めていた。** 数えるのはコアごと(以前は全コア共有の数で、
+     * どのコアが掃除するかが偶然で決まっていた)。 */
+    if ((tick & 0xFFu) == 0u) {
+        const uint64_t now = timer_now();
+        tcp_timewait_reap(now);
         tcp_backlog_reap();
-        if (g_tcp_keepalive_enable) tcp_keepalive_check(core);
+        tcp_cold_check(core, now);
         tcp_ooo_sweep(core);
     }
 }
@@ -3711,13 +4453,20 @@ static int tcp_send_reliable(tcp_conn_t *conn, tcp_priv_t *priv, uint8_t flags,
     priv->ack_received = 0;
 
     uint32_t rto_ms = priv->rto_ms;
+    const uint32_t seq0 = conn->snd_seq;
     for (int attempt = 0; attempt <= TCP_MAX_RETRIES; attempt++) {
         if (attempt > 0) {
             g_tcp_retransmit_count[smp_core_index()]++;
             uart_printf("[TCP] 再送 (%d/%d, RTO=%ums)\n", attempt, TCP_MAX_RETRIES, rto_ms);
         }
         uint64_t sent_at = timer_now();
-        if (tcp_send_segment(conn, priv, flags, data, data_len) != 0) {
+        conn->snd_seq = seq0;
+        int rc = tcp_send_segment(conn, priv, flags, data, data_len);
+        /* 待っている間に送る純 ACK(同時クローズで相手の FIN に返す ACK など)は SEQ=SND.NXT
+         * (= FIN の次)で出す(RFC 9293 3.10.7.4)。FIN の seq のままだと、相手はこちらの FIN を
+         * 受け取った後なので窓の外として捨てる。 */
+        conn->snd_seq = expected_ack;
+        if (rc != 0) {
             return -1;  /* 送信自体の失敗(ARP解決失敗等)は再送しても無駄 */
         }
 
@@ -3783,6 +4532,9 @@ static void tcp_parse_syn_options(tcp_conn_t *conn, tcp_priv_t *priv,
             uint16_t peer_mss = rd16be(opts + i + 2);
             uint16_t local_cap = tcp_mss_cap_for((const netaddr_t *)&conn->remote_ip);
             if (peer_mss > local_cap) peer_mss = local_cap;
+            /* **下限で抑える**(0 や極端に小さい値を信じると、MSS で割る所が 0 除算になり、
+             * 送信が事実上止まる。TCP_MSS_MIN の説明)。 */
+            if (peer_mss < TCP_MSS_MIN) peer_mss = TCP_MSS_MIN;
             conn->snd_mss = peer_mss;
             uart_printf("[TCP] 相手のMSSオプション受信: %u (採用値=%u)\n",
                         rd16be(opts + i + 2), conn->snd_mss);
@@ -3838,7 +4590,7 @@ static void tcp_parse_syn_options(tcp_conn_t *conn, tcp_priv_t *priv,
  *   end_seq     - このセグメントの終わりの seq(seq + ペイロード長、FIN なら + 1)
  *   out_tsecr   - 相手が echo してきた自分の TSval(RTT 計測用)
  * 戻り値:
- *   1=処理を続けてよい、0=PAWS で破棄した
+ *   1=処理を続けてよい、0=PAWS で破棄した、-1=Timestamps を合意したのに TS が無いので破棄した
  * コール元:
  *   tcp_input_addr()
  * ===============================================================*/
@@ -3846,7 +4598,9 @@ static int tcp_input_options(tcp_conn_t *conn, tcp_priv_t *priv,
                               const volatile uint8_t *in, uint8_t hdr_len,
                               uint32_t seq, uint32_t end_seq, uint32_t *out_tsecr)
 {
-    if (hdr_len <= TCP_HDR_LEN) return 1;  /* 相手が付けてこなかった */
+    /* 相手が付けてこなかった。Timestamps を合意した接続なら捨てる(RFC 7323 3.2: TS を合意した後の
+     * RST 以外のセグメントに TS が無ければ黙って捨てるべき)。RST はここより前で処理している。 */
+    if (hdr_len <= TCP_HDR_LEN) return priv->ts_enabled ? -1 : 1;
 
     const volatile uint8_t *o = in + TCP_HDR_LEN;
     uint8_t olen = (uint8_t)(hdr_len - TCP_HDR_LEN);
@@ -3908,17 +4662,27 @@ static int tcp_input_options(tcp_conn_t *conn, tcp_priv_t *priv,
             }
             i = (uint8_t)(i + l);
         }
-        /* Timestamps が無効(SACK だけ合意)か、合意したのに付いていない
-         * ときはここで終わり。PAWS は Timestamps があってこそ。 */
-        if (!found) return 1;
+        /* Timestamps が無効(SACK だけ合意)ならここで終わり。合意したのに付いていない
+         * ときは捨てる(RFC 7323 3.2、上と同じ)。PAWS は Timestamps があってこそ。 */
+        if (!found) return priv->ts_enabled ? -1 : 1;
     }
 
     /* R1: TSval が TS.Recent より古ければ「一周した古いセグメント」。
-     * ACK を返して破棄する(相手にこちらの状態を伝えるため)。 */
+     * ACK を返して破棄する(相手にこちらの状態を伝えるため)。
+     * **TS.Recent が 24 日動いていなければ無効とみなして通す**(RFC 7323 5.5。相手の時計が
+     * 一周しても長く黙っていた接続を、PAWS で永久に締め出さない)。印は冷たい経路が立てる
+     * (tcp_cold_check())ので、ここで見るのは捨てる側の枝の旗 1 つだけ。 */
     if ((int32_t)(tsval - priv->ts_recent) < 0) {
-        g_tcp_paws_drop_count++;
-        tcp_send_segment(conn, priv, TCP_FLAG_ACK, NULL, 0);
-        return 0;
+        if (priv->ts_recent_stale) {
+            priv->ts_recent_stale = 0;
+            priv->ts_recent = tsval;
+        } else {
+            g_tcp_paws_drop_count++;
+            /* データも FIN も運ばないものへの ACK は頻度に上限(RFC 5961 7。Linux も PAWS の
+             * ACK を tcp_oow_rate_limited() で絞る)。 */
+            (void)tcp_send_oow_ack(conn, priv, end_seq == seq, 0);
+            return 0;
+        }
     }
 
     /* R3: ACK 済みの範囲に続くセグメントのときだけ TS.Recent を進める
@@ -4119,9 +4883,31 @@ static void tcp_priv_init(tcp_priv_t *priv, unsigned core)
     priv->retx_end         = 0;
     priv->undo_ended       = 0;
     priv->undo_retrans     = 0;
-    priv->ka_seen          = 0;
+    priv->rx_segs          = 0;
+    priv->ka_rx_snap       = 0;
+    priv->ka_enabled       = g_tcp_keepalive_enable ? 1u : 0u;   /* 張ったときの既定(MUST-24/25)*/
     priv->ka_idle_since    = 0;
     priv->ka_probes        = 0;
+    priv->snd_max          = 0;
+    priv->snd_wl1          = 0;
+    priv->snd_wl2          = 0;
+    priv->rcv_wnd_edge     = 0;
+    priv->rcv_wnd_valid    = 0;
+    priv->fin_pend         = 0;
+    priv->fin_pend_seq     = 0;
+    priv->urg_valid        = 0;
+    priv->rcv_up           = 0;
+    priv->oow_last_at      = 0;
+    priv->rto_since        = 0;
+    priv->connect_start    = 0;
+    priv->icmp_hard        = 0;
+    priv->icmp_soft_err    = 0;
+    priv->ts_recent_snap   = 0;
+    priv->ts_recent_snap_at = 0;
+    priv->ts_recent_stale  = 0;
+    priv->ack_owed_since   = 0;
+    priv->ack_owed_mark    = 0;
+    priv->zwp_interval_ms  = 0;
     tcp_ooo_release_all(priv);
     priv->ooo_head         = TCP_OOO_NONE;
     priv->ooo_bytes        = 0;
@@ -4202,28 +4988,23 @@ static void tcp_connect_begin_addr(tcp_conn_t *conn, const netaddr_t *local_ip,
     conn->remote_ip   = *dst;
     conn->remote_port = dst_port;
     conn->snd_win     = 0;                     /* 相手の最初のACKで確定するまでは未知 */
-    conn->snd_mss     = TCP_MSS_DEFAULT_RFC879; /* 相手がMSSオプションを付けなければこの既定値のまま */
+    /* 相手が MSS オプションを付けなければこの既定値のまま(IPv4 536 / IPv6 1220、MUST-15)。 */
+    conn->snd_mss     = (dst->family == NETADDR_V6) ? TCP_MSS_DEFAULT_V6 : TCP_MSS_DEFAULT_RFC879;
     conn->rcv_seq     = 0;
 
-    uint32_t isn = (uint32_t)timer_now();
-    conn->snd_seq   = isn;
-    conn->local_port = (uint16_t)(49152u + (isn & 0x3fffu));
-    /* **RSS で受信を散らしているときは、相手からの受信が自分のコアの受信キューに来る送信元ポートを選ぶ。**
-     * TCP の接続は張ったコアの表(s_conns[core])にしか載らず、別のコアに届いた SYN|ACK は捨てられる。
-     * ポートを変えれば行き先のコアが変わるので、NIC と同じハッシュ(net_rss_core_v4())で当たるものを探す
-     * (当たる確率はコア数分の 1 なので、数回で見つかる)。 */
-    if (dst->family == NETADDR_V4 && core >= 1u) {
-        uint32_t rip = ((uint32_t)dst->a[0] << 24) | ((uint32_t)dst->a[1] << 16) |
-                       ((uint32_t)dst->a[2] << 8) | dst->a[3];
-        uint32_t lip = ((uint32_t)local_ip->a[0] << 24) | ((uint32_t)local_ip->a[1] << 16) |
-                       ((uint32_t)local_ip->a[2] << 8) | local_ip->a[3];
-        if (net_rss_core_v4(rip, lip, dst_port, conn->local_port) >= 0) {
-            for (uint32_t k = 0; k < 0x4000u; k++) {
-                uint16_t p = (uint16_t)(49152u + ((isn + k) & 0x3fffu));
-                if (net_rss_core_v4(rip, lip, dst_port, p) == (int)core) { conn->local_port = p; break; }
-            }
-        }
+    /* 自分側のポート(RFC 6056)。**RSS で受信を散らしているときは、相手からの受信が自分のコアの
+     * 受信キューに来るものを選ぶ。** TCP の接続は張ったコアの表(s_conns[core])にしか載らず、
+     * 別のコアに届いた SYN|ACK は捨てられる(tcp_pick_port() が NIC と同じハッシュで確かめる)。 */
+    const uint16_t lport = tcp_pick_port(core, local_ip, dst, dst_port);
+    if (lport == 0u) {
+        uart_printf("[!] TCP: 使える一時ポートが無い\n");
+        conn->state = TCP_CLOSED;
+        return;
     }
+    conn->local_port = lport;
+    /* ISN(RFC 6528)。ポートが決まってから 4-tuple で決める。 */
+    uint32_t isn = tcp_isn_gen(local_ip, lport, dst, dst_port);
+    conn->snd_seq   = isn;
 
     tcp_priv_init(priv, core);
     tcp_priv_try_grant_mlx5_async_overflow(priv, core, (const netaddr_t *)&conn->local_ip);
@@ -4246,6 +5027,7 @@ static void tcp_connect_begin_addr(tcp_conn_t *conn, const netaddr_t *local_ip,
     priv->connect_attempt  = 0;
     priv->connect_rto_ms   = priv->rto_ms;  /* tcp_priv_init()直後はTCP_INITIAL_RTO_MS */
     priv->connect_sent_at  = timer_now();
+    priv->connect_start    = priv->connect_sent_at;   /* SYN の R2(3 分)の起点 */
 
     if (tcp_send_segment(conn, priv, TCP_FLAG_SYN, NULL, 0) != 0) {
         uart_printf("[!] TCP: SYN送信失敗\n");
@@ -4337,10 +5119,22 @@ int tcp_connect_poll(tcp_conn_t *conn)
         return -1;
     }
 
+    /* 別のコアで受けた ICMP の HARD(相手にその口が無い)。SYN を送り続けずにすぐ失敗させる
+     * (RFC 1122 4.2.3.9 / RFC 5461)。 */
+    if (priv->icmp_hard && conn->state == TCP_SYN_SENT) {
+        tcp_icmp_hard_close(conn, priv);
+        return -1;
+    }
+
     if (priv->ack_received) {
         if (conn->state == TCP_ESTABLISHED) {
             if (priv->connect_attempt == 0) {
                 { const uint64_t t = timer_now(); tcp_rtt_update(priv, t - priv->connect_sent_at, t); }
+            } else if (priv->srtt_us == 0u && priv->rto_ms < 3000u) {
+                /* SYN を送り直したのに RTT の標本が無い: データを送り始めるときの RTO を 3 秒にする
+                 * (RFC 6298 5.7)。SYN が落ちる経路では初期 RTO が短すぎた可能性がある。
+                 * Timestamps があれば最初の ACK で測り直される。 */
+                priv->rto_ms = 3000u;
             }
             conn->snd_seq = priv->expected_ack;  /* SYNは1バイト分のシーケンス番号を消費する */
             /* **未確認の先頭もここで揃える。** 以前は最初の送信を同期の tcp_send() で
@@ -4367,10 +5161,13 @@ int tcp_connect_poll(tcp_conn_t *conn)
         return 0;  /* まだ待つ */
     }
 
-    /* RTOタイムアウト -- 再送するか、再送上限なら諦める。 */
+    /* RTOタイムアウト -- 再送するか、再送上限なら諦める。**上限は回数ではなく時間**
+     * (RFC 1122 4.2.3.5 の MUST-23: SYN は 3 分以上送り直す)。以前は 5 回(RTO 倍々で約 15 秒)。
+     * それより早く諦めたいアプリは自分の時間切れで止める(呼び出し側が tcp_connect_poll() を
+     * 呼ぶのをやめて tcp_close() する)。 */
     priv->connect_attempt++;
-    if (priv->connect_attempt > TCP_MAX_RETRIES) {
-        uart_printf("[!] TCP: SYN送信/再送すべて失敗\n");
+    if (timeout_ms(priv->connect_start, TCP_R2_SYN_MS)) {
+        uart_printf("[!] TCP: SYN送信/再送すべて失敗(%u 秒)\n", (unsigned)(TCP_R2_SYN_MS / 1000u));
         conn->state = TCP_CLOSED;
         unsigned slot = tcp_conn_slot(conn);
         if (slot < TCP_MAX_CONNS) s_conns[conn->owner_core][slot] = NULL;
@@ -4378,8 +5175,8 @@ int tcp_connect_poll(tcp_conn_t *conn)
     }
 
     g_tcp_retransmit_count[smp_core_index()]++;
-    uart_printf("[TCP] 再送 (%u/%d, RTO=%ums)\n",
-                priv->connect_attempt, TCP_MAX_RETRIES, priv->connect_rto_ms);
+    uart_printf("[TCP] SYN 再送 (%u 回目、上限 %u 秒, RTO=%ums)\n",
+                priv->connect_attempt, (unsigned)(TCP_R2_SYN_MS / 1000u), priv->connect_rto_ms);
     priv->connect_rto_ms *= 2;
     if (priv->connect_rto_ms > TCP_MAX_RTO_MS) priv->connect_rto_ms = TCP_MAX_RTO_MS;
     priv->connect_sent_at = timer_now();
@@ -4422,7 +5219,7 @@ int tcp_connect_poll(tcp_conn_t *conn)
  * ===============================================================*/
 static void tcp_send_window_update(tcp_conn_t *conn, tcp_priv_t *priv)
 {
-    uint16_t win = tcp_wire_window(conn, priv, TCP_FLAG_ACK);
+    uint16_t win = tcp_wire_window(conn, priv, TCP_FLAG_ACK, NULL);
     if (conn->rcv_seq == priv->last_ack_sent && win == priv->last_win_sent) {
         return;  /* 前回と同じ -- 送っても情報が増えない */
     }
@@ -4639,7 +5436,13 @@ int tcp_send(tcp_conn_t *conn, const void *buf, uint32_t len)
 
     priv->in_bulk_send = 1;
 
-    uint64_t overall_start = timer_now();
+    /* **全体の打ち切りは「相手から何も届かない時間」で測る**(RFC 1122 4.2.2.17 の MUST-37:
+     * 相手が窓 0 の確認に応え続けている間は接続を切ってはいけない)。以前は送り始めてから
+     * 30 秒で打ち切っていたので、相手が長く窓を閉じているだけで送信が失敗していた。
+     * 相手が応えなくなってから R2(100 秒)で諦める(再送の上限と同じ値)。 */
+    uint64_t last_rx_at = timer_now();
+    uint32_t rx_snap    = priv->rx_segs;
+    uint64_t rto_episode_at = 0;        /* RTO で送り直し始めた時刻(R2 の起点、進んだら 0)*/
 
     uint32_t last_logged_swin = 0xFFFFFFFFu;
 
@@ -4651,9 +5454,14 @@ int tcp_send(tcp_conn_t *conn, const void *buf, uint32_t len)
     uint64_t zwp_since = 0;             /* 相手の窓が 0 になってからの時刻(持続タイマ) */
 
     while (tcp_seq_lt(priv->snd_una, end_seq)) {
-        if (timeout_ms(overall_start, TCP_SEND_OVERALL_TIMEOUT_MS)) {
-            uart_printf("[!] TCP: tcp_send全体タイムアウト (%u/%u バイト送信済み)\n",
-                        (unsigned)(priv->snd_una - base_seq), len);
+        if (priv->rx_segs != rx_snap) {
+            rx_snap    = priv->rx_segs;
+            last_rx_at = timer_now();
+        } else if (timeout_ms(last_rx_at, TCP_R2_DATA_MS)) {
+            uart_printf("[!] TCP: tcp_send 相手から %u 秒何も届かない (%u/%u バイト送信済み)\n",
+                        (unsigned)(TCP_R2_DATA_MS / 1000u), (unsigned)(priv->snd_una - base_seq), len);
+            g_tcp_retx_abort++;
+            tcp_abort_conn(conn, priv, "相手の応答が無い(R2)");
             break;
         }
         if (conn->state != TCP_ESTABLISHED && conn->state != TCP_CLOSE_WAIT) {
@@ -4689,6 +5497,14 @@ int tcp_send(tcp_conn_t *conn, const void *buf, uint32_t len)
                tcp_seq_lt(snd_nxt, priv->snd_una + usable_window)) {
             uint32_t remaining_in_window = (priv->snd_una + usable_window) - snd_nxt;
             uint32_t remaining_data = end_seq - snd_nxt;
+            /* **送り手の SWS 回避**(RFC 1122 4.2.3.4 の MUST-38)。未確認のデータがあり、窓の空きが
+             * MSS 未満で、しかも残りのデータより小さいときは送らずに ACK を待つ(小さなセグメントを
+             * 刻んで送り続けない)。Linux の tcp_snd_wnd_test() と同じ形で、未確認が無いときや残りが
+             * 全部入るときは待たない(qd=1 の小さい PDU の遅延を増やさない)。 */
+            if (remaining_in_window < conn->snd_mss && remaining_in_window < remaining_data &&
+                tcp_seq_gt(snd_nxt, priv->snd_una)) {
+                break;
+            }
             uint32_t chunk32 = (remaining_in_window < remaining_data) ? remaining_in_window : remaining_data;
             uint32_t lso_max = net_active_lso_max_bytes();
             if (lso_max > TCP_LSO_MAX_DATA_LEN) lso_max = TCP_LSO_MAX_DATA_LEN;
@@ -4707,6 +5523,10 @@ int tcp_send(tcp_conn_t *conn, const void *buf, uint32_t len)
             }
             if(ts_log_mode()&0x1) ts_log(TS_MK(TS_FILE_TCP, TS_FUNC_tcp_send, 2), tcp_conn_arg(conn, chunk));
             snd_nxt += chunk;
+            /* **conn->snd_seq は SND.NXT に置いておく。** この間に送る純 ACK(受信への ACK や窓の確認の応答)は
+             * SEQ=SND.NXT で出すべきもの(RFC 9293 3.10.7.4)で、以前は送った塊の先頭のままだった。相手は
+             * RCV.NXT より前の seq の純 ACK を窓の外として捨てる(Linux も、今のこちらも)ので、ACK が届かない。 */
+            conn->snd_seq = snd_nxt;
 
             if (!rto_active) {
                 rto_active = 1;
@@ -4725,6 +5545,7 @@ int tcp_send(tcp_conn_t *conn, const void *buf, uint32_t len)
         if (priv->ack_advanced) {
             priv->ack_advanced = 0;
             retransmit_attempts = 0;  /* 進捗があったので連続再送カウントをリセット */
+            rto_episode_at = 0;
 
             /* Timestamps が有効なら RTT は受信側(TSecr)で測っているので、
              * ここで二重に更新しない(再送の有無に関わらず測れるぶん、
@@ -4796,6 +5617,7 @@ int tcp_send(tcp_conn_t *conn, const void *buf, uint32_t len)
                 g_tcp_fast_retransmit_count[smp_core_index()]++;
                 if(ts_log_mode()&0x1) ts_log(TS_MK(TS_FILE_TCP, TS_FUNC_tcp_send, 6), tcp_conn_arg(conn, resent));
                 /* RTO タイマを張り直し、この往復では RTT を測らない(Karn)。 */
+                conn->snd_seq = snd_nxt;   /* 送り直しの後は SND.NXT へ戻す(塊を送った後と同じ理由) */
                 window_sent_at = timer_now();
                 window_retransmitted = 1;
                 rto_active = 1;
@@ -4804,14 +5626,20 @@ int tcp_send(tcp_conn_t *conn, const void *buf, uint32_t len)
 
         if (rto_active && timeout_ms(window_sent_at, rto_ms)) {
             retransmit_attempts++;
-            if (retransmit_attempts > TCP_MAX_RETRIES) {
+            /* 再送の上限は回数ではなく時間(R2 = 100 秒、RFC 1122 4.2.3.5)。諦めたら seq を
+             * 巻き戻さずに RST で閉じる(RFC 9293 3.8.3 の MUST-20、tcp_abort_conn())。 */
+            if (rto_episode_at == 0u) {
+                rto_episode_at = timer_now();
+            } else if (timeout_ms(rto_episode_at, TCP_R2_DATA_MS)) {
                 uart_printf("[!] TCP: 再送上限到達、送信を諦める (%u/%u バイト送信済み)\n",
                             (unsigned)(priv->snd_una - base_seq), len);
+                g_tcp_retx_abort++;
+                tcp_abort_conn(conn, priv, "再送の上限(R2)");
                 break;
             }
             g_tcp_retransmit_count[smp_core_index()]++;
-            uart_printf("[TCP] 送信ウィンドウ再送 (%d/%d, una=%u nxt=%u RTO=%ums)\n",
-                        retransmit_attempts, TCP_MAX_RETRIES, priv->snd_una, snd_nxt, rto_ms);
+            uart_printf("[TCP] 送信ウィンドウ再送 (%d 回目, una=%u nxt=%u RTO=%ums)\n",
+                        retransmit_attempts, priv->snd_una, snd_nxt, rto_ms);
             if(ts_log_mode()&0x1) ts_log(TS_MK(TS_FILE_TCP, TS_FUNC_tcp_send, 4), tcp_conn_arg(conn, (uint32_t)retransmit_attempts));
 
             /* 回復中でなければ undo の準備(RTO が無駄だったと Timestamps / DSACK で分かれば戻す)。
@@ -4852,6 +5680,7 @@ int tcp_send(tcp_conn_t *conn, const void *buf, uint32_t len)
                 if (!priv->sack_enabled) priv->dup_ack_suppress++;
                 g_tcp_retransmit_segs++;
             }
+            conn->snd_seq = snd_nxt;   /* 送り直しの後は SND.NXT へ戻す(塊を送った後と同じ理由) */
             window_sent_at = timer_now();
             window_retransmitted = 1;
         }
@@ -5120,14 +5949,19 @@ static int tcp_send_async_ex(tcp_conn_t *conn, const void *buf, uint16_t len, in
         }
         uint32_t room = (usable_window > outstanding) ? (usable_window - outstanding) : 0u;
         uint64_t probe_since = 0;
-        if (room == 0) {
+        const uint32_t remain_all = (uint32_t)len - sent_total;
+        /* 待つ条件: 窓に余地が無い、または**送り手の SWS 回避**(RFC 1122 4.2.3.4 の MUST-38):
+         * 未確認があり、余地が MSS 未満で残りより小さい(tcp_send() と同じ形)。 */
+#define TCP_LONG_MUST_WAIT() \
+        (room == 0u || (outstanding > 0u && room < (uint32_t)conn->snd_mss && room < remain_all))
+        if (TCP_LONG_MUST_WAIT()) {
             g_tcp_async_long_winwait++;
             if (priv->cwnd + tcp_cwnd_credit(priv) < conn->snd_win) g_tcp_async_long_cwndlim++;
             g_tcp_long_last_outstanding = outstanding;
             g_tcp_long_last_cwnd        = priv->cwnd;
             g_tcp_long_last_sndwin      = conn->snd_win;
         }
-        while (room == 0) {
+        while (TCP_LONG_MUST_WAIT()) {
             /* 窓が 0 の間は送らずに待つ(以前は 1 とみなして 1 バイト送り、
              * Linux に捨てられて再送タイムアウトを待っていた)。 */
             tcp_window_probe(conn, priv, &probe_since, conn->snd_win == 0u);
@@ -5144,6 +5978,8 @@ static int tcp_send_async_ex(tcp_conn_t *conn, const void *buf, uint16_t len, in
             }
             room = (usable_window > outstanding) ? (usable_window - outstanding) : 0u;
         }
+
+#undef TCP_LONG_MUST_WAIT
 
         uint32_t remaining = (uint32_t)len - sent_total;
         uint32_t max_chunk = (lso_cap > conn->snd_mss) ? lso_cap : (uint32_t)conn->snd_mss;
@@ -5266,6 +6102,7 @@ unsigned tcp_send_short_free(const tcp_conn_t *conn, unsigned *cap_out)
         if (tcp_seq_lt(priv->snd_una, sl->seq + sl->len)) break;
         priv->async_short_head = (priv->async_short_head + 1u) % g_tcp_async_short_cap;
         priv->async_short_count--;
+        priv->rto_since = 0;   /* 進んだので R2 を測り直す */
     }
     return priv->async_short_count < cap ? cap - priv->async_short_count : 0u;
 }
@@ -5290,6 +6127,7 @@ unsigned tcp_send_long_free(const tcp_conn_t *conn, unsigned *cap_out)
         if (tcp_seq_lt(priv->snd_una, sl->seq + sl->len)) break;
         priv->async_head = (priv->async_head + 1u) % priv->async_cap;
         priv->async_count--;
+        priv->rto_since = 0;
     }
     return priv->async_count < priv->async_cap ? priv->async_cap - priv->async_count : 0u;
 }
@@ -5560,14 +6398,24 @@ void tcp_close(tcp_conn_t *conn)
                        !timeout_ms(start, TCP_CLOSE_FIN_WAIT_MS)) {
                     tcp_poll_once();
                 }
-                if (conn->state != TCP_TIME_WAIT && conn->state != TCP_CLOSED) {
+                /* **能動クローズは TIME_WAIT を必ず残す**(RFC 9293 3.6)。相手の FIN を受けて
+                 * TIME_WAIT に入った場合も、FIN_WAIT_2 のまま待ち切れなかった場合も。以前は
+                 * TIME_WAIT に入ったときに限って登録していなかったので、こちらの最後の ACK が
+                 * 落ちて相手が FIN を送り直すと、表に無い 4-tuple として RST を返していた。 */
+                if (conn->state != TCP_CLOSED) {
                     tcp_timewait_register((const netaddr_t *)&conn->local_ip, conn->local_port,
                                            (const netaddr_t *)&conn->remote_ip, conn->remote_port,
-                                           conn->snd_seq);
+                                           conn->snd_seq, priv->ts_enabled, priv->ts_recent);
                 }
             }
-        } else {
-            uart_printf("[!] TCP: FIN再送上限到達、ローカルで強制クローズ\n");
+        } else if (conn->state != TCP_CLOSED) {
+            /* FIN の再送を諦めた(相手から RST が来たのではない): 黙って消えずに RST を送る
+             * (RFC 9293 3.8.3 の MUST-20、相手が半端な状態で残らないように)。tcp_close() は
+             * 呼び出し側を待たせるので、ここの上限は回数(TCP_MAX_RETRIES、約 13 秒)のまま
+             * にしてある(アプリが決める linger の時間、RFC 9293 3.10.4 の ABORT と同じ扱い)。 */
+            uart_printf("[!] TCP: FIN再送上限到達、RST を送って閉じる\n");
+            g_tcp_retx_abort++;
+            tcp_abort_conn(conn, priv, "FIN の再送の上限");
         }
     }
 
@@ -5674,13 +6522,24 @@ void tcp_conns_show(void)
             if (!c || c->state != TCP_ESTABLISHED) continue;
             const tcp_priv_t *pv = &s_priv[core][i];
             uart_printf("  core%u %u->%u 未確認=%u cwnd=%u ssthresh=%u 相手の窓=%u(最大 %u)長経路の枠=%u/%u 短経路の枠=%u"
-                        " 高速回復=%d rto=%ums snd_seq=%u\n",
+                        " 高速回復=%d rto=%ums snd_seq=%u snd_max=%u 受信窓の右端=+%u keepalive=%s ICMP=%u\n",
                         core, (unsigned)c->local_port, (unsigned)c->remote_port,
                         (unsigned)(c->snd_seq - pv->snd_una), pv->cwnd, pv->ssthresh, (unsigned)c->snd_win, pv->snd_win_max,
                         pv->async_count, pv->async_cap, pv->async_short_count,
-                        pv->in_fast_recovery, pv->rto_ms, (unsigned)c->snd_seq);
+                        pv->in_fast_recovery, pv->rto_ms, (unsigned)c->snd_seq, (unsigned)pv->snd_max,
+                        (unsigned)(pv->rcv_wnd_edge - c->rcv_seq), pv->ka_enabled ? "有" : "無",
+                        (unsigned)pv->icmp_soft_err);
         }
     }
+    uart_printf("  RFC の検査: SND.NXT 越えの ACK=%u 窓外=%u 同期済みへの SYN=%u ACK 無し=%u 待ち受けへの RST=%u"
+                " TS 無し=%u 窓外 ACK の省略=%u 再送の上限で RST=%u ACK の時間切れ=%u URG=%u 握手の RST=%u\n",
+                (unsigned)g_tcp_ack_unsent_drop, (unsigned)g_tcp_rx_oow_drop, (unsigned)g_tcp_syn_challenge,
+                (unsigned)g_tcp_noack_drop, (unsigned)g_tcp_listen_rst, (unsigned)g_tcp_ts_missing_drop,
+                (unsigned)g_tcp_oow_ack_limited, (unsigned)g_tcp_retx_abort, (unsigned)g_tcp_ack_time_flush,
+                (unsigned)g_tcp_urg_rx, (unsigned)g_tcp_synsent_rst);
+    uart_printf("  ICMP: soft=%u hard=%u(握手を失敗させた %u) PMTU=%u 引用が合わない=%u\n",
+                (unsigned)g_tcp_icmp_soft_count, (unsigned)g_tcp_icmp_hard_count, (unsigned)g_tcp_icmp_hard_abort,
+                (unsigned)g_tcp_icmp_pmtu_ok, (unsigned)g_tcp_icmp_bogus_count);
 }
 
 /*=================================================================
@@ -6041,10 +6900,302 @@ int tcp_conn_sack_enabled(const tcp_conn_t *conn)
 }
 
 /*=================================================================
- * 受信 TCP セグメントを処理する。チェックサム検証(HW 検証済みなら省略)、
- * リスナーへの SYN 受け付け、既存コネクションの状態遷移、in-order データの
- * 配置(upcall か rx_buf)、順序不正セグメントの先読み保持、ACK 処理と
- * 遅延 ACK、TIME_WAIT 宛の再送への応答までを行う。
+ * 接続ごとに Keepalive を使うかを決める(RFC 1122 4.2.3.6 の MUST-24)。既定は張ったときの
+ * g_tcp_keepalive_enable(既定 0、MUST-25)。時間(idle / 間隔 / 回数)は全体の設定を使う。
+ * コール元: 上位(Keepalive を使いたい接続)
+ * ===============================================================*/
+void tcp_set_keepalive(tcp_conn_t *conn, int on)
+{
+    tcp_priv_t *priv = tcp_priv_for(conn);
+    if (!priv) return;
+    priv->ka_enabled    = on ? 1u : 0u;
+    priv->ka_idle_since = 0;   /* 次の冷たい検査で測り始める */
+    priv->ka_probes     = 0;
+}
+
+/*=================================================================
+ * 緊急ポインタ(URG)が、アプリがまだ読んでいない位置より先にあるかを返す(RFC 9293 3.8.5 の
+ * MUST-30/31「緊急データが来たことを上位へ知らせる」)。読み出し位置は、pull 型なら rx_buf に
+ * 溜まっている分だけ rcv_seq より手前、upcall 型なら rcv_seq(渡し済み)。通り過ぎたら印を消す。
+ * ===============================================================*/
+int tcp_urgent_mark(const tcp_conn_t *conn, uint32_t *bytes_ahead)
+{
+    tcp_priv_t *priv = tcp_priv_for((tcp_conn_t *)conn);
+    if (bytes_ahead) *bytes_ahead = 0;
+    if (!priv || !priv->urg_valid) return 0;
+    const uint32_t read_pos = conn->rcv_seq - (priv->recv_upcall ? 0u : priv->rx_count);
+    if (!tcp_seq_gt(priv->rcv_up, read_pos)) {
+        priv->urg_valid = 0;
+        return 0;
+    }
+    if (bytes_ahead) *bytes_ahead = priv->rcv_up - read_pos;
+    return 1;
+}
+
+/* 送った最大の seq(SND.NXT)。試験と表示用。 */
+uint32_t tcp_snd_max(const tcp_conn_t *conn)
+{
+    tcp_priv_t *priv = tcp_priv_for((tcp_conn_t *)conn);
+    return priv ? priv->snd_max : conn->snd_seq;
+}
+
+/*=================================================================
+ * 受信したセグメントのオプションから TSval を探す(冷たい経路。TIME_WAIT の応答の TSecr 用)。
+ * 戻り値: 1=見つかった
+ * ===============================================================*/
+static int tcp_find_tsval(const volatile uint8_t *in, uint8_t hdr_len, uint32_t *tsval)
+{
+    const volatile uint8_t *o = in + TCP_HDR_LEN;
+    const unsigned olen = (hdr_len > TCP_HDR_LEN) ? (unsigned)(hdr_len - TCP_HDR_LEN) : 0u;
+    unsigned i = 0;
+    while (i < olen) {
+        const uint8_t kind = o[i];
+        if (kind == TCP_OPT_KIND_END) break;
+        if (kind == TCP_OPT_KIND_NOP) { i++; continue; }
+        if (i + 1u >= olen) break;
+        const uint8_t l = o[i + 1];
+        if (l < 2u || i + l > olen) break;
+        if (kind == TCP_OPT_KIND_TS && l == 10u) { *tsval = rd32be(o + i + 2); return 1; }
+        i += l;
+    }
+    return 0;
+}
+
+/*=================================================================
+ * 待ち受けているポートへの SYN(ACK / RST / FIN の無いもの)を受ける(受動 open)。
+ * 受け皿(tcp_accept_begin())が用意されていればそこへ、無ければ待ち行列(backlog)へ
+ * SYN_RCVD で受理して SYN|ACK を返す。
+ *
+ * 戻り値: 1=待ち受けが見つかった(受理した、または受け皿も待ち行列も無く黙って捨てた)、
+ *         0=このインターフェースでそのポートを待ち受けていない
+ * コール元: tcp_input_noconn()
+ * ===============================================================*/
+static int tcp_input_listen(unsigned core, const volatile uint8_t *in, uint16_t len, uint8_t hdr_len,
+                            const netaddr_t *src, const netaddr_t *dst,
+                            uint16_t src_port, uint16_t dst_port)
+{
+    int matched_listener = -1;
+    int backlog_index    = -1;  /* >=0 = 待ち行列のエントリ、-1 = 受け皿へ直接 */
+    /* **リスナは全コアで共有している。** RSS で受信を複数コアへ散らすと、
+     * 別々の 4-tuple の SYN が同時にここへ入りうるので、「受け皿を掴む /
+     * 待ち行列の枠を取る」までは排他する。**受け皿の奪い合いは
+     * `accept_conn->state` を SYN_RCVD にするところまで守らないと防げない**
+     * (見てから書くまでの間に他コアが同じ受け皿を見てしまう)。
+     * SYN のときしか通らない冷たい経路なので費用は無い。 */
+    smp_spin_lock(&s_listener_lock);
+    for (unsigned li = 0; li < TCP_LISTENER_TOTAL; li++) {
+        tcp_listener_slot_t *l = &s_listeners[li];
+        if (l->in_use &&
+            l->port == dst_port &&
+            (l->bound_ctx == NULL || l->bound_ctx == g_active_ctx)) {
+            matched_listener = (int)li;
+            break;
+        }
+    }
+    if (matched_listener < 0) {
+        smp_spin_unlock(&s_listener_lock);
+        return 0;
+    }
+    /* 受け皿が用意されているなら従来どおりそこへ直接受理する
+     * (複製が要らないぶん素直で、既存の経路がそのまま残る)。
+     * 用意されていない隙間に届いたぶんだけ待ち行列へ積む。 */
+    tcp_listener_slot_t *l = &s_listeners[matched_listener];
+    if (l->accept_conn != NULL && l->accept_conn->state == TCP_CLOSED) {
+        backlog_index = -1;
+    } else {
+        backlog_index = tcp_backlog_find_free(l);
+        if (backlog_index < 0) {
+            /* 待ち行列が無効/満杯。Linux が accept キュー溢れでそう
+             * するのと同じく黙って捨てる(RST を返すと相手の接続が
+             * 即死する -- 段階 1 の教訓)。 */
+            g_tcp_backlog_overflow_count++;
+            smp_spin_unlock(&s_listener_lock);
+            if (g_tcp_backlog_overflow_count <= 8u) {
+                uart_printf("[TCP] backlog: 受け皿も待ち行列も無く SYN を破棄 "
+                            "(local_port=%u, 深さ=%u)\n",
+                            (unsigned)dst_port, (unsigned)g_tcp_backlog_max);
+            }
+            return 1;
+        }
+    }
+    int slot = tcp_find_free_slot();
+    if (slot < 0) {
+        smp_spin_unlock(&s_listener_lock);
+        uart_printf("[!] TCP: 空きコネクションスロットが無く受動openのSYNを破棄 "
+                    "(local_port=%u, 最大%u本)\n", dst_port, TCP_MAX_CONNS);
+        return 1;
+    }
+    tcp_conn_t *aconn = (backlog_index >= 0) ? &l->pending[backlog_index] : l->accept_conn;
+    tcp_priv_t *apriv = &s_priv[core][slot];
+    tcp_priv_init(apriv, core);
+
+    const uint32_t seg_seq = rd32be(in + TCP_OFF_SEQ);
+
+    aconn->local_ip    = dst ? *dst : netaddr_v4(NET_SELF_IP);
+    tcp_priv_try_grant_mlx5_async_overflow(apriv, core, (const netaddr_t *)&aconn->local_ip);
+    aconn->remote_ip   = *src;
+    aconn->remote_port = src_port;
+    aconn->local_port  = dst_port;
+    aconn->state       = TCP_SYN_RCVD;
+    /* ISN(RFC 6528。tcp_isn_gen() の説明)。 */
+    aconn->snd_seq     = tcp_isn_gen((const netaddr_t *)&aconn->local_ip, dst_port, src, src_port);
+
+    aconn->owner_core = core;
+    s_conns[core][slot] = aconn;
+    if (backlog_index >= 0) {
+        l->pending_since[backlog_index] = timer_now();
+        l->pending_estab[backlog_index] = 0;
+        l->pending_used[backlog_index]  = 1;
+    }
+    /* ここまでで受け皿(state=SYN_RCVD)と待ち行列の枠を確保し終えた。
+     * 以降は自分が掴んだ tcp_conn_t しか触らないので排他を外す
+     * (SYN|ACK の送信をロックの中でやらない)。 */
+    smp_spin_unlock(&s_listener_lock);
+
+    aconn->rcv_seq = seg_seq + 1;  /* SYN消費分 */
+    /* 相手が MSS オプションを付けなかったときの既定(IPv4 536 / IPv6 1220、MUST-15)。 */
+    aconn->snd_mss = (src->family == NETADDR_V6) ? TCP_MSS_DEFAULT_V6 : TCP_MSS_DEFAULT_RFC879;
+    if (hdr_len > TCP_HDR_LEN && hdr_len <= len) {
+        tcp_parse_syn_options(aconn, apriv, in + TCP_HDR_LEN, (uint8_t)(hdr_len - TCP_HDR_LEN));
+    }
+    /* SYN の窓は Window Scale を掛けない(RFC 7323 2.2)。WL1 / WL2 は握手を終える ACK で決める。 */
+    aconn->snd_win = rd16be(in + TCP_OFF_WINDOW);
+    apriv->snd_win_max = aconn->snd_win;
+    apriv->snd_wl1 = seg_seq;
+    apriv->snd_wl2 = 0;
+
+    uart_printf("[TCP] accept: SYN受信、SYN|ACK送信 (local_port=%u, slot=%d, backlog=%d)\n",
+                dst_port, slot, backlog_index);
+
+    tcp_send_segment(aconn, apriv, TCP_FLAG_SYN | TCP_FLAG_ACK, NULL, 0);
+
+    aconn->snd_seq++;  /* SYNは1バイト分のシーケンス番号を消費する */
+    apriv->expected_ack = aconn->snd_seq;
+    apriv->ack_received = 0;
+    return 1;
+}
+
+/*=================================================================
+ * どの接続にも一致しないセグメント(冷たい経路)。
+ *   - 待ち受けのポートへの SYN(ACK / RST / FIN の無いもの)は受動 open
+ *   - TIME_WAIT の表にあれば、FIN の再送に ACK を返す(2MSL を測り直す)
+ *   - 待ち受けのポートへの **ACK 付き**のセグメント(SYN|ACK を含む)には RST
+ *     (RFC 9293 3.10.7.2 LISTEN: "any acknowledgment is bad ... send a reset")
+ *   - 待ち受けのポートへの ACK の無いもの(受け皿の隙間に当たった SYN、SYN|FIN など)は黙って捨てる
+ *     (**SYN に RST を返すと、accept を張り直す一瞬の隙間で相手の接続が即死する** -- 段階 1 の
+ *     教訓。SYN|FIN は Linux も捨てる)
+ *   - それ以外(閉じたポート)は RST(RFC 9293 3.10.7.1 CLOSED)
+ * ===============================================================*/
+static void tcp_input_noconn(unsigned core, const volatile uint8_t *in, uint16_t len, uint8_t hdr_len,
+                             uint8_t flags, const netaddr_t *src, const netaddr_t *dst,
+                             uint16_t src_port, uint16_t dst_port)
+{
+    const int pure_syn = ((flags & (TCP_FLAG_SYN | TCP_FLAG_ACK | TCP_FLAG_RST | TCP_FLAG_FIN)) == TCP_FLAG_SYN);
+    if (pure_syn && tcp_input_listen(core, in, len, hdr_len, src, dst, src_port, dst_port)) return;
+
+    /* TIME_WAIT は 4-tuple 一致だけで先に判定する(FIN のときだけ引くのでは
+     * なく)。閉じた直後の相手から届く遅延セグメントを「閉じたポート宛」と
+     * 誤判定して RST を返すと、相手の TIME_WAIT を勝手に潰すことになる。 */
+    tcp_timewait_t tw;
+    if (tcp_timewait_find(src, src_port, dst_port, &tw)) {
+        if ((flags & TCP_FLAG_FIN) && !(flags & TCP_FLAG_RST)) {
+            const uint32_t fin_seq = rd32be(in + TCP_OFF_SEQ);
+            const uint16_t fin_payload_len = (uint16_t)(len - hdr_len);
+            uint32_t tsecr = tw.ts_recent;
+            if (tw.ts_ok) (void)tcp_find_tsval(in, hdr_len, &tsecr);
+            tcp_send_bare_ack(&tw.local_ip, tw.local_port, &tw.remote_ip, tw.remote_port,
+                              tw.local_seq, fin_seq + fin_payload_len + 1u, tw.ts_ok, tsecr);
+            tcp_timewait_restart(src, src_port, dst_port);
+        }
+        return;
+    }
+    /* RST を返さない条件(順に確認する):
+     *  - 受信が RST -- RST に RST を返すと無限ループになる(最重要)。
+     *  - 宛先がマルチキャスト -- 誰宛か特定できないものへ RST は返さない。
+     *  - そのポートにリスナが居て、ACK が無い -- accept を張り直す隙間に届いた SYN など。
+     *  - 他コアに 4-tuple 一致のコネクションが居る -- 自分のコネクションを
+     *    自分で撃たないための保険。 */
+    if (flags & TCP_FLAG_RST) return;
+    if (dst && dst->family == NETADDR_V6 && dst->a[0] == 0xFFu) return;
+    const int listening = tcp_port_has_listener(dst_port);
+    if (listening && !(flags & TCP_FLAG_ACK)) return;
+    if (tcp_conn_exists_any_core(src, src_port, dst_port)) return;
+
+    netaddr_t nm_local = dst ? *dst : netaddr_v4(NET_SELF_IP);
+    tcp_send_bare_rst(&nm_local, dst_port, src, src_port,
+                      flags, rd32be(in + TCP_OFF_SEQ), rd32be(in + TCP_OFF_ACK),
+                      (uint16_t)(len - hdr_len));
+    if (listening) {
+        g_tcp_listen_rst++;
+        uart_printf("[TCP] 待ち受けのポートへの ACK 付きセグメント (local_port=%u, remote_port=%u) へ RST を返しました\n",
+                    (unsigned)dst_port, (unsigned)src_port);
+    } else {
+        uart_printf("[TCP] 待ち受けの無いポート宛 (local_port=%u, remote_port=%u) へ RST を返しました\n",
+                    (unsigned)dst_port, (unsigned)src_port);
+    }
+}
+
+/*=================================================================
+ * 順番どおりになった FIN を受け入れる(RFC 9293 3.10.7.4 eighth)。rcv_seq を 1 進め、ACK を
+ * 返して状態を進める。
+ *   ESTABLISHED → CLOSE_WAIT、FIN_WAIT_1(自分の FIN が未確認)→ CLOSING(同時クローズ)、
+ *   FIN_WAIT_2 → TIME_WAIT
+ * **FIN は「その前のデータを全部受け取った」ときにだけ処理する。** 以前は FIN が立っていれば
+ * 穴があっても、データを受け取れなくても rcv_seq = seq + 長さ + 1 にしていたので、穴の
+ * ぶんのデータを失ったまま接続を閉じ、古い seq の FIN+データでは受け取り済みのデータを
+ * もう一度上位へ渡していた。
+ * ===============================================================*/
+static void tcp_fin_accept(tcp_conn_t *conn, tcp_priv_t *priv)
+{
+    conn->rcv_seq++;
+    priv->fin_pend     = 0;
+    priv->fin_received = 1;
+    tcp_send_segment(conn, priv, TCP_FLAG_ACK, NULL, 0);
+    if(ts_log_mode()&TS_MODE_HOTPATH) ts_log(TS_MK(TS_FILE_TCP, TS_FUNC_tcp_input, 4), tcp_conn_arg(conn, 0u));
+    switch (conn->state) {
+    case TCP_ESTABLISHED:
+        conn->state = TCP_CLOSE_WAIT;
+        uart_printf("[TCP] FIN受信、ACK返送してCLOSE_WAITへ遷移\n");
+        break;
+    case TCP_FIN_WAIT_1:
+        conn->state = TCP_CLOSING;
+        uart_printf("[TCP] 同時クローズ: FIN_WAIT_1 で FIN 受信、CLOSING へ遷移\n");
+        break;
+    case TCP_FIN_WAIT_2:
+        conn->state = TCP_TIME_WAIT;
+        break;
+    default:
+        break;
+    }
+}
+
+/*=================================================================
+ * 緊急ポインタを記録する(RFC 9293 3.8.5、RFC 6093)。緊急データの終わり = seq + 緊急ポインタ。
+ * 進んだときだけ記録し、上位は tcp_urgent_mark() で知る(MUST-30/31)。データ自体はストリームの
+ * 中で普段どおり渡す(RFC 6093 の推奨どおり、帯域外のデータとしては扱わない)。
+ * ===============================================================*/
+static void tcp_urg_note(tcp_conn_t *conn, tcp_priv_t *priv, uint32_t seq, uint16_t up)
+{
+    (void)conn;
+    if (up == 0u) return;
+    const uint32_t mark = seq + up;
+    if (!priv->urg_valid || tcp_seq_gt(mark, priv->rcv_up)) {
+        priv->rcv_up    = mark;
+        priv->urg_valid = 1;
+        g_tcp_urg_rx++;
+    }
+}
+
+/*=================================================================
+ * 受信 TCP セグメントを処理する。RFC 9293 3.10.7.4 の順に:
+ *   チェックサム → 4-tuple の照合(無ければ tcp_input_noconn())→ 同期済みへの SYN(challenge ACK)
+ *   → RST の検証(RFC 5961)→ SYN_SENT → PAWS / Timestamps → シーケンスの受け入れ判定
+ *   → ACK ビット → SYN_RCVD の確立 → SND.NXT を越える ACK → 送信窓(WL1/WL2)→ ACK の処理
+ *   → 緊急ポインタ → データ → FIN
+ *
+ * **ホットパス(確立済みで順番どおりのデータ / ACK)に足したのは比較数個だけ**
+ * (seq == rcv_seq なら受け入れ判定を飛ばす、ACK > SND.NXT、WL1/WL2、ACK ビット)。
+ * 時刻の読み出しや表の走査は、受け入れられないセグメントの側にしか無い。
  *
  * 引数:
  *   pkt    - TCP ヘッダ先頭(IP ヘッダの直後)
@@ -6053,7 +7204,7 @@ int tcp_conn_sack_enabled(const tcp_conn_t *conn)
  *   dst - 同じく宛先。IPv4 で「アクティブなインターフェースの IPv4」と
  *         分かっている場合は NULL を渡してよい(受信 1 パケットごとに
  *         netaddr_t を組み立てる無駄を避けるため。実際に使うのは受動 open と
- *         ソフトウェアチェックサム検証の 2 箇所だけ)
+ *         ソフトウェアチェックサム検証と RST の 3 箇所だけ)
  * コール元:
  *   tcp_input(), ipv6_handle_frame()
  * ===============================================================*/
@@ -6072,129 +7223,32 @@ void tcp_input_addr(const uint8_t *pkt, uint16_t len,
 
     uint16_t src_port = rd16be(in + TCP_OFF_SRC_PORT);
     uint16_t dst_port = rd16be(in + TCP_OFF_DST_PORT);
-
-    int matched_listener = -1;
-    int backlog_index    = -1;  /* >=0 = 待ち行列のエントリ、-1 = 受け皿へ直接 */
-    if (in[TCP_OFF_FLAGS] & TCP_FLAG_SYN) {
-        /* 再送された SYN を新しい接続として受理しない(待ち行列を作ると、
-         * 同じ相手の SYN 再送がエントリを食い潰す)。既に SYN_RCVD まで
-         * 進んでいるなら SYN|ACK を送り直す -- こちらの SYN|ACK が落ちた場合、
-         * 相手は SYN を再送してくるので、無視すると永久に確立しない。 */
-        for (unsigned i = 0; i < TCP_MAX_CONNS; i++) {
-            tcp_conn_t *ec = s_conns[core][i];
-            if (ec != NULL &&
-                src_port == ec->remote_port &&
-                dst_port == ec->local_port &&
-                netaddr_eq(src, (const netaddr_t *)&ec->remote_ip)) {
-                if (ec->state == TCP_SYN_RCVD) {
-                    tcp_priv_t *epriv = &s_priv[core][i];
-                    uint32_t    saved = ec->snd_seq;
-                    ec->snd_seq = epriv->expected_ack - 1u;  /* SYN 消費前の ISN */
-                    tcp_send_segment(ec, epriv, TCP_FLAG_SYN | TCP_FLAG_ACK, NULL, 0);
-                    ec->snd_seq = saved;
-                    g_tcp_synack_retx_count++;
-                    uart_printf("[TCP] accept: SYN 再送を受けて SYN|ACK を送り直し "
-                                "(local_port=%u)\n", (unsigned)dst_port);
-                    return;
-                }
-                break;  /* SYN|ACK など、既存コネクションの通常処理へ落とす */
-            }
-        }
-        /* **リスナは全コアで共有している。** RSS で受信を複数コアへ散らすと、
-         * 別々の 4-tuple の SYN が同時にここへ入りうるので、「受け皿を掴む /
-         * 待ち行列の枠を取る」までは排他する。**受け皿の奪い合いは
-         * `accept_conn->state` を SYN_RCVD にするところまで守らないと防げない**
-         * (見てから書くまでの間に他コアが同じ受け皿を見てしまう)。
-         * SYN のときしか通らない冷たい経路なので費用は無い。 */
-        smp_spin_lock(&s_listener_lock);
-        for (unsigned li = 0; li < TCP_LISTENER_TOTAL; li++) {
-            tcp_listener_slot_t *l = &s_listeners[li];
-            if (l->in_use &&
-                l->port == dst_port &&
-                (l->bound_ctx == NULL || l->bound_ctx == g_active_ctx)) {
-                matched_listener = (int)li;
-                break;
-            }
-        }
-        if (matched_listener >= 0) {
-            /* 受け皿が用意されているなら従来どおりそこへ直接受理する
-             * (複製が要らないぶん素直で、既存の経路がそのまま残る)。
-             * 用意されていない隙間に届いたぶんだけ待ち行列へ積む。 */
-            tcp_listener_slot_t *l = &s_listeners[matched_listener];
-            if (l->accept_conn != NULL && l->accept_conn->state == TCP_CLOSED) {
-                backlog_index = -1;
-            } else {
-                backlog_index = tcp_backlog_find_free(l);
-                if (backlog_index < 0) {
-                    /* 待ち行列が無効/満杯。Linux が accept キュー溢れでそう
-                     * するのと同じく黙って捨てる(RST を返すと相手の接続が
-                     * 即死する -- 段階 1 の教訓)。 */
-                    g_tcp_backlog_overflow_count++;
-                    smp_spin_unlock(&s_listener_lock);
-                    if (g_tcp_backlog_overflow_count <= 8u) {
-                        uart_printf("[TCP] backlog: 受け皿も待ち行列も無く SYN を破棄 "
-                                    "(local_port=%u, 深さ=%u)\n",
-                                    (unsigned)dst_port, (unsigned)g_tcp_backlog_max);
-                    }
-                    return;
-                }
-            }
-        }
-        if (matched_listener < 0) smp_spin_unlock(&s_listener_lock);
+    uint8_t  flags    = in[TCP_OFF_FLAGS];
+    uint8_t  hdr_len  = (uint8_t)(((in[TCP_OFF_DATA_OFFSET] >> 4) & 0x0Fu) * 4u);
+    if (hdr_len < TCP_HDR_LEN || hdr_len > len) {
+        uart_printf("[TCP] 不正なヘッダ長 (hdr_len=%u len=%u) 無視\n",
+                    hdr_len, (unsigned)len);
+        return;
     }
-    if (matched_listener >= 0) {
-        tcp_listener_slot_t *l = &s_listeners[matched_listener];
-        int slot = tcp_find_free_slot();
-        if (slot < 0) {
-            smp_spin_unlock(&s_listener_lock);
-            uart_printf("[!] TCP: 空きコネクションスロットが無く受動openのSYNを破棄 "
-                        "(local_port=%u, 最大%u本)\n", dst_port, TCP_MAX_CONNS);
+
+    /* **チェックサムは何をするより先に確かめる**(RFC 9293 3.10.7 の MUST-2/3)。以前は 4-tuple が
+     * 一致した後でしか確かめておらず、壊れた SYN で受動 open したり、壊れたセグメントに RST を
+     * 返したりしていた。HW が確かめた普段の受信では分岐 1 つ(以前と同じ費用)。 */
+    if (!eth_rx_hw_csum_ok()) {
+        uint16_t csum_check;
+        netaddr_t dst_v4;
+        const netaddr_t *d = dst;
+        if (!d) { dst_v4 = netaddr_v4(NET_SELF_IP); d = &dst_v4; }
+        if (src->family == NETADDR_V6) {
+            csum_check = ipv6_pseudo_checksum(src->a, d->a, IP_PROTO_TCP, pkt, len);
+        } else {
+            csum_check = pseudo_header_checksum(src->a, d->a, IP_PROTO_TCP, pkt, len);
         }
-        if (slot >= 0) {
-            tcp_conn_t *aconn = (backlog_index >= 0) ? &l->pending[backlog_index]
-                                                     : l->accept_conn;
-            tcp_priv_t *apriv = &s_priv[core][slot];
-            tcp_priv_init(apriv, core);
-
-            uint32_t seg_seq  = rd32be(in + TCP_OFF_SEQ);
-            uint8_t  hdr_len2 = (uint8_t)(((in[TCP_OFF_DATA_OFFSET] >> 4) & 0x0Fu) * 4u);
-
-            aconn->local_ip    = dst ? *dst : netaddr_v4(NET_SELF_IP);
-            tcp_priv_try_grant_mlx5_async_overflow(apriv, core, (const netaddr_t *)&aconn->local_ip);
-            aconn->remote_ip   = *src;
-            aconn->remote_port = src_port;
-            aconn->local_port  = dst_port;
-            aconn->state       = TCP_SYN_RCVD;
-            aconn->snd_seq     = (uint32_t)timer_now();  /* ISN(tcp_connect()と同じ採り方) */
-
-            aconn->owner_core = core;
-            s_conns[core][slot] = aconn;
-            if (backlog_index >= 0) {
-                l->pending_since[backlog_index] = timer_now();
-                l->pending_estab[backlog_index] = 0;
-                l->pending_used[backlog_index]  = 1;
-            }
-            /* ここまでで受け皿(state=SYN_RCVD)と待ち行列の枠を確保し終えた。
-             * 以降は自分が掴んだ tcp_conn_t しか触らないので排他を外す
-             * (SYN|ACK の送信をロックの中でやらない)。 */
-            smp_spin_unlock(&s_listener_lock);
-
-            aconn->rcv_seq = seg_seq + 1;  /* SYN消費分 */
-            aconn->snd_mss = TCP_MSS_DEFAULT_RFC879;
-            if (hdr_len2 > TCP_HDR_LEN && hdr_len2 <= len) {
-                tcp_parse_syn_options(aconn, apriv, in + TCP_HDR_LEN, (uint8_t)(hdr_len2 - TCP_HDR_LEN));
-            }
-            aconn->snd_win = rd16be(in + TCP_OFF_WINDOW);
-            apriv->snd_win_max = aconn->snd_win;
-
-            uart_printf("[TCP] accept: SYN受信、SYN|ACK送信 (local_port=%u, slot=%d, backlog=%d)\n",
-                        dst_port, slot, backlog_index);
-
-            tcp_send_segment(aconn, apriv, TCP_FLAG_SYN | TCP_FLAG_ACK, NULL, 0);
-
-            aconn->snd_seq++;  /* SYNは1バイト分のシーケンス番号を消費する */
-            apriv->expected_ack = aconn->snd_seq;
-            apriv->ack_received = 0;
+        if (csum_check != 0) {
+            if(ts_log_mode()&TS_MODE_HOTPATH) ts_log(TS_MK(TS_FILE_TCP, TS_FUNC_tcp_input, 1), len);
+            uart_printf("[TCP] チェックサム不正 (計算結果=0x%04X、0であるべき) セグメント破棄\n",
+                        csum_check);
+            g_tcp_rx_csum_drop[core]++;
             return;
         }
     }
@@ -6216,90 +7270,48 @@ void tcp_input_addr(const uint8_t *pkt, uint16_t len,
         }
     }
     if (!conn) {
-        uint8_t nm_flags = in[TCP_OFF_FLAGS];
-        /* TIME_WAIT は 4-tuple 一致だけで先に判定する(FIN のときだけ引くのでは
-         * なく)。閉じた直後の相手から届く遅延セグメントを「閉じたポート宛」と
-         * 誤判定して RST を返すと、相手の TIME_WAIT を勝手に潰すことになる。 */
-        tcp_timewait_t *tw = tcp_timewait_find(src, src_port, dst_port);
-        if (tw) {
-            if (nm_flags & TCP_FLAG_FIN) {
-                uint8_t fin_hdr_len = (uint8_t)(((in[TCP_OFF_DATA_OFFSET] >> 4) & 0x0Fu) * 4u);
-                if (fin_hdr_len >= TCP_HDR_LEN && fin_hdr_len <= len) {
-                    uint32_t fin_seq = rd32be(in + TCP_OFF_SEQ);
-                    uint16_t fin_payload_len = (uint16_t)(len - fin_hdr_len);
-                    tcp_send_bare_ack(&tw->local_ip, tw->local_port,
-                                       &tw->remote_ip, tw->remote_port,
-                                       tw->local_seq, fin_seq + fin_payload_len + 1u);
-                }
-            }
-            return;
-        }
-        /* TIME_WAIT にも一致しない -- 閉じたポート宛。RFC 793 に従って RST を
-         * 返し、相手を SYN 再送のタイムアウトまで待たせない。
-         *
-         * RST を返さない条件(順に確認する):
-         *  - 受信が RST -- RST に RST を返すと無限ループになる(最重要)。
-         *  - 宛先がマルチキャスト -- 誰宛か特定できないものへ RST は返さない。
-         *  - そのポートにリスナが居る -- accept を張り直す隙間に届いた SYN。
-         *  - 他コアに 4-tuple 一致のコネクションが居る -- 自分のコネクションを
-         *    自分で撃たないための保険。 */
-        if (nm_flags & TCP_FLAG_RST) return;
-        if (dst && dst->family == NETADDR_V6 && dst->a[0] == 0xFFu) return;
-        if (tcp_port_has_listener(dst_port)) return;
-        if (tcp_conn_exists_any_core(src, src_port, dst_port)) return;
-
-        uint8_t nm_hdr_len = (uint8_t)(((in[TCP_OFF_DATA_OFFSET] >> 4) & 0x0Fu) * 4u);
-        if (nm_hdr_len < TCP_HDR_LEN || nm_hdr_len > len) return;
-
-        netaddr_t nm_local = dst ? *dst : netaddr_v4(NET_SELF_IP);
-        tcp_send_bare_rst(&nm_local, dst_port, src, src_port,
-                           nm_flags, rd32be(in + TCP_OFF_SEQ), rd32be(in + TCP_OFF_ACK),
-                           (uint16_t)(len - nm_hdr_len));
-        uart_printf("[TCP] 待ち受けの無いポート宛 (local_port=%u, remote_port=%u) へ RST を返しました\n",
-                    (unsigned)dst_port, (unsigned)src_port);
+        tcp_input_noconn(core, in, len, hdr_len, flags, src, dst, src_port, dst_port);
         return;
     }
+    if (conn->state == TCP_CLOSED) return;
 
-    /* Keepalive の「相手は生きている」印。**ホットパスに置くのはこの 1 バイトの
-     * store だけ**で、時刻の読み出しと期限の判定は冷たい経路が行う
-     * (tcp_keepalive_check())。probe への応答は純 ACK なので、ここで印を
-     * 付けないと**応答が返っていることを知る手段が無い**。 */
-    priv->ka_seen = 1;
+    /* Keepalive / tcp_send() の「相手は生きている」印。**ホットパスに置くのはこの 1 つの
+     * 加算だけ**で、時刻の読み出しと期限の判定は冷たい経路が行う(tcp_keepalive_one())。
+     * probe への応答は純 ACK なので、ここで数えないと**応答が返っていることを知る手段が無い**。 */
+    priv->rx_segs++;
 
-    int hw_ok = eth_rx_hw_csum_ok();
-    if(ts_log_mode()&TS_MODE_HOTPATH) ts_log(TS_MK(TS_FILE_TCP, TS_FUNC_tcp_input, 0), tcp_conn_arg(conn, len));
-    if (!hw_ok) {
-        uint16_t csum_check;
-        netaddr_t dst_v4;
-        if (!dst) { dst_v4 = netaddr_v4(NET_SELF_IP); dst = &dst_v4; }
-        if (src->family == NETADDR_V6) {
-            csum_check = ipv6_pseudo_checksum(src->a, dst->a, IP_PROTO_TCP, pkt, len);
-        } else {
-            csum_check = pseudo_header_checksum(src->a, dst->a, IP_PROTO_TCP, pkt, len);
-        }
-        if (csum_check != 0) {
-            if(ts_log_mode()&TS_MODE_HOTPATH) ts_log(TS_MK(TS_FILE_TCP, TS_FUNC_tcp_input, 1), tcp_conn_arg(conn, len));
-            uart_printf("[TCP] チェックサム不正 (計算結果=0x%04X、0であるべき) セグメント破棄\n",
-                        csum_check);
-            g_tcp_rx_csum_drop[core]++;
-            return;
-        }
-    }
     if(ts_log_mode()&TS_MODE_HOTPATH) ts_log(TS_MK(TS_FILE_TCP, TS_FUNC_tcp_input, 2), tcp_conn_arg(conn, len));
 
     uint32_t seq   = rd32be(in + TCP_OFF_SEQ);
     uint32_t ack   = rd32be(in + TCP_OFF_ACK);
-    uint8_t  flags = in[TCP_OFF_FLAGS];
-    uint8_t  hdr_len = (uint8_t)(((in[TCP_OFF_DATA_OFFSET] >> 4) & 0x0Fu) * 4u);
-
-    if (hdr_len < TCP_HDR_LEN || hdr_len > len) {
-        uart_printf("[TCP] 不正なヘッダ長 (hdr_len=%u len=%u) 無視\n",
-                    hdr_len, (unsigned)len);
-        return;
-    }
 
     const volatile uint8_t *payload = in + hdr_len;
     uint16_t payload_len = (uint16_t)(len - hdr_len);
+
+    if (flags & TCP_FLAG_SYN) {
+        /* 再送された SYN を新しい接続として受理しない。既に SYN_RCVD まで進んでいるなら
+         * SYN|ACK を送り直す -- こちらの SYN|ACK が落ちた場合、相手は SYN を再送してくるので、
+         * 無視すると永久に確立しない。 */
+        if (conn->state == TCP_SYN_RCVD && !(flags & (TCP_FLAG_ACK | TCP_FLAG_RST))) {
+            uint32_t saved = conn->snd_seq;
+            conn->snd_seq = priv->expected_ack - 1u;  /* SYN 消費前の ISN */
+            tcp_send_segment(conn, priv, TCP_FLAG_SYN | TCP_FLAG_ACK, NULL, 0);
+            conn->snd_seq = saved;
+            g_tcp_synack_retx_count++;
+            uart_printf("[TCP] accept: SYN 再送を受けて SYN|ACK を送り直し "
+                        "(local_port=%u)\n", (unsigned)dst_port);
+            return;
+        }
+        /* **同期済みの接続への SYN は、seq によらず challenge ACK を返して捨てる**(RFC 5961 4、
+         * RFC 9293 3.10.7.4 fourth)。以前は既存の接続を見つけても待ち受けの処理へ進み、
+         * 同じ 4-tuple の 2 つ目の TCB を作っていた。相手が本当に作り直したのなら、challenge
+         * ACK を受けて RST を返してくるので、それで古い接続が閉じる。 */
+        if (conn->state != TCP_SYN_SENT && conn->state != TCP_SYN_RCVD && !(flags & TCP_FLAG_RST)) {
+            g_tcp_syn_challenge++;
+            (void)tcp_send_oow_ack(conn, priv, 1, 1);
+            return;
+        }
+    }
 
     if (flags & TCP_FLAG_RST) {
         /* **RST はシーケンス番号を検証してから受け入れる**(RFC 5961 3)。
@@ -6316,16 +7328,18 @@ void tcp_input_addr(const uint8_t *pkt, uint16_t len,
         } else if (seq == conn->rcv_seq) {
             rst_ok = 1;
         } else {
-            uint32_t rwnd = (uint32_t)priv->last_win_sent;
-            if (priv->wscale_enabled) rwnd <<= priv->rcv_wscale;
-            if (rwnd == 0) rwnd = 1u;   /* 窓 0 でも RCV.NXT の 1 個だけは窓内 */
+            /* 窓は最後に広告した右端で測る(以前は直前に送った窓の値。LSO の送信では
+             * 控えていなかった)。窓 0 でも RCV.NXT の 1 個だけは窓内。 */
+            uint32_t rwnd = (priv->rcv_wnd_valid && tcp_seq_gt(priv->rcv_wnd_edge, conn->rcv_seq))
+                          ? priv->rcv_wnd_edge - conn->rcv_seq : 0u;
+            if (rwnd == 0) rwnd = 1u;
             int in_window = !tcp_seq_lt(seq, conn->rcv_seq) &&
                              tcp_seq_lt(seq, conn->rcv_seq + rwnd);
             if (in_window) {
                 /* 窓内だが RCV.NXT ではない -- challenge ACK を返して、
-                 * 本物なら相手が正しい seq で送り直すのを待つ。 */
+                 * 本物なら相手が正しい seq で送り直すのを待つ(頻度に上限、RFC 5961 7)。 */
                 g_tcp_rst_challenge_count++;
-                tcp_send_segment(conn, priv, TCP_FLAG_ACK, NULL, 0);
+                (void)tcp_send_oow_ack(conn, priv, 1, 1);
             } else {
                 g_tcp_rst_dropped_count++;
             }
@@ -6344,6 +7358,41 @@ void tcp_input_addr(const uint8_t *pkt, uint16_t len,
         return;
     }
 
+    if (conn->state == TCP_SYN_SENT) {
+        /* RFC 9293 3.10.7.3。**受け入れられない ACK(自分の SYN を確認していない)には RST**
+         * (相手は前の接続の半端な状態かもしれない。以前は黙って捨てていたので、相手は
+         * SYN|ACK を送り直し続けた)。ACK だけで SYN が無いものは捨てる。 */
+        if ((flags & TCP_FLAG_ACK) && ack != priv->expected_ack) {
+            g_tcp_synsent_rst++;
+            tcp_send_bare((const netaddr_t *)&conn->local_ip, conn->local_port,
+                          (const netaddr_t *)&conn->remote_ip, conn->remote_port,
+                          TCP_FLAG_RST, ack, 0u);
+            return;
+        }
+        if (!(flags & TCP_FLAG_SYN)) return;
+        conn->rcv_seq = seq + 1;
+        tcp_parse_syn_options(conn, priv, in + TCP_HDR_LEN, (uint8_t)(hdr_len - TCP_HDR_LEN));
+        /* SYN の窓は Window Scale を掛けない(RFC 7323 2.2)。 */
+        conn->snd_win      = rd16be(in + TCP_OFF_WINDOW);
+        priv->snd_win_max  = conn->snd_win;
+        priv->snd_wl1      = seq;
+        priv->snd_wl2      = ack;
+        if (flags & TCP_FLAG_ACK) {
+            conn->state = TCP_ESTABLISHED;
+            priv->ack_received = 1;
+            conn->snd_seq = ack;
+            tcp_send_segment(conn, priv, TCP_FLAG_ACK, NULL, 0);
+        } else {
+            /* **同時オープン**(RFC 9293 3.5 図 7)。相手も SYN を送ってきた: SYN_RCVD へ進み、
+             * 同じ ISN で SYN|ACK を返す。相手の SYN|ACK(か ACK)で ESTABLISHED になる。
+             * 以前は捨てていたので、同時オープンは両側の SYN 再送が尽きるまで確立しなかった。 */
+            conn->state = TCP_SYN_RCVD;
+            tcp_send_segment(conn, priv, TCP_FLAG_SYN | TCP_FLAG_ACK, NULL, 0);
+            uart_printf("[TCP] connect: 同時オープン、SYN_RCVD へ\n");
+        }
+        return;
+    }
+
     /* Timestamps(RFC 7323)。合意していないコネクションでは分岐 1 つで抜ける。
      * PAWS(古いセグメントの検出)はここで行う -- RST より後に置いてあるので
      * RST は PAWS の対象外(相手を切れなくなるのを避ける)。 */
@@ -6352,356 +7401,401 @@ void tcp_input_addr(const uint8_t *pkt, uint16_t len,
     /* PRR: この ACK で新しく SACK された量を出すため、読む前の SACK 済みの量を控える(回復中だけ)。 */
     const uint32_t prr_una0    = priv->snd_una;
     const uint32_t prr_sacked0 = priv->prr_active ? tcp_sacked_bytes(priv) : 0u;
-    const uint32_t seg_end = seq + (uint32_t)(len - hdr_len) +
-                             ((in[TCP_OFF_FLAGS] & TCP_FLAG_FIN) ? 1u : 0u);
-    if ((priv->ts_enabled || priv->sack_enabled) &&
-        !tcp_input_options(conn, priv, in, hdr_len, seq, seg_end, &seg_tsecr)) {
-        g_tcp_rx_paws_drop[core]++;
-        return;  /* PAWS で破棄(ACK は tcp_input_options() が返している) */
+    const int fin = (flags & TCP_FLAG_FIN) != 0;
+    const uint32_t seg_end = seq + (uint32_t)payload_len + (fin ? 1u : 0u);
+    if (priv->ts_enabled || priv->sack_enabled) {
+        const int r = tcp_input_options(conn, priv, in, hdr_len, seq, seg_end, &seg_tsecr);
+        if (r <= 0) {
+            if (r == 0) g_tcp_rx_paws_drop[core]++;   /* PAWS(ACK は tcp_input_options() が返している)*/
+            else        g_tcp_ts_missing_drop++;      /* TS が無い(RFC 7323 3.2: 黙って捨てる)*/
+            return;
+        }
     }
 
-    uint32_t prev_snd_win = conn->snd_win;  /* dup ACK 判定に要る(更新前の値) */
-    if (priv->wscale_enabled) {
-        conn->snd_win = (uint32_t)rd16be(in + TCP_OFF_WINDOW) << priv->snd_wscale;
-    } else {
-        conn->snd_win = rd16be(in + TCP_OFF_WINDOW);
+    /* **シーケンスの受け入れ判定**(RFC 9293 3.10.7.4 first check)。受信窓 = 最後に広告した
+     * 右端まで。窓の外のセグメントは(RST 以外)ACK を返して捨てる。以前はこの判定が無く、
+     * 窓のはるか先のデータでも順序外の置き場へ入れていた。
+     * **seq == RCV.NXT のときは判定を飛ばす**(ホットパス)。窓 0 でも RCV.NXT 上のセグメントは
+     * ACK を処理する(3.10.7.4 の注: 窓 0 でも正しい ACK は受け付ける)。データは受け取れなければ
+     * 下で捨てる(rx_nospace)。 */
+    if (seq != conn->rcv_seq) {
+        const uint32_t rcv = conn->rcv_seq;
+        const uint32_t seg_len = seg_end - seq;
+        uint32_t wnd;
+        if (priv->rcv_wnd_valid) wnd = tcp_seq_gt(priv->rcv_wnd_edge, rcv) ? priv->rcv_wnd_edge - rcv : 0u;
+        else                     wnd = 0xFFFFu;
+        int ok;
+        if (seg_len == 0u) ok = (wnd != 0u) && !tcp_seq_lt(seq, rcv) && tcp_seq_lt(seq, rcv + wnd);
+        else               ok = (wnd != 0u) && tcp_seq_lt(seq, rcv + wnd) && tcp_seq_gt(seq + seg_len, rcv);
+        if (!ok) {
+            if (payload_len > 0u && !tcp_seq_gt(seq + payload_len, rcv)) {
+                /* 全部受け取り済みのデータ(相手の無駄な再送)。DSACK で知らせる(RFC 2883)。 */
+                g_tcp_rx_dup[core]++;
+                tcp_dsack_note(priv, seq, seq + payload_len);
+            }
+            g_tcp_rx_oow_drop++;
+            /* データも FIN も運ばないものへの ACK は頻度に上限(RFC 5961 7)。 */
+            const int limited = (payload_len == 0u && !fin);
+            if (tcp_send_oow_ack(conn, priv, limited, 0) && limited && tcp_seq_lt(seq, rcv)) {
+                /* **相手の Keepalive probe(1 バイト過去の seq で 0 バイト)。** RFC 1122 4.2.3.6 は
+                 * ACK を返すことを求める。返さないと相手はこちらが死んだと判断して接続を切る
+                 * (Linux は既定で Keepalive を使う)。 */
+                g_tcp_keepalive_reply_count++;
+            }
+            return;
+        }
     }
-    if (conn->snd_win > priv->snd_win_max) priv->snd_win_max = conn->snd_win;
 
+    /* **ACK ビットの無いセグメントは捨てる**(RFC 9293 3.10.7.4 fifth: "if the ACK bit is off,
+     * drop the segment and return")。SYN_RCVD も同じ。 */
+    if (!(flags & TCP_FLAG_ACK)) {
+        g_tcp_noack_drop++;
+        return;
+    }
+
+    if (conn->state == TCP_SYN_RCVD) {
+        /* 握手を終える ACK。**受け入れられない ACK には RST**(RFC 9293 3.10.7.4 SYN-RECEIVED)。 */
+        if (ack != priv->expected_ack) {
+            g_tcp_synsent_rst++;
+            tcp_send_bare((const netaddr_t *)&conn->local_ip, conn->local_port,
+                          (const netaddr_t *)&conn->remote_ip, conn->remote_port,
+                          TCP_FLAG_RST, ack, 0u);
+            return;
+        }
+        priv->snd_una = ack;
+        priv->ack_received = 1;   /* 同時オープンの能動側は tcp_connect_poll() がこれを見る */
+        conn->state = TCP_ESTABLISHED;
+        tcp_cwnd_init(conn, priv);
+        /* 送信窓はこのセグメントから(Window Scale は SYN で合意済み)。 */
+        conn->snd_win = (uint32_t)rd16be(in + TCP_OFF_WINDOW) << (priv->wscale_enabled ? priv->snd_wscale : 0u);
+        if (conn->snd_win > priv->snd_win_max) priv->snd_win_max = conn->snd_win;
+        priv->snd_wl1 = seq;
+        priv->snd_wl2 = ack;
+        for (unsigned li = 0; li < TCP_LISTENER_TOTAL; li++) {
+            if (!s_listeners[li].in_use) continue;
+            if (s_listeners[li].accept_conn == conn) {
+                s_listeners[li].accept_ready = 1;  /* 受け皿へ直接受理した経路 */
+                break;
+            }
+            int bp = tcp_backlog_index_of(&s_listeners[li], conn);
+            if (bp >= 0) {
+                /* 待ち行列の中で確立した。呼び出し側が受け皿を用意した
+                 * 時点で tcp_accept_ready_poll() が引き渡す。 */
+                s_listeners[li].pending_estab[bp] = 1;
+                (void)__atomic_add_fetch(&s_backlog_estab_cnt[core], 1u, __ATOMIC_ACQ_REL);
+                break;
+            }
+        }
+        uart_printf("[TCP] accept: ESTABLISHED (peer MSS=%u, 初期cwnd=%u)\n",
+                    conn->snd_mss, priv->cwnd);
+        /* **この ACK に載ったデータと FIN も続けて処理する**(RFC 9293 3.10.7.4 SYN-RECEIVED:
+         * "continue processing")。以前はここで終わり、データは相手の再送を待っていた。 */
+    }
+
+    /* **まだ送っていないものへの ACK は受け入れない**(RFC 9293 3.10.7.4 fifth、RFC 5961 5.2)。
+     * ACK を返して捨てる(頻度に上限)。SND.NXT は snd_max で見る -- conn->snd_seq は tcp_send() の
+     * 再送中は巻き戻っている。以前はこの検査が無く、偽の ACK で snd_una を送った量より先へ
+     * 進められ、未確認の量が負(4G 近く)になって送信が止まった。 */
+    if (tcp_seq_gt(ack, priv->snd_max)) {
+        g_tcp_ack_unsent_drop++;
+        (void)tcp_send_oow_ack(conn, priv, 1, 1);
+        return;
+    }
+
+    /* 送信窓の更新(RFC 9293 3.10.7.4 fifth の SND.WL1 / WL2)。**古いセグメント(seq が前に
+     * 窓を更新したものより前)では窓を戻さない。** 以前は届いた順に上書きしていたので、
+     * 順序が入れ替わった古いセグメントが、開いた窓を閉じた値へ戻すことがあった。
+     * 重複 ACK の判定には更新前の値が要る。 */
+    const uint32_t prev_snd_win = conn->snd_win;
+    if ((tcp_seq_lt(priv->snd_wl1, seq) ||
+         (priv->snd_wl1 == seq && !tcp_seq_lt(ack, priv->snd_wl2))) &&
+        !tcp_seq_lt(ack, priv->snd_una)) {
+        uint32_t w = rd16be(in + TCP_OFF_WINDOW);
+        if (priv->wscale_enabled) w <<= priv->snd_wscale;
+        conn->snd_win = w;
+        priv->snd_wl1 = seq;
+        priv->snd_wl2 = ack;
+        if (w > priv->snd_win_max) priv->snd_win_max = w;
+    }
+
+    /* ---- ACK の処理(同期済みの全状態で同じ。以前は ESTABLISHED だけが RTT / 回復 / PRR を
+     * 見ていて、CLOSE_WAIT では snd_una しか進めていなかった)---- */
+    if (ack == priv->expected_ack) {
+        priv->ack_received = 1;  /* 単発の信頼送信(tcp_send_reliable())向け */
+    }
+    if (priv->tlp_active && ack == priv->snd_una) {
+        /* 進まない ACK。probe が無駄だったと分かる DSACK か、情報の無い純 ACK で TLP を終える。 */
+        tcp_tlp_on_ack(conn, priv, ack,
+                       payload_len == 0 && priv->sack_gen == sack_gen0 && !priv->tlp_dsack);
+    }
+    if (tcp_seq_gt(ack, priv->snd_una)) {
+        priv->snd_una = ack;     /* パイプライン送信(tcp_send())向け、累積ACKで進める */
+        priv->ack_advanced = 1;
+        priv->neigh_confirm = 1;   /* 上位層の到達確認(NUD)*/
+        tcp_on_new_ack(priv, ack);
+        /* **Timestamps があれば再送中でも RTT を測れる。** Karn の
+         * アルゴリズム(再送したウィンドウの RTT は測らない)は
+         * 「どちらの送信への ACK か分からない」ことへの対処なので、
+         * TSecr で判別できるなら制約そのものが消える。 */
+        uint64_t ack_now = 0;   /* 時刻を読んだら TLP の起点に使う(余分に読まない) */
+        if (priv->ts_enabled && seg_tsecr != 0u) {
+            ack_now = timer_now();
+            uint32_t elapsed = (uint32_t)(ack_now >> 10) - seg_tsecr;   /* = tcp_ts_now() - TSecr */
+            /* 異常値(相手が変な echo を返した)は捨てる。1.024us 刻みで
+             * 10 秒ぶん(約 977 万)を超えたら採らない。 */
+            if (elapsed < 10000000u) {
+                tcp_rtt_update(priv, (uint64_t)elapsed << 10, ack_now);
+                g_tcp_ts_rtt_samples++;
+            }
+        }
+        if (priv->sack_enabled) {   /* TLP と PRR の手詰まりの判定の起点 */
+            priv->tlp_ack_at = ack_now ? ack_now : timer_now();
+        }
+        if (priv->undo_valid) {
+            /* **Eifel(RFC 3522)。** 送り直した範囲が全部 ACK されたとき、その ACK の TSecr が
+             * 最初の送り直しより前の自分の時刻なら、相手は送り直しより前に送った元のセグメントで
+             * 穴を埋めている = 送り直しは要らなかった(Linux の tcp_packet_delayed())。
+             * **送り直した範囲の途中で判定しない** -- RACK が送り直すのは snd_una の位置とは限らず、
+             * その手前の届いていたセグメントへの ACK は古い TSecr を返すので、本物のロスでも
+             * undo してしまう(実測で 167 回)。 */
+            if (priv->undo_ts_ok && seg_tsecr != 0u && priv->undo_retrans > 0u &&
+                priv->retx_ts != 0u && !tcp_seq_lt(ack, priv->retx_end) &&
+                (int32_t)(seg_tsecr - priv->retx_ts) < 0) {
+                tcp_undo_do(conn, priv, 1);
+            } else if (!priv->undo_ended) {
+                /* 回復の範囲まで ACK されたら、後から来る DSACK を待つのはもう 1 往復だけ。 */
+                if (!tcp_seq_lt(ack, priv->undo_high)) {
+                    priv->undo_ended = 1;
+                    priv->undo_limit = conn->snd_seq;
+                }
+            } else if (tcp_seq_gt(ack, priv->undo_limit)) {
+                priv->undo_valid = 0;
+            }
+        }
+        if (priv->retx_ts != 0u && !tcp_seq_lt(ack, priv->retx_end)) priv->retx_ts = 0;
+        if (priv->tlp_active) tcp_tlp_on_ack(conn, priv, ack, 0);
+    } else if (ack == priv->snd_una &&
+               payload_len == 0 &&
+               !fin &&
+               conn->snd_win == prev_snd_win &&
+               tcp_seq_gt(conn->snd_seq, priv->snd_una)) {
+        /* RFC 5681 の重複 ACK の定義: 累積 ACK が進まず、データを運ばず、
+         * SYN/FIN も無く、広告ウィンドウも変わっておらず、**未確認データが
+         * 存在する**もの。
+         *
+         * 最後の条件(RFC 5681 の condition 1)を落とすと、このスタックでは
+         * 誤検出が壊滅的になる。`tcp_recv_internal()` はアプリが受信バッファ
+         * から読み出すたびにウィンドウ更新の純 ACK を送るが(tcp.c の
+         * send_ack 経路)、広告ウィンドウは safe_window_cap で頭打ちなので
+         * **ワイヤ上の値が変わらない** -- つまり「ack 据え置き・データ無し・
+         * ウィンドウ不変」となり、条件 5 では弾けない。
+         * 実測では、ロスがゼロのときでも重複 ACK を 419 万個・高速再送を
+         * 10 万回誤検出していた。 */
+        tcp_on_dup_ack(conn, priv);
+    }
+    if (priv->prr_active && priv->in_fast_recovery) {
+        /* 届いた量 = 累積 ACK の進み + SACK 済みの増え(累積 ACK に吸われた SACK 済みは引かれる)。
+         * SACK が無い相手は、重複 ACK 1 個を 1 MSS 届いたとみなす(RFC 6937)。 */
+        int64_t d = (int64_t)(uint32_t)(priv->snd_una - prr_una0) +
+                    (int64_t)tcp_sacked_bytes(priv) - (int64_t)prr_sacked0;
+        if (!priv->sack_enabled && priv->snd_una == prr_una0 && payload_len == 0) d = conn->snd_mss;
+        tcp_prr_on_ack(conn, priv, d > 0 ? (uint32_t)d : 0u);
+    }
+    if(ts_log_mode()&TS_MODE_HOTPATH) ts_log_tcp_ack(TS_MK(TS_FILE_TCP, TS_FUNC_tcp_input, 3), (uint8_t)tcp_conn_slot(conn),
+                   seq, ack, conn->snd_win, flags);
+
+    /* 自分の FIN が確認された(RFC 9293 3.10.7.4 fifth の各状態)。expected_ack は tcp_close() が
+     * 送った FIN の次の seq。 */
     switch (conn->state) {
-    case TCP_SYN_RCVD:
-        if ((flags & TCP_FLAG_ACK) && ack == priv->expected_ack) {
-            priv->snd_una = ack;
-            conn->state = TCP_ESTABLISHED;
-            tcp_cwnd_init(conn, priv);
-            for (unsigned li = 0; li < TCP_LISTENER_TOTAL; li++) {
-                if (!s_listeners[li].in_use) continue;
-                if (s_listeners[li].accept_conn == conn) {
-                    s_listeners[li].accept_ready = 1;  /* 受け皿へ直接受理した経路 */
-                    break;
-                }
-                int bp = tcp_backlog_index_of(&s_listeners[li], conn);
-                if (bp >= 0) {
-                    /* 待ち行列の中で確立した。呼び出し側が受け皿を用意した
-                     * 時点で tcp_accept_ready_poll() が引き渡す。 */
-                    s_listeners[li].pending_estab[bp] = 1;
-                    (void)__atomic_add_fetch(&s_backlog_estab_cnt[core], 1u, __ATOMIC_ACQ_REL);
-                    break;
-                }
-            }
-            uart_printf("[TCP] accept: ESTABLISHED (peer MSS=%u, 初期cwnd=%u)\n",
-                        conn->snd_mss, priv->cwnd);
-        }
+    case TCP_FIN_WAIT_1:
+        if (!tcp_seq_lt(ack, priv->expected_ack)) conn->state = TCP_FIN_WAIT_2;
         break;
-
-    case TCP_SYN_SENT:
-        if ((flags & (TCP_FLAG_SYN | TCP_FLAG_ACK)) == (TCP_FLAG_SYN | TCP_FLAG_ACK) &&
-            ack == priv->expected_ack) {
-            conn->rcv_seq = seq + 1;
-            conn->state = TCP_ESTABLISHED;
+    case TCP_CLOSING:
+        if (!tcp_seq_lt(ack, priv->expected_ack)) conn->state = TCP_TIME_WAIT;
+        return;   /* 相手の FIN は受け取り済み(データも来ない)*/
+    case TCP_LAST_ACK:
+        /* tcp_close() が送った自分の FIN への ACK を待っている。 */
+        if (!tcp_seq_lt(ack, priv->expected_ack)) {
             priv->ack_received = 1;
-            tcp_parse_syn_options(conn, priv, in + TCP_HDR_LEN, (uint8_t)(hdr_len - TCP_HDR_LEN));
-            conn->snd_seq = ack;
-            tcp_send_segment(conn, priv, TCP_FLAG_ACK, NULL, 0);
+            conn->state = TCP_CLOSED;
         }
-        break;
+        return;
+    case TCP_CLOSE_WAIT:
+    case TCP_TIME_WAIT:
+        return;   /* 相手の FIN は受け取り済み。データと FIN は来ない(来ても窓の外) */
+    default:
+        break;    /* ESTABLISHED / FIN_WAIT_1 / FIN_WAIT_2: データと FIN へ */
+    }
 
-    case TCP_ESTABLISHED:
-        if (flags & TCP_FLAG_ACK) {
-            if (ack == priv->expected_ack) {
-                priv->ack_received = 1;  /* 単発の信頼送信(tcp_send_reliable())向け */
-            }
-            if (priv->tlp_active && ack == priv->snd_una) {
-                /* 進まない ACK。probe が無駄だったと分かる DSACK か、情報の無い純 ACK で TLP を終える。 */
-                tcp_tlp_on_ack(conn, priv, ack,
-                               payload_len == 0 && priv->sack_gen == sack_gen0 && !priv->tlp_dsack);
-            }
-            if (tcp_seq_gt(ack, priv->snd_una)) {
-                priv->snd_una = ack;     /* パイプライン送信(tcp_send())向け、累積ACKで進める */
-                priv->ack_advanced = 1;
-                priv->neigh_confirm = 1;   /* 上位層の到達確認(NUD)*/
-                tcp_on_new_ack(priv, ack);
-                /* **Timestamps があれば再送中でも RTT を測れる。** Karn の
-                 * アルゴリズム(再送したウィンドウの RTT は測らない)は
-                 * 「どちらの送信への ACK か分からない」ことへの対処なので、
-                 * TSecr で判別できるなら制約そのものが消える。 */
-                uint64_t ack_now = 0;   /* 時刻を読んだら TLP の起点に使う(余分に読まない) */
-                if (priv->ts_enabled && seg_tsecr != 0u) {
-                    ack_now = timer_now();
-                    uint32_t elapsed = (uint32_t)(ack_now >> 10) - seg_tsecr;   /* = tcp_ts_now() - TSecr */
-                    /* 異常値(相手が変な echo を返した)は捨てる。1.024us 刻みで
-                     * 10 秒ぶん(約 977 万)を超えたら採らない。 */
-                    if (elapsed < 10000000u) {
-                        tcp_rtt_update(priv, (uint64_t)elapsed << 10, ack_now);
-                        g_tcp_ts_rtt_samples++;
-                    }
-                }
-                if (priv->sack_enabled) {   /* TLP と PRR の手詰まりの判定の起点 */
-                    priv->tlp_ack_at = ack_now ? ack_now : timer_now();
-                }
-                if (priv->undo_valid) {
-                    /* **Eifel(RFC 3522)。** 送り直した範囲が全部 ACK されたとき、その ACK の TSecr が
-                     * 最初の送り直しより前の自分の時刻なら、相手は送り直しより前に送った元のセグメントで
-                     * 穴を埋めている = 送り直しは要らなかった(Linux の tcp_packet_delayed())。
-                     * **送り直した範囲の途中で判定しない** -- RACK が送り直すのは snd_una の位置とは限らず、
-                     * その手前の届いていたセグメントへの ACK は古い TSecr を返すので、本物のロスでも
-                     * undo してしまう(実測で 167 回)。 */
-                    if (priv->undo_ts_ok && seg_tsecr != 0u && priv->undo_retrans > 0u &&
-                        priv->retx_ts != 0u && !tcp_seq_lt(ack, priv->retx_end) &&
-                        (int32_t)(seg_tsecr - priv->retx_ts) < 0) {
-                        tcp_undo_do(conn, priv, 1);
-                    } else if (!priv->undo_ended) {
-                        /* 回復の範囲まで ACK されたら、後から来る DSACK を待つのはもう 1 往復だけ。 */
-                        if (!tcp_seq_lt(ack, priv->undo_high)) {
-                            priv->undo_ended = 1;
-                            priv->undo_limit = conn->snd_seq;
-                        }
-                    } else if (tcp_seq_gt(ack, priv->undo_limit)) {
-                        priv->undo_valid = 0;
-                    }
-                }
-                if (priv->retx_ts != 0u && !tcp_seq_lt(ack, priv->retx_end)) priv->retx_ts = 0;
-                if (priv->tlp_active) tcp_tlp_on_ack(conn, priv, ack, 0);
-            } else if (ack == priv->snd_una &&
-                       payload_len == 0 &&
-                       (flags & (TCP_FLAG_SYN | TCP_FLAG_FIN)) == 0 &&
-                       conn->snd_win == prev_snd_win &&
-                       tcp_seq_gt(conn->snd_seq, priv->snd_una)) {
-                /* RFC 5681 の重複 ACK の定義: 累積 ACK が進まず、データを運ばず、
-                 * SYN/FIN も無く、広告ウィンドウも変わっておらず、**未確認データが
-                 * 存在する**もの。
-                 *
-                 * 最後の条件(RFC 5681 の condition 1)を落とすと、このスタックでは
-                 * 誤検出が壊滅的になる。`tcp_recv_internal()` はアプリが受信バッファ
-                 * から読み出すたびにウィンドウ更新の純 ACK を送るが(tcp.c の
-                 * send_ack 経路)、広告ウィンドウは safe_window_cap で頭打ちなので
-                 * **ワイヤ上の値が変わらない** -- つまり「ack 据え置き・データ無し・
-                 * ウィンドウ不変」となり、条件 5 では弾けない。
-                 * 実測では、ロスがゼロのときでも重複 ACK を 419 万個・高速再送を
-                 * 10 万回誤検出していた。 */
-                tcp_on_dup_ack(conn, priv);
-            }
-            if (priv->prr_active && priv->in_fast_recovery) {
-                /* 届いた量 = 累積 ACK の進み + SACK 済みの増え(累積 ACK に吸われた SACK 済みは引かれる)。
-                 * SACK が無い相手は、重複 ACK 1 個を 1 MSS 届いたとみなす(RFC 6937)。 */
-                int64_t d = (int64_t)(uint32_t)(priv->snd_una - prr_una0) +
-                            (int64_t)tcp_sacked_bytes(priv) - (int64_t)prr_sacked0;
-                if (!priv->sack_enabled && priv->snd_una == prr_una0 && payload_len == 0) d = conn->snd_mss;
-                tcp_prr_on_ack(conn, priv, d > 0 ? (uint32_t)d : 0u);
-            }
-            if(ts_log_mode()&TS_MODE_HOTPATH) ts_log_tcp_ack(TS_MK(TS_FILE_TCP, TS_FUNC_tcp_input, 3), (uint8_t)tcp_conn_slot(conn),
-                           seq, ack, conn->snd_win, flags);
+    /* 緊急ポインタ(RFC 9293 3.8.5)。URG は滅多に来ないので分岐 1 つ。 */
+    if (flags & TCP_FLAG_URG) tcp_urg_note(conn, priv, seq, rd16be(in + TCP_OFF_URGENT));
+
+    /* FIN の位置(データの後ろ)。データを切り詰める前の seq で決める。 */
+    const uint32_t fin_at = seq + payload_len;
+    int ack_now_req   = 0;   /* すぐ ACK を返す理由がある(順序外 / 穴が埋まった / 受け取れない) */
+    int accepted_inorder = 0;
+    if (payload_len > 0) {
+        uint32_t free_space = TCP_RX_BUF_SIZE - priv->rx_count;
+        /* **先頭が受け取り済みの範囲にかかるセグメントは、新しい部分だけ受け取る**
+         * (送り直しの区切りが前回と違うと、こういうセグメントが来る)。 */
+        if (tcp_seq_lt(seq, conn->rcv_seq) && tcp_seq_lt(conn->rcv_seq, seq + payload_len)) {
+            uint32_t d = conn->rcv_seq - seq;
+            tcp_dsack_note(priv, seq, conn->rcv_seq);
+            payload     += d;
+            payload_len  = (uint16_t)(payload_len - d);
+            seq          = conn->rcv_seq;
         }
-        if (flags & TCP_FLAG_FIN) {
-            uint32_t free_space = TCP_RX_BUF_SIZE - priv->rx_count;
-            if (payload_len > 0 && (priv->recv_upcall || payload_len <= free_space)) {
-                tcp_deliver_data(priv, payload, payload_len);
-            }
-            conn->rcv_seq = seq + payload_len + 1;
-            tcp_send_segment(conn, priv, TCP_FLAG_ACK, NULL, 0);
-            conn->state = TCP_CLOSE_WAIT;
-            priv->fin_received = 1;
-            if(ts_log_mode()&TS_MODE_HOTPATH) ts_log(TS_MK(TS_FILE_TCP, TS_FUNC_tcp_input, 4), tcp_conn_arg(conn, payload_len));
-            uart_printf("[TCP] FIN受信、ACK返送してCLOSE_WAITへ遷移\n");
-        } else if (payload_len == 0 && (flags & TCP_FLAG_SYN) == 0 &&
-                   tcp_seq_lt(seq, conn->rcv_seq)) {
-            /* **相手の Keepalive probe(1 バイト過去の seq で 0 バイト)。**
-             * RFC 1122 4.2.3.6 は ACK を返すことを求める。返さないと、
-             * **相手はこちらが死んだと判断して接続を切る**(Linux は
-             * 既定で Keepalive を使う)。データを運ぶ経路だけで ACK を
-             * 返していたので、ここに来る 0 バイトのセグメントは黙殺していた。
-             *
-             * 「既に受け取った範囲の再送」もここに来るが、ACK を返すのは
-             * RFC 793 的にも正しい(相手にこちらの受信位置を伝える)。 */
-            g_tcp_keepalive_reply_count++;
-            tcp_send_segment(conn, priv, TCP_FLAG_ACK, NULL, 0);
-        } else if (payload_len > 0) {
-            uint32_t free_space = TCP_RX_BUF_SIZE - priv->rx_count;
-            int accepted_inorder = 0;
-            /* **先頭が受け取り済みの範囲にかかるセグメントは、新しい部分だけ受け取る**
-             * (送り直しの区切りが前回と違うと、こういうセグメントが来る)。 */
-            if (tcp_seq_lt(seq, conn->rcv_seq) && tcp_seq_lt(conn->rcv_seq, seq + payload_len)) {
-                uint32_t d = conn->rcv_seq - seq;
-                tcp_dsack_note(priv, seq, conn->rcv_seq);
-                payload     += d;
-                payload_len  = (uint16_t)(payload_len - d);
-                seq          = conn->rcv_seq;
-            }
-            if (seq == conn->rcv_seq && (priv->recv_upcall || payload_len <= free_space)) {
-                accepted_inorder = 1;
-                tcp_deliver_data(priv, payload, payload_len);
-                conn->rcv_seq += payload_len;
-                /* 累積 ACK が進んだので、そこまでの区間は SACK で伝えない。 */
-                if (priv->sack_tx_count) tcp_sack_tx_trim(priv, conn->rcv_seq);
-                if(ts_log_mode()&TS_MODE_HOTPATH) ts_log(TS_MK(TS_FILE_TCP, TS_FUNC_tcp_input, 5), tcp_conn_arg(conn, payload_len));
+        if (seq == conn->rcv_seq && (priv->recv_upcall || payload_len <= free_space)) {
+            accepted_inorder = 1;
+            tcp_deliver_data(priv, payload, payload_len);
+            conn->rcv_seq += payload_len;
+            /* 累積 ACK が進んだので、そこまでの区間は SACK で伝えない。 */
+            if (priv->sack_tx_count) tcp_sack_tx_trim(priv, conn->rcv_seq);
+            if(ts_log_mode()&TS_MODE_HOTPATH) ts_log(TS_MK(TS_FILE_TCP, TS_FUNC_tcp_input, 5), tcp_conn_arg(conn, payload_len));
 
-                /* 穴が埋まった。続きを順序外の列の先頭から渡す(列は seq の順)。 */
-                while (priv->ooo_head != TCP_OOO_NONE) {
-                    uint16_t n = priv->ooo_head;
-                    uint32_t nseq = s_ooo_seq[n];
-                    uint32_t nend = nseq + s_ooo_len[n];
-                    if (tcp_seq_gt(nseq, conn->rcv_seq)) break;          /* まだ穴がある */
-                    if (!tcp_seq_lt(conn->rcv_seq, nend)) {              /* 全部受け取り済み */
-                        smp_spin_lock(&s_ooo_lock);
-                        priv->ooo_head = s_ooo_next[n];
-                        tcp_ooo_node_free_locked(priv, n);
-                        smp_spin_unlock(&s_ooo_lock);
-                        continue;
-                    }
-                    uint32_t off = conn->rcv_seq - nseq;
-                    uint16_t nlen = (uint16_t)(nend - conn->rcv_seq);
-                    free_space = TCP_RX_BUF_SIZE - priv->rx_count;
-                    if (!priv->recv_upcall && nlen > free_space) break;  /* 読まれるのを待つ */
-                    tcp_deliver_data(priv, tcp_ooo_data(n) + off, nlen);
-                    conn->rcv_seq += nlen;
+            /* 穴が埋まった。続きを順序外の列の先頭から渡す(列は seq の順)。 */
+            while (priv->ooo_head != TCP_OOO_NONE) {
+                uint16_t n = priv->ooo_head;
+                uint32_t nseq = s_ooo_seq[n];
+                uint32_t nend = nseq + s_ooo_len[n];
+                if (tcp_seq_gt(nseq, conn->rcv_seq)) break;          /* まだ穴がある */
+                ack_now_req = 1;   /* 穴が埋まった: すぐ ACK を返す(RFC 5681 4.2)*/
+                if (!tcp_seq_lt(conn->rcv_seq, nend)) {              /* 全部受け取り済み */
                     smp_spin_lock(&s_ooo_lock);
                     priv->ooo_head = s_ooo_next[n];
                     tcp_ooo_node_free_locked(priv, n);
                     smp_spin_unlock(&s_ooo_lock);
-                    if (priv->sack_tx_count) tcp_sack_tx_trim(priv, conn->rcv_seq);
+                    continue;
                 }
-            } else if (seq == conn->rcv_seq) {
-                g_tcp_rx_nospace[core]++;
-                if(ts_log_mode()&TS_MODE_HOTPATH) ts_log(TS_MK(TS_FILE_TCP, TS_FUNC_tcp_input, 6), tcp_conn_arg(conn, payload_len));
-            } else if (tcp_seq_gt(seq, conn->rcv_seq) && payload_len <= TCP_MSS_LOCAL) {
-                int r = tcp_ooo_insert(priv, seq, payload, payload_len);
-                if (r == 1) {
-                    if (priv->sack_enabled) tcp_sack_tx_add(priv, seq, payload_len);
-                    g_tcp_rx_ooo[core]++;
-                    /* ここは ts_log だけにしてある(順序外の到着は回復の途中で普通に起きるので、
-                     * 1 セグメントごとにコンソールへ出すと受信が出力に支配される)。 */
-                    if(ts_log_mode()&TS_MODE_HOTPATH) ts_log(TS_MK(TS_FILE_TCP, TS_FUNC_tcp_input, 7), tcp_conn_arg(conn, payload_len));
-                } else if (r == 0) {
-                    g_tcp_rx_dup[core]++;    /* 全部持っていた */
-                    tcp_dsack_note(priv, seq, seq + payload_len);
-                } else {
-                    if (r == -3) g_tcp_rx_ooo_pool_drop[core]++;
-                    g_tcp_rx_ooo_drop[core]++;
-                    if(ts_log_mode()&TS_MODE_HOTPATH) ts_log(TS_MK(TS_FILE_TCP, TS_FUNC_tcp_input, 8), tcp_conn_arg(conn, payload_len));
-                    /* 表示は 1, 2, 4, 8 .. 回目だけ(溢れ続けると受信が出力に支配される)。 */
-                    uint32_t nd = g_tcp_rx_ooo_drop[core];
-                    if ((nd & (nd - 1u)) == 0u) {
-                        uart_printf("[!] TCP: 順序外のセグメントを破棄(%s、接続の使用 %u / 予算 %u バイト、%u 個)"
-                                    "(seq=%u rcv_seq=%u len=%u、%u 回目)\n",
-                                    (r == -2) ? "陰性対照の 64 個" : (r == -3) ? "共有の置き場が尽きた" : "接続の予算を超えた",
-                                    (unsigned)priv->ooo_bytes, (unsigned)g_tcp_rcvbuf, priv->ooo_count,
-                                    seq, conn->rcv_seq, payload_len, (unsigned)nd);
-                    }
-                }
-            } else if (tcp_seq_gt(seq, conn->rcv_seq)) {
-                if(ts_log_mode()&TS_MODE_HOTPATH) ts_log(TS_MK(TS_FILE_TCP, TS_FUNC_tcp_input, 9), tcp_conn_arg(conn, payload_len));
-            } else {
-                g_tcp_rx_dup[core]++;   /* 既に受け取った範囲(seq < rcv_seq)*/
+                uint32_t off = conn->rcv_seq - nseq;
+                uint16_t nlen = (uint16_t)(nend - conn->rcv_seq);
+                free_space = TCP_RX_BUF_SIZE - priv->rx_count;
+                if (!priv->recv_upcall && nlen > free_space) break;  /* 読まれるのを待つ */
+                tcp_deliver_data(priv, tcp_ooo_data(n) + off, nlen);
+                conn->rcv_seq += nlen;
+                smp_spin_lock(&s_ooo_lock);
+                priv->ooo_head = s_ooo_next[n];
+                tcp_ooo_node_free_locked(priv, n);
+                smp_spin_unlock(&s_ooo_lock);
+                if (priv->sack_tx_count) tcp_sack_tx_trim(priv, conn->rcv_seq);
+            }
+        } else if (seq == conn->rcv_seq) {
+            g_tcp_rx_nospace[core]++;
+            ack_now_req = 1;
+            if(ts_log_mode()&TS_MODE_HOTPATH) ts_log(TS_MK(TS_FILE_TCP, TS_FUNC_tcp_input, 6), tcp_conn_arg(conn, payload_len));
+        } else if (tcp_seq_gt(seq, conn->rcv_seq) && payload_len <= TCP_MSS_LOCAL) {
+            /* **順序外の到着はすぐ ACK を返す**(RFC 5681 4.2 / RFC 9293 3.10.7.4。相手の高速再送と
+             * SACK の材料。以前は相乗りを頼んだ接続では借りにして遅らせていた)。 */
+            ack_now_req = 1;
+            int r = tcp_ooo_insert(priv, seq, payload, payload_len);
+            if (r == 1) {
+                if (priv->sack_enabled) tcp_sack_tx_add(priv, seq, payload_len);
+                g_tcp_rx_ooo[core]++;
+                /* ここは ts_log だけにしてある(順序外の到着は回復の途中で普通に起きるので、
+                 * 1 セグメントごとにコンソールへ出すと受信が出力に支配される)。 */
+                if(ts_log_mode()&TS_MODE_HOTPATH) ts_log(TS_MK(TS_FILE_TCP, TS_FUNC_tcp_input, 7), tcp_conn_arg(conn, payload_len));
+            } else if (r == 0) {
+                g_tcp_rx_dup[core]++;    /* 全部持っていた */
                 tcp_dsack_note(priv, seq, seq + payload_len);
-            }
-            /* **「ちょうどフルサイズのときだけ間引く」ではいけない。**
-             * NVMe/TCP の PDU は 4120B / 8240B のように MSS(9204)ちょうどには
-             * ならないので、この条件だと**間引きが一度も効かず毎セグメント
-             * ACK を返す**ことになる。実測で、相手が送るデータセグメント
-             * 1 個につき **1.22 個の ACK** を返しており(Linux の遅延 ACK なら
-             * 0.5)、**相手の CPU をこちらの ACK 処理で食い潰していた**
-             * (4K read で相手の cpu0 が 100%)。
-             *
-             * 受け取ったセグメントの大きさによらず数えて、
-             * `g_tcp_ack_threshold` 個ごとに 1 回返す。**遅らせても止まらない
-             * のは、次のコマンドを送るときに ACK が相乗りするから**
-             * (確立後のセグメントは常に ACK ビットを立てる)。
-             * `ackthresh 1` が従来の挙動 = 陰性対照。
-             *
-             * **ただし小さいセグメントは即 ACK する。** 間引く対象を大きさで
-             * 絞らないと、write の応答 PDU(24 バイト)まで待たせてしまい
-             * 512B write が 5〜8% 落ちる。閾値は MSS の 1/8
-             * (`g_tcp_ack_min_seg` で調整可能。0 = 大きさを見ない)。 */
-            uint32_t ack_min = (g_tcp_ack_min_seg != 0u)
-                             ? g_tcp_ack_min_seg : (uint32_t)(conn->snd_mss / 8u);
-            uint32_t ack_th = priv->ack_thin_off ? 1u : g_tcp_ack_threshold;
-            if (priv->dsack_valid) {
-                /* **DSACK はすぐ純 ACK で返す。** SACK のブロックはデータを運ばないセグメントにしか
-                 * 載らないので、応答への相乗りや間引きを待つと届かない。 */
-                tcp_send_segment(conn, priv, TCP_FLAG_ACK, NULL, 0);
-                priv->unacked_full_segments = 0;
-            } else if (accepted_inorder && payload_len >= ack_min) {
-                priv->unacked_full_segments++;
-                if (priv->unacked_full_segments >= ack_th) {
-                    if (priv->ack_hold_thin) tcp_ack_thin_note(priv, core, 0);
-                    tcp_send_segment(conn, priv, TCP_FLAG_ACK, NULL, 0);
-                    priv->unacked_full_segments = 0;
-                } else if (g_tcp_ack_hold != 0u && priv->ack_deferred == 0u) {
-                    /* **返していない ACK の期限。** 最初に返さなかったセグメントから数えて
-                     * 受信の周回 g_tcp_ack_hold 回で tcp_ack_flush_deferred() が返す(延長はしない)。
-                     * こちらから何か送れば相乗りして消える。 */
-                    priv->ack_deferred = (uint8_t)((g_tcp_ack_hold > 255u) ? 255u : g_tcp_ack_hold);
-                    priv->ack_hold_thin = 1;
-                    s_ack_deferred_any[core] = 1;
-                }
-            } else if (g_tcp_ack_piggyback && priv->ack_piggy_ok) {
-                /* **応答へ相乗りさせる。** 相乗りを頼んだコネクション(nvmet の IO
-                 * キュー、`iscsit ackpiggy on`)は受け取ったものに対して必ず応答を
-                 * 出すので、ここで裸の ACK を出すと 1 コマンドが 2 パケットになる。
-                 * 以前は upcall を持つことも条件にしていて、**受信を pull で読む
-                 * iSCSI ターゲットでは一度も効いていなかった**(SPEC 17.14)。
-                 * 応答は同じ tick のうちに出て ACK を運ぶので、**遅延は
-                 * 増えない**。応答が出なかったときは呼び出し側が
-                 * `tcp_ack_flush()` で必ず吐き出す(下の nvmet の排出ループ)。 */
-                priv->ack_deferred = (uint8_t)((g_tcp_ack_piggyback > 255u)
-                                               ? 255u : g_tcp_ack_piggyback);
-                s_ack_deferred_any[core] = 1;
-                priv->unacked_full_segments = 0;
             } else {
-                tcp_send_segment(conn, priv, TCP_FLAG_ACK, NULL, 0);
-                priv->unacked_full_segments = 0;
+                if (r == -3) g_tcp_rx_ooo_pool_drop[core]++;
+                g_tcp_rx_ooo_drop[core]++;
+                if(ts_log_mode()&TS_MODE_HOTPATH) ts_log(TS_MK(TS_FILE_TCP, TS_FUNC_tcp_input, 8), tcp_conn_arg(conn, payload_len));
+                /* 表示は 1, 2, 4, 8 .. 回目だけ(溢れ続けると受信が出力に支配される)。 */
+                uint32_t nd = g_tcp_rx_ooo_drop[core];
+                if ((nd & (nd - 1u)) == 0u) {
+                    uart_printf("[!] TCP: 順序外のセグメントを破棄(%s、接続の使用 %u / 予算 %u バイト、%u 個)"
+                                "(seq=%u rcv_seq=%u len=%u、%u 回目)\n",
+                                (r == -2) ? "陰性対照の 64 個" : (r == -3) ? "共有の置き場が尽きた" : "接続の予算を超えた",
+                                (unsigned)priv->ooo_bytes, (unsigned)g_tcp_rcvbuf, priv->ooo_count,
+                                seq, conn->rcv_seq, payload_len, (unsigned)nd);
+                }
             }
+            /* 順序外の FIN: 位置を覚え、穴が埋まったら処理する(データを置けたときだけ)。 */
+            if (fin && r >= 0) { priv->fin_pend = 1; priv->fin_pend_seq = fin_at; }
+        } else if (tcp_seq_gt(seq, conn->rcv_seq)) {
+            ack_now_req = 1;
+            if(ts_log_mode()&TS_MODE_HOTPATH) ts_log(TS_MK(TS_FILE_TCP, TS_FUNC_tcp_input, 9), tcp_conn_arg(conn, payload_len));
+        } else {
+            g_tcp_rx_dup[core]++;   /* 既に受け取った範囲(受け入れ判定を通った後なので普通は来ない)*/
+            tcp_dsack_note(priv, seq, seq + payload_len);
+            ack_now_req = 1;
         }
-        break;
+    } else if (fin && tcp_seq_gt(fin_at, conn->rcv_seq)) {
+        /* データの無い FIN が穴の向こうに来た: 位置を覚える。 */
+        priv->fin_pend     = 1;
+        priv->fin_pend_seq = fin_at;
+        ack_now_req = 1;
+    }
 
-    case TCP_CLOSE_WAIT:
-        if (flags & TCP_FLAG_ACK) {
-            if (ack == priv->expected_ack) {
-                priv->ack_received = 1;
-            }
-            if (tcp_seq_gt(ack, priv->snd_una)) {
-                priv->snd_una = ack;
-                priv->ack_advanced = 1;
-                priv->neigh_confirm = 1;   /* 上位層の到達確認(NUD)*/
-            }
-        }
-        if (flags & TCP_FLAG_FIN) {
+    /* ---- FIN(RFC 9293 3.10.7.4 eighth)。**その前のデータを全部受け取ったときだけ**処理する。
+     * このセグメントの FIN か、前に覚えた順序外の FIN の位置に rcv_seq が届いたか。 ---- */
+    if ((fin && fin_at == conn->rcv_seq) ||
+        (priv->fin_pend && priv->fin_pend_seq == conn->rcv_seq)) {
+        tcp_fin_accept(conn, priv);   /* ACK も返す */
+        return;
+    }
+    if (fin) ack_now_req = 1;          /* FIN を受け取れなかった(穴 / 空き無し): 今の位置を知らせる */
+    if (payload_len == 0 && !ack_now_req) return;   /* 純 ACK: 返すものは無い */
+
+    /* **「ちょうどフルサイズのときだけ間引く」ではいけない。**
+     * NVMe/TCP の PDU は 4120B / 8240B のように MSS(9204)ちょうどには
+     * ならないので、この条件だと**間引きが一度も効かず毎セグメント
+     * ACK を返す**ことになる。実測で、相手が送るデータセグメント
+     * 1 個につき **1.22 個の ACK** を返しており(Linux の遅延 ACK なら
+     * 0.5)、**相手の CPU をこちらの ACK 処理で食い潰していた**
+     * (4K read で相手の cpu0 が 100%)。
+     *
+     * 受け取ったセグメントの大きさによらず数えて、
+     * `g_tcp_ack_threshold` 個ごとに 1 回返す。**遅らせても止まらない
+     * のは、次のコマンドを送るときに ACK が相乗りするから**
+     * (確立後のセグメントは常に ACK ビットを立てる)。
+     * `ackthresh 1` が従来の挙動 = 陰性対照。
+     *
+     * **ただし小さいセグメントは即 ACK する。** 間引く対象を大きさで
+     * 絞らないと、write の応答 PDU(24 バイト)まで待たせてしまい
+     * 512B write が 5〜8% 落ちる。閾値は MSS の 1/8
+     * (`g_tcp_ack_min_seg` で調整可能。0 = 大きさを見ない)。 */
+    uint32_t ack_min = (g_tcp_ack_min_seg != 0u)
+                     ? g_tcp_ack_min_seg : (uint32_t)(conn->snd_mss / 8u);
+    uint32_t ack_th = priv->ack_thin_off ? 1u : g_tcp_ack_threshold;
+    if (priv->dsack_valid || ack_now_req) {
+        /* **DSACK はすぐ純 ACK で返す。** SACK のブロックはデータを運ばないセグメントにしか
+         * 載らないので、応答への相乗りや間引きを待つと届かない。順序外の到着・穴が埋まった
+         * ときも同じくすぐ返す(RFC 5681 4.2)。 */
+        tcp_send_segment(conn, priv, TCP_FLAG_ACK, NULL, 0);
+        priv->unacked_full_segments = 0;
+    } else if (accepted_inorder && payload_len >= ack_min) {
+        priv->unacked_full_segments++;
+        if (priv->unacked_full_segments >= ack_th) {
+            if (priv->ack_hold_thin) tcp_ack_thin_note(priv, core, 0);
             tcp_send_segment(conn, priv, TCP_FLAG_ACK, NULL, 0);
+            priv->unacked_full_segments = 0;
+        } else if (g_tcp_ack_hold != 0u && priv->ack_deferred == 0u) {
+            /* **返していない ACK の期限。** 最初に返さなかったセグメントから数えて
+             * 受信の周回 g_tcp_ack_hold 回で tcp_ack_flush_deferred() が返す(延長はしない)。
+             * こちらから何か送れば相乗りして消える。ackhold 0(周回の上限なし)でも、
+             * 冷たい経路が TCP_DELACK_MAX_MS で必ず返す(tcp_cold_check()、MUST-40)。 */
+            priv->ack_deferred = (uint8_t)((g_tcp_ack_hold > 255u) ? 255u : g_tcp_ack_hold);
+            priv->ack_hold_thin = 1;
+            s_ack_deferred_any[core] = 1;
         }
-        break;
-
-    case TCP_LAST_ACK:
-        /* tcp_close()が送った自分のFINへのACKを待っている。 */
-        if ((flags & TCP_FLAG_ACK) && ack == priv->expected_ack) {
-            priv->ack_received = 1;
-            conn->state = TCP_CLOSED;
-        }
-        break;
-
-    case TCP_FIN_WAIT_1:
-        if ((flags & TCP_FLAG_ACK) && ack == priv->expected_ack) {
-            priv->ack_received = 1;
-            conn->state = TCP_FIN_WAIT_2;
-        }
-        if (flags & TCP_FLAG_FIN) {
-            conn->rcv_seq = seq + 1;
-            tcp_send_segment(conn, priv, TCP_FLAG_ACK, NULL, 0);
-            conn->state = TCP_TIME_WAIT;
-        }
-        break;
-
-    case TCP_FIN_WAIT_2:
-        if (flags & TCP_FLAG_FIN) {
-            conn->rcv_seq = seq + 1;
-            tcp_send_segment(conn, priv, TCP_FLAG_ACK, NULL, 0);
-            conn->state = TCP_TIME_WAIT;
-        }
-        break;
-
-    case TCP_TIME_WAIT:
-    case TCP_CLOSED:
-    default:
-        break;
+    } else if (g_tcp_ack_piggyback && priv->ack_piggy_ok) {
+        /* **応答へ相乗りさせる。** 相乗りを頼んだコネクション(nvmet の IO
+         * キュー、`iscsit ackpiggy on`)は受け取ったものに対して必ず応答を
+         * 出すので、ここで裸の ACK を出すと 1 コマンドが 2 パケットになる。
+         * 以前は upcall を持つことも条件にしていて、**受信を pull で読む
+         * iSCSI ターゲットでは一度も効いていなかった**(SPEC 17.14)。
+         * 応答は同じ tick のうちに出て ACK を運ぶので、**遅延は
+         * 増えない**。応答が出なかったときは呼び出し側が
+         * `tcp_ack_flush()` で必ず吐き出す(下の nvmet の排出ループ)。 */
+        priv->ack_deferred = (uint8_t)((g_tcp_ack_piggyback > 255u)
+                                       ? 255u : g_tcp_ack_piggyback);
+        s_ack_deferred_any[core] = 1;
+        priv->unacked_full_segments = 0;
+    } else {
+        tcp_send_segment(conn, priv, TCP_FLAG_ACK, NULL, 0);
+        priv->unacked_full_segments = 0;
     }
 }
 

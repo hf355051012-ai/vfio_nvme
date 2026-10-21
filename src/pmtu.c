@@ -55,10 +55,22 @@ int pmtu_learn(const netaddr_t *dst, uint32_t reported_mtu)
 {
     uint16_t floor = pmtu_floor(dst);
 
-    if (reported_mtu < floor || reported_mtu > 0xFFFFu) {
-        uart_printf("[PMTU] 報告 MTU=%u は下限 %u を下回る(または大きすぎる)ので採用しない\n",
-                    (unsigned)reported_mtu, floor);
-        return 0;
+    if (reported_mtu > 0xFFFFu) return 0;
+    if (reported_mtu < floor) {
+        /* **IPv4 は下限まで下げる**(RFC 1191 3:報告された次ホップ MTU に基づいて
+         * 推定を下げる MUST。下限は 68 だが、偽の小さい値で全通信を細切れにされる
+         * のを避けるため、Linux の min_pmtu と同じく 576 で抑える)。無視すると、
+         * DF を立てた TCP がその経路で黙って落ちる(PMTU のブラックホール)。
+         * **IPv6 は 1280 未満の報告を無視する**(RFC 8201 4:最小リンク MTU の
+         * 1280 より下げてはならない。1280 は必ず通る)。 */
+        if (dst->family == NETADDR_V6 || reported_mtu < 68u) {
+            uart_printf("[PMTU] 報告 MTU=%u は下限 %u を下回るので採用しない\n",
+                        (unsigned)reported_mtu, floor);
+            return 0;
+        }
+        uart_printf("[PMTU] 報告 MTU=%u は下限 %u を下回るので %u に抑えて採用する\n",
+                    (unsigned)reported_mtu, floor, floor);
+        reported_mtu = floor;
     }
     uint16_t mtu = (uint16_t)reported_mtu;
     uint64_t now = timer_now();

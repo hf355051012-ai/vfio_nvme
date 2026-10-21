@@ -28,6 +28,10 @@
 #define TLS13_HS_MAX      4096u                       /* 握手メッセージ 1 個の上限(ClientHello)*/
 #define TLS13_HASH_MAX    48u                         /* SHA-384 */
 #define TLS13_COOKIE_MAX  256u
+/* 0-RTT を受け付けないときに読み飛ばす早期データの上限(RFC 8446 4.2.10 の max_early_data_size)。
+ * 外部 PSK に設定値は無いので OpenSSL の既定(2^14)にレコード 1 個ぶんの余裕(256)を足した値。
+ * 暗号文の本体(タグ込み)の長さで数える。 */
+#define TLS13_EARLY_SKIP_MAX (TLS13_PLAIN_MAX + 256u)
 
 /* 鍵共有の群(tls13_t.groups / share のビット)*/
 enum {
@@ -68,6 +72,7 @@ enum {
     TLS13_ALERT_PROTOCOL_VERSION = 70,
     TLS13_ALERT_INTERNAL_ERROR = 80,
     TLS13_ALERT_MISSING_EXTENSION = 109,
+    TLS13_ALERT_UNSUPPORTED_EXTENSION = 110,
     TLS13_ALERT_UNKNOWN_PSK_IDENTITY = 115,
 };
 
@@ -109,6 +114,11 @@ typedef struct {
     const uint8_t *test_ee;       /* EncryptedExtensions をこのバイト列にする */
     size_t   test_ee_len;
     int      test_resumption;     /* binder の label を "res binder" にし、身元を問わず先頭を選ぶ */
+    int      test_early_data;     /* クライアント: ClientHello に early_data を付ける(0-RTT を読み飛ばす試験用)*/
+
+    uint8_t  close_sent;          /* close_notify を送った(受けたときに送り返すかの判定)*/
+    uint8_t  early_offered;       /* サーバ: 相手が early_data を付けてきた(0-RTT は受け付けず読み飛ばす)*/
+    uint32_t early_left;          /* サーバ: あと読み飛ばしてよい早期データ(TLS13_EARLY_SKIP_MAX から減らす)*/
 
     /* 決まったもの */
     crypto_hash_id_t hid;         /* 握手のハッシュ(PSK のハッシュ)*/

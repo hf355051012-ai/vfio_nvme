@@ -104,7 +104,10 @@ static void do_inquiry(unsigned lun, const uint8_t *cdb, uint8_t *b, uint32_t ca
         /* 版記述子(SPC-4 6.6.2 / 表 49)。**SBC-3 への準拠はここで宣言する** -- 宣言しないで
          * SBC-3 の長さの VPD 0xB0 を返すと iscsi-test-cu の Inquiry.BlockLimits が咎める。 */
         iscsi_put16(&b[58], 0x00A0);   /* SAM-5 */
-        iscsi_put16(&b[60], 0x0960);   /* iSCSI */
+        /* iSCSI。RFC 7144 4.2 は 0960h + 合意した iSCSIProtocolLevel にする。レベルはセッションで
+         * 決まるので、合意したセッション(レベル 1 以上)ではトランスポートが
+         * scsi_inquiry_set_iscsi_level() で書き換える。鍵が出ないセッション(open-iscsi / libiscsi)は 0。 */
+        iscsi_put16(&b[60], 0x0960);
         iscsi_put16(&b[62], 0x0460);   /* SPC-4 */
         iscsi_put16(&b[64], 0x04C0);   /* SBC-3 */
         reply(r, b, 96, alloc);
@@ -329,6 +332,48 @@ int scsi_verify_cmp(const scsi_result_t *r, uint32_t off, const uint8_t *buf, ui
     for (uint32_t i = 0; i < r->verify_blocks; i++)
         if (memcmp(r->data + (uint64_t)i * SCSI_BLOCK_SIZE, buf, SCSI_BLOCK_SIZE) != 0) return 1;
     return 0;
+}
+
+/* ---- Unit Attention ---- */
+
+void scsi_ua_set(scsi_ua_t *u, unsigned lun_mask, uint8_t asc, uint8_t ascq)
+{
+    for (unsigned l = 0; l < SCSI_MAX_LUNS; l++) {
+        if (!(lun_mask & (1u << l)) || u->asc[l]) continue;
+        u->asc[l] = asc;
+        u->ascq[l] = ascq;
+        u->any = 1;
+    }
+}
+
+int scsi_ua_apply(scsi_ua_t *u, unsigned lun, const uint8_t cdb[16], scsi_result_t *r)
+{
+    if (lun >= SCSI_MAX_LUNS || !u->asc[lun]) return 0;
+    const uint8_t op = cdb[0];
+    /* INQUIRY / REPORT LUNS は UA を報告しない(SPC-4 5.14)。 */
+    if (op == 0x12 || op == 0xA0) return 0;
+    const uint8_t asc = u->asc[lun], ascq = u->ascq[lun];
+    u->asc[lun] = 0;
+    u->ascq[lun] = 0;
+    u->any = 0;
+    for (unsigned l = 0; l < SCSI_MAX_LUNS; l++) if (u->asc[l]) u->any = 1;
+    if (op == 0x03 && r->status == SCSI_STATUS_GOOD && r->data) {
+        /* REQUEST SENSE: UA をセンスとして返して消す(状態は GOOD)。 */
+        r->data[2] = SCSI_SK_UNIT_ATTENTION;
+        r->data[12] = asc;
+        r->data[13] = ascq;
+        return 1;
+    }
+    check(r, SCSI_SK_UNIT_ATTENTION, asc, ascq);
+    return 1;
+}
+
+void scsi_inquiry_set_iscsi_level(const uint8_t cdb[16], scsi_result_t *r, unsigned level)
+{
+    /* 標準 INQUIRY の応答(作業場所に 96 バイト組んである)だけ。割り当て長で切られていても
+     * 作業場所には全部あるので、そこを書き換えれば切られた後の中身も合う。 */
+    if (cdb[0] != 0x12 || (cdb[1] & 1u) || r->status != SCSI_STATUS_GOOD || !r->data || level == 0) return;
+    iscsi_put16(&r->data[60], (uint16_t)(0x0960u + level));
 }
 
 void scsi_exec(unsigned lun, const uint8_t cdb[16], uint8_t *b, uint32_t cap, scsi_result_t *r)

@@ -51,4 +51,8 @@ int ip_send_prepared(net_buf_t *nb, uint16_t payload_len);
 void ip_roce_dup_show(int clear);
 void ip_roce_dup_set_port(uint16_t port);
 
+/* 送るデータグラムの TTL と TOS(RFC 1122 3.2.1.7 / 3.2.1.6)。シェルの `ipttl` / `iptos`。 */
+extern volatile uint8_t g_ip_ttl;
+extern volatile uint8_t g_ip_tos;
+
 #endif /* IP_H */

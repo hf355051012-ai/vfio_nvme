@@ -1,5 +1,8 @@
 #include "ipfrag.h"
 #include "net.h"
+#include "netif.h"
+#include "icmp.h"
+#include "ipv6.h"
 #include "smp.h"
 #include "timer.h"
 #include "uart.h"
@@ -34,7 +37,27 @@ typedef struct {
     uint32_t  blocks_set;   /* 埋まった 8 バイト単位の数 */
     uint16_t  page[IPFRAG_DGRAM_PAGES];  /* 位置 p のデータは page[p / 4096] に置く */
     uint8_t   bitmap[IPFRAG_BITMAP_LEN];
+    /* オフセット 0 の断片の控え(上位プロトコルと、時間切れの ICMP の引用・宛先)。 */
+    uint8_t   first_seen;
+    uint8_t   first_proto;
+    uint16_t  head_len;
+    uint8_t   head[IPFRAG_HEAD_SAVE];
+    uint8_t   src_mac[6];
+    netif_t  *netif;
 } ipfrag_ctx_t;
+
+/* 時間切れで ICMP を返す相手。ロックを持ったまま送らないよう、回収で控えてから
+ * ロックの外で送る(コアごと、1 回の回収で最大 8 個)。 */
+#define IPFRAG_TE_MAX 8u
+typedef struct {
+    netaddr_t src;
+    uint16_t  head_len;
+    uint8_t   head[IPFRAG_HEAD_SAVE];
+    uint8_t   src_mac[6];
+    netif_t  *netif;
+} ipfrag_te_t;
+static ipfrag_te_t s_te[SMP_MAX_CORES][IPFRAG_TE_MAX];
+static uint32_t    s_te_n[SMP_MAX_CORES];
 
 /* 使用量は「使っているページ x 4KB + 使っている文脈 x 文脈の大きさ」で数える
  * (Linux が組み立て中の skb の truesize を足し上げるのに相当する)。 */
@@ -115,12 +138,24 @@ static void ipfrag_free_locked(uint32_t slot)
 static void ipfrag_reap_locked(uint64_t now)
 {
     (void)now;
+    unsigned core = smp_core_index();
     for (uint32_t s = 0; s < s_nactive; ) {
         ipfrag_ctx_t *c = &s_ctx[s_active[s]];
         if (timeout_ms(c->started_at, IPFRAG_TIMEOUT_MS)) {
             uart_printf("[IPfrag] 組み立てを %u ms で打ち切り (id=%u proto=%u %u/%u バイト)\n",
                         (unsigned)IPFRAG_TIMEOUT_MS, (unsigned)c->id, (unsigned)c->protocol,
                         (unsigned)(c->blocks_set * IPFRAG_BLOCK), (unsigned)c->total_len);
+            /* **先頭の断片を受け取っていたら Time Exceeded(code 1)を返す**
+             * (RFC 1122 3.3.2 / RFC 8200 4.5)。先頭が無ければ、上位の何を
+             * 引用すればよいか分からないので返さない(RFC も同じ条件)。 */
+            if (c->first_seen && s_te_n[core] < IPFRAG_TE_MAX) {
+                ipfrag_te_t *t = &s_te[core][s_te_n[core]++];
+                t->src = c->src;
+                t->head_len = c->head_len;
+                for (uint32_t i = 0; i < c->head_len; i++) t->head[i] = c->head[i];
+                for (uint32_t i = 0; i < 6u; i++) t->src_mac[i] = c->src_mac[i];
+                t->netif = c->netif;
+            }
             ipfrag_free_locked(s);
             s_timeouts++;
             continue;   /* 詰めて入った要素を同じ位置で見る */
@@ -146,6 +181,8 @@ static ipfrag_ctx_t *ipfrag_lookup_locked(const netaddr_t *src, const netaddr_t 
                                            uint32_t id, uint8_t protocol, uint64_t now,
                                            uint32_t *slot)
 {
+    /* IPv6 の鍵に Next Header は入れない(RFC 8200 4.5)。 */
+    if (src->family == NETADDR_V6) protocol = 0;
     for (uint32_t s = 0; s < s_nactive; s++) {
         ipfrag_ctx_t *c = &s_ctx[s_active[s]];
         if (c->id == id && c->protocol == protocol &&
@@ -173,6 +210,8 @@ static ipfrag_ctx_t *ipfrag_lookup_locked(const netaddr_t *src, const netaddr_t 
     c->started_at = now;
     c->total_len  = 0;
     c->blocks_set = 0;
+    c->first_seen = 0;
+    c->head_len   = 0;
     for (uint32_t i = 0; i < IPFRAG_DGRAM_PAGES; i++) c->page[i] = IPFRAG_NO_PAGE;
     for (uint32_t b = 0; b < IPFRAG_BITMAP_LEN; b++) c->bitmap[b] = 0;
     *slot = s_nactive++;
@@ -201,12 +240,39 @@ static uint8_t *ipfrag_page_locked(ipfrag_ctx_t *c, uint32_t p)
     return s_pages[c->page[pi]];
 }
 
+/*=================================================================
+ * 時間切れで控えた相手へ ICMP Time Exceeded(code 1)を返す(ロックの外で呼ぶ)。
+ * コール元:
+ *   ipfrag_input()
+ * ===============================================================*/
+static void ipfrag_send_time_exceeded(void)
+{
+    unsigned core = smp_core_index();
+    uint32_t n = s_te_n[core];
+    s_te_n[core] = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        ipfrag_te_t *t = &s_te[core][i];
+        netif_t *prev = g_active_ctx;
+        if (t->netif) netif_activate(t->netif);
+        if (t->src.family == NETADDR_V6) {
+            icmpv6_send_error(ICMPV6_TYPE_TIME_EXCEEDED, 1u, 0u, t->head, t->head_len,
+                              t->src.a, t->src_mac);
+        } else {
+            uint8_t sip[4] = { t->src.a[0], t->src.a[1], t->src.a[2], t->src.a[3] };
+            icmp_send_time_exceeded(1u, t->head, t->head_len, sip, t->src_mac);
+        }
+        if (t->netif) netif_activate(prev);
+    }
+}
+
 int ipfrag_input(const netaddr_t *src, const netaddr_t *dst,
                  uint32_t id, uint8_t protocol,
                  uint32_t frag_off, int more,
                  const volatile uint8_t *data, uint32_t len,
-                 const uint8_t **out_data, uint32_t *out_len)
+                 const uint8_t *pkt, uint32_t pkt_len, const uint8_t *src_mac,
+                 const uint8_t **out_data, uint32_t *out_len, uint8_t *out_proto)
 {
+    const int v6 = (src->family == NETADDR_V6);
     unsigned core = smp_core_index();
     uint64_t now  = timer_now();
 
@@ -244,6 +310,7 @@ int ipfrag_input(const netaddr_t *src, const netaddr_t *dst,
         uint32_t nref = ++s_refused;
         s_dropped++;
         smp_spin_unlock(&s_lock);
+        ipfrag_send_time_exceeded();
         /* 上限に当たり続けると断片ごとに出るので、1, 2, 4, 8 .. 回目だけ表示する。 */
         if ((nref & (nref - 1u)) == 0u) {
             uart_printf("[IPfrag] 組み立ての領域が上限(使用 %u / 上限 %u バイト、組み立て中 %u 個)"
@@ -266,7 +333,32 @@ int ipfrag_input(const netaddr_t *src, const netaddr_t *dst,
                         (unsigned)was, (unsigned)end);
             return 0;
         }
+        /* **全長が決まった時点で、それより後ろが 1 つでも埋まっていたら組み立てを
+         * 捨てる。** 後ろの断片を「埋まった数」に数えたままだと、全長の内側に穴が
+         * 残っていても数の上ではそろったことになり、ページの無い位置を読む
+         * (領域外の読み出し、または前に使ったページの古い中身を渡す)。 */
+        uint32_t end_blk_all = (end + IPFRAG_BLOCK - 1u) / IPFRAG_BLOCK;
+        int beyond = 0;
+        for (uint32_t blk = end_blk_all; blk < IPFRAG_BITMAP_LEN * 8u; blk++) {
+            if (c->bitmap[blk / 8u] & (uint8_t)(1u << (blk % 8u))) { beyond = 1; break; }
+        }
+        if (beyond) {
+            ipfrag_free_locked(slot);
+            s_dropped++;
+            smp_spin_unlock(&s_lock);
+            uart_printf("[IPfrag] 全長 %u より後ろの断片がある -- 組み立てを破棄\n", (unsigned)end);
+            return 0;
+        }
         c->total_len = end;
+    } else if (c->total_len != 0u && frag_off + len > c->total_len) {
+        /* 全長が決まった後に、それを越える断片が来た。どちらかが偽物。 */
+        uint32_t was = c->total_len;
+        ipfrag_free_locked(slot);
+        s_dropped++;
+        smp_spin_unlock(&s_lock);
+        uart_printf("[IPfrag] 全長 %u を越える断片 (off=%u len=%u) -- 組み立てを破棄\n",
+                    (unsigned)was, (unsigned)frag_off, (unsigned)len);
+        return 0;
     }
 
     /* **既に埋まっている場所は上書きしない。** 重複した断片を数え直さない
@@ -274,6 +366,35 @@ int ipfrag_input(const netaddr_t *src, const netaddr_t *dst,
      * (重なり合う断片を使った古典的な攻撃への対処)。 */
     uint32_t start_blk = frag_off / IPFRAG_BLOCK;
     uint32_t end_blk   = (frag_off + len + IPFRAG_BLOCK - 1u) / IPFRAG_BLOCK;
+    if (v6) {
+        /* **IPv6 は重なりを見つけたら組み立てごと捨てる**(RFC 5722 の MUST。
+         * どちらの中身を残すかが受け手ごとに違うと、検査の装置と最終的な受け手で
+         * 違う中身を見せられる)。範囲が全部埋まっているものは、まったく同じ
+         * 断片の再送とみなし、その断片だけを捨てる(RFC 5722 が許す扱い)。 */
+        uint32_t set = 0;
+        for (uint32_t blk = start_blk; blk < end_blk; blk++) {
+            if (c->bitmap[blk / 8u] & (uint8_t)(1u << (blk % 8u))) set++;
+        }
+        if (set != 0u && set != end_blk - start_blk) {
+            ipfrag_free_locked(slot);
+            s_dropped++;
+            smp_spin_unlock(&s_lock);
+            ipfrag_send_time_exceeded();
+            uart_printf("[IPfrag] IPv6 の断片が重なっている (off=%u len=%u) -- 組み立てを破棄"
+                        "(RFC 5722)\n", (unsigned)frag_off, (unsigned)len);
+            return 0;
+        }
+    }
+    /* オフセット 0 の断片の頭を控える(上位プロトコルと、時間切れの ICMP のため)。 */
+    if (frag_off == 0u && !c->first_seen) {
+        c->first_seen  = 1;
+        c->first_proto = protocol;
+        uint32_t h = pkt_len < IPFRAG_HEAD_SAVE ? pkt_len : IPFRAG_HEAD_SAVE;
+        for (uint32_t i = 0; i < h && pkt; i++) c->head[i] = pkt[i];
+        c->head_len = (uint16_t)(pkt ? h : 0u);
+        for (uint32_t i = 0; i < 6u; i++) c->src_mac[i] = src_mac ? src_mac[i] : 0u;
+        c->netif = g_active_ctx;
+    }
     for (uint32_t blk = start_blk; blk < end_blk; blk++) {
         uint32_t byte = blk / 8u;
         uint8_t  bit  = (uint8_t)(1u << (blk % 8u));
@@ -310,6 +431,7 @@ int ipfrag_input(const netaddr_t *src, const netaddr_t *dst,
             if (n > IPFRAG_PAGE_BYTES) n = IPFRAG_PAGE_BYTES;
             volatile_fast_copy(out + off, s_pages[c->page[off / IPFRAG_PAGE_BYTES]], n);
         }
+        if (out_proto) *out_proto = c->first_proto;
         ipfrag_free_locked(slot);
         s_completed++;
         if (out_data) *out_data = out;
@@ -317,6 +439,7 @@ int ipfrag_input(const netaddr_t *src, const netaddr_t *dst,
         done = 1;
     }
     smp_spin_unlock(&s_lock);
+    ipfrag_send_time_exceeded();
     return done;
 }
 

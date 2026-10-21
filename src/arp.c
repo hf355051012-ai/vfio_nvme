@@ -163,6 +163,7 @@ int arp_cache_lookup_nud(uint32_t ip, uint8_t out_mac[ETH_ALEN], int confirmed)
                                   &cache[i].probes);
         if (age == NEIGH_DEAD) {
             cache[i].valid = 0;
+            netif_gw4_dead(g_active_ctx, ip);   /* ゲートウェイなら次の候補へ */
             return -1;
         }
         for (int j = 0; j < ETH_ALEN; j++) out_mac[j] = cache[i].mac[j];
@@ -614,5 +615,6 @@ int arp_resolve(uint32_t ip, uint8_t out_mac[ETH_ALEN])
         net_poll_all_and_dispatch();
         if (arp_cache_lookup(ip, out_mac) == 0) return 0;
     } while ((int64_t)(timer_now() - until) < 0);
+    netif_gw4_dead(g_active_ctx, ip);   /* ゲートウェイなら次の候補へ */
     return -1;
 }

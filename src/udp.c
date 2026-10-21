@@ -16,9 +16,10 @@
 #define UDP_MAX_BINDINGS 8u
 
 typedef struct {
-    int           used;
-    uint16_t      port;
-    udp_handler_t handler;
+    int                 used;
+    uint16_t            port;
+    udp_handler_t       handler;
+    udp_error_handler_t err;      /* NULL 可。ICMP エラーを受けるとき */
 } udp_binding_t;
 
 static udp_binding_t s_bindings[UDP_MAX_BINDINGS];
@@ -60,11 +61,60 @@ int udp_bind(uint16_t port, udp_handler_t handler)
             s_bindings[i].used    = 1;
             s_bindings[i].port    = port;
             s_bindings[i].handler = handler;
+            s_bindings[i].err     = NULL;
             return 0;
         }
     }
     uart_printf("[!] UDP: バインド表が満杯 (port=%u)\n", port);
     return -1;
+}
+
+/*=================================================================
+ * 登録済みのポートに ICMP エラーのハンドラを付ける(NULL で外す)。
+ *
+ * 戻り値:
+ *   0=付けた、-1=そのポートは登録されていない
+ * ===============================================================*/
+int udp_set_error_handler(uint16_t port, udp_error_handler_t fn)
+{
+    for (unsigned i = 0; i < UDP_MAX_BINDINGS; i++) {
+        if (s_bindings[i].used && s_bindings[i].port == port) {
+            s_bindings[i].err = fn;
+            return 0;
+        }
+    }
+    return -1;
+}
+
+/*=================================================================
+ * ICMP / ICMPv6 のエラーが引用した UDP ヘッダから、自分のどのポートの送信が
+ * 失敗したかを引き、そのポートのエラーハンドラへ渡す(RFC 1122 4.1.3.3:
+ * UDP は受けた ICMP エラーをすべて上位へ渡す MUST)。ハンドラが無ければ数えるだけ。
+ *
+ * 引数:
+ *   remote     - 引用されたデータグラムの宛先(= 相手)
+ *   quoted_udp - 引用の UDP ヘッダ(8 バイト以上)
+ *   type/code  - ICMP(v6 なら ICMPv6)の type / code
+ * コール元:
+ *   icmp_handle(), ipv6_handle_icmpv6()
+ * ===============================================================*/
+volatile uint32_t g_udp_icmp_errors;
+
+void udp_icmp_error(const netaddr_t *remote, const uint8_t *quoted_udp, size_t qlen,
+                    uint8_t type, uint8_t code, int v6)
+{
+    if (qlen < 4u) return;
+    uint16_t local_port  = rd16be(quoted_udp + UDP_OFF_SRC_PORT);
+    uint16_t remote_port = rd16be(quoted_udp + UDP_OFF_DST_PORT);
+    g_udp_icmp_errors++;
+    for (unsigned i = 0; i < UDP_MAX_BINDINGS; i++) {
+        if (s_bindings[i].used && s_bindings[i].port == local_port) {
+            if (s_bindings[i].err) {
+                s_bindings[i].err(remote, remote_port, local_port, type, code, v6);
+            }
+            return;
+        }
+    }
 }
 
 /*=================================================================
@@ -122,10 +172,14 @@ int udp_input_addr(const uint8_t *data, size_t len,
         return -2;
     }
 
-    /* IPv4 の UDP チェックサムは省略可(0 なら未計算)。IPv6 では必須なので
-     * 0 は本来ありえないが、届いてしまった場合も破棄せず素通しする
-     * (相手の実装不備でこちらが通信不能になるのは割に合わない)。 */
+    /* IPv4 の UDP チェックサムは省略可(0 なら未計算)。**IPv6 では必須**で、
+     * 0 のものは捨てる(RFC 8200 8.1 の must。IPv6 には IP ヘッダのチェックサムが
+     * 無いので、UDP のチェックサムが無いとアドレスの化けを誰も検出できない)。 */
     uint16_t rx_csum = rd16be(in + UDP_OFF_CHECKSUM);
+    if (rx_csum == 0u && src->family == NETADDR_V6) {
+        uart_printf("[UDP] IPv6 でチェックサムが 0 -- 破棄(RFC 8200 8.1)\n");
+        return -2;
+    }
     if (rx_csum != 0u && !eth_rx_hw_csum_ok()) {
         uint16_t verify;
         if (src->family == NETADDR_V6) {
@@ -142,7 +196,7 @@ int udp_input_addr(const uint8_t *data, size_t len,
     for (unsigned i = 0; i < UDP_MAX_BINDINGS; i++) {
         if (s_bindings[i].used && s_bindings[i].port == dst_port) {
             s_bindings[i].handler(data + UDP_HDR_LEN, (size_t)udp_len - UDP_HDR_LEN,
-                                   src, src_port, src_mac);
+                                   src, src_port, dst, src_mac);
             return 0;
         }
     }

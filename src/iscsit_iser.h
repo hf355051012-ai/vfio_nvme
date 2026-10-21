@@ -19,6 +19,9 @@
 int  iscsit_iser_start(mlx5_dev_t *dev, const char *self_label, const uint8_t peer_mac[6], unsigned inst,
                        unsigned core);
 int  iscsit_iser_started(void);
+/* iSER の各実体の仕事を捨てて Unit Attention を立てる / cold なら接続を畳ませる(iscsit_xreset() と
+ * 同じ意味。TCP のターゲットの LU / TARGET RESET からも呼ぶ)。except の実体は除く。 */
+void iscsit_iser_xreset(unsigned lun_mask, uint8_t asc, uint8_t ascq, unsigned flags, int cold, const void *except);
 void iscsit_iser_status(void);
 void iscsit_iser_stats_clear(void);
 

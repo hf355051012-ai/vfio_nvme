@@ -42,8 +42,20 @@ extern volatile uint32_t g_iscsit_nopin_wait_ms;
 /* 接続 idx にログアウトを求める(Async Message、AsyncEvent = 1)。 */
 void iscsit_request_logout(unsigned idx);
 
-/* 通常セッションに CHAP を求める(NULL で解除)。Discovery には求めない(LIO の既定と同じ)。 */
-void iscsit_set_chap(const iscsi_chap_cfg_t *cfg);
+/* 通常セッションに CHAP を求める(NULL で解除)。Discovery には求めない(LIO の既定と同じ)。
+ * 両方向に同じ秘密の設定は断る(-1。RFC 7143 12.1.3)。96 ビット未満は警告だけ。 */
+int  iscsit_set_chap(const iscsi_chap_cfg_t *cfg);
+
+/* 他のセッション(TCP の各接続)の仕事を捨てて Unit Attention を立てる(LU / TARGET RESET、
+ * CLEAR TASK SET。iSER のターゲットからも呼ぶ)。lun_mask のビット = LUN、flags は
+ * 1u << 16 = 捨てた仕事があったときだけ UA。cold = 1 なら接続を閉じさせる(TARGET COLD RESET)。
+ * except の接続(呼んだ本人)は除く。実際の処理は各接続のジョブが自分のコアで行う。 */
+void iscsit_xreset(unsigned lun_mask, uint8_t asc, uint8_t ascq, unsigned flags, int cold, const void *except);
+
+/* 試験の口(`rfctest iscsi`)。mem は iscsit_selftest_size() バイト。戻り値 = NG の数。 */
+#include <stddef.h>
+size_t iscsit_selftest_size(void);
+int    iscsit_selftest_cmdsn(void *mem, int (*report)(int ok, const char *what));
 
 int  iscsit_start(uint16_t port, netif_t *nif);
 int  iscsit_started(void);

@@ -50,6 +50,9 @@ void eth_register_handler(uint16_t ethertype, eth_handler_t handler);
 void eth_dispatch(net_buf_t *nb);
 
 int eth_rx_hw_csum_ok(void);
+/* いま処理している受信フレームの宛先 MAC がブロードキャスト / マルチキャストか
+ * (RFC 1122 2.4:リンク層はこれを上位へ知らせる MUST)。 */
+int eth_rx_l2_multicast(void);
 
 #define ARP_CACHE_SIZE 8u
 
@@ -126,7 +129,8 @@ void neigh_probe_notify(int is_v6, int is_unicast, const uint8_t dst_mac[ETH_ALE
  * 区別できない。** この数が増えていることが効いた証拠になる。 */
 extern volatile uint32_t g_neigh_confirm_count;
 
-/* 有効期間(ミリ秒)。DELAY は TTL/12、確認要求の間隔は TTL/60 として連動する。
+/* 有効期間の基準値(ミリ秒、RFC 4861 の BaseReachableTime)。実際の有効期間はこの 0.5〜1.5 倍
+ * (neigh_reachable_ms())。DELAY は TTL/12、確認要求の間隔は TTL/60 として連動する。
  * シェルの `arpage` で変更できる(短くして検証するため)。 */
 extern volatile uint32_t g_neigh_cache_ttl_ms;
 #define NEIGH_CACHE_TTL_DEFAULT_MS 60000u
@@ -138,7 +142,9 @@ unsigned neigh_delay_ms(void);
 int neigh_peek_state(uint64_t now, uint64_t expires_at, uint64_t probe_at,
                      uint8_t probes, uint32_t *remain_ms);
 uint64_t neigh_expiry_from_now(void);
+uint32_t neigh_reachable_ms(void);   /* 実際の有効期間(基準値の 0.5〜1.5 倍、RFC 4861 6.3.2) */
 uint64_t *neigh_req_stamp(const netaddr_t *addr);
+int neigh_req_pending(const netaddr_t *addr);
 
 typedef struct {
     int (*send_frags)(void *priv, const eth_frag_t *frags, unsigned frag_count);
@@ -172,6 +178,54 @@ typedef struct {
 /* RFC 5227 の DEFEND_INTERVAL。自分の IPv4 を名乗る他人の ARP を受けてから、次に
  * 防御の Announcement を出すまでの最短間隔。 */
 #define ARP_DEFEND_INTERVAL_MS 10000u
+
+/* ---- IPv6 のアドレス・on-link のプレフィックス・ルータ・宛先キャッシュ ----
+ * (RFC 4861 5.1 の Prefix List / Default Router List / Destination Cache と、
+ *  RFC 4862 の複数のアドレス)。どれも数個しか持たない小さい配列で、先頭から
+ * *_cnt 個だけが使われている(詰めて置く)。*_cnt が 0 なら走査そのものを飛ばす
+ * ので、使っていないときの送受信のコストは比較 1 つ。 */
+#define NETIF_IP6_EXTRA    3u   /* ip6_global(1 つ目)の他に持てる SLAAC のアドレス */
+#define NETIF_PREFIX6_MAX  4u   /* RA の L=1 で覚える on-link のプレフィックス */
+#define NETIF_ROUTER6_MAX  4u   /* デフォルトルータの一覧(RFC 4861 6.3.4 の MUST は 2 つ以上) */
+#define NETIF_DEST6_MAX    4u   /* Redirect で覚える宛先ごとの次ホップ */
+
+/* 2 つ目以降の SLAAC のアドレス(1 つ目は netif_t の ip6_global 一式)。 */
+typedef struct {
+    uint8_t  addr[16];
+    uint8_t  plen;
+    uint8_t  dad;          /* NETIF_DAD_*(TENTATIVE のあいだは自分のアドレスとして使わない) */
+    uint64_t valid_until;  /* timer_now() と同じ ns。0=無期限 */
+    uint64_t pref_until;   /* 推奨寿命の終わり。0=無期限。過ぎたら新しい通信の送信元にしない */
+    uint64_t dad_until;    /* DAD の判定時刻(TENTATIVE のときだけ意味がある) */
+} netif_ip6addr_t;
+
+/* on-link のプレフィックス(RFC 4861 6.3.4。RA の Prefix Information で L=1 のもの)。 */
+typedef struct {
+    uint8_t  prefix[16];
+    uint8_t  plen;
+    uint64_t valid_until;  /* 0=無期限 */
+} netif_prefix6_t;
+
+/* デフォルトルータの一覧の 1 件(RA の送信元リンクローカルと Router Lifetime)。 */
+typedef struct {
+    uint8_t  addr[16];
+    uint64_t valid_until;  /* 0=無期限 */
+} netif_router6_t;
+
+/* 宛先キャッシュの 1 件(RFC 4861 8.3。Redirect で教わった「この宛先はこの次ホップへ」)。 */
+typedef struct {
+    uint8_t  dst[16];
+    uint8_t  nexthop[16];
+} netif_dest6_t;
+
+/* IPv4 のデフォルトゲートウェイの候補の数(RFC 1122 3.3.1.2:複数持てること)と、
+ * Redirect で教わった宛先の数(RFC 1122 3.2.2.2 / 3.3.1.2 の route cache)。 */
+#define NETIF_GW4_MAX   4u
+#define NETIF_DEST4_MAX 8u
+typedef struct {
+    uint32_t dst;
+    uint32_t nexthop;
+} netif_dest4_t;
 
 typedef struct netif {
     const char *name;   /* ログ/`net use`コマンド用の識別子("rp1","mlx5-pf0"等) */
@@ -237,6 +291,38 @@ typedef struct netif {
      * スロット番号が出て、NIC が読み終える前に互いのフレームを上書きする(2 ポートを 1 コアで
      * 受けたときに踏んだ。SPEC 27.14)。 */
     unsigned    txq_index;
+
+    /* ---- IPv6 で RFC に合わせて足した状態(既存の欄の意味は変えていない)----
+     * ip6_global 一式は「1 つ目のアドレス」、gateway6 一式は「いま選んでいる
+     * デフォルトルータ」(手動設定ならそれ)のまま。2 つ目以降のアドレスと、ルータの
+     * 一覧・プレフィックスの一覧・宛先キャッシュをここに置く。 */
+    uint64_t        ip6_global_pref_until;  /* 1 つ目のアドレスの推奨寿命の終わり(0=無期限) */
+    uint64_t        ip6_global_dad_until;   /* 1 つ目のアドレスの DAD の判定時刻 */
+    netif_ip6addr_t ip6_extra[NETIF_IP6_EXTRA];
+    uint8_t         ip6_extra_cnt;          /* ip6_extra の使用数(先頭から詰める) */
+    uint8_t         prefix6_cnt;            /* prefix6 の使用数 */
+    uint8_t         router6_cnt;            /* router6 の使用数 */
+    uint8_t         dest6_cnt;              /* dest6 の使用数。0 なら次ホップの判定で引かない */
+    uint8_t         ra_cur_hop_limit;       /* RA の Cur Hop Limit(0=未指定なら 64 を使う) */
+    netif_prefix6_t prefix6[NETIF_PREFIX6_MAX];
+    netif_router6_t router6[NETIF_ROUTER6_MAX];
+    netif_dest6_t   dest6[NETIF_DEST6_MAX];
+    /* MLD(RFC 3810 / 2710)。v1 互換モードはインターフェースごと(RFC 3810 8.2.1)。 */
+    uint64_t        mld_v1_until;           /* 0=v2 で喋る */
+    uint64_t        mld_rep_at;             /* 非要請 Report の次の再送時刻 */
+    uint8_t         mld_rep_left;           /* 非要請 Report の残りの再送回数 */
+    uint8_t         mld_leave_left;         /* 離脱通知の残りの再送回数 */
+    uint8_t         mld_leave_group[16];    /* 離脱を再送するグループ */
+    uint64_t        mld_leave_at;           /* 離脱通知の次の再送時刻 */
+
+    /* ---- IPv4 で RFC 1122 に合わせて足した状態 ----
+     * gateway は「いま使っているデフォルトゲートウェイ」のまま。候補の一覧と、
+     * Redirect で教わった宛先ごとの次ホップをここに置く。 */
+    uint32_t        gw4_list[NETIF_GW4_MAX];
+    uint8_t         gw4_cnt;                /* gw4_list の使用数 */
+    uint8_t         dest4_cnt;              /* dest4 の使用数。0 なら次ホップの判定で引かない */
+    uint8_t         dest4_next;             /* 満杯のとき次に上書きする位置 */
+    netif_dest4_t   dest4[NETIF_DEST4_MAX];
 } netif_t;
 
 #define NETIF_TXQ_MAX 2u   /* 送信キュー(PF)の数の上限。作業領域の添字に使う */
@@ -338,12 +424,94 @@ static inline uint32_t netif_next_hop4(const netif_t *ni, uint32_t dst)
     /* 同一サブネットなら宛先を直接解決する(サブネットブロードキャストも
      * マスク内なのでこの判定に含まれる)。 */
     if (((dst ^ ni->ip) & ni->netmask) == 0u) return dst;
+    /* Redirect で教わった宛先(RFC 1122 3.2.2.2)。空なら比較 1 つで飛ばす。 */
+    if (ni->dest4_cnt) {
+        for (unsigned i = 0; i < ni->dest4_cnt; i++) {
+            if (ni->dest4[i].dst == dst) return ni->dest4[i].nexthop;
+        }
+    }
     return ni->gateway;
 }
 
+/* ゲートウェイ gw が死んだ(到達確認がすべて無応答 / 解決に失敗した)ことを知らせる。
+ * 候補が他にあれば次へ切り替える(RFC 1122 3.3.1.4 の dead gateway detection)。 */
+void netif_gw4_dead(netif_t *ni, uint32_t gw);
+
+/* Redirect を受け入れて、dst の次ホップを nexthop にする(検査は呼び出し側)。 */
+void netif_dest4_set(netif_t *ni, uint32_t dst, uint32_t nexthop);
+
 /*=================================================================
- * netif_next_hop4() の IPv6 版。戻り値は dst か ni->gateway6 のどちらかを
- * 指すポインタで、コピーは発生しない。
+ * a の先頭 plen ビットがプレフィックス p と一致するか(IPv6)。
+ *
+ * 引数:
+ *   a    - 調べるアドレス
+ *   p    - プレフィックス
+ *   plen - プレフィックス長(0〜128)
+ * 戻り値:
+ *   1=一致、0=不一致
+ * コール元:
+ *   netif_next_hop6()、ipv6.c(送信元の選択・on-link の判定)
+ * ===============================================================*/
+static inline int netif_prefix6_match(const uint8_t a[16], const uint8_t p[16], unsigned plen)
+{
+    if (plen > 128u) return 0;
+    unsigned full = plen >> 3;
+    for (unsigned i = 0; i < full; i++) if (a[i] != p[i]) return 0;
+    unsigned rem = plen & 7u;
+    if (rem) {
+        uint8_t m = (uint8_t)(0xFFu << (8u - rem));
+        if ((a[full] & m) != (p[full] & m)) return 0;
+    }
+    return 1;
+}
+
+/*=================================================================
+ * dst が on-link か(RFC 4861 5.2 の next-hop determination、RFC 5942)。
+ *
+ * **on-link とみなすのは 2 つだけ:**
+ *   - `ip6addr` で手動設定したアドレスのプレフィックス(運用者が「このプレフィックスは
+ *     このリンク上」と言ったのと同じ。手動設定は IPv4 の netmask と同じ扱い)
+ *   - RA の Prefix Information で **L=1** と言われたプレフィックス(prefix6[])。
+ *     ただしこれを見るのはデフォルトルータが RA 由来のときだけ。手動のゲートウェイが
+ *     あるときは経路は手動の設定だけで決める(RA で手動の経路を変えない。`routetest`
+ *     などが手動の gateway6 で「グローバル宛はゲートウェイへ」を確かめているところへ、
+ *     前の試験の RA で覚えた広いプレフィックスが割り込むと、原因の分からない形で落ちる)。
+ * **SLAAC で作ったアドレスのプレフィックス(A=1 だけで L=0)は on-link にしない**
+ * (RFC 5942 4。アドレスを作ってよいことと、そのプレフィックスの相手に直接届くことは別)。
+ *
+ * コール元:
+ *   netif_next_hop6()
+ * ===============================================================*/
+static inline int netif_onlink6(const netif_t *ni, const uint8_t dst[16])
+{
+    if (ni->ip6_global_set && !ni->ip6_global_from_ra && ni->ip6_prefix_len &&
+        netif_prefix6_match(dst, ni->ip6_global, ni->ip6_prefix_len)) {
+        return 1;
+    }
+    if (ni->gateway6_from_ra) {
+        for (unsigned i = 0; i < ni->prefix6_cnt; i++) {
+            if (netif_prefix6_match(dst, ni->prefix6[i].prefix, ni->prefix6[i].plen)) return 1;
+        }
+    }
+    return 0;
+}
+
+/*=================================================================
+ * netif_next_hop4() の IPv6 版(RFC 4861 5.2 の next-hop determination)。
+ * 戻り値は dst、ni->gateway6、宛先キャッシュの次ホップのどれかを指すポインタで、
+ * コピーは発生しない。
+ *
+ * 判定の順:
+ *   1. 宛先キャッシュ(Redirect で教わった宛先、RFC 4861 8.3)。空なら比較 1 つで飛ばす。
+ *   2. デフォルトルータが無ければ宛先を直接解決する(**従来どおり**。RFC 5942 4 の
+ *      rule 4 は「ルータが無く on-link でもない宛先は届かない」だが、このスタックの
+ *      試験(`udp6send` で Pi5 のグローバルアドレスへ送る、`ext6test`、`pmtutest`)は
+ *      ルータの居ない 1 本のリンクで「グローバルアドレスへ直接 NDP する」ことに
+ *      頼っている。ルータが居ないリンクで直接引いても、居なければ NDP が失敗する
+ *      だけで、誤った相手へ送ることは無い)。
+ *   3. マルチキャストとリンクローカルは宛先へ。
+ *   4. on-link のプレフィックスに入る宛先は宛先へ(netif_onlink6())。
+ *   5. それ以外はデフォルトルータ。
  *
  * 引数:
  *   ni  - 送信元インターフェース(NULL 可)
@@ -355,9 +523,19 @@ static inline uint32_t netif_next_hop4(const netif_t *ni, uint32_t dst)
  * ===============================================================*/
 static inline const uint8_t *netif_next_hop6(const netif_t *ni, const uint8_t dst[16])
 {
-    if (!ni || !ni->gateway6_set) return dst;
+    if (!ni) return dst;
+    if (ni->dest6_cnt) {
+        for (unsigned i = 0; i < ni->dest6_cnt; i++) {
+            const uint8_t *d = ni->dest6[i].dst;
+            unsigned j = 0;
+            while (j < 16u && d[j] == dst[j]) j++;
+            if (j == 16u) return ni->dest6[i].nexthop;
+        }
+    }
+    if (!ni->gateway6_set) return dst;
     if (dst[0] == 0xFFu) return dst;                              /* ff00::/8 マルチキャスト */
     if (dst[0] == 0xFEu && (dst[1] & 0xC0u) == 0x80u) return dst; /* fe80::/10 リンクローカル */
+    if (netif_onlink6(ni, dst)) return dst;                       /* on-link のプレフィックス */
     return ni->gateway6;
 }
 
@@ -369,6 +547,7 @@ int net_resolve_mac(const netaddr_t *dst, uint8_t out_mac[ETH_ALEN]);
 #define NETIF_DAD_UNKNOWN   0   /* 未実施 */
 #define NETIF_DAD_PASSED    1   /* 衝突なし */
 #define NETIF_DAD_CONFLICT  2   /* 衝突を検出した */
+#define NETIF_DAD_TENTATIVE 3   /* 検査中(RFC 4862 5.4 の tentative。まだ自分のアドレスとして使わない) */
 
 /* インターフェースの IPv4 アドレスと IPv6 リンクローカルの両方について
  * 重複アドレス検出を行い、結果を netif_t へ記録する。0=どちらも衝突なし、

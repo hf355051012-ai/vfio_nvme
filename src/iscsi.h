@@ -110,6 +110,70 @@
 #define ISCSI_REJECT_INVALID_FIELD  0x09u
 #define ISCSI_REJECT_WAITING_LOGOUT 0x0Cu
 
+/* ---- SCSI Command の byte1(11.3.1)の残りと AHS(11.2.1.2)---- */
+#define ISCSI_CMD_ATTR_MASK   0x07u  /* タスク属性: 0 untagged / 1 simple / 2 ordered / 3 HoQ / 4 ACA / 5〜7 予約 */
+#define ISCSI_AHS_EXT_CDB     0x01u  /* Extended CDB */
+#define ISCSI_AHS_BIDI_RLEN   0x02u  /* Bidirectional Read Expected Data Transfer Length */
+
+/* ---- Task Management(11.5 / 11.6)。番号は RFC 7143 11.5.1、9〜12 は RFC 7144 4.1 ---- */
+#define ISCSI_TMF_ABORT_TASK        1u
+#define ISCSI_TMF_ABORT_TASK_SET    2u
+#define ISCSI_TMF_CLEAR_ACA         3u
+#define ISCSI_TMF_CLEAR_TASK_SET    4u
+#define ISCSI_TMF_LU_RESET          5u
+#define ISCSI_TMF_TARGET_WARM_RESET 6u
+#define ISCSI_TMF_TARGET_COLD_RESET 7u
+#define ISCSI_TMF_TASK_REASSIGN     8u
+#define ISCSI_TMF_QUERY_TASK        9u
+#define ISCSI_TMF_QUERY_TASK_SET    10u
+#define ISCSI_TMF_IT_NEXUS_RESET    11u
+#define ISCSI_TMF_QUERY_ASYNC_EVENT 12u
+#define ISCSI_TMF_OFF_REFCMDSN      32u  /* RefCmdSN */
+/* 応答(11.6.1) */
+#define ISCSI_TMF_RSP_COMPLETE      0u
+#define ISCSI_TMF_RSP_NO_TASK       1u
+#define ISCSI_TMF_RSP_NO_LUN        2u
+#define ISCSI_TMF_RSP_ALLEGIANT     3u
+#define ISCSI_TMF_RSP_REASSIGN_NS   4u
+#define ISCSI_TMF_RSP_NOT_SUPPORTED 5u
+#define ISCSI_TMF_RSP_AUTH_FAILED   6u
+#define ISCSI_TMF_RSP_REJECTED      255u
+
+/* function の番号 -> 中身が決まっていれば ISCSI_TMF_RSP_COMPLETE 以外の「これで答える」値を返す
+ * (対応しない / 予約値)。0 = この関数では決めない(呼び出し側が処理する)。TCP と iSER の
+ * ターゲットで同じ表を使う(番号の読み違いを 2 か所で起こさないため)。 */
+static inline uint8_t iscsi_tmf_static_rsp(uint8_t fn)
+{
+    switch (fn) {
+    case ISCSI_TMF_ABORT_TASK: case ISCSI_TMF_ABORT_TASK_SET: case ISCSI_TMF_CLEAR_TASK_SET:
+    case ISCSI_TMF_LU_RESET: case ISCSI_TMF_TARGET_WARM_RESET: case ISCSI_TMF_TARGET_COLD_RESET:
+        return 0;
+    case ISCSI_TMF_CLEAR_ACA:        /* NormACA=0 なので ACA は起きない */
+        return ISCSI_TMF_RSP_NOT_SUPPORTED;
+    case ISCSI_TMF_TASK_REASSIGN:    /* ERL=0 では持てない(11.6.1 の 4)*/
+        return ISCSI_TMF_RSP_REASSIGN_NS;
+    case ISCSI_TMF_QUERY_TASK: case ISCSI_TMF_QUERY_TASK_SET:
+    case ISCSI_TMF_IT_NEXUS_RESET: case ISCSI_TMF_QUERY_ASYNC_EVENT:
+        return ISCSI_TMF_RSP_NOT_SUPPORTED;   /* RFC 7144 の関数は持たない */
+    default:
+        return ISCSI_TMF_RSP_REJECTED;        /* 0 と 13〜127 は割り当てが無い */
+    }
+}
+
+/* ---- Logout 応答(11.15.1)---- */
+#define ISCSI_LOGOUT_RSP_OK         0u
+#define ISCSI_LOGOUT_RSP_NO_CID     1u
+#define ISCSI_LOGOUT_RSP_NO_RECOVERY 2u
+#define ISCSI_LOGOUT_OFF_CID        20u
+
+/* ---- Async Message(11.9.1)---- */
+#define ISCSI_ASYNC_OFF_EVENT       36u
+#define ISCSI_ASYNC_OFF_PARAM3      42u
+#define ISCSI_ASYNC_LOGOUT_REQ      1u
+#define ISCSI_ASYNC_DROP_CONN       2u
+#define ISCSI_ASYNC_DROP_ALL        3u
+#define ISCSI_ASYNC_RENEGOTIATE     4u
+
 /* ---- 多バイトの読み書き ---- */
 static inline uint32_t iscsi_be32(const uint8_t *p)
 {
@@ -164,6 +228,9 @@ typedef struct {
     uint8_t  rdma_ext;
     uint32_t ini_recv_dsl;         /* InitiatorRecvDataSegmentLength(イニシエータが受け取れる)*/
     uint32_t tgt_recv_dsl;         /* TargetRecvDataSegmentLength(ターゲットが受け取れる)*/
+    /* TaggedBufferForSolicitedDataOnly(RFC 7145 6.9)。tbsdo_set = 相手が鍵を出した。 */
+    uint8_t  tbsdo, tbsdo_set;
+    uint8_t  proto_level;          /* iSCSIProtocolLevel の結果(RFC 7143 13.24、出なければ 0)*/
 } iscsi_params_t;
 
 #endif /* ISCSI_H */

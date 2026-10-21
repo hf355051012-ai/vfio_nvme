@@ -58,6 +58,33 @@ const scsi_lun_t *scsi_get_lun(unsigned lun);
 /* CDB の LUN の欄(SAM の 8 バイト)から LUN 番号を取り出す(周辺 / フラット。それ以外は 0xFFFF)。 */
 unsigned scsi_decode_lun(const uint8_t lun8[8]);
 
+/*=================================================================
+ * Unit Attention(SAM-5 5.14 / SPC-4 5.14)。I_T nexus(= iSCSI のセッション)ごと・LUN ごとに 1 つ持つ。
+ * LOGICAL UNIT RESET / TARGET RESET / 他の nexus の CLEAR TASK SET で立て、次のコマンドを
+ * CHECK CONDITION / UNIT ATTENTION で断って消す。INQUIRY と REPORT LUNS は報告せずに通し
+ * (SPC-4 5.14)、REQUEST SENSE はセンスとして返して消す。トランスポートは「1 つでも立っているか」
+ * (any)だけをホットパスで見る。
+ * ===============================================================*/
+#define SCSI_ASC_RESET_OCCURRED      0x29u   /* 29/00 POWER ON, RESET, OR BUS DEVICE RESET OCCURRED */
+#define SCSI_ASCQ_BUS_DEVICE_RESET   0x03u   /* 29/03 BUS DEVICE RESET FUNCTION OCCURRED(LU RESET)*/
+#define SCSI_ASC_CMDS_CLEARED        0x2Fu   /* 2F/00 COMMANDS CLEARED BY ANOTHER INITIATOR */
+#define SCSI_ASC_PROTOCOL_CRC        0x47u   /* 47/05 PROTOCOL SERVICE CRC ERROR(RFC 7143 11.4.7.2)*/
+#define SCSI_ASCQ_PROTOCOL_CRC       0x05u
+
+typedef struct {
+    uint8_t any;                       /* 1 つでも立っているか */
+    uint8_t asc[SCSI_MAX_LUNS], ascq[SCSI_MAX_LUNS];   /* asc = 0 なら無し */
+} scsi_ua_t;
+
+/* lun_mask のビットの LUN に UA を立てる(既に立っていれば上書きしない = 古いほうを先に報告)。 */
+void scsi_ua_set(scsi_ua_t *u, unsigned lun_mask, uint8_t asc, uint8_t ascq);
+/* scsi_exec() の後に呼ぶ(u->any のときだけ)。報告したら 1(r を書き換えた / 消した)。 */
+int  scsi_ua_apply(scsi_ua_t *u, unsigned lun, const uint8_t cdb[16], scsi_result_t *r);
+
+/* 標準 INQUIRY の版記述子の iSCSI(0960h)に、合意した iSCSIProtocolLevel を足す(RFC 7144 4.2:
+ * 0960h + レベル)。level = 0 なら何もしない(呼び出し側もそのときは呼ばない)。 */
+void scsi_inquiry_set_iscsi_level(const uint8_t cdb[16], scsi_result_t *r, unsigned level);
+
 /* 1 コマンドを解釈する。buf は INQUIRY などの応答を組み立てる作業場所(cap バイト)。
  * READ / WRITE はディスクの位置を返すだけで、データの移動は呼び出し側がする。 */
 void scsi_exec(unsigned lun, const uint8_t cdb[16], uint8_t *buf, uint32_t cap, scsi_result_t *r);

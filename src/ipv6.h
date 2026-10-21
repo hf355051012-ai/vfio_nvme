@@ -31,7 +31,8 @@
 #define IPV6_TLV_ACT_MASK     0xC0u
 #define IPV6_TLV_ACT_SKIP     0x00u  /* 00: 読み飛ばして処理を続ける */
 #define IPV6_TLV_ACT_DISCARD  0x40u  /* 01: 破棄 */
-/* 10/11 も破棄(加えて ICMPv6 Parameter Problem を返すべきだが未実装)。 */
+#define IPV6_TLV_ACT_PP       0x80u  /* 10: 破棄して Parameter Problem code 2(宛先がマルチキャストでも) */
+#define IPV6_TLV_ACT_PP_UNI   0xC0u  /* 11: 破棄して、宛先がマルチキャストでなければ Parameter Problem code 2 */
 
 /* Fragment 拡張ヘッダ(RFC 8200 4.5、glibc の struct ip6_frag)。8 バイト固定。
  *   nxt(0) / reserved(1) / offset+flags(2-3) / identification(4-7)
@@ -46,8 +47,20 @@
  * 未使用 4 バイトの下位 16bit だけ。ここを取り違えやすい。
  * IPv6 は経路上で分割しない仕様なので、これを処理しないと MTU の小さい経路で
  * **通信が完全に成立しない**(IPv4 なら経路が分割してくれる)。 */
+#define ICMPV6_TYPE_DEST_UNREACH   1u
 #define ICMPV6_TYPE_PACKET_TOO_BIG 2u
 #define ICMPV6_TYPE_TIME_EXCEEDED  3u
+#define ICMPV6_TYPE_PARAM_PROBLEM  4u
+/* Destination Unreachable の code(RFC 4443 3.1) */
+#define ICMPV6_CODE_NO_ROUTE       0u
+#define ICMPV6_CODE_ADMIN_PROHIB   1u
+#define ICMPV6_CODE_ADDR_UNREACH   3u
+#define ICMPV6_CODE_PORT_UNREACH   4u
+/* Parameter Problem の code(RFC 4443 3.4、RFC 7112) */
+#define ICMPV6_CODE_PP_HEADER      0u  /* ヘッダの欄が不正 */
+#define ICMPV6_CODE_PP_NEXTHDR     1u  /* 知らない Next Header */
+#define ICMPV6_CODE_PP_OPTION      2u  /* 知らないオプション */
+#define ICMPV6_CODE_PP_CHAIN       3u  /* 先頭の断片がヘッダの並びを全部含まない(RFC 7112) */
 #define ICMPV6_TYPE_ECHO_REQUEST 128u
 #define ICMPV6_TYPE_ECHO_REPLY   129u
 /* MLD(Multicast Listener Discovery、RFC 2710 = v1 / RFC 3810 = v2)。
@@ -60,6 +73,14 @@
 #define ICMPV6_TYPE_RA           134u  /* Router Advertisement */
 #define ICMPV6_TYPE_NS           135u  /* Neighbor Solicitation */
 #define ICMPV6_TYPE_NA           136u  /* Neighbor Advertisement */
+#define ICMPV6_TYPE_REDIRECT     137u  /* Redirect(RFC 4861 4.5) */
+
+/* Redirect のバイト配置(RFC 4861 4.5): ICMPv6 ヘッダ 4 + reserved 4、Target(8-23)、
+ * Destination(24-39)、オプションは 40 から。 */
+#define REDIRECT_OFF_TARGET  8u
+#define REDIRECT_OFF_DEST   24u
+#define REDIRECT_OPT_OFF    40u
+#define NDP_OPT_REDIRECTED   4u   /* Redirected Header オプション(読み飛ばす) */
 
 /* NDP オプション種別(RFC 4861 4.6。glibc の <netinet/icmp6.h> の
  * ND_OPT_* と同じ値)。 */
@@ -112,8 +133,47 @@ int ipv6_addr_is_ours(const uint8_t addr[IPV6_ADDR_LEN]);
 
 /* addr に対応する要請ノードマルチキャスト ff02::1:ffXX:XXXX を組む。 */
 void ipv6_solicited_node_addr(const uint8_t addr[IPV6_ADDR_LEN], uint8_t out[IPV6_ADDR_LEN]);
+/* 1 つ目のグローバルアドレス。**DAD 中(tentative)・有効期間切れのものは返さない**
+ * (RFC 4862 5.4。SLAAC で作ったものだけ。手動設定は常に返す)。 */
 int ipv6_global_addr(uint8_t out[IPV6_ADDR_LEN]);
+/* 宛先に合わせた送信元(RFC 6724 の rule 2 / 3 / 8 の簡略版)。 */
 void ipv6_source_for(const uint8_t dst[IPV6_ADDR_LEN], uint8_t out[IPV6_ADDR_LEN]);
+
+/* NDP 以外の送信に使う hop limit(RFC 4861 6.3.4 の CurHopLimit。RA の Cur Hop Limit が
+ * 0 でなければそれ、無ければ 64)。NDP(RS / RA / NS / NA / Redirect)だけは 255。 */
+uint8_t ipv6_default_hop_limit(void);
+
+/* SLAAC で作ったアドレスの DAD の待ち時間(RFC 4862 の DupAddrDetectTransmits=1 x
+ * RetransTimer)。RFC の RetransTimer は 1 秒だが、ルータの居ないこのリンクでは起動と
+ * 試験が延びるだけなので、手動設定の DAD(2 回 x 50ms)と同じ 100ms にしてある。 */
+#define IPV6_SLAAC_DAD_MS 100u
+
+/* 時間で進める仕事(DAD の判定、MLD の Report / 離脱の再送、寿命切れの掃除)を進める。
+ * **冷たい経路から呼ぶこと**(仕事が無ければ volatile の旗を 1 つ読むだけで戻る)。
+ * IPv6 のフレームを受けるたびにも呼ばれるが、受信が無いと進まないので、定期的に
+ * 回る冷たい経路(ポーリングループの数百回に 1 回など)からも呼ぶのが望ましい。 */
+void ipv6_timer_tick(void);
+
+/* 送信する IPv6 パケット(ipv6_send_from() の経路)を覗くフック(`rfctest ipv6` の観測用)。
+ * hop limit と上位の種類、上位のメッセージの先頭を渡す。 */
+typedef void (*ipv6_tx_observer_t)(uint8_t hop_limit, uint8_t next_header,
+                                    const uint8_t *payload, uint16_t len);
+void ipv6_set_tx_observer(ipv6_tx_observer_t fn);
+
+/* 受けた ICMPv6 のエラーの数と、最後のエラーの種類(`rfctest ipv6` の観測用)。 */
+extern volatile uint32_t g_icmpv6_err_rx;
+extern volatile uint8_t  g_icmpv6_err_rx_type;
+extern volatile uint8_t  g_icmpv6_err_rx_code;
+extern volatile uint32_t g_icmpv6_err_rx_param;
+/* 送った ICMPv6 のエラーの数と、頻度の制限で送らなかった数。 */
+extern volatile uint32_t g_icmpv6_err_tx;
+extern volatile uint32_t g_icmpv6_err_ratelimited;
+/* 受け付けた Redirect の数。 */
+extern volatile uint32_t g_ipv6_redirect_count;
+/* ICMPv6 のエラーの送る頻度の上限(RFC 4443 2.4(f)。トークンバケツの 1 秒あたりの
+ * 補充数と、溜められる上限)。 */
+#define ICMPV6_ERR_RATE_PER_SEC 10u
+#define ICMPV6_ERR_BURST        10u
 
 int ipv6_send(const uint8_t dst[IPV6_ADDR_LEN], const uint8_t dst_mac[6],
               uint8_t next_header, const uint8_t *payload, uint16_t payload_len);
@@ -180,9 +240,9 @@ void ndp_cache_update_na(const uint8_t addr[IPV6_ADDR_LEN], const uint8_t mac[6]
  * 0=fresh、1=stale、-1=未登録または確認要求がすべて無応答。 */
 int  ndp_cache_peek(const uint8_t addr[IPV6_ADDR_LEN], uint32_t *remain_ms);
 
-/* 受信した IPv6 断片を捨てる直前に呼ばれるフック(`ext6test` の観測用)。
- * **受信側の再構成は実装していない**(IPv4 と同じ方針)ので、送信側の
- * 断片化はこれでしか確かめられない。ip_set_frag_observer() と同じ考え方。 */
+/* 受信した IPv6 断片を組み立てへ渡す直前に呼ばれるフック(`ext6test` / `rfctest ipv6` の
+ * 観測用)。組み立てた結果からは「何個に割れて、識別子とオフセットがいくつか」が
+ * 見えないので、断片単位の形はこれで確かめる。ip_set_frag_observer() と同じ考え方。 */
 typedef void (*ipv6_frag_observer_t)(uint32_t id, uint16_t frag_off, int more,
                                       uint8_t next_header,
                                       const uint8_t *payload, uint16_t len);
@@ -198,8 +258,7 @@ int ipv6_send_echo_request(uint16_t ident, uint16_t seq, uint16_t payload_len);
 int ipv6_send_rs(void);
 
 /* ni へ RS を送り、RA が来てグローバルアドレスが決まるまで待つ。
- * 決まったら **その場で DAD を実行**してから使用可能にする(RA 受信ハンドラ
- * からは DAD を走らせられない -- 受信ポーリングの再入になるため)。
+ * DAD は RA の処理が待たずに始めている(TENTATIVE)ので、その結果が出るまで待つ。
  * 戻り値: 1=グローバルアドレスを設定した、0=RA が来なかった/採用しなかった、
  *         -1=RS の送信に失敗。 */
 int ipv6_slaac_solicit(netif_t *ni, unsigned solicits, uint32_t interval_ms);
@@ -225,7 +284,7 @@ void ipv6_slaac_age(netif_t *ni);
 /* 報告対象のマルチキャストグループを列挙する(要請ノードマルチキャスト)。
  * **ff02::1(全ノード)は含めない** -- RFC 3810 6 が報告対象外としている。
  * 戻り値は書き込んだ個数。 */
-#define IPV6_MCAST_MAX 4u
+#define IPV6_MCAST_MAX 6u   /* リンクローカル + 1 つ目 + 2 つ目以降(NETIF_IP6_EXTRA)ぶん */
 unsigned ipv6_mcast_groups(netif_t *ni, uint8_t out[][IPV6_ADDR_LEN], unsigned max);
 
 /* いま参加している全グループを報告する(非要請 Report)。
@@ -235,10 +294,12 @@ int ipv6_mld_report_all(netif_t *ni);
 /* 1 グループの離脱を通知する(v1=Done、v2=CHANGE_TO_INCLUDE)。 */
 int ipv6_mld_leave(const uint8_t group[IPV6_ADDR_LEN]);
 
-/* いま MLDv1 互換モードか(v1 の Query を受けると一定時間そうなる)。 */
+/* アクティブなインターフェースがいま MLDv1 互換モードか(v1 の Query を受けると
+ * 一定時間そうなる)。**インターフェースごと**(RFC 3810 8.2.1。Querier はリンクごと)。 */
 int ipv6_mld_v1_mode(void);
 
-/* v1 互換モードを即座に解除する(`mldtest` の後始末用。通常は時間で切れる)。 */
+/* v1 互換モードを即座に解除する(全インターフェース。`mldtest` の後始末用。
+ * 通常は時間で切れる)。 */
 void ipv6_mld_clear_v1_mode(void);
 
 /* MLD の送信を止める/再開する。**スヌーピングするスイッチ配下では止めると
@@ -254,8 +315,16 @@ typedef void (*ipv6_mld_observer_t)(const uint8_t *msg, unsigned len,
                                      const uint8_t dst[IPV6_ADDR_LEN]);
 void ipv6_set_mld_observer(ipv6_mld_observer_t fn);
 
-/* 非要請 Report を何回送るか(RFC 3810 の Robustness Variable)。 */
-#define MLD_UNSOLICITED_REPORTS 2u
+/* 非要請 Report / 離脱通知を合わせて何回送るか(RFC 3810 9.1 の Robustness Variable)。 */
+#define MLD_ROBUSTNESS 2u
+/* そのうち、その場ですぐに送る数。**残り(MLD_ROBUSTNESS - これ)は間隔を空けて
+ * 再送する**(RFC 3810 6.1 / RFC 2710 4。続けて送ると同じ理由で両方落ちうる)。
+ * ipv6_mld_report_all() / ipv6_mld_leave() はこの数だけ送って戻る。 */
+#define MLD_UNSOLICITED_REPORTS 1u
+/* 再送の間隔の上限(Unsolicited Report Interval)。v2 は 1 秒(RFC 3810 9.11)、
+ * v1 互換モードは 10 秒(RFC 2710 7.10)。実際の間隔は (0, 上限] の乱数。 */
+#define MLD_UNSOL_INTERVAL_MS    1000u
+#define MLD_V1_UNSOL_INTERVAL_MS 10000u
 
 /* v1 の Query を受けてから v1 互換モードを保つ時間(RFC 3810 9.12 の
  * Older Version Querier Present Timeout = RV * QI + QRI = 2*125+10)。 */
@@ -267,5 +336,15 @@ extern volatile uint32_t g_ipv6_ra_count[SMP_MAX_CORES];
 extern volatile uint32_t g_ipv6_echo_request_count[SMP_MAX_CORES];
 extern volatile uint32_t g_ipv6_echo_reply_count[SMP_MAX_CORES];
 extern volatile uint32_t g_ipv6_ns_count[SMP_MAX_CORES];
+
+/* ---- ICMPv6 のエラーを送る(RFC 4443)----
+ * invoking は誘因になったパケット(IPv6 ヘッダの先頭から)。最小 MTU(1280)に収まる
+ * 長さまで引用する。RFC 4443 2.4(e) の「エラーにエラーを返さない」「マルチキャスト宛て /
+ * マルチキャスト送信元には返さない(Packet Too Big と Parameter Problem code 2 を除く)」と、
+ * 2.4(f) の送る頻度の制限(MUST)はこの関数の中で守る。アクティブなインターフェースから送る。
+ * 戻り値: 0=送った、-1=送らなかった(制限・条件・失敗)。 */
+int icmpv6_send_error(uint8_t type, uint8_t code, uint32_t param,
+                      const uint8_t *invoking, size_t len,
+                      const uint8_t dst[IPV6_ADDR_LEN], const uint8_t *dst_mac);
 
 #endif /* IPV6_H */

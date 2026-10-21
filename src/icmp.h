@@ -7,8 +7,11 @@
 
 #define ICMP_TYPE_ECHO_REPLY    0u
 #define ICMP_TYPE_DEST_UNREACH  3u
+#define ICMP_TYPE_SOURCE_QUENCH 4u
+#define ICMP_TYPE_REDIRECT      5u
 #define ICMP_TYPE_ECHO_REQUEST  8u
 #define ICMP_TYPE_TIME_EXCEEDED 11u
+#define ICMP_TYPE_PARAM_PROBLEM 12u
 
 /* Destination Unreachable の code(RFC 792) */
 #define ICMP_CODE_PROTO_UNREACH 2u
@@ -31,5 +34,16 @@ void icmp_handle(const uint8_t *data, size_t len,
 int icmp_send_dest_unreach(uint8_t code,
                             const uint8_t *orig_ip_hdr, size_t orig_len,
                             const uint8_t src_ip[4], const uint8_t *src_mac);
+
+/* ICMP Time Exceeded を返す(code 1 = 断片の組み立てが時間切れ。RFC 1122 3.3.2)。
+ * orig は元のデータグラムの IP ヘッダの先頭から(ヘッダ + 8 バイトまで引用する)。 */
+int icmp_send_time_exceeded(uint8_t code, const uint8_t *orig, size_t orig_len,
+                            const uint8_t dst_ip[4], const uint8_t *dst_mac);
+
+/* ICMP エラーを送る頻度の上限(1 秒あたりの個数)。シェルの `icmprate` で変える。 */
+extern volatile uint32_t g_icmp_err_rate;
+/* 送った ICMP エラーの数と、頻度の制限で送らなかった数(試験・表示用)。 */
+extern volatile uint32_t g_icmp_err_sent;
+extern volatile uint32_t g_icmp_err_limited;
 
 #endif /* ICMP_H */

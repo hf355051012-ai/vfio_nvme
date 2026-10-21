@@ -655,6 +655,11 @@ typedef struct {
 
 static nvme_connect_job_ctx_t s_nvme_connect_job_ctx;
 
+/* TCP の接続(SYN の往復)を待つ上限。**TCP 自身は SYN を 3 分まで送り直す**
+ * (RFC 9293 MUST-23)ので、届かない相手への接続で NVMe の接続ジョブが 3 分止まらない
+ * よう、アプリの側で先に諦める(RFC 9293 3.8.3 も上位が先に諦めることを認めている)。 */
+#define NVME_CONNECT_TCP_TIMEOUT_MS 15000u
+
 static job_result_t nvme_connect_job_fail(nvme_connect_job_ctx_t *jc, int close_admin, int close_io,
                                            const char *reason)
 {
@@ -762,13 +767,20 @@ static job_result_t nvme_connect_job_step(job_t *self)
     case NCONN_ST_TCP_ADMIN_BEGIN:
         if (jc->src_ctx) netif_activate(jc->src_ctx);
         tcp_connect_begin_to(&ctx->admin.tcp, &jc->addr, jc->port);
+        jc->wait_started_ticks = timer_now();
         self->state = NCONN_ST_TCP_ADMIN_WAIT;
         return JOB_WAITING;
 
     case NCONN_ST_TCP_ADMIN_WAIT: {
         int r = tcp_connect_poll(&ctx->admin.tcp);
         if (r < 0) return nvme_connect_job_fail(jc, 0, 0, "admin TCP接続失敗");
-        if (r == 0) return JOB_WAITING;
+        if (r == 0) {
+            if (timeout_ms(jc->wait_started_ticks, NVME_CONNECT_TCP_TIMEOUT_MS)) {
+                tcp_close(&ctx->admin.tcp);
+                return nvme_connect_job_fail(jc, 0, 0, "admin TCP接続がタイムアウト");
+            }
+            return JOB_WAITING;
+        }
         if (ctx->req_tls) {
             /* **ICReq より前に TLS の握手**(NVMe/TCP の決まり)。 */
             if (nvme_tls_client_start(&s_cli_tls[0], &ctx->admin.tcp, NVME_HOST_NQN,
@@ -1079,6 +1091,7 @@ static job_result_t nvme_connect_job_step(job_t *self)
         }
         if (jc->src_ctx) netif_activate(jc->src_ctx);
         tcp_connect_begin_to(&ctx->io.tcp, &jc->addr, jc->port);
+        jc->wait_started_ticks = timer_now();
         self->state = NCONN_ST_TCP_IO_WAIT;
         return JOB_WAITING;
     }
@@ -1086,7 +1099,13 @@ static job_result_t nvme_connect_job_step(job_t *self)
     case NCONN_ST_TCP_IO_WAIT: {
         int r = tcp_connect_poll(&ctx->io.tcp);
         if (r < 0) return nvme_connect_job_fail(jc, 1, 0, "IO TCP接続失敗");
-        if (r == 0) return JOB_WAITING;
+        if (r == 0) {
+            if (timeout_ms(jc->wait_started_ticks, NVME_CONNECT_TCP_TIMEOUT_MS)) {
+                tcp_close(&ctx->io.tcp);
+                return nvme_connect_job_fail(jc, 1, 0, "IO TCP接続がタイムアウト");
+            }
+            return JOB_WAITING;
+        }
         if (ctx->req_tls) {
             if (nvme_tls_client_start(&s_cli_tls[1], &ctx->io.tcp, NVME_HOST_NQN, ctx->subnqn) != 0)
                 return nvme_connect_job_fail(jc, 1, 1, "IO の TLS 握手を始められない");

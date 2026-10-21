@@ -51,6 +51,7 @@ const char *tls13_alert_name(uint8_t d) {
     case TLS13_ALERT_PROTOCOL_VERSION: return "protocol_version";
     case TLS13_ALERT_INTERNAL_ERROR: return "internal_error";
     case TLS13_ALERT_MISSING_EXTENSION: return "missing_extension";
+    case TLS13_ALERT_UNSUPPORTED_EXTENSION: return "unsupported_extension";
     case TLS13_ALERT_UNKNOWN_PSK_IDENTITY: return "unknown_psk_identity";
     default: return "?";
     }
@@ -429,13 +430,14 @@ static int on_client_hello(tls13_t *t, const uint8_t *msg, size_t mlen, obuf_t *
     NEED(1);
     const uint8_t cmlen = *p++;
     NEED(cmlen);
+    const uint8_t *cm = p;
     p += cmlen;
     NEED(2);
     const uint16_t extlen = rd16(p);
     p += 2;
     if ((size_t)(end - p) != extlen) return fail(t, o, TLS13_ALERT_DECODE_ERROR, "拡張の長さが合わない");
 
-    int v13 = 0, dhe = 0;
+    int v13 = 0, dhe = 0, kexm = 0, early_ext = 0;
     const uint8_t *ks = NULL, *sg = NULL, *psk_ext = NULL;
     size_t kslen = 0, sglen = 0, psk_len = 0;
     while (p < end) {
@@ -450,7 +452,11 @@ static int on_client_hello(tls13_t *t, const uint8_t *msg, size_t mlen, obuf_t *
             for (unsigned i = 1; el >= 1 && i + 1u <= e[0] && i + 1u < el; i += 2) v13 |= (rd16(e + i) == 0x0304);
             break;
         case EXT_PSK_KEX_MODES:
+            kexm = 1;
             for (unsigned i = 1; el >= 1 && i <= e[0] && i < el; i++) dhe |= (e[i] == 1);
+            break;
+        case EXT_EARLY_DATA:
+            early_ext = 1;
             break;
         case EXT_KEY_SHARE:
             if (el < 2 || 2u + rd16(e) > el) return fail(t, o, TLS13_ALERT_DECODE_ERROR, "key_share の長さ");
@@ -468,12 +474,33 @@ static int on_client_hello(tls13_t *t, const uint8_t *msg, size_t mlen, obuf_t *
             psk_len = el;
             break;
         default:
-            break;   /* 知らない拡張は読み飛ばす(early_data も受け付けないだけ)*/
+            break;   /* 知らない拡張は読み飛ばす */
         }
     }
     if (!v13) return fail(t, o, TLS13_ALERT_PROTOCOL_VERSION, "TLS 1.3 を出していない");
+    /* RFC 8446 4.1.2: TLS 1.3 の ClientHello の legacy_compression_methods は「0 が 1 バイト」ちょうど。
+     * それ以外は illegal_parameter で断る(MUST)。以前は長さだけ読み飛ばしていた。 */
+    if (cmlen != 1 || cm[0] != 0)
+        return fail(t, o, TLS13_ALERT_ILLEGAL_PARAMETER, "legacy_compression_methods が 0 の 1 バイトでない");
     if (!psk_ext) return fail(t, o, TLS13_ALERT_MISSING_EXTENSION, "pre_shared_key が無い(証明書は使えない)");
+    /* 4.2.9: pre_shared_key を出して psk_key_exchange_modes を出さないクライアントは断る(MUST)。
+     * 9.2 の決まりで alert は missing_extension(以前は psk_dhe_ke が無いのと同じ handshake_failure)。 */
+    if (!kexm) return fail(t, o, TLS13_ALERT_MISSING_EXTENSION, "psk_key_exchange_modes が無い");
     if (!dhe) return fail(t, o, TLS13_ALERT_HANDSHAKE_FAILURE, "psk_dhe_ke を出していない");
+    /* 9.2: supported_groups と key_share は両方あるか両方無いか。片方だけなら missing_extension。
+     * 以前は supported_groups だけのときに HelloRetryRequest で key_share を求め直していた。 */
+    if ((sg != NULL) != (ks != NULL))
+        return fail(t, o, TLS13_ALERT_MISSING_EXTENSION, "supported_groups と key_share の片方しか無い");
+    /* early_data(4.2.10): 0-RTT は受け付けない(EncryptedExtensions に early_data を返さない)。
+     * 相手は早期データを送ってくるので、max_early_data_size までは読み飛ばす(on_record())。
+     * HelloRetryRequest の後の ClientHello に early_data を付けてはいけない(4.1.2)。 */
+    if (early_ext) {
+        if (t->hrr) return fail(t, o, TLS13_ALERT_ILLEGAL_PARAMETER, "2 回目の ClientHello に early_data");
+        t->early_offered = 1;
+        t->early_left = TLS13_EARLY_SKIP_MAX;
+    } else if (t->hrr) {
+        t->early_left = 0;   /* 2 回目の ClientHello の後は早期データが来ない(握手の鍵で開けるはず)*/
+    }
 
     /* pre_shared_key: 識別子のリスト → binder のリスト。PSK のハッシュの暗号スイートを相手が出していて、
      * (CNSA 2.0 専用なら)SHA-384 のものだけを選ぶ。HRR の後は 1 回目と同じハッシュに限る。 */
@@ -664,8 +691,12 @@ void tls13_client_init(tls13_t *t, const tls13_psk_t *psk) {
 
 /* ClientHello の本体を ch へ組み立てる(binder まで計算する)。share は key_share を付ける群。
  * HelloRetryRequest の後(t->hrr)は、乱数とセッション ID は 1 回目と同じ、cookie を返し、
- * binder は transcript(message_hash + HRR)の続きで計算する。0 なら失敗。 */
-static size_t build_client_hello(tls13_t *t, uint8_t *ch, size_t cap, unsigned share) {
+ * binder は transcript(message_hash + HRR)の続きで計算する。
+ * reuse = 1 なら key_share の値を作り直さず 1 回目と同じにする(cookie だけの HelloRetryRequest。
+ * RFC 8446 4.1.2: 2 回目の ClientHello は、HRR が key_share を指定したときだけ key_share を差し替え、
+ * ほかは同じでなければならない)。x25519 は控えた秘密鍵から公開値を作り直し、ML-KEM は
+ * 復号鍵の中のカプセル化鍵(FIPS 203: dk = dk_pke || ek || H(ek) || z)をそのまま使う。0 なら失敗。 */
+static size_t build_client_hello(tls13_t *t, uint8_t *ch, size_t cap, unsigned share, int reuse) {
     const tls13_psk_t *psk = &t->psks[0];
     const unsigned allow = allowed_groups(t);
     static const uint8_t base[32] = { 9 };
@@ -699,11 +730,13 @@ static size_t build_client_hello(tls13_t *t, uint8_t *ch, size_t cap, unsigned s
         n += 6;
         if (share & TLS13_GROUP_MLKEM1024) {
             wr16(ch + n, GROUP_MLKEM1024); wr16(ch + n + 2, CRYPTO_MLKEM1024_EK_LEN);
-            if (crypto_mlkem1024_keygen(ch + n + 4, t->ml_dk) != 0) return 0;
+            if (reuse) memcpy(ch + n + 4, t->ml_dk + 384u * 4u, CRYPTO_MLKEM1024_EK_LEN);
+            else if (crypto_mlkem1024_keygen(ch + n + 4, t->ml_dk) != 0) return 0;
             n += 4 + CRYPTO_MLKEM1024_EK_LEN;
         }
         if (share & TLS13_GROUP_X25519) {
-            if (t->test_priv) memcpy(t->cpriv, t->test_priv, 32);
+            if (reuse) { /* 控えた秘密鍵のまま */ }
+            else if (t->test_priv) memcpy(t->cpriv, t->test_priv, 32);
             else if (crypto_random(t->cpriv, 32) != 0) return 0;
             wr16(ch + n, GROUP_X25519); wr16(ch + n + 2, 32);
             crypto_x25519(ch + n + 4, t->cpriv, base);
@@ -721,6 +754,8 @@ static size_t build_client_hello(tls13_t *t, uint8_t *ch, size_t cap, unsigned s
     }
     /* psk_key_exchange_modes: psk_dhe_ke だけ */
     wr16(ch + n, EXT_PSK_KEX_MODES); wr16(ch + n + 2, 2); ch[n + 4] = 1; ch[n + 5] = 1; n += 6;
+    /* early_data(試験用だけ。HelloRetryRequest の後は付けない。4.1.2)*/
+    if (t->test_early_data && !t->hrr) { wr16(ch + n, EXT_EARLY_DATA); wr16(ch + n + 2, 0); n += 4; }
     /* pre_shared_key(**最後の拡張**): 身元 1 本 + binder 1 本 */
     const unsigned il = psk->identity_len, hl = t->hl;
     if (n + 4 + 2 + 2 + il + 4 + 2 + 1 + hl > cap) return 0;
@@ -752,13 +787,58 @@ size_t tls13_client_hello(tls13_t *t, uint8_t *out, size_t cap) {
     const unsigned share = t->share ? (t->share & allow) : allow;
     if (!share) return 0;
     uint8_t ch[TLS13_HS_MAX];
-    const size_t n = build_client_hello(t, ch, sizeof(ch), share);
+    const size_t n = build_client_hello(t, ch, sizeof(ch), share, 0);
     if (!n) return 0;
     crypto_hash_init(&t->th, t->hid);
     crypto_hash_update(&t->th, ch, n);
     put_plain(&o, CT_HANDSHAKE, ch, n);
     t->state = TLS13_ST_WAIT_SH;
     return o.over ? 0 : o.len;
+}
+
+/* ---- クライアントが受ける拡張の確かめ(RFC 8446 4.2)----
+ * 応答(ServerHello / HelloRetryRequest / EncryptedExtensions)の拡張は、
+ *   - クライアントが出していないもの(HRR の cookie を除く)なら unsupported_extension(MUST)、
+ *   - 出したがそのメッセージに入ってはいけないものなら illegal_parameter(MUST)、
+ *   - 同じ拡張が 2 つあれば illegal_parameter(4.2: 同じ種類は 1 つまで)。
+ * 以前は知らない拡張を読み飛ばしていた。 */
+enum {
+    EB_SUPPORTED_GROUPS = 1u, EB_PRE_SHARED_KEY = 2u, EB_EARLY_DATA = 4u, EB_SUPPORTED_VERSIONS = 8u,
+    EB_COOKIE = 16u, EB_PSK_KEX_MODES = 32u, EB_KEY_SHARE = 64u,
+};
+
+static unsigned ext_bit(uint16_t et) {
+    switch (et) {
+    case EXT_SUPPORTED_GROUPS: return EB_SUPPORTED_GROUPS;
+    case EXT_PRE_SHARED_KEY: return EB_PRE_SHARED_KEY;
+    case EXT_EARLY_DATA: return EB_EARLY_DATA;
+    case EXT_SUPPORTED_VERSIONS: return EB_SUPPORTED_VERSIONS;
+    case EXT_COOKIE: return EB_COOKIE;
+    case EXT_PSK_KEX_MODES: return EB_PSK_KEX_MODES;
+    case EXT_KEY_SHARE: return EB_KEY_SHARE;
+    default: return 0;
+    }
+}
+
+/* クライアントが ClientHello に付けた拡張か。 */
+static int client_sent_ext(const tls13_t *t, uint16_t et) {
+    switch (et) {
+    case EXT_SUPPORTED_VERSIONS: case EXT_SUPPORTED_GROUPS: case EXT_KEY_SHARE:
+    case EXT_PSK_KEX_MODES: case EXT_PRE_SHARED_KEY:
+        return 1;
+    case EXT_COOKIE: return t->hrr && t->cookie_len != 0;
+    case EXT_EARLY_DATA: return t->test_early_data != 0;
+    default: return 0;
+    }
+}
+
+/* 0 = よい、それ以外は送る alert。allow はそのメッセージに入ってよい拡張(EB_*)。 */
+static uint8_t resp_ext_check(const tls13_t *t, uint16_t et, unsigned allow, unsigned *seen) {
+    const unsigned b = ext_bit(et);
+    if (!client_sent_ext(t, et) && !(b == EB_COOKIE && (allow & EB_COOKIE))) return TLS13_ALERT_UNSUPPORTED_EXTENSION;
+    if (!(allow & b) || (*seen & b)) return TLS13_ALERT_ILLEGAL_PARAMETER;
+    *seen |= b;
+    return 0;
 }
 
 /* HelloRetryRequest を受けた: 求められた群の key_share だけを付けた ClientHello を送り直す。 */
@@ -774,31 +854,44 @@ static int on_hello_retry(tls13_t *t, const uint8_t *msg, size_t mlen, obuf_t *o
     if ((size_t)(end - p) != extlen) return fail(t, o, TLS13_ALERT_DECODE_ERROR, "拡張の長さが合わない");
     int v13 = 0;
     uint16_t want = 0;
+    unsigned seen = 0;
     t->cookie_len = 0;
     while (p + 4 <= end) {
         const uint16_t et = rd16(p), el = rd16(p + 2);
         const uint8_t *e = p + 4;
         if (e + el > end) return fail(t, o, TLS13_ALERT_DECODE_ERROR, "拡張の長さが合わない");
+        /* HelloRetryRequest に入ってよいのは supported_versions / key_share / cookie だけ(4.1.4)。
+         * cookie はクライアントが出していなくても返ってくる唯一の拡張(4.2)。 */
+        const uint8_t bad = resp_ext_check(t, et, EB_SUPPORTED_VERSIONS | EB_KEY_SHARE | EB_COOKIE, &seen);
+        if (bad) return fail(t, o, bad, "HelloRetryRequest に出していない / 入ってはいけない拡張");
         if (et == EXT_SUPPORTED_VERSIONS && el == 2) v13 = (rd16(e) == 0x0304);
         else if (et == EXT_KEY_SHARE && el == 2) want = rd16(e);
-        else if (et == EXT_COOKIE && el >= 2 && rd16(e) + 2u == el && rd16(e) <= TLS13_COOKIE_MAX) {
+        else if (et == EXT_COOKIE) {
+            if (el < 3 || rd16(e) + 2u != el || rd16(e) > TLS13_COOKIE_MAX)
+                return fail(t, o, TLS13_ALERT_DECODE_ERROR, "cookie の長さ");
             t->cookie_len = rd16(e);
             memcpy(t->cookie, e + 2, t->cookie_len);
         }
         p = e + el;
     }
     if (!v13) return fail(t, o, TLS13_ALERT_PROTOCOL_VERSION, "TLS 1.3 でない");
-    /* 求められた群は、使ってよく、まだ key_share を付けていないものでなければならない(RFC 8446 4.1.4)*/
+    /* 求められた群は、使ってよく、まだ key_share を付けていないものでなければならない(RFC 8446 4.1.4)。
+     * **key_share が無く cookie だけの HelloRetryRequest も正しい**(サーバが状態を持たずに
+     * アドレスの到達性を確かめる使い方。4.2.2)。そのときは key_share をそのまま、cookie を足して送り直す。
+     * どちらも無ければ ClientHello が何も変わらないので illegal_parameter(4.1.4)。 */
     const unsigned wb = group_bit(want);
-    if (!want || !(allowed_groups(t) & wb) || (t->sent & wb))
+    if (want && (!(allowed_groups(t) & wb) || (t->sent & wb)))
         return fail(t, o, TLS13_ALERT_ILLEGAL_PARAMETER, "HelloRetryRequest が求めた群が使えない / 既に送った");
+    if (!want && !t->cookie_len)
+        return fail(t, o, TLS13_ALERT_ILLEGAL_PARAMETER, "HelloRetryRequest が ClientHello を何も変えない");
     uint8_t h1[HMAX];
     transcript(t, h1);   /* CH1 の Hash */
     t->hrr = 1;
     t->group = want;
     transcript_hrr(t, h1, msg, mlen);
     uint8_t ch[TLS13_HS_MAX];
-    const size_t n = build_client_hello(t, ch, sizeof(ch), wb);
+    const size_t n = want ? build_client_hello(t, ch, sizeof(ch), wb, 0)
+                          : build_client_hello(t, ch, sizeof(ch), t->sent, 1);
     if (!n) return fail(t, o, TLS13_ALERT_INTERNAL_ERROR, "2 回目の ClientHello を組めない");
     crypto_hash_update(&t->th, ch, n);
     put_ccs(o);   /* 互換モード: 2 回目の ClientHello の前に CCS(RFC 8446 D.4。Finished の前には送らない)*/
@@ -822,10 +915,14 @@ static int on_server_hello(tls13_t *t, const uint8_t *msg, size_t mlen, obuf_t *
     int v13 = 0, psk_ok = 0;
     const uint8_t *share = NULL;
     uint16_t grp = 0;
+    unsigned seen = 0;
     while (p + 4 <= end) {
         const uint16_t et = rd16(p), el = rd16(p + 2);
         const uint8_t *e = p + 4;
         if (e + el > end) return fail(t, o, TLS13_ALERT_DECODE_ERROR, "拡張の長さが合わない");
+        /* ServerHello に入ってよいのは supported_versions / key_share / pre_shared_key だけ(4.1.3 / 4.2)*/
+        const uint8_t bad = resp_ext_check(t, et, EB_SUPPORTED_VERSIONS | EB_KEY_SHARE | EB_PRE_SHARED_KEY, &seen);
+        if (bad) return fail(t, o, bad, "ServerHello に出していない / 入ってはいけない拡張");
         if (et == EXT_SUPPORTED_VERSIONS && el == 2) v13 = (rd16(e) == 0x0304);
         else if (et == EXT_KEY_SHARE && el >= 4 && rd16(e + 2) + 4u == el) {
             const uint16_t g = rd16(e), kl = rd16(e + 2);
@@ -864,6 +961,12 @@ static int on_server_hello(tls13_t *t, const uint8_t *msg, size_t mlen, obuf_t *
     keylog(t, "CLIENT_HANDSHAKE_TRAFFIC_SECRET", t->c_hs);
     keylog(t, "SERVER_HANDSHAKE_TRAFFIC_SECRET", t->s_hs);
     dir_install(t, &t->rx, t->s_hs);
+    /* **送信もここでクライアントの握手の鍵にする。** ServerHello を受けた後の alert は握手の鍵で
+     * 保護して送る(RFC 8446 5 / 7.3: サーバはこの後のクライアントのレコードを c_hs で開く)。
+     * 以前は Finished を送るときに入れていたので、EncryptedExtensions / サーバの Finished の段で
+     * 断ったときの alert が平文で出て、サーバには読めなかった。Finished はこの鍵のまま
+     * (順序番号 0 から。alert を送っていれば握手は終わっている)で送る。 */
+    dir_install(t, &t->tx, t->c_hs);
     crypto_wipe(t->early, sizeof(t->early)); crypto_wipe(t->cpriv, sizeof(t->cpriv));
     crypto_wipe(t->ml_dk, sizeof(t->ml_dk));
     crypto_wipe(shared, sizeof(shared)); crypto_wipe(hs, sizeof(hs));
@@ -893,8 +996,7 @@ static int on_server_finished(tls13_t *t, const uint8_t *msg, size_t mlen, obuf_
     /* 互換モードではこちらも最初の暗号化レコードの前に CCS を 1 個送る(RFC 8446 D.4)。
      * HelloRetryRequest を受けたときは 2 回目の ClientHello の前に送ってある。 */
     if (!t->hrr) put_ccs(o);
-    dir_install(t, &t->tx, t->c_hs);
-    put_enc(o, &t->tx, CT_HANDSHAKE, fin, 4u + t->hl);
+    put_enc(o, &t->tx, CT_HANDSHAKE, fin, 4u + t->hl);   /* tx は ServerHello のときに c_hs にしてある */
     dir_install(t, &t->tx, c_ap);
     dir_install(t, &t->rx, s_ap);
     crypto_wipe(t->master, sizeof(t->master));
@@ -912,6 +1014,7 @@ static int on_handshake(tls13_t *t, const uint8_t *msg, size_t mlen, obuf_t *o) 
     case TLS13_ST_WAIT_CFIN:
         if (msg[0] != HS_FINISHED || mlen != 4u + t->hl) return fail(t, o, TLS13_ALERT_UNEXPECTED_MESSAGE, "Finished でない");
         if (!crypto_equal(msg + 4, t->cfin, t->hl)) return fail(t, o, TLS13_ALERT_DECRYPT_ERROR, "相手の Finished が合わない");
+        t->early_left = 0;   /* 早期データの読み飛ばしはここまで(以後の開けないレコードは bad_record_mac)*/
         dir_install(t, &t->rx, t->master);
         crypto_wipe(t->master, sizeof(t->master));
         t->state = TLS13_ST_OPEN;
@@ -921,15 +1024,33 @@ static int on_handshake(tls13_t *t, const uint8_t *msg, size_t mlen, obuf_t *o) 
         return on_server_hello(t, msg, mlen, o);
     case TLS13_ST_WAIT_EE:
         if (msg[0] != HS_ENCRYPTED_EXTENSIONS) return fail(t, o, TLS13_ALERT_UNEXPECTED_MESSAGE, "EncryptedExtensions でない");
-        crypto_hash_update(&t->th, msg, mlen);   /* 中身(record_size_limit など)は使わない */
+        if (mlen < 6 || 6u + rd16(msg + 4) != mlen) return fail(t, o, TLS13_ALERT_DECODE_ERROR, "EncryptedExtensions の長さ");
+        {
+            /* こちらが出した拡張のうち EncryptedExtensions に入ってよいのは supported_groups だけ
+             * (サーバの好みの群を知らせる。4.2.7)。0-RTT は送らないので early_data も受けない。 */
+            unsigned seen = 0;
+            for (const uint8_t *p = msg + 6; p < msg + mlen;) {
+                if (p + 4 > msg + mlen || p + 4 + rd16(p + 2) > msg + mlen)
+                    return fail(t, o, TLS13_ALERT_DECODE_ERROR, "EncryptedExtensions の拡張の長さ");
+                const uint8_t bad = resp_ext_check(t, rd16(p), EB_SUPPORTED_GROUPS, &seen);
+                if (bad) return fail(t, o, bad, "EncryptedExtensions に出していない / 入ってはいけない拡張");
+                p += 4 + rd16(p + 2);
+            }
+        }
+        crypto_hash_update(&t->th, msg, mlen);   /* 中身(supported_groups)は使わない */
         t->state = TLS13_ST_WAIT_SFIN;
         return 0;
     case TLS13_ST_WAIT_SFIN:
         if (msg[0] != HS_FINISHED || mlen != 4u + t->hl) return fail(t, o, TLS13_ALERT_UNEXPECTED_MESSAGE, "サーバの Finished でない");
         return on_server_finished(t, msg, mlen, o);
     case TLS13_ST_OPEN:
-        if (msg[0] == HS_KEY_UPDATE && mlen == 5) {
-            /* 相手の鍵を進める。求められたらこちらも進めて KeyUpdate を返す(RFC 8446 4.6.3)*/
+        if (msg[0] == HS_KEY_UPDATE) {
+            /* 相手の鍵を進める。求められたらこちらも進めて KeyUpdate を返す(RFC 8446 4.6.3)。
+             * 本体は request_update の 1 バイトだけで、値は 0(求めない)/ 1(求める)だけ。
+             * 長さが違えば decode_error、値が違えば illegal_parameter(4.6.3 の MUST)。
+             * 以前は長さが違うと「想定外のメッセージ」、値が 2 以上だと黙って 0 と同じに扱っていた。 */
+            if (mlen != 5) return fail(t, o, TLS13_ALERT_DECODE_ERROR, "KeyUpdate の長さ");
+            if (msg[4] > 1) return fail(t, o, TLS13_ALERT_ILLEGAL_PARAMETER, "KeyUpdate の request_update が 0 / 1 でない");
             uint8_t ns[HMAX];
             expand_label(t, t->rx.secret, "traffic upd", NULL, 0, ns, t->hl);
             dir_install(t, &t->rx, ns);
@@ -942,7 +1063,9 @@ static int on_handshake(tls13_t *t, const uint8_t *msg, size_t mlen, obuf_t *o) 
             crypto_wipe(ns, sizeof(ns));
             return 0;
         }
-        if (msg[0] == HS_NEW_SESSION_TICKET) return 0;
+        /* NewSessionTicket はサーバだけが送る(4.6.1)。クライアントは読み捨てる(再開は使わない)。
+         * サーバが受けたら unexpected_message(以前はどちら側でも読み捨てていた)。 */
+        if (msg[0] == HS_NEW_SESSION_TICKET && t->is_client) return 0;
         return fail(t, o, TLS13_ALERT_UNEXPECTED_MESSAGE, "握手の後の想定外のメッセージ");
     default:
         return -1;
@@ -976,13 +1099,19 @@ static int on_record(tls13_t *t, uint8_t *rec, size_t rlen, obuf_t *o,
     uint8_t *d = rec + 5;
     size_t n = rlen - 5;
     if (type == CT_CCS) {
-        /* 互換モードの CCS は相手の Finished までは無視する(RFC 8446 5)*/
-        if (n == 1 && d[0] == 1 && t->state != TLS13_ST_OPEN) return 0;
+        /* 互換モードの CCS は無視する(RFC 8446 5 / D.4)。受けてよいのは**最初の ClientHello の後から
+         * 相手の Finished まで**で、握手メッセージの途中(5.1: 握手メッセージに別の種類のレコードを
+         * 挟まない)でもいけない。サーバが最初の ClientHello より前に受けたら unexpected_message(5)。 */
+        const int before_ch = !t->is_client && t->state == TLS13_ST_WAIT_CH && !t->hrr;
+        if (n == 1 && d[0] == 1 && t->state != TLS13_ST_OPEN && !before_ch && t->hlen == 0) return 0;
         return fail(t, o, TLS13_ALERT_UNEXPECTED_MESSAGE, "想定外の ChangeCipherSpec");
     }
     if (t->rx.on) {
         if (type != CT_APPDATA) return fail(t, o, TLS13_ALERT_UNEXPECTED_MESSAGE, "暗号化されていないレコード");
         if (n < 17) return fail(t, o, TLS13_ALERT_DECODE_ERROR, "暗号文が短い");
+        /* 復号した TLSInnerPlaintext が 2^14 + 1 を超えるなら record_overflow(5.2 / 5.4 の MUST)。
+         * AEAD のタグは 16 バイト固定なので、復号の前に長さで分かる(開ける手間も省ける)。 */
+        if (n - 16u > TLS13_PLAIN_MAX + 1u) return fail(t, o, TLS13_ALERT_RECORD_OVERFLOW, "復号した長さが 2^14 + 1 を超える");
         uint8_t iv[12];
         nonce(&t->rx, iv);
         /* **平文の受け取り先へ直接復号する**(段階 G。その場で復号してから写すと
@@ -990,24 +1119,59 @@ static int on_record(tls13_t *t, uint8_t *rec, size_t rlen, obuf_t *o,
          * 受け取り先を渡された場合など)だけその場で復号する。application_data で
          * なかったら(握手 / alert)そこを作業域として使うだけで、applen は進めない。 */
         uint8_t *dst = (*applen + (n - 16u) <= appcap) ? app + *applen : d;
-        if (crypto_aesgcm_open(&t->rx.aead, iv, rec, 5, d, n - 16u, dst, d + n - 16u) != 0)
+        if (crypto_aesgcm_open(&t->rx.aead, iv, rec, 5, d, n - 16u, dst, d + n - 16u) != 0) {
+            /* 0-RTT を受け付けなかったサーバは、握手の鍵で開けないレコードを早期データとして
+             * max_early_data_size まで読み飛ばす(RFC 8446 4.2.10)。早期データは early secret の鍵なので
+             * 開けないのが正しい。順序番号は進めない(早期データは握手の鍵の列に入らない)。
+             * 相手が early_data を出していなければ、または上限を超えたら従来どおり断る。 */
+            if (t->early_left && t->state == TLS13_ST_WAIT_CFIN) {
+                if (n > t->early_left)
+                    return fail(t, o, TLS13_ALERT_UNEXPECTED_MESSAGE, "早期データが max_early_data_size を超える");
+                t->early_left -= (uint32_t)n;
+                return 0;
+            }
             return fail(t, o, TLS13_ALERT_BAD_RECORD_MAC, "復号できない(タグが合わない)");
+        }
         d = dst;
         t->rx.seq++;
         n -= 16u;
         while (n && d[n - 1] == 0) n--;   /* 詰め物 */
         if (!n) return fail(t, o, TLS13_ALERT_UNEXPECTED_MESSAGE, "内側の種別が無い");
         type = d[--n];
+    } else if (type == CT_APPDATA && t->early_left && t->hrr && t->state == TLS13_ST_WAIT_CH) {
+        /* HelloRetryRequest の後、2 回目の ClientHello までに届く application_data は 1 回目の
+         * ClientHello に続けて送られた 0-RTT。開ける鍵は無いので、max_early_data_size まで読み飛ばす
+         * (RFC 8446 4.2.10)。 */
+        if (n > t->early_left) return fail(t, o, TLS13_ALERT_UNEXPECTED_MESSAGE, "早期データが max_early_data_size を超える");
+        t->early_left -= (uint32_t)n;
+        return 0;
     }
+    /* 握手メッセージの途中(hbuf に続きを待つものがある)に別の種類のレコードを挟んではいけない
+     * (RFC 8446 5.1 の MUST)。ふだんは hlen が 0 なので比較 1 個。 */
+    if (t->hlen != 0 && type != CT_HANDSHAKE)
+        return fail(t, o, TLS13_ALERT_UNEXPECTED_MESSAGE, "握手メッセージの途中に別の種類のレコード");
     switch (type) {
     case CT_HANDSHAKE:
         return on_handshake_bytes(t, d, n, o);
     case CT_ALERT:
         if (n != 2) return fail(t, o, TLS13_ALERT_DECODE_ERROR, "alert の長さ");
         t->alert_recv = d[1];
-        t->state = (d[1] == TLS13_ALERT_CLOSE_NOTIFY) ? TLS13_ST_CLOSED : TLS13_ST_FAILED;
-        if (d[1] != TLS13_ALERT_CLOSE_NOTIFY) t->why = "相手から alert";
-        return d[1] == TLS13_ALERT_CLOSE_NOTIFY ? 0 : -1;
+        if (d[1] == TLS13_ALERT_CLOSE_NOTIFY) {
+            /* 相手が書き込みを閉じた。**こちらも close_notify を送ってから閉じる**(RFC 8446 6.1:
+             * 誤りの alert を送っていない限り、書き込みを閉じる前に close_notify を送る MUST)。
+             * 以前は受けたら CLOSED にするだけで、nvmet_tls_close() は OPEN のときしか送らなかったので
+             * 相手から閉じたときは一度も送っていなかった。送る alert は out に入り、呼び出し側が吐く。 */
+            if (!t->close_sent && t->tx.on) {
+                static const uint8_t cn[2] = { 1, TLS13_ALERT_CLOSE_NOTIFY };
+                put_enc(o, &t->tx, CT_ALERT, cn, 2);
+                t->close_sent = 1;
+            }
+            t->state = TLS13_ST_CLOSED;
+            return 0;
+        }
+        t->state = TLS13_ST_FAILED;
+        t->why = "相手から alert";
+        return -1;
     case CT_APPDATA:
         if (t->state != TLS13_ST_OPEN) return fail(t, o, TLS13_ALERT_UNEXPECTED_MESSAGE, "握手の前の application_data");
         if (d == app + *applen) {   /* 直接復号した */
@@ -1033,7 +1197,7 @@ int tls13_input(tls13_t *t, const uint8_t *in, size_t n,
          * バッファへ写さずにその場から直接復号する。** 自作の送り手は 1 レコード =
          * 1 セグメントで送るのでほぼ毎回ここを通る。入力は書き換えない(復号は平文の
          * 受け取り先へ。入り切らないなら近道を使わない)。 */
-        if (t->rlen == 0 && n >= 5 && t->rx.on && in[0] == CT_APPDATA && in[1] == 3) {
+        if (t->rlen == 0 && n >= 5 && t->rx.on && in[0] == CT_APPDATA) {   /* 版の 2 バイトは見ない(5.1)*/
             const size_t rl = 5u + rd16(in + 3);
             if (rl <= n && rl <= sizeof(t->rbuf) && rl >= 5u + 17u && *applen + (rl - 5u - 16u) <= appcap) {
                 rc = on_record(t, (uint8_t *)(uintptr_t)in, rl, &o, app, appcap, applen);
@@ -1056,15 +1220,22 @@ int tls13_input(tls13_t *t, const uint8_t *in, size_t n,
         in += take;
         n -= take;
         if (t->rlen < 5) continue;
-        /* **ヘッダが揃ったらすぐ種別と版を確かめる。** TLS を使わないホストの平文の
+        /* **ヘッダが揃ったらすぐ種別を確かめる。** TLS を使わないホストの平文の
          * ICReq(先頭 0x00)を長さだけ見て待つと、ありもしない残りを待って
-         * ホストが諦めるまで黙ることになる(実機で踏んだ)。 */
-        if (t->rbuf[0] < CT_CCS || t->rbuf[0] > CT_APPDATA || t->rbuf[1] != 3) {
+         * ホストが諦めるまで黙ることになる(実機で踏んだ)。
+         * legacy_record_version(2 バイト目と 3 バイト目)は**見ない**(RFC 8446 5.1: どんな目的にも
+         * 使ってはならない。最初の ClientHello は 0x0301 のこともある)。以前は 2 バイト目が 3 で
+         * なければ断っていた。 */
+        if (t->rbuf[0] < CT_CCS || t->rbuf[0] > CT_APPDATA) {
             rc = fail(t, &o, TLS13_ALERT_UNEXPECTED_MESSAGE, "TLS のレコードでない(TLS を使わないホストか)");
             break;
         }
+        /* 長さの上限(5.1 / 5.2 の MUST、超えたら record_overflow): 平文のレコード(TLSPlaintext)は
+         * 2^14、暗号文(TLSCiphertext、外側の種別が application_data)は 2^14 + 256。
+         * 以前は平文のレコードも 2^14 + 256 まで受けていた。 */
+        const size_t lim = (t->rbuf[0] == CT_APPDATA) ? TLS13_PLAIN_MAX + 256u : TLS13_PLAIN_MAX;
         want = 5u + rd16(t->rbuf + 3);
-        if (want > sizeof(t->rbuf)) {
+        if (want - 5u > lim || want > sizeof(t->rbuf)) {
             rc = fail(t, &o, TLS13_ALERT_RECORD_OVERFLOW, "レコードが大きすぎる");
             break;
         }
@@ -1099,7 +1270,8 @@ size_t tls13_seal2(tls13_t *t, const void *p1, size_t l1, const void *p2, size_t
 
 size_t tls13_close(tls13_t *t, uint8_t *out) {
     static const uint8_t a[2] = { 1, TLS13_ALERT_CLOSE_NOTIFY };
-    if (!t->tx.on) return 0;
+    if (!t->tx.on || t->close_sent) return 0;
+    t->close_sent = 1;
     return seal_record(&t->tx, CT_ALERT, a, 2, out);
 }
 

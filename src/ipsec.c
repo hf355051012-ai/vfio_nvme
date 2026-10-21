@@ -21,7 +21,8 @@ void eth_rx_set_hw_csum_ok(int v);
 #define ESP_IV_LEN    8u
 #define ESP_ICV_LEN   16u
 #define IKE_PORT      500u
-#define IKE_NATT_PORT 4500u
+/* ESN を使わないので、送信の順序番号は 32 ビットで使い切る(RFC 4303 2.2 / 3.3.3)。 */
+#define ESP_SEQ_LAST  0xFFFFFFFFull
 /* NIC の送信スロット 1 つにつき 1 つ(送信はゼロコピーで、NIC が読み終えるまで書き換えられない。
  * 以前は 16 個を slot % 16 で使い回していて、17 個以上が同時に載ると読み終える前に上書きした)。 */
 #define OUT_SLOTS     ETH_TX_RING_SIZE
@@ -37,9 +38,12 @@ typedef struct {
     volatile uint64_t seq_out;     /* 次に送る順序番号 - 1 */
     uint32_t rp_top;               /* 受け取った最大の順序番号 */
     uint64_t rp_map;               /* rp_top から下 64 個を受けたか */
+    smp_spinlock_t rp_lock;        /* 再送攻撃の窓の「確かめ直して進める」を守る(esp_input の説明)*/
+    uint32_t seq_warned;           /* 順序番号を使い切ったことを 1 回だけ表示した */
     /* 統計 */
     volatile uint64_t tx_pkts, tx_bytes, rx_pkts, rx_bytes;
     volatile uint32_t rx_auth_fail, rx_replay, tx_no_sa, rx_plain_drop, tx_frag_drop;
+    volatile uint32_t tx_seq_exhausted, rx_pad_bad;
 } ipsec_peer_t;
 
 volatile uint32_t g_ipsec_npol;
@@ -86,10 +90,28 @@ int ipsec_policy_match(uint32_t ip)
     return g_ipsec_npol && peer_find(ip) != NULL;
 }
 
+/*=================================================================
+ * 受信の SPI が、ip 以外の相手の SA で使われているか。
+ *
+ * 受信は SPI だけで SA を引く(ipsec_esp_input())ので、**相手が違っても受信の SPI が
+ * 重なってはいけない**(RFC 4301 4.1: 受け手は SPI で SA を一意に決める)。重なると、
+ * 片方の相手のパケットがもう片方の鍵で開けられずに捨てられ、どちらの SA が当たるかは
+ * 表の並び順で決まる。ike.c が SPI を選ぶときにこれで確かめて選び直す。
+ * 既定の SA が無い相手(up = 0)の spi_in も数える(作り直しの途中で古い値を使い回さない)。
+ * ===============================================================*/
+int ipsec_spi_in_used(uint32_t spi, uint32_t except_ip)
+{
+    for (unsigned i = 0; i < IPSEC_MAX_PEERS; i++)
+        if (s_peer[i].used && s_peer[i].peer != except_ip && s_peer[i].spi_in == spi) return 1;
+    return 0;
+}
+
 int ipsec_sa_install(uint32_t ip, uint32_t spi_in, const uint8_t *key_in,
                      uint32_t spi_out, const uint8_t *key_out, size_t aes_klen)
 {
     if (aes_klen != 16u && aes_klen != 32u) return -1;
+    /* 1〜255 は IANA の予約、0 はローカルで使う値(RFC 4303 2.1)。受信の SPI はほかの相手と重ねない。 */
+    if (spi_in < 256u || ipsec_spi_in_used(spi_in, ip)) return -1;
     ipsec_peer_t *p = peer_find(ip);
     if (!p) {
         if (ipsec_policy_add(ip) < 0) return -1;
@@ -104,8 +126,10 @@ int ipsec_sa_install(uint32_t ip, uint32_t spi_in, const uint8_t *key_in,
     p->spi_in = spi_in;
     p->spi_out = spi_out;
     p->seq_out = 0;
+    p->seq_warned = 0;
     p->rp_top = 0;
     p->rp_map = 0;
+    p->rp_lock = 0;
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
     p->up = 1;
     return 0;
@@ -119,6 +143,14 @@ void ipsec_sa_del(uint32_t ip)
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
     crypto_wipe(&p->k_in, sizeof(p->k_in));
     crypto_wipe(&p->k_out, sizeof(p->k_out));
+}
+
+/* 受信の SPI が spi_in の SA のときだけ消す。IKE SA を置き換えた直後に、古い IKE SA の
+ * Delete(相手から / こちらの後始末)で新しい子 SA を消さないため(相手ごとに ESP の SA は 1 つ)。 */
+void ipsec_sa_del_if(uint32_t ip, uint32_t spi_in)
+{
+    ipsec_peer_t *p = peer_find(ip);
+    if (p && p->up && p->spi_in == spi_in) ipsec_sa_del(ip);
 }
 
 int ipsec_sa_up(uint32_t ip)
@@ -181,11 +213,25 @@ static void l4_csum(const uint8_t *ip, uint8_t proto, uint8_t *l4, size_t len)
     l4[off + 1] = (uint8_t)c;
 }
 
-static int is_ike(uint8_t proto, const uint8_t *l4, size_t len)
+/*=================================================================
+ * 方針を持つ相手との間で、ESP で包まずに通してよい平文か(IKE だけ)。
+ *
+ * RFC 4301 5.1 / 5.2 は、SPD の BYPASS を「IKE が自分の SA を作るための通信」に絞ることを
+ * 求める。**素通しにするのは自分の IKE(UDP 500)だけ**:
+ *   - 受信(in = 1): 宛先ポートが 500(ike.c が待ち受けるポート)。送信元は見ない
+ *     (相手の IKE は 500 から送ってくるが、NAT の後ろなら変わりうる。届け先が自分の
+ *     IKE である限り、ike.c が中身で判断する)。
+ *   - 送信(in = 0): 送信元ポートが 500(ike.c は必ず 500 から送る)。
+ * **4500(NAT-T)は素通しにしない。** NAT-T(RFC 3948)は実装していないので、4500 の
+ * 平文を通すと「IKE でも ESP でもない UDP」がその相手との間で暗号化されずに流れる
+ * 抜け道になる。以前は 500 / 4500 を送信元・宛先のどちらで見ても通していて、
+ * たとえば宛先 500 の任意のアプリの UDP や、送信元 4500 の UDP も平文で出ていた。
+ * ===============================================================*/
+static int is_ike(uint8_t proto, const uint8_t *l4, size_t len, int in)
 {
     if (proto != IP_PROTO_UDP || len < 8) return 0;
-    const uint16_t sp = (uint16_t)((l4[0] << 8) | l4[1]), dp = (uint16_t)((l4[2] << 8) | l4[3]);
-    return sp == IKE_PORT || dp == IKE_PORT || sp == IKE_NATT_PORT || dp == IKE_NATT_PORT;
+    const uint16_t port = in ? (uint16_t)((l4[2] << 8) | l4[3]) : (uint16_t)((l4[0] << 8) | l4[1]);
+    return port == IKE_PORT;
 }
 
 /* ---------------------------------------------------------------- 送信 */
@@ -201,6 +247,23 @@ static int esp_send_one(ipsec_peer_t *p, uint8_t *frame, uint32_t flen, int asyn
     uint8_t *l4 = ip + 20;
     const uint32_t l4len = tot - 20u;
     l4_csum(ip, proto, l4, l4len);
+
+    /* 順序番号。**ESN を使わないので 2^32 - 1 が最後で、それを超えて送ってはいけない**
+     * (RFC 4303 2.2 / 3.3.3: 送り手は順序番号を一周させてはならず、その前に SA を
+     * 作り直す)。この実装は SA を作り直さない(ike.h)ので、使い切ったら送らずに捨てて数える
+     * (`ipsec stat` の「順序番号切れ」)。続けるには `ipsec down` / `up` で SA を作り直す。
+     * 一周させると相手の再送攻撃の窓が新しいパケットを古いものとして捨てるうえ、
+     * 同じ (鍵, IV) を二度使う(GCM では致命的。IV は順序番号から作る)。
+     * ホットパスに足したのは比較 1 個(25 Gb/s・9KB でも 2^32 個は約 3.5 時間かかる)。 */
+    const uint64_t seq = __atomic_add_fetch(&p->seq_out, 1u, __ATOMIC_RELAXED);
+    if (seq > ESP_SEQ_LAST) {
+        p->tx_seq_exhausted++;
+        if (__atomic_exchange_n(&p->seq_warned, 1u, __ATOMIC_RELAXED) == 0u)
+            uart_printf("[ipsec] %u.%u.%u.%u: 送信の順序番号を使い切った(2^32 - 1)。以後は送らずに捨てる"
+                        "(ipsec down / up で SA を作り直す)\n", p->peer >> 24, (p->peer >> 16) & 255u,
+                        (p->peer >> 8) & 255u, p->peer & 255u);
+        return 0;   /* SA が無いときと同じく黙って捨てる(TCP は再送するが、それも捨てる)*/
+    }
 
     /* 送り先は、NIC の送信スロットに対応させた作業場所(NIC が読み終えるまで書き換えない)。 */
     const unsigned core = smp_core_index();
@@ -218,7 +281,6 @@ static int esp_send_one(ipsec_peer_t *p, uint8_t *frame, uint32_t flen, int asyn
     oip[9] = IP_PROTO_ESP;
     ip_csum(oip);
     uint8_t *esp = oip + 20;
-    const uint64_t seq = __atomic_add_fetch(&p->seq_out, 1u, __ATOMIC_RELAXED);
     wr32be(esp, p->spi_out);
     wr32be(esp + 4, (uint32_t)seq);
     uint8_t *iv = esp + ESP_HDR_LEN;
@@ -247,7 +309,7 @@ static ipsec_peer_t *out_target(const uint8_t *frame, uint32_t flen)
     if ((ip[0] >> 4) != 4) return NULL;
     ipsec_peer_t *p = peer_find(rd32be(ip + 16));
     if (!p) return NULL;
-    if ((ip[0] & 0x0Fu) == 5u && is_ike(ip[9], ip + 20, flen - ETH_HDR_LEN - 20u)) return NULL;
+    if ((ip[0] & 0x0Fu) == 5u && is_ike(ip[9], ip + 20, flen - ETH_HDR_LEN - 20u, 0)) return NULL;
     return p;
 }
 
@@ -342,6 +404,14 @@ int ipsec_out_lso(const void *hdr, uint16_t hdr_len, const void *payload,
 
 /* ---------------------------------------------------------------- 受信 */
 
+/* 順序番号 seq を既に受けたか / 窓より古いか(受けてはいけないなら 1)。 */
+static inline int replay_seen(const ipsec_peer_t *p, uint32_t seq)
+{
+    const uint32_t top = p->rp_top;
+    return seq == 0 || (top >= 64u && seq <= top - 64u) ||
+           (seq <= top && ((p->rp_map >> (top - seq)) & 1u));
+}
+
 void ipsec_esp_input(const uint8_t *ipc, size_t len, const uint8_t *src_mac)
 {
     uint8_t *ip = (uint8_t *)(uintptr_t)ipc;   /* 受信バッファはその場で復号してよい */
@@ -356,9 +426,9 @@ void ipsec_esp_input(const uint8_t *ipc, size_t len, const uint8_t *src_mac)
         s_rx_unknown_spi++;
         return;
     }
-    /* 再送攻撃の窓(64)。認証の前に「明らかに古い」ものだけ捨て、窓の更新は認証の後。 */
-    if (seq == 0 || (p->rp_top >= 64u && seq <= p->rp_top - 64u) ||
-        (seq <= p->rp_top && (p->rp_map >> (p->rp_top - seq)) & 1u)) {
+    /* 再送攻撃の窓(64)。認証の前に「明らかに古い」ものだけ捨て、窓の更新は認証の後
+     * (RFC 4303 3.4.3: 窓を進めるのは完全性の検証が通ってから)。 */
+    if (replay_seen(p, seq)) {
         p->rx_replay++;
         return;
     }
@@ -371,6 +441,26 @@ void ipsec_esp_input(const uint8_t *ipc, size_t len, const uint8_t *src_mac)
         p->rx_auth_fail++;
         return;
     }
+    /* **窓は「確かめ直して進める」をロックの中で 1 回で行う。** 上の確かめはロックの外の
+     * 早い足切りで、同じ順序番号の 2 個が別々のコアで同時に復号まで進むと、両方が窓を
+     * 通ってしまう(再送攻撃の検出が抜ける)。窓の rp_top と rp_map も 2 語なので、
+     * 同時に書くと壊れる。
+     *
+     * 同じ SA を 2 つのコアが同時に受ける前提は崩れうる:
+     *   - RSS の TIR は TCP の 4 つ組でハッシュする設定(mlx5.c)で、ESP は ポートを持たない。
+     *     ESP の先頭 4 バイト(SPI)をポートとみなすか IP だけで決めるかは NIC 次第で、
+     *     **断片になった ESP(後ろの断片は L4 ヘッダを持たない)は別のハッシュになりうる**。
+     *     組み立ては全コアで 1 つの表(ipfrag.c)で、最後の断片を受けたコアが ESP を渡す。
+     *   - 1 コアで 2 つの PF を回す構成や、netmt を実行中に変えたときも持ち主が変わる。
+     * Linux も xfrm_input() で復号の後に x->lock を取って窓を確かめ直す(xfrm_replay_check +
+     * advance)。ロックは SA ごとで、ふだんは取り合わないので 1 パケットあたり原子命令 2 個
+     * (9KB の AES-GCM に比べて無視できる)。 */
+    smp_spin_lock(&p->rp_lock);
+    if (replay_seen(p, seq)) {
+        smp_spin_unlock(&p->rp_lock);
+        p->rx_replay++;
+        return;
+    }
     if (seq > p->rp_top) {
         const uint32_t d = seq - p->rp_top;
         p->rp_map = (d >= 64u) ? 1u : ((p->rp_map << d) | 1u);
@@ -378,9 +468,21 @@ void ipsec_esp_input(const uint8_t *ipc, size_t len, const uint8_t *src_mac)
     } else {
         p->rp_map |= (uint64_t)1u << (p->rp_top - seq);
     }
+    smp_spin_unlock(&p->rp_lock);
     const uint8_t padlen = ct[ctlen - 2], nh = ct[ctlen - 1];
     if ((uint32_t)padlen + 2u > ctlen) return;
     const uint32_t inner = ctlen - 2u - padlen;
+    /* パディングの中身は 1, 2, 3, ... でなければならない(RFC 4303 2.4。受け手は確かめる
+     * のが SHOULD)。認証の後なので中身は相手が送ったとおりで、食い違うのは相手の実装の
+     * 誤り(Pad Length の位置のずれなど)。そのまま渡すと中身の長さを読み違えた平文を上へ
+     * 渡すことになるので捨てて数える。Linux / こちらの送り手のパディングは 0〜3 バイト
+     * (暗号文を 4 の倍数に揃えるだけ)なので、ふだんの比較は 3 個まで。 */
+    for (uint32_t i = 0; i < padlen; i++) {
+        if (ct[inner + i] != (uint8_t)(i + 1u)) {
+            p->rx_pad_bad++;
+            return;
+        }
+    }
     p->rx_pkts++;
     p->rx_bytes += inner;
     if (nh == 59u) return;   /* 中身無し(ダミー)*/
@@ -407,7 +509,7 @@ int ipsec_rx_drop_plain(uint32_t src_ip, uint8_t proto, const uint8_t *l4, size_
 {
     if (s_via_esp[smp_core_index()]) return 0;
     ipsec_peer_t *p = peer_find(src_ip);
-    if (!p || proto == IP_PROTO_ESP || is_ike(proto, l4, len)) return 0;
+    if (!p || proto == IP_PROTO_ESP || is_ike(proto, l4, len, 1)) return 0;
     p->rx_plain_drop++;
     return 1;
 }
@@ -423,10 +525,11 @@ void ipsec_status(void)
         uart_printf("  %u.%u.%u.%u: SA %s  SPI 受 0x%08x / 送 0x%08x\n", p->peer >> 24, (p->peer >> 16) & 255u,
                     (p->peer >> 8) & 255u, p->peer & 255u, p->up ? "あり" : "なし", p->spi_in, p->spi_out);
         uart_printf("    送 %llu 個 %llu バイト、受 %llu 個 %llu バイト、認証の失敗 %u、再送 %u、"
-                    "SA 無しで捨てた %u、平文を捨てた %u、断片を捨てた %u\n",
+                    "SA 無しで捨てた %u、平文を捨てた %u、断片を捨てた %u、順序番号切れ %u、パディング不正 %u\n",
                     (unsigned long long)p->tx_pkts, (unsigned long long)p->tx_bytes,
                     (unsigned long long)p->rx_pkts, (unsigned long long)p->rx_bytes,
-                    p->rx_auth_fail, p->rx_replay, p->tx_no_sa, p->rx_plain_drop, p->tx_frag_drop);
+                    p->rx_auth_fail, p->rx_replay, p->tx_no_sa, p->rx_plain_drop, p->tx_frag_drop,
+                    p->tx_seq_exhausted, p->rx_pad_bad);
     }
 }
 
@@ -437,5 +540,46 @@ void ipsec_stats_clear(void)
         ipsec_peer_t *p = &s_peer[i];
         p->tx_pkts = p->tx_bytes = p->rx_pkts = p->rx_bytes = 0;
         p->rx_auth_fail = p->rx_replay = p->tx_no_sa = p->rx_plain_drop = p->tx_frag_drop = 0;
+        p->tx_seq_exhausted = p->rx_pad_bad = 0;
     }
+}
+
+/* ---------------------------------------------------------------- 試験用(rfctest sec)*/
+
+int ipsec_test_stats(uint32_t ip, ipsec_test_stats_t *o)
+{
+    const ipsec_peer_t *p = peer_find(ip);
+    if (!p) return -1;
+    o->rx_pkts = (uint32_t)p->rx_pkts;
+    o->rx_replay = p->rx_replay;
+    o->rx_auth_fail = p->rx_auth_fail;
+    o->rx_pad_bad = p->rx_pad_bad;
+    o->rx_plain_drop = p->rx_plain_drop;
+    o->tx_seq_exhausted = p->tx_seq_exhausted;
+    o->spi_in = p->spi_in;
+    o->spi_out = p->spi_out;
+    return 0;
+}
+
+void ipsec_test_set_seq_out(uint32_t ip, uint64_t seq)
+{
+    ipsec_peer_t *p = peer_find(ip);
+    if (p) {
+        p->seq_out = seq;
+        p->seq_warned = 1u;   /* 試験では使い切りの表示を出さない */
+    }
+}
+
+int ipsec_test_send(uint32_t ip, const uint8_t *frame, uint32_t flen)
+{
+    ipsec_peer_t *p = peer_find(ip);
+    static uint8_t f[OUT_BYTES];
+    if (!p || !p->up || flen > sizeof(f)) return -1;
+    memcpy(f, frame, flen);
+    return esp_send_one(p, f, flen, 0);
+}
+
+int ipsec_test_tx_bypass(const uint8_t *frame, uint32_t flen)
+{
+    return out_target(frame, flen) == NULL;
 }

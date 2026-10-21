@@ -95,7 +95,83 @@ void ip_roce_dup_show(int clear)
 
 #define IP_DEFAULT_TTL 64u
 
-static uint16_t s_ip_id[SMP_MAX_CORES];  /* IP identification: 単純増加カウンタ(固定値でも可) */
+/* 送るデータグラムの TTL と TOS(RFC 1122 3.2.1.7 は TTL を設定できること、3.2.1.6 は
+ * TOS を上位から設定できることを MUST とする)。シェルの `ipttl` / `iptos` で変える。 */
+volatile uint8_t g_ip_ttl = IP_DEFAULT_TTL;
+volatile uint8_t g_ip_tos = 0;
+
+/* IP の Identification。**DF を立てる TCP(分割されない = atomic)と、分割しうる
+ * UDP / ICMP とで数え方を分ける**(RFC 6864)。atomic な方はどんな値でもよい。
+ * 分割しうる方は、同じ (送信元, 宛先, プロトコル) で寿命の間に重ならないことが
+ * MUST なので、コアごとの数え始めを 4096 ずつずらし、コアどうしで重ならないように
+ * する(TCP の大量の送信でこちらの番号を消費しない)。 */
+static uint16_t s_ip_id[SMP_MAX_CORES];
+static uint16_t s_ip_id_frag[SMP_MAX_CORES];
+
+static inline uint16_t ip_next_frag_id(void)
+{
+    unsigned core = smp_core_index();
+    uint16_t n = s_ip_id_frag[core]++;
+    return (uint16_t)(((core & 0xFu) << 12) | (n & 0x0FFFu));
+}
+
+/*=================================================================
+ * 受信したデータグラムの送信元が、1 台の機器を指す正しいアドレスか
+ * (RFC 1122 3.2.1.3。正しくないものは黙って捨てる MUST)。
+ * 0.0.0.0、ブロードキャスト(全 1 と、自分のサブネットの全 1)、
+ * マルチキャスト(224/4)、予約(240/4)、ループバック(127/8)は正しくない。
+ * **比較が数個だけ**なので、TCP の受信ごとに通しても費用は無視できる。
+ * ===============================================================*/
+static inline int ip_src_valid(uint32_t s)
+{
+    if (s == 0u || (s >> 28) >= 0xEu || (s >> 24) == 127u) return 0;
+    const netif_t *ni = g_active_ctx;
+    if (ni && ni->netmask != 0u && ni->netmask != 0xFFFFFFFFu &&
+        (s & ~ni->netmask) == ~ni->netmask && (s & ni->netmask) == (ni->ip & ni->netmask)) {
+        return 0;   /* 自分のサブネットのブロードキャスト */
+    }
+    return 1;
+}
+
+/*=================================================================
+ * 宛先が、自分のサブネットか全体へのブロードキャストか(RFC 1122 3.3.6)。
+ * ===============================================================*/
+static inline int ip_dst_is_bcast(uint32_t d)
+{
+    if (d == 0xFFFFFFFFu) return 1;
+    const netif_t *ni = g_active_ctx;
+    return ni && ni->netmask != 0u && ni->netmask != 0xFFFFFFFFu &&
+           (d & ~ni->netmask) == ~ni->netmask && (d & ni->netmask) == (ni->ip & ni->netmask);
+}
+
+/*=================================================================
+ * ICMP エラーに付ける「元のデータグラムの IP ヘッダ + 続く 8 バイト」を作る
+ * (RFC 792 / RFC 1122 3.2.2)。組み立てたデータグラムなら、最後に届いた断片の
+ * ヘッダではなく、組み立て後の姿(オフセット 0、MF 無し、全長)と、先頭 8 バイト
+ * (上位のヘッダ)を引用する。そうしないと相手は誰宛てのエラーか分からない。
+ *
+ * 引数:
+ *   out            - 書き込み先(60 + 8 バイト以上)
+ *   hdr / hdr_len  - 受信した IP ヘッダ
+ *   payload / plen - 上位へ渡すペイロード(組み立て後なら全体)
+ *   reasm          - 1 なら組み立てたデータグラム
+ * 戻り値:
+ *   書いたバイト数
+ * ===============================================================*/
+static size_t ip_icmp_quote(uint8_t *out, const volatile uint8_t *hdr, size_t hdr_len,
+                            const uint8_t *payload, size_t plen, int reasm)
+{
+    for (size_t i = 0; i < hdr_len; i++) out[i] = hdr[i];
+    if (reasm) {
+        wr16be(out + IP_OFF_TOTAL_LEN, (uint16_t)(hdr_len + plen));
+        wr16be(out + IP_OFF_FLAGS_FRAG, (uint16_t)(rd16be(out + IP_OFF_FLAGS_FRAG) & 0x4000u));
+        wr16be(out + IP_OFF_CHECKSUM, 0);
+        wr16be(out + IP_OFF_CHECKSUM, inet_checksum(out, hdr_len));
+    }
+    size_t d = plen < 8u ? plen : 8u;
+    for (size_t i = 0; i < d; i++) out[hdr_len + i] = payload[i];
+    return hdr_len + d;
+}
 
 /* 受信した断片を観測するフック(検証専用、既定は無効)。ip.c は断片を
  * 再構成しないので、これを登録しないと送信側の分割が正しいかを確かめられない。 */
@@ -158,13 +234,17 @@ void ip_handle_frame(const uint8_t *payload, size_t len, const uint8_t *src_mac)
         uart_printf("[IP] 非対応バージョン (version=%u) 無視\n", version);
         return;
     }
-    if (ihl != 5) {
-        uart_printf("[IP] オプション付きIPヘッダ(IHL=%u)は未対応、無視\n", ihl);
+    /* **オプション付きのヘッダも受け取る**(RFC 1122 3.2.1.8:知らないオプションは
+     * 黙って無視する MUST)。このソフトはオプションを使わないので、ヘッダ長だけ
+     * 正しく読み飛ばす。IHL が 5 未満は形が壊れている。 */
+    size_t hdr_len = (size_t)ihl * 4u;
+    if (ihl < 5u || hdr_len > len) {
+        uart_printf("[IP] IHL が不正 (IHL=%u len=%u) 無視\n", ihl, (unsigned)len);
         return;
     }
 
     if (!eth_rx_hw_csum_ok()) {
-        uint16_t verify = inet_checksum(in, sizeof(ip_header_t));
+        uint16_t verify = inet_checksum(in, hdr_len);
         if (verify != 0) {
             uart_printf("[IP] ヘッダチェックサム不正 (計算結果=0x%04X、0であるべき) 無視\n",
                         verify);
@@ -178,7 +258,7 @@ void ip_handle_frame(const uint8_t *payload, size_t len, const uint8_t *src_mac)
                     total_len, (unsigned)len);
         return;
     }
-    if (total_len < sizeof(ip_header_t)) {
+    if (total_len < hdr_len) {
         uart_printf("[IP] total_lengthがヘッダ長未満 (total_len=%u) 無視\n", total_len);
         return;
     }
@@ -186,17 +266,32 @@ void ip_handle_frame(const uint8_t *payload, size_t len, const uint8_t *src_mac)
     /* RoCEv2(UDP 4791)は NIC の RDMA の受信が QP へ配るもので、ここへ届いた写しは宛先を問わず
      * 数えて捨てる(`rocedup`。ICMP のエラーも返さない)。宛先の判定より前に置くのは、
      * 自分以外の宛先の写しも数えるため。 */
-    if (in[IP_OFF_PROTOCOL] == IP_PROTO_UDP && total_len >= sizeof(ip_header_t) + 4u &&
-        rd16be(in + sizeof(ip_header_t) + 2) == s_roce_dup_port) {
+    if (in[IP_OFF_PROTOCOL] == IP_PROTO_UDP && total_len >= hdr_len + 4u &&
+        rd16be(in + hdr_len + 2) == s_roce_dup_port) {
         uint8_t d[4] = { in[IP_OFF_DST_IP], in[IP_OFF_DST_IP + 1], in[IP_OFF_DST_IP + 2], in[IP_OFF_DST_IP + 3] };
-        roce_dup_count(payload + sizeof(ip_header_t), (uint32_t)(total_len - sizeof(ip_header_t)), d);
+        roce_dup_count(payload + hdr_len, (uint32_t)(total_len - hdr_len), d);
         return;
     }
 
+    /* 宛先は自分のアドレス。ブロードキャストは UDP だけへ渡す(RFC 1122 3.3.6 は
+     * ブロードキャストを宛先として認識することを MUST とする。TCP はブロードキャストを
+     * 使わない。ICMP Echo への応答もしない -- 3.2.2.6 が黙って捨ててよいとしている)。 */
     uint32_t dst_ip = rd32be(in + IP_OFF_DST_IP);
+    int dst_bcast = 0;
     if (dst_ip != NET_SELF_IP) {
-        return;
+        if (in[IP_OFF_PROTOCOL] != IP_PROTO_UDP || !ip_dst_is_bcast(dst_ip)) return;
+        dst_bcast = 1;
     }
+
+    /* 送信元が 1 台の機器を指していなければ黙って捨てる(RFC 1122 3.2.1.3 の MUST)。
+     * ブロードキャストやマルチキャストを名乗るデータグラムに ICMP エラーを返すと、
+     * 1 通で全員へ撒くことになる。 */
+    if (!ip_src_valid(rd32be(in + IP_OFF_SRC_IP))) return;
+    /* **リンク層のブロードキャスト / マルチキャストで届いたのに IP の宛先が自分だけ**
+     * というデータグラムは黙って捨てる(RFC 1122 3.3.6 の SHOULD)。ICMP エラーも
+     * 返さない(3.2.2 の MUST NOT)。 */
+    int l2_mcast = eth_rx_l2_multicast();
+    if (l2_mcast && !dst_bcast) return;
 
     uint8_t protocol = in[IP_OFF_PROTOCOL];
     uint8_t src_ip[4];
@@ -205,9 +300,9 @@ void ip_handle_frame(const uint8_t *payload, size_t len, const uint8_t *src_mac)
     src_ip[2] = in[IP_OFF_SRC_IP + 2];
     src_ip[3] = in[IP_OFF_SRC_IP + 3];
 
-    size_t hdr_len = sizeof(ip_header_t);
     size_t ip_payload_len = (size_t)total_len - hdr_len;
     const uint8_t *ip_payload = payload + hdr_len;
+    int reasm = 0;
 
     /* 断片化されたデータグラムは組み立ててから上位へ渡す。**断片のまま
      * 渡してはいけない**(TCP/ICMP が壊れたペイロードを読む)。MF(bit13)が
@@ -224,23 +319,46 @@ void ip_handle_frame(const uint8_t *payload, size_t len, const uint8_t *src_mac)
             s_frag_observer(rd16be(in + IP_OFF_ID), (uint16_t)frag_off, more,
                             protocol, ip_payload, (uint16_t)ip_payload_len);
         }
+        /* IPv4 のデータグラムは IP ヘッダを含めて 65535 バイトまで(RFC 791)。
+         * 組み立てた後にそれを越えるものは作らせない。 */
+        if (frag_off + ip_payload_len + hdr_len > 65535u) {
+            uart_printf("[IP] 断片を組み立てると 65535 バイトを越える (off=%u len=%u) 破棄\n",
+                        (unsigned)frag_off, (unsigned)ip_payload_len);
+            return;
+        }
         netaddr_t fs = netaddr_v4(ip_from_octets(src_ip[0], src_ip[1], src_ip[2], src_ip[3]));
         netaddr_t fd = netaddr_v4(dst_ip);
         const uint8_t *whole = NULL;
         uint32_t whole_len = 0;
         if (!ipfrag_input(&fs, &fd, rd16be(in + IP_OFF_ID), protocol,
                           frag_off, more, ip_payload, (uint32_t)ip_payload_len,
-                          &whole, &whole_len)) {
+                          payload, (uint32_t)(hdr_len + (ip_payload_len < 8u ? ip_payload_len : 8u)),
+                          src_mac, &whole, &whole_len, NULL)) {
             return;  /* まだそろっていない */
         }
         ip_payload     = whole;
         ip_payload_len = whole_len;
+        reasm = 1;
     }
 
     if (g_ipsec_npol) {
         const uint32_t sip = ip_from_octets(src_ip[0], src_ip[1], src_ip[2], src_ip[3]);
         if (protocol == IP_PROTO_ESP) {
-            ipsec_esp_input(payload, total_len, src_mac);
+            /* ESP の受け口は「20 バイトの IP ヘッダ + ESP」を受け取り、その場で復号する。
+             * **組み立てたデータグラムとオプション付きのヘッダ**は、20 バイトの
+             * ヘッダを付け直した写しを渡す(最後の断片だけを渡すと復号できない)。 */
+            if (reasm || hdr_len != sizeof(ip_header_t)) {
+                static uint8_t esp_buf[SMP_MAX_CORES][20u + IPFRAG_MAX_LEN] __attribute__((aligned(64)));
+                uint8_t *b = esp_buf[smp_core_index()];
+                for (size_t i = 0; i < 20u; i++) b[i] = in[i];
+                b[IP_OFF_VER_IHL] = 0x45u;
+                wr16be(b + IP_OFF_TOTAL_LEN, (uint16_t)(20u + ip_payload_len));
+                wr16be(b + IP_OFF_FLAGS_FRAG, 0);
+                for (size_t i = 0; i < ip_payload_len; i++) b[20u + i] = ip_payload[i];
+                ipsec_esp_input(b, 20u + ip_payload_len, src_mac);
+            } else {
+                ipsec_esp_input(payload, total_len, src_mac);
+            }
             return;
         }
         /* IPsec の方針を持つ相手からの平文(IKE 以外)は捨てる。 */
@@ -258,17 +376,23 @@ void ip_handle_frame(const uint8_t *payload, size_t len, const uint8_t *src_mac)
         dst_ip_oct[1] = in[IP_OFF_DST_IP + 1];
         dst_ip_oct[2] = in[IP_OFF_DST_IP + 2];
         dst_ip_oct[3] = in[IP_OFF_DST_IP + 3];
-        if (udp_input(ip_payload, ip_payload_len, src_ip, dst_ip_oct, src_mac) == -1) {
-            /* 待ち受けの無いポート宛 -- Port Unreachable を返す。 */
-            icmp_send_dest_unreach(ICMP_CODE_PORT_UNREACH, payload, len, src_ip, src_mac);
+        if (udp_input(ip_payload, ip_payload_len, src_ip, dst_ip_oct, src_mac) == -1 &&
+            !dst_bcast) {
+            /* 待ち受けの無いポート宛 -- Port Unreachable を返す。ブロードキャスト宛てには
+             * 返さない(RFC 1122 3.2.2 の MUST NOT。全員が一斉に返すことになる)。 */
+            uint8_t q[60u + 8u];
+            size_t qn = ip_icmp_quote(q, in, hdr_len, ip_payload, ip_payload_len, reasm);
+            icmp_send_dest_unreach(ICMP_CODE_PORT_UNREACH, q, qn, src_ip, src_mac);
         }
     } else {
         /* 上位が居ないプロトコルは Protocol Unreachable を返す。相手を無駄に
-         * 待たせないため。ICMP エラーに対して ICMP エラーは返さない(RFC 1812)
+         * 待たせないため。ICMP エラーに対して ICMP エラーは返さない(RFC 1122 3.2.2)
          * が、ここへ来るのは ICMP/TCP/UDP 以外なのでその条件には当たらない。 */
         uart_printf("[IP] 未対応プロトコル (protocol=%u)、Protocol Unreachable を返します\n",
                     protocol);
-        icmp_send_dest_unreach(ICMP_CODE_PROTO_UNREACH, payload, len, src_ip, src_mac);
+        uint8_t q[60u + 8u];
+        size_t qn = ip_icmp_quote(q, in, hdr_len, ip_payload, ip_payload_len, reasm);
+        icmp_send_dest_unreach(ICMP_CODE_PROTO_UNREACH, q, qn, src_ip, src_mac);
     }
 }
 
@@ -309,11 +433,11 @@ static void ip_build_header_frag(uint8_t *buf, const uint8_t dst_ip[4], const ui
     uint16_t total_len = (uint16_t)(sizeof(ip_header_t) + payload_len);
 
     iph[IP_OFF_VER_IHL] = 0x45;  /* version=4, IHL=5(20バイト、オプション無し) */
-    iph[IP_OFF_TOS]     = 0;
+    iph[IP_OFF_TOS]     = g_ip_tos;
     wr16be(iph + IP_OFF_TOTAL_LEN, total_len);
     wr16be(iph + IP_OFF_ID, id);
     wr16be(iph + IP_OFF_FLAGS_FRAG, flags_frag);
-    iph[IP_OFF_TTL]      = IP_DEFAULT_TTL;
+    iph[IP_OFF_TTL]      = g_ip_ttl;
     iph[IP_OFF_PROTOCOL] = protocol;
     wr16be(iph + IP_OFF_CHECKSUM, 0);  /* チェックサム計算前に0クリア */
     for (int i = 0; i < 4; i++) iph[IP_OFF_SRC_IP + i] = self_ip[i];
@@ -323,11 +447,17 @@ static void ip_build_header_frag(uint8_t *buf, const uint8_t dst_ip[4], const ui
     wr16be(iph + IP_OFF_CHECKSUM, csum);
 }
 
+/*=================================================================
+ * TCP 用。**DF(分割禁止)を立てる**(RFC 1191 6.5:経路 MTU 探索をする経路の
+ * データグラムは DF を立てるべき)。立てないと、MTU の小さい経路のルータが
+ * 黙って分割し、Fragmentation Needed が返らないので経路 MTU を学べない。
+ * 分割されない(atomic な)データグラムなので、ID は数え方を問わない(RFC 6864)。
+ * ===============================================================*/
 void ip_build_header(uint8_t *buf, const uint8_t dst_ip[4], const uint8_t dst_mac[6],
                       uint8_t protocol, uint16_t payload_len)
 {
     ip_build_header_frag(buf, dst_ip, dst_mac, protocol, payload_len,
-                          s_ip_id[smp_core_index()]++, 0u);
+                          s_ip_id[smp_core_index()]++, 0x4000u);
 }
 
 /*=================================================================
@@ -357,7 +487,8 @@ net_buf_t *ip_prepare_send_buf(const uint8_t dst_ip[4], const uint8_t dst_mac[6]
         return NULL;
     }
 
-    ip_build_header(nb->data, dst_ip, dst_mac, protocol, payload_len);
+    /* UDP / ICMP は経路で分割されてよいので DF を立てない。ID は分割しうる側の数え方。 */
+    ip_build_header_frag(nb->data, dst_ip, dst_mac, protocol, payload_len, ip_next_frag_id(), 0u);
     nb->len = (uint16_t)(ETH_HDR_LEN + sizeof(ip_header_t) + payload_len);
     return nb;
 }
@@ -423,7 +554,7 @@ static int ip_send_fragmented(const uint8_t dst_ip[4], const uint8_t dst_mac[6],
         return -1;
     }
 
-    const uint16_t id = s_ip_id[smp_core_index()]++;  /* 全断片で共通 */
+    const uint16_t id = ip_next_frag_id();  /* 全断片で共通 */
     uint16_t off = 0;
     unsigned count = 0;
 

@@ -18,7 +18,7 @@ BUILD_DIR := build
 TARGET    := $(BUILD_DIR)/vfio_nvme
 
 # VFIO HAL(コンソール / タイマ / SMP / DMA / VFIO / エントリ)。
-PLATFORM_OBJS := console hal_timer hal_smp hal_dma vfio main
+PLATFORM_OBJS := console hal_timer hal_smp hal_dma vfio main rfctest_tcp rfctest_ipv6 rfctest_sec rfctest_iscsi rfctest_ipv4
 
 # アーキ非依存コア: mlx5 ドライバ + RoCEv2/NVMe-oF + TCP/IP + 計測基盤。
 CORE_OBJS := crc32c crypto crypto_dh crypto_aes crypto_aes_x86 crypto_x25519 crypto_mlkem tls13 timer mlx5 mlx5_qp timestamp netif net_buf \

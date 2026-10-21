@@ -11,6 +11,50 @@
 
 volatile uint32_t g_neigh_cache_ttl_ms = NEIGH_CACHE_TTL_DEFAULT_MS;
 
+/* 実際に使う有効期間(RFC 4861 の ReachableTime)と、それを決めたときの基準値・時刻。 */
+static volatile uint32_t s_reach_ms;
+static volatile uint32_t s_reach_base;
+static volatile uint64_t s_reach_at;
+
+/*=================================================================
+ * 実際に使う有効期間(ミリ秒)を返す。基準値(g_neigh_cache_ttl_ms、RFC 4861 の
+ * BaseReachableTime)の 0.5〜1.5 倍の一様乱数で、基準値が変わったときと、
+ * 3 時間ごとに引き直す(RFC 4861 6.3.2)。
+ *
+ * **乱数でずらすのは、同じ時刻に覚えた相手の期限が一斉に切れて、確認の
+ * 問い合わせが同時に出るのを避けるため**(RFC 4861 6.3.2 の説明のとおり)。
+ * 一度決めたら同じ値を使い続けるので、エントリごとに期限がばらつくのではなく、
+ * 機器ごとにばらつく(リンク上の機器どうしが同期しない)。
+ *
+ * 引数:
+ *   now - 現在時刻(timer_now() の ns)
+ * コール元:
+ *   neigh_expiry_from_now(), neigh_reachable_ms()
+ * ===============================================================*/
+static uint32_t neigh_reach_at(uint64_t now)
+{
+    uint32_t base = g_neigh_cache_ttl_ms;
+    if (s_reach_ms != 0u && s_reach_base == base &&
+        now - s_reach_at < 3ull * 3600ull * 1000000000ull) {
+        return s_reach_ms;
+    }
+    /* 暗号の強さは要らない(同期を崩すだけ)ので、時刻を xorshift でかき混ぜる。 */
+    uint64_t x = now ^ 0x9E3779B97F4A7C15ull;
+    x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+    uint32_t ms = base / 2u + (uint32_t)(x % ((uint64_t)base + 1u));   /* base x [0.5, 1.5] */
+    if (ms == 0u) ms = 1u;
+    s_reach_base = base;
+    s_reach_at   = now;
+    s_reach_ms   = ms;
+    return ms;
+}
+
+/* 今の有効期間(ミリ秒)。`arpage` の表示と、検査の待ち時間に使う。 */
+uint32_t neigh_reachable_ms(void)
+{
+    return neigh_reach_at(timer_now());
+}
+
 /*=================================================================
  * 近隣キャッシュへ新しく入れる(または延命する)エントリの有効期限を返す。
  *
@@ -21,7 +65,8 @@ volatile uint32_t g_neigh_cache_ttl_ms = NEIGH_CACHE_TTL_DEFAULT_MS;
  * ===============================================================*/
 uint64_t neigh_expiry_from_now(void)
 {
-    return timer_now() + (uint64_t)g_neigh_cache_ttl_ms * 1000000ull;
+    uint64_t now = timer_now();
+    return now + (uint64_t)neigh_reach_at(now) * 1000000ull;
 }
 
 /*=================================================================
@@ -139,6 +184,91 @@ uint64_t *neigh_req_stamp(const netaddr_t *addr)
     return &t[slot].at;
 }
 
+/*=================================================================
+ * 宛先 addr を、いま解決している最中(問い合わせを出して NEIGH_RETRANS_MS 以内)か。
+ * RFC 4861 の INCOMPLETE 状態の代わり(このスタックは INCOMPLETE のエントリを
+ * 作らず、ndp_resolve() が問い合わせを出して応答を待つ)。
+ *
+ * 引数:
+ *   addr - 宛先
+ * 戻り値:
+ *   1=解決中、0=そうでない
+ * コール元:
+ *   ndp_cache_update_na()
+ * ===============================================================*/
+int neigh_req_pending(const netaddr_t *addr)
+{
+    const neigh_req_t *t = g_active_ctx->neigh_req;
+    uint64_t now = timer_now();
+    for (unsigned i = 0; i < NEIGH_REQ_SLOTS; i++) {
+        if (t[i].at != 0u && netaddr_eq(&t[i].addr, addr)) {
+            return now - t[i].at < (uint64_t)NEIGH_RETRANS_MS * 1000000ull;
+        }
+    }
+    return 0;
+}
+
+/*=================================================================
+ * IPv4 のゲートウェイ gw が死んだことを受けて、候補の次のものへ切り替える
+ * (RFC 1122 3.3.1.4:dead gateway detection。3.3.1.2:デフォルトゲートウェイを
+ * 複数持てること)。死んだと判断するのは、近隣キャッシュの確認要求がすべて無応答
+ * だったときと、解決に失敗したとき(arp.c から呼ぶ)。**その gw を次ホップにして
+ * いた Redirect の宛先も消す**(死んだルータへ向け続けないため)。
+ *
+ * 引数:
+ *   ni - インターフェース
+ *   gw - 死んだと分かったアドレス(ゲートウェイでなければ何もしない)
+ * コール元:
+ *   arp_cache_lookup_nud(), arp_resolve()
+ * ===============================================================*/
+void netif_gw4_dead(netif_t *ni, uint32_t gw)
+{
+    if (!ni || gw == 0u) return;
+    for (unsigned i = 0; i < ni->dest4_cnt; ) {
+        if (ni->dest4[i].nexthop == gw) {
+            ni->dest4[i] = ni->dest4[--ni->dest4_cnt];
+            continue;
+        }
+        i++;
+    }
+    if (ni->gateway != gw || ni->gw4_cnt < 2u) return;
+    unsigned cur = 0;
+    for (unsigned i = 0; i < ni->gw4_cnt; i++) if (ni->gw4_list[i] == gw) cur = i;
+    uint32_t next = ni->gw4_list[(cur + 1u) % ni->gw4_cnt];
+    ni->gateway = next;
+    uart_printf("[ROUTE] %s: ゲートウェイ %u.%u.%u.%u に届かない -- %u.%u.%u.%u へ切り替え"
+                "(RFC 1122 3.3.1.4)\n", ni->name ? ni->name : "?",
+                (gw >> 24) & 0xFFu, (gw >> 16) & 0xFFu, (gw >> 8) & 0xFFu, gw & 0xFFu,
+                (next >> 24) & 0xFFu, (next >> 16) & 0xFFu, (next >> 8) & 0xFFu, next & 0xFFu);
+}
+
+/*=================================================================
+ * Redirect を受け入れて、宛先 dst の次ホップを nexthop にする(宛先ごとの経路、
+ * RFC 1122 3.3.1.2 の route cache)。同じ宛先があれば置き換え、満杯なら古いものから
+ * 順に上書きする。
+ * コール元:
+ *   icmp_handle()
+ * ===============================================================*/
+void netif_dest4_set(netif_t *ni, uint32_t dst, uint32_t nexthop)
+{
+    if (!ni) return;
+    for (unsigned i = 0; i < ni->dest4_cnt; i++) {
+        if (ni->dest4[i].dst == dst) { ni->dest4[i].nexthop = nexthop; return; }
+    }
+    unsigned slot;
+    if (ni->dest4_cnt < NETIF_DEST4_MAX) {
+        slot = ni->dest4_cnt;
+        ni->dest4[slot].dst = dst;
+        ni->dest4[slot].nexthop = nexthop;
+        ni->dest4_cnt++;
+        return;
+    }
+    slot = ni->dest4_next % NETIF_DEST4_MAX;
+    ni->dest4_next = (uint8_t)((slot + 1u) % NETIF_DEST4_MAX);
+    ni->dest4[slot].dst = dst;
+    ni->dest4[slot].nexthop = nexthop;
+}
+
 /* ---- 確認要求の観測フック(`nudtest` 用)---- */
 volatile uint32_t g_neigh_confirm_count;
 
@@ -230,6 +360,12 @@ void eth_register_handler(uint16_t ethertype, eth_handler_t handler)
 
 /* eth_dispatch() 呼び出しのネストは無い前提の per-core スカラー。 */
 static int s_rx_hw_csum_ok[SMP_MAX_CORES];
+static int s_rx_l2_mcast[SMP_MAX_CORES];
+
+int eth_rx_l2_multicast(void)
+{
+    return s_rx_l2_mcast[smp_core_index()];
+}
 
 /*=================================================================
  * いま eth_dispatch() が処理中のフレームが、NIC で L3/L4 チェックサム検証
@@ -278,6 +414,7 @@ void eth_dispatch(net_buf_t *nb)
 
     unsigned core = smp_core_index();
     s_rx_hw_csum_ok[core] = nb->hw_csum_ok;
+    s_rx_l2_mcast[core] = nb->data[0] & 1u;   /* 宛先 MAC の I/G ビット */
 
     for (int i = 0; i < HANDLER_MAX; i++) {
         if (g_handlers[i].used && g_handlers[i].ethertype == etype) {
@@ -286,6 +423,7 @@ void eth_dispatch(net_buf_t *nb)
         }
     }
     s_rx_hw_csum_ok[core] = 0;
+    s_rx_l2_mcast[core] = 0;
 }
 
 /*=================================================================
@@ -594,6 +732,14 @@ netif_t *netif_find_by_ip6(const uint8_t addr[16])
             }
             if (gsame) return s_registered[i];
         }
+        /* 2 つ目以降のグローバルアドレス(RA の複数のプレフィックスから作ったもの)。 */
+        for (unsigned k = 0; k < s_registered[i]->ip6_extra_cnt; k++) {
+            int esame = 1;
+            for (unsigned j = 0; j < 16; j++) {
+                if (s_registered[i]->ip6_extra[k].addr[j] != addr[j]) { esame = 0; break; }
+            }
+            if (esame) return s_registered[i];
+        }
     }
     return NULL;
 }
@@ -642,6 +788,13 @@ static netif_t *netif_resolve_frame_owner(netif_t *poller, const net_buf_t *nb)
                     if (c->ip6_global[j] != d6[j]) { same = 0; break; }
                 }
                 if (same) return c;
+                for (unsigned k = 0; k < c->ip6_extra_cnt; k++) {
+                    int esame = 1;
+                    for (unsigned j = 0; j < 16u; j++) {
+                        if (c->ip6_extra[k].addr[j] != d6[j]) { esame = 0; break; }
+                    }
+                    if (esame) return c;
+                }
             }
         }
         return poller;
@@ -902,6 +1055,14 @@ int net_poll_all_and_dispatch(void)
             netif_activate(prev);
             return 0;
         }
+    }
+
+    /* **時間で進める IPv6 の仕事**(DAD の判定、MLD の再送、寿命切れの掃除)を、
+     * 受信を見るコアの 256 周に 1 回だけ呼ぶ。IPv6 のフレームが来ないあいだも進める
+     * ため。仕事が無ければ ipv6_timer_tick() は旗を 1 つ読んで戻る。 */
+    {
+        static uint32_t s_tick_div[SMP_MAX_CORES];
+        if (((++s_tick_div[core]) & 0xFFu) == 0u) ipv6_timer_tick();
     }
 
     /* **受信フレーム数はローカルに溜めて、最後に 1 回だけ書く。**

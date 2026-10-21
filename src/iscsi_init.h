@@ -23,8 +23,12 @@ int  iscsi_ini_discover(const netaddr_t *dst, uint16_t port, char *first, unsign
  * 食い違いの数を *mismatch へ返す。 */
 int  iscsi_ini_bench(int is_read, uint32_t chunk, uint32_t qd, uint32_t runtime_ms,
                      uint64_t *bytes, uint32_t *count, uint32_t *elapsed_ms, uint32_t *mismatch);
-/* 通常セッションのログインで CHAP を使う(NULL で解除)。 */
-void iscsi_ini_set_chap(const iscsi_chap_cfg_t *cfg);
+/* 通常セッションのログインで CHAP を使う(NULL で解除)。両方向に同じ秘密の設定は断る(-1。
+ * RFC 7143 12.1.3)。96 ビット未満は警告だけ。 */
+int  iscsi_ini_set_chap(const iscsi_chap_cfg_t *cfg);
+/* 何もしていない間の受信(NOP-In への答え、Async のログアウト要求 / 再交渉への答え)。
+ * シェルの待ちのループから定期的に呼ぶ(呼んだコアの実体)。 */
+void iscsi_ini_poll(void);
 void iscsi_ini_status(void);
 
 #endif /* ISCSI_INIT_H */

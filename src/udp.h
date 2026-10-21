@@ -13,10 +13,23 @@
 #define UDP_PORT_ROCEV2 4791u
 
 /* ポートに紐づく受信ハンドラ。data はペイロード先頭(UDP ヘッダの直後)。
- * src は IPv4/IPv6 のどちらもありうる(family を見て区別する)。 */
+ * src は IPv4/IPv6 のどちらもありうる(family を見て区別する)。
+ * dst は受け取ったデータグラムの宛先(自分のアドレスか、IPv4 のブロードキャスト)。
+ * **応答の送信元を選ぶのに要る**(RFC 1122 4.1.3.5 は宛先を上位へ渡すことを MUST とする)。 */
 typedef void (*udp_handler_t)(const uint8_t *data, size_t len,
                                const netaddr_t *src, uint16_t src_port,
-                               const uint8_t *src_mac);
+                               const netaddr_t *dst, const uint8_t *src_mac);
+
+/* ポートに紐づく ICMP エラーのハンドラ(RFC 1122 4.1.3.3:UDP は受けた ICMP エラーを
+ * 上位へ渡す MUST)。remote / remote_port は引用されたデータグラムの宛先(= 相手)、
+ * local_port は自分のポート。type / code は ICMP(v6 なら ICMPv6)のもの。 */
+typedef void (*udp_error_handler_t)(const netaddr_t *remote, uint16_t remote_port,
+                                     uint16_t local_port, uint8_t type, uint8_t code, int v6);
+int udp_set_error_handler(uint16_t port, udp_error_handler_t fn);
+
+/* ICMP / ICMPv6 のエラーが引用した UDP ヘッダを渡す(icmp.c / ipv6.c から)。 */
+void udp_icmp_error(const netaddr_t *remote, const uint8_t *quoted_udp, size_t qlen,
+                    uint8_t type, uint8_t code, int v6);
 
 void udp_init(void);
 

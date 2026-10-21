@@ -112,7 +112,9 @@ void tcp_rack_show(void);
 extern volatile uint32_t g_tcp_retransmit_segs;
 
 /* Keepalive(RFC 1122 4.2.3.6)。シェルの `tcpkeepalive`。
- * **既定は慣例どおり 2 時間 + 75 秒 x 9 回。短くすると無通信だが生きている
+ * **g_tcp_keepalive_enable は「これから張る接続の既定」**(既定 0 = 使わない。RFC 1122 の
+ * MUST-25「既定は無効」)。接続ごとの有効 / 無効は tcp_set_keepalive() で変える(MUST-24)。
+ * 時間は慣例どおり 2 時間 + 75 秒 x 9 回。**短くすると無通信だが生きている
  * 接続を切ってしまう**ので、検証のとき以外は縮めないこと。 */
 extern volatile uint32_t g_tcp_keepalive_enable;
 extern volatile uint32_t g_tcp_keepalive_idle_ms;
@@ -194,6 +196,9 @@ typedef enum {
     TCP_CLOSE_WAIT,
     TCP_LAST_ACK,
     TCP_SYN_RCVD,
+    /* 同時クローズ(RFC 9293 3.6)。自分の FIN がまだ ACK されないうちに相手の FIN が届いた。
+     * 既存の値を変えないよう末尾に足した(ほかのファイルが数値で比べている所は無いが念のため)。 */
+    TCP_CLOSING,
 } tcp_state_t;
 
 /* 毎パケット触るスカラを前半へ固め、17 バイトのアドレスは後半へ置く
@@ -367,5 +372,65 @@ void tcp_debug_inject_rst(const tcp_conn_t *victim, uint32_t seq);
 
 void tcp_debug_dump_rx(const tcp_conn_t *conn);
 void tcp_conns_show(void);
+
+/* ---- ICMP / ICMPv6 のエラーを TCP へ伝える(RFC 1122 4.2.3.9、RFC 5461、RFC 5927)----
+ * 引用された TCP ヘッダ(quoted_tcp、先頭 8 バイト以上)の 4-tuple でコネクションを探し、
+ * 引用の seq が SND.UNA <= seq < SND.NXT(送った範囲)に入っているかを確かめる
+ * (外れていれば偽の ICMP として何もしない)。
+ *   TCP_ICMP_SOFT - 一時的なエラー(Net/Host Unreachable、Time Exceeded、Parameter Problem)。
+ *                   接続は切らず、記録だけする。
+ *   TCP_ICMP_HARD - 相手にその口が無い(Protocol / Port Unreachable、ICMPv6 の Port
+ *                   Unreachable)。接続の途中(SYN_SENT / SYN_RCVD)なら接続を失敗させる。
+ *                   確立した後は SOFT と同じ扱い(RFC 5461)。
+ *   TCP_ICMP_PMTU - Fragmentation Needed / Packet Too Big。検査だけして結果を返す
+ *                   (呼び出し側が 1 のときだけ経路 MTU を学ぶ)。
+ * local は引用の送信元(= 自分)、remote は引用の宛先(= 相手)。
+ * 戻り値: 1=引用が自分の生きているコネクションのもので、seq も範囲内。0=それ以外。 */
+#define TCP_ICMP_SOFT 0
+#define TCP_ICMP_HARD 1
+#define TCP_ICMP_PMTU 2
+int tcp_icmp_error(const netaddr_t *local, const netaddr_t *remote,
+                   const uint8_t *quoted_tcp, size_t qlen, int kind);
+/* ICMP エラーの計数: 引用が自分の接続と範囲に合った(SOFT / HARD / PMTU)、合わなかった(偽物か古い)、
+ * HARD で接続の途中を失敗させた。 */
+extern volatile uint32_t g_tcp_icmp_soft_count, g_tcp_icmp_hard_count, g_tcp_icmp_pmtu_ok;
+extern volatile uint32_t g_tcp_icmp_bogus_count, g_tcp_icmp_hard_abort;
+
+/* ---- RFC に合わせて足した検査の計数(`rfctest tcp` と `tcpconns` が見る)---- */
+extern volatile uint32_t g_tcp_ack_unsent_drop;    /* SND.NXT を越える ACK を捨てた(RFC 9293 3.10.7.4)*/
+extern volatile uint32_t g_tcp_rx_oow_drop;        /* 受信窓の外のセグメントを捨てた(同 first check)*/
+extern volatile uint32_t g_tcp_syn_challenge;      /* 同期済みの接続への SYN に challenge ACK(RFC 5961 4)*/
+extern volatile uint32_t g_tcp_oow_ack_limited;    /* 窓外への ACK / challenge ACK を頻度の上限で省いた(RFC 5961 7)*/
+extern volatile uint32_t g_tcp_noack_drop;         /* 同期済みで ACK ビットの無いセグメントを捨てた */
+extern volatile uint32_t g_tcp_listen_rst;         /* 待ち受けのポートへの SYN 以外の ACK 付きに RST を返した */
+extern volatile uint32_t g_tcp_ts_missing_drop;    /* Timestamps を合意したのに TS の無いセグメントを捨てた(RFC 7323 3.2)*/
+extern volatile uint32_t g_tcp_retx_abort;         /* 再送の上限で接続を RST で閉じた(RFC 9293 3.8.3)*/
+extern volatile uint32_t g_tcp_ack_time_flush;     /* 返していない ACK を時間の上限で返した(RFC 1122 4.2.3.2)*/
+extern volatile uint32_t g_tcp_urg_rx;             /* 緊急ポインタが進んだ回数(RFC 9293 3.8.5)*/
+extern volatile uint32_t g_tcp_synsent_rst;        /* SYN_SENT / SYN_RCVD で受け入れられない ACK に RST を返した */
+
+/* 接続ごとの Keepalive の有効 / 無効(RFC 1122 4.2.3.6 の MUST-24)。既定は張ったときの
+ * g_tcp_keepalive_enable。 */
+void tcp_set_keepalive(tcp_conn_t *conn, int on);
+
+/* 緊急データ(URG)。相手が送った緊急ポインタが、アプリがまだ読んでいない位置より先にあるか
+ * (RFC 9293 3.8.5 の MUST-30/31「上位へ知らせる」)。データ自体は普段どおりストリームの中で渡す。
+ * 戻り値: 1=緊急データの終わり(ポインタの位置)が読み出し位置より先にある、0=無い。
+ * bytes_ahead: 読み出し位置から緊急データの終わりまでのバイト数(NULL 可)。 */
+int tcp_urgent_mark(const tcp_conn_t *conn, uint32_t *bytes_ahead);
+
+/* 送った最大の seq(SND.NXT。tcp_send() の再送中や高速再送中でも下がらない)。試験用。 */
+uint32_t tcp_snd_max(const tcp_conn_t *conn);
+
+/* 検証用: 相手を騙って victim へ任意のセグメントを 1 つ撃ち込む。victim が Timestamps を
+ * 合意していれば TS を付ける(付けないと RFC 7323 の検査で捨てられる)。window は相手の
+ * 広告窓としてそのまま(Window Scale 前の 16 ビット)書く。 */
+void tcp_debug_inject(const tcp_conn_t *victim, uint8_t flags, uint32_t seq, uint32_t ack,
+                      uint16_t window, const void *data, uint16_t len);
+/* 検証用: 接続を持たない 4-tuple から任意のセグメントを撃ち込む(待ち受けへの ACK など)。
+ * mss >= 0 なら MSS オプション(その値)を付ける(-1 = 付けない)。 */
+void tcp_debug_inject_to(const netaddr_t *from, uint16_t from_port,
+                         const netaddr_t *to, uint16_t to_port,
+                         uint8_t flags, uint32_t seq, uint32_t ack, int mss);
 
 #endif /* TCP_H */

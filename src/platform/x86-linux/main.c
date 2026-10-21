@@ -42,6 +42,7 @@
 #include "tcp.h"       /* ackthresh コマンド(g_tcp_ack_threshold) */
 #include "ipsec.h"     /* ipsec コマンド */
 #include "ike.h"
+#include "rfctest.h"   /* rfctest コマンド */
 
 /*=================================================================
  * CRC32C を 2 段階で確認する。
@@ -576,9 +577,10 @@ static volatile uint32_t s_udptest_sum;
  * ===============================================================*/
 static void shell_udptest_handler(const uint8_t *data, size_t len,
                                    const netaddr_t *src, uint16_t src_port,
-                                   const uint8_t *src_mac)
+                                   const netaddr_t *dst, const uint8_t *src_mac)
 {
     (void)src_mac;
+    (void)dst;
     s_udptest_len = (uint16_t)len;
     uint32_t sum = 0;
     for (size_t i = 0; i < len; i++) sum += data[i];
@@ -692,6 +694,26 @@ static netif_t *shell_peer_ll6(uint8_t out[16])
     out[14] = mac[4];
     out[15] = mac[5];
     return peer;
+}
+
+netif_t *rfctest_peer(uint8_t peer_ll[16])
+{
+    return shell_peer_ll6(peer_ll);
+}
+
+/*=================================================================
+ * シェルの `rfctest <層> [引数]`。RFC に合わせて直した動きを層ごとに確かめる
+ * (tcp / ipv6 / ipv4 / sec / iscsi)。各層の試験は rfctest_<層>.c にある。
+ * ===============================================================*/
+static void shell_rfctest(const char *args)
+{
+    while (*args == ' ') args++;
+    if (strncmp(args, "tcp", 3) == 0)        rfctest_tcp(args + 3);
+    else if (strncmp(args, "ipv6", 4) == 0)  rfctest_ipv6(args + 4);
+    else if (strncmp(args, "ipv4", 4) == 0)  rfctest_ipv4(args + 4);
+    else if (strncmp(args, "sec", 3) == 0)   rfctest_sec(args + 3);
+    else if (strncmp(args, "iscsi", 5) == 0) rfctest_iscsi(args + 5);
+    else uart_printf("rfctest: tcp | ipv6 | ipv4 | sec | iscsi のどれかを指定してください\n");
 }
 
 /*=================================================================
@@ -2503,11 +2525,33 @@ static void shell_route(char *args)
             uart_printf("route: netmask/gateway の書式が不正です(a.b.c.d)\n");
             return;
         }
-        ni->netmask = mask;
-        ni->gateway = gw;
-        uart_printf("route: %s を設定しました\n", ni->name);
+        if (strcmp(tok[1], "addgw") == 0) {
+            /* デフォルトゲートウェイの候補を足す(RFC 1122 3.3.1.2)。いま使っている
+             * ものが死んだら、この順に切り替える(3.3.1.4)。 */
+            if (shell_parse_ipv4(tok[2], &gw) != 0 || gw == 0u) {
+                uart_printf("route: gateway の書式が不正です(a.b.c.d)\n");
+                return;
+            }
+            if (ni->gw4_cnt == 0u && ni->gateway != 0u) ni->gw4_list[ni->gw4_cnt++] = ni->gateway;
+            if (ni->gw4_cnt < NETIF_GW4_MAX) ni->gw4_list[ni->gw4_cnt++] = gw;
+            if (ni->gateway == 0u) ni->gateway = gw;
+            uart_printf("route: %s の候補に足しました(%u 個)\n", ni->name, (unsigned)ni->gw4_cnt);
+        } else {
+            if (shell_parse_ipv4(tok[1], &mask) != 0 || shell_parse_ipv4(tok[2], &gw) != 0) {
+                uart_printf("route: netmask/gateway の書式が不正です(a.b.c.d)\n");
+                return;
+            }
+            ni->netmask = mask;
+            ni->gateway = gw;
+            /* 候補の一覧と Redirect の宛先はやり直す。 */
+            ni->gw4_cnt = 0;
+            if (gw != 0u) ni->gw4_list[ni->gw4_cnt++] = gw;
+            ni->dest4_cnt = 0;
+            uart_printf("route: %s を設定しました\n", ni->name);
+        }
     } else if (nt != 0u) {
-        uart_printf("route: 使い方 -- route | route <ifname> <netmask> <gateway>\n");
+        uart_printf("route: 使い方 -- route | route <ifname> <netmask> <gateway> | "
+                    "route <ifname> addgw <gateway>\n");
         return;
     }
 
@@ -2525,6 +2569,15 @@ static void shell_route(char *args)
             uart_printf(" gw なし(全て同一リンク扱い)");
         }
         uart_printf("  %s%s\n", ni->name, ni->gateway6_set ? " [gw6 設定あり]" : "");
+        for (unsigned g = 0; g < ni->gw4_cnt; g++) {
+            shell_print_ipv4("    候補 ", ni->gw4_list[g]);
+            uart_printf("%s\n", ni->gw4_list[g] == ni->gateway ? "(使用中)" : "");
+        }
+        for (unsigned d = 0; d < ni->dest4_cnt; d++) {
+            shell_print_ipv4("    Redirect ", ni->dest4[d].dst);
+            shell_print_ipv4(" -> ", ni->dest4[d].nexthop);
+            uart_printf("\n");
+        }
     }
 }
 
@@ -2832,6 +2885,10 @@ static uint8_t s_pmtu_dump;  /* 1=注入した ICMP を 16 進で出す(tools/ic
  * コール元:
  *   shell_pmtutest()
  * ===============================================================*/
+/* 1 なら、引用する元のデータグラムを TCP にする(RFC 5927 の検査で無視されることを見る陰性対照)。
+ * 既定は UDP(TCP を引用すると、生きたコネクションの送った範囲の seq でない限り偽物として無視される)。 */
+static int s_inject_quote_tcp;
+
 static int shell_inject_frag_needed(const uint8_t to_ip[4], const uint8_t to_mac[6],
                                      uint32_t orig_src, uint32_t orig_dst, uint16_t mtu)
 {
@@ -2850,7 +2907,7 @@ static int shell_inject_frag_needed(const uint8_t to_ip[4], const uint8_t to_mac
     q[2] = 0x25; q[3] = 0x00;          /* total_length: 何でもよい(9472) */
     q[6] = 0x40;                       /* DF を立てる(Frag Needed の前提) */
     q[8] = 64;                         /* TTL */
-    q[9] = IP_PROTO_TCP;
+    q[9] = s_inject_quote_tcp ? IP_PROTO_TCP : IP_PROTO_UDP;
     q[12] = (uint8_t)(orig_src >> 24); q[13] = (uint8_t)(orig_src >> 16);
     q[14] = (uint8_t)(orig_src >> 8);  q[15] = (uint8_t)orig_src;
     q[16] = (uint8_t)(orig_dst >> 24); q[17] = (uint8_t)(orig_dst >> 16);
@@ -2899,7 +2956,7 @@ static int shell_inject_packet_too_big(const uint8_t to[16], const uint8_t to_ma
     uint8_t *q = msg + 8u;
     q[0] = 0x60;                       /* version=6 */
     q[4] = 0x24; q[5] = 0x00;          /* payload_length: 何でもよい */
-    q[6] = IPV6_NH_TCP;
+    q[6] = IPV6_NH_UDP;   /* TCP を引用すると、生きたコネクションの seq でない限り無視される(RFC 5927) */
     q[7] = 64;                         /* hop limit */
     for (unsigned i = 0; i < 16; i++) q[8 + i]  = orig_src[i];
     for (unsigned i = 0; i < 16; i++) q[24 + i] = orig_dst[i];
@@ -3070,9 +3127,9 @@ static void shell_pmtutest(char *args)
     }
     netif_activate(self);
 
-    /* ---- [7] 床: 下限未満の報告は採用しない ---- */
+    /* ---- [7] 床: 68 未満(IPv4 として不正)と、IPv6 の 1280 未満の報告は採用しない ---- */
     netif_activate(peer);
-    shell_inject_frag_needed(self_ip_oct, self_mac, self_ip, far_ip, 100u);   /* < 576 */
+    shell_inject_frag_needed(self_ip_oct, self_mac, self_ip, far_ip, 60u);    /* < 68 */
     netif_activate(self);
     for (uint64_t t0 = timer_now(); !timeout_ms(t0, 100u); ) net_poll_all_and_dispatch();
     netif_activate(peer);
@@ -3082,7 +3139,7 @@ static void shell_pmtutest(char *args)
 
     int floor_ok = (pmtu_lookup(&far_addr) == v4_mtu) &&
                    (pmtu_lookup(&peer6) == (uint16_t)v6_mtu);
-    uart_printf("pmtutest: %s [7] 床 -- v4 に 100 / v6 に 1000 を報告しても学習値は"
+    uart_printf("pmtutest: %s [7] 床 -- v4 に 60 / v6 に 1000 を報告しても学習値は"
                 " %u / %u のまま\n", floor_ok ? "OK" : "NG",
                 pmtu_lookup(&far_addr), pmtu_lookup(&peer6));
     if (!floor_ok) ok = 0;
@@ -3097,6 +3154,29 @@ static void shell_pmtutest(char *args)
                 "(上げ直しは TTL 満了に任せる)\n",
                 nogrow ? "OK" : "NG", pmtu_lookup(&far_addr));
     if (!nogrow) ok = 0;
+
+    /* ---- [8b] 陰性対照: 引用が TCP で、生きたコネクションの seq でないものは偽物として無視する
+     * (RFC 5927)---- */
+    s_inject_quote_tcp = 1;
+    netif_activate(peer);
+    shell_inject_frag_needed(self_ip_oct, self_mac, self_ip, far_ip, 700u);
+    netif_activate(self);
+    for (uint64_t t0 = timer_now(); !timeout_ms(t0, 100u); ) net_poll_all_and_dispatch();
+    s_inject_quote_tcp = 0;
+    int tcp_ignored = (pmtu_lookup(&far_addr) == v4_mtu);
+    uart_printf("pmtutest: %s [8b] 引用が TCP の偽の Frag Needed(MTU=700)は無視する(学習値 %u)\n",
+                tcp_ignored ? "OK" : "NG", pmtu_lookup(&far_addr));
+    if (!tcp_ignored) ok = 0;
+
+    /* ---- [8c] IPv4 で 576 未満(68 以上)の報告は 576 に抑えて採用する(RFC 1191 3)---- */
+    netif_activate(peer);
+    shell_inject_frag_needed(self_ip_oct, self_mac, self_ip, far_ip, 100u);
+    netif_activate(self);
+    for (uint64_t t0 = timer_now(); !timeout_ms(t0, 100u); ) net_poll_all_and_dispatch();
+    int clamped = (pmtu_lookup(&far_addr) == PMTU_MIN_V4);
+    uart_printf("pmtutest: %s [8c] MTU=100 の報告は %u に抑えて採用(学習値 %u)\n",
+                clamped ? "OK" : "NG", (unsigned)PMTU_MIN_V4, pmtu_lookup(&far_addr));
+    if (!clamped) ok = 0;
 
     uart_printf("pmtutest: 学習済みエントリ:\n");
     pmtu_dump();
@@ -4293,7 +4373,7 @@ static void shell_nudtest(void)
     ndp_cache_insert(peer_ll, peer->mac);
 
     /* ---- [1] DELAY: 失効直後の lookup では確認要求を出さない ---- */
-    for (uint64_t t0 = timer_now(); !timeout_ms(t0, ttl + 20u); ) net_poll_all_and_dispatch();
+    for (uint64_t t0 = timer_now(); !timeout_ms(t0, neigh_reachable_ms() + 20u); ) net_poll_all_and_dispatch();
     s_nud_uni = 0; s_nud_multi = 0;
     netif_activate(self);
     /* **「確認要求が 0 個」だけでは DELAY を確かめたことにならない** --
@@ -4340,7 +4420,7 @@ static void shell_nudtest(void)
     /* ---- [4] 上位層の到達確認: confirmed=1 なら確認要求を出さずに延命 ---- */
     netif_activate(self);
     arp_resolve(peer->ip, mac);
-    for (uint64_t t0 = timer_now(); !timeout_ms(t0, ttl + delay_ms + 30u); ) {
+    for (uint64_t t0 = timer_now(); !timeout_ms(t0, neigh_reachable_ms() + delay_ms + 30u); ) {
         net_poll_all_and_dispatch();
     }
     netif_activate(self);
@@ -4369,7 +4449,7 @@ static void shell_nudtest(void)
      * 「待ったのに DEAD」になって気付いた)。`arp_cache_insert()` は必ず
      * 現在の TTL で入れ直すので、こちらを使う(`arptest` と同じ手)。 */
     arp_cache_insert(peer->ip, peer->mac);
-    for (uint64_t t0 = timer_now(); !timeout_ms(t0, ttl5 + 20u); ) {
+    for (uint64_t t0 = timer_now(); !timeout_ms(t0, neigh_reachable_ms() + 20u); ) {
         net_poll_all_and_dispatch();
     }
     netif_activate(self);
@@ -4444,7 +4524,7 @@ static void shell_nudtest(void)
         shell_inject_na(self_ll, self_mac, fake, bogus, 1, 1);
         netif_activate(self);
         for (uint64_t t0 = timer_now(); !timeout_ms(t0, 30u); ) net_poll_all_and_dispatch();
-        for (uint64_t t0 = timer_now(); !timeout_ms(t0, ttl - 10u); ) {
+        for (uint64_t t0 = timer_now(); !timeout_ms(t0, neigh_reachable_ms() - 10u); ) {
             net_poll_all_and_dispatch();
         }
         netif_activate(self);
@@ -4596,7 +4676,9 @@ static void shell_nudtest(void)
      * 1 個も出さないことを見る(1 秒以内の再送の抑止)。 */
     {
         const uint32_t absent4 = ip_from_octets(192, 168, 101, 95);
-        uint8_t absent6[16] = { 0xFE, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xBE, 0xEF };
+        /* 誰も使っていないアドレス。ほかの試験が近隣キャッシュに残すもの(rfctest ipv6 の
+         * Redirect の宛先 fe80::beef など)と重ならない値にする。 */
+        uint8_t absent6[16] = { 0xFE, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x95, 0x95, 0x95, 0x95 };
         for (int v6 = 0; v6 <= 1; v6++) {
             netif_activate(self);
             netaddr_t a = v6 ? netaddr_v6(absent6) : netaddr_v4(absent4);
@@ -5107,9 +5189,10 @@ static void shell_arpage(char *args)
         }
         g_neigh_cache_ttl_ms = ms;
     }
-    uart_printf("arpage: TTL=%ums DELAY=%ums 確認要求の間隔=%ums x 最大 %u 回\n",
-                g_neigh_cache_ttl_ms, neigh_delay_ms(), neigh_probe_interval_ms(),
-                NEIGH_MAX_UNICAST_SOLICIT);
+    uart_printf("arpage: TTL=%ums(実際の有効期間 %ums、基準値の 0.5〜1.5 倍の乱数)DELAY=%ums "
+                "確認要求の間隔=%ums x 最大 %u 回\n",
+                g_neigh_cache_ttl_ms, neigh_reachable_ms(), neigh_delay_ms(),
+                neigh_probe_interval_ms(), NEIGH_MAX_UNICAST_SOLICIT);
 }
 
 /*=================================================================
@@ -6166,8 +6249,11 @@ static void shell_iscsi_chap(char *args, int target)
     iscsi_chap_cfg_t cfg;
     const int r = shell_chap_parse(args, &cfg);
     if (r < 0) { uart_printf("%s: <user> <secret> [<muser> <msecret>] | off\n", name); return; }
-    if (target) iscsit_set_chap(r ? &cfg : NULL);
-    else { iscsi_ini_close(); iscsi_ini_set_chap(r ? &cfg : NULL); }   /* 認証はログインで 1 回だけなので張り直させる */
+    /* 双方向で 2 つの秘密が同じ設定は断る(RFC 7143 12.1.3。中で理由を表示する)。 */
+    int rc;
+    if (target) rc = iscsit_set_chap(r ? &cfg : NULL);
+    else { iscsi_ini_close(); rc = iscsi_ini_set_chap(r ? &cfg : NULL); }   /* 認証はログインで 1 回だけなので張り直させる */
+    if (rc < 0) { uart_printf("%s: 設定しませんでした\n", name); return; }
     uart_printf("%s: %s\n", name, r ? (cfg.mutual ? "CHAP(双方向)" : "CHAP(片方向)") : "解除");
 }
 
@@ -8333,6 +8419,27 @@ static void shell_dispatch(char *line, int s0, int s1)
         shell_ext6test(line + 8);
     } else if (strncmp(line, "nudtest", 7) == 0) {
         shell_nudtest();
+    } else if (strncmp(line, "rfctest", 7) == 0) {
+        shell_rfctest(line + 7);
+    } else if (strncmp(line, "ipttl", 5) == 0) {
+        /* 送る IPv4 の TTL(RFC 1122 3.2.1.7:設定できること MUST)。 */
+        const char *a = line + 5;
+        while (*a == ' ') a++;
+        if (*a >= '0' && *a <= '9') { int v = atoi(a); if (v >= 1 && v <= 255) g_ip_ttl = (uint8_t)v; }
+        uart_printf("ipttl: %u\n", (unsigned)g_ip_ttl);
+    } else if (strncmp(line, "iptos", 5) == 0) {
+        /* 送る IPv4 の TOS(RFC 1122 3.2.1.6)。 */
+        const char *a = line + 5;
+        while (*a == ' ') a++;
+        if (*a >= '0' && *a <= '9') { int v = atoi(a); if (v >= 0 && v <= 255) g_ip_tos = (uint8_t)v; }
+        uart_printf("iptos: %u\n", (unsigned)g_ip_tos);
+    } else if (strncmp(line, "icmprate", 8) == 0) {
+        /* ICMP エラーを送る頻度の上限(1 秒あたり、0 = 制限なし)。 */
+        const char *a = line + 8;
+        while (*a == ' ') a++;
+        if (*a >= '0' && *a <= '9') g_icmp_err_rate = (uint32_t)atoi(a);
+        uart_printf("icmprate: 1 秒に %u 個まで(送った %u / 制限で送らなかった %u)\n",
+                    (unsigned)g_icmp_err_rate, (unsigned)g_icmp_err_sent, (unsigned)g_icmp_err_limited);
     } else if (strncmp(line, "mldtest", 7) == 0) {
         shell_mldtest(line + 7);
     } else if (strncmp(line, "mld", 3) == 0) {
@@ -8598,6 +8705,10 @@ static void run_shell(int s0, int s1)
         /* アイドル: 常駐ジョブ(nvmet ターゲット等)と受信ポーリングを回す。 */
         job_scheduler_tick();
         net_poll_all_and_dispatch();
+        /* 自作の iSCSI イニシエータが繋がっていれば、ベンチの合間も相手の NOP-In と
+         * Async(event 1 = Parameter3 の期限内にログアウト、4 = Text Request)に答える
+         * (RFC 7143 11.9.1 / 11.18)。繋がっていなければ旗を 1 つ見て戻る。 */
+        iscsi_ini_poll();
         usleep(1000);
     }
 }

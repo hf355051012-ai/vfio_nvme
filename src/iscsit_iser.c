@@ -57,10 +57,14 @@
 enum { SQ_SEND_FREE = 1, SQ_SEND_LOGIN, SQ_WRITE, SQ_READ };
 enum { ST_IDLE = 0, ST_CM_WAIT, ST_RUN };
 
+#define ISERT_HOLD_MAX    16u                   /* CmdSN の先回りを保留する数(受信スロットごと持つ)*/
+
 typedef struct {
     uint8_t  in_use;
     uint8_t  aborted;         /* TMF で捨てた(応答を出さない)*/
     uint8_t  verify;
+    uint8_t  issued;          /* RDMA_READ を出した(未発行なら rra_pend に居る)*/
+    uint8_t  tmf_waited;      /* 待っている TMF の応答の数に入れた */
     uint32_t itt, edtl, total;
     uint8_t  lun8[8];
     uint8_t  tx[ISERT_TX_BYTES] __attribute__((aligned(64)));
@@ -87,15 +91,29 @@ typedef struct {
     uint32_t      rra_pend_head, rra_pend_tail;
     struct { uint64_t va; uint32_t stag, len; uint8_t *dst; } rd[ISERT_TASKS];
     /* ---- セッション ---- */
-    uint8_t       ffp, login_started, logged_out;
+    uint8_t       ffp, login_started, logged_out, login_failed;
     uint8_t       isid[6];
-    uint16_t      tsih, tsih_next;
+    uint16_t      tsih, tsih_next, cid;
     uint32_t      stat_sn, exp_cmd_sn;
     iscsi_neg_t   neg;
+    iscsi_login_state_t lst;
     uint32_t      text_len;
     uint8_t       text[16384];
     uint8_t       login_busy;
     uint64_t      t_logout;
+    /* ---- CmdSN の先回りの保留(受信スロットを投稿し直さずに持つ。iscsit.c と同じ規則)---- */
+    uint8_t       hold_n;
+    struct { uint8_t used, phantom; uint16_t slot; uint32_t sn, len; } hold[ISERT_HOLD_MAX];
+    uint16_t      cur_slot;        /* 処理中の受信スロット */
+    uint8_t       cur_held;        /* 処理中のメッセージを保留した(投稿し直さない)*/
+    /* ---- TMF の応答待ち(捨てた書き込みの RDMA_READ が終わってから応答する)---- */
+    uint8_t       tmf_pend, tmf_cold;
+    uint32_t      tmf_wait, tmf_itt;
+    /* ---- 他のセッションからの頼み(iscsit_iser_xreset())と Unit Attention ---- */
+    volatile uint32_t xreq;
+    volatile uint16_t xreq_ua;
+    volatile uint8_t  xcold;
+    scsi_ua_t     ua;
     /* ---- 統計 ---- */
     uint32_t      logins, logouts, rejects, check_cond, tmf, nop, cqe_err, disconnects;
     uint64_t      cmds, reads, writes, bytes_read, bytes_written;
@@ -115,6 +133,7 @@ static __thread isert_t *s_cur = &s_iser[0];
 /* ---------------------------------------------------------------- 送信 */
 
 static int sq_room(void) { return (s_i.sq_tail - s_i.sq_head) + 4u < ISERT_SQ_RING; }
+static int post_rx(unsigned slot);
 
 static void sq_push(uint8_t op, unsigned task)
 {
@@ -130,6 +149,8 @@ static int task_alloc(void)
             s_i.task[i].in_use = 1;
             s_i.task[i].aborted = 0;
             s_i.task[i].verify = 0;
+            s_i.task[i].issued = 0;
+            s_i.task[i].tmf_waited = 0;
             return (int)i;
         }
     }
@@ -171,6 +192,8 @@ static int send_pdu(const uint8_t *bhs, const uint8_t *data, uint32_t dlen)
     return send_task_pdu((unsigned)ti, bhs, data, dlen);
 }
 
+/* Reject(11.17)。データは断った PDU のヘッダ全体 = BHS + AHS(11.17.4)。受信バッファでは BHS の直後に
+ * AHS が続いているので、その長さまで渡す(相手の受信バッファに合わせて 128 バイトで切られる)。 */
 static int send_reject(uint8_t reason, const uint8_t *bad_bhs)
 {
     uint8_t bhs[ISCSI_BHS_LEN] = {0};
@@ -180,7 +203,17 @@ static int send_reject(uint8_t reason, const uint8_t *bad_bhs)
     iscsi_put32(&bhs[ISCSI_OFF_ITT], ISCSI_RSVD_TAG);
     fill_sn(bhs, 1);
     s_i.rejects++;
-    return send_pdu(bhs, bad_bhs, ISCSI_BHS_LEN);
+    return send_pdu(bhs, bad_bhs, ISCSI_BHS_LEN + (uint32_t)bad_bhs[ISCSI_OFF_AHSLEN] * 4u);
+}
+
+/* 断ったコマンドの CmdSN は受け取ったことにしない(RFC 7143 7.2。iscsit.c の send_reject_cmd() と同じ)。 */
+static int send_reject_cmd(uint8_t reason, const uint8_t *b)
+{
+    if (!(b[0] & ISCSI_OP_IMMEDIATE)) {
+        const uint32_t sn = iscsi_be32(&b[ISCSI_OFF_CMDSN]);
+        if (sn + 1u == s_i.exp_cmd_sn) s_i.exp_cmd_sn = sn;
+    }
+    return send_reject(reason, b);
 }
 
 static void residual(uint32_t edtl, uint32_t actual, uint8_t *flags, uint32_t *resid)
@@ -255,9 +288,16 @@ static int send_login_rsp(uint8_t flags, uint16_t status, uint32_t itt, const ui
     return 0;
 }
 
+/* ログインを断る。**Login reject の後に接続を閉じ、ログインの状態を戻す**(RFC 7143 11.13.5:
+ * 状態クラス 0 以外の応答の後、ターゲットは接続を閉じる)。応答の SEND の完了(SQ_SEND_LOGIN)で
+ * 切断して conn_down() が状態を戻す。完了が来ないときは logged_out の時間切れで閉じる。
+ * それまでに届いた PDU は捨てる(login_failed)。 */
 static int login_fail(uint16_t status, uint32_t itt, uint8_t csg, const char *why)
 {
     uart_printf("[iser] Login を断る(0x%04x): %s\n", status, why);
+    s_i.login_failed = 1;
+    s_i.logged_out = 1;
+    s_i.t_logout = timer_now();
     return send_login_rsp((uint8_t)(csg << 2), status, itt, NULL, 0);
 }
 
@@ -271,14 +311,18 @@ static int login_rx(const uint8_t *b, const uint8_t *data, uint32_t dlen)
         s_i.login_started = 1;
         memcpy(s_i.isid, &b[ISCSI_LOGIN_OFF_ISID], 6);
         s_i.tsih = 0;
+        s_i.cid = iscsi_be16(&b[ISCSI_LOGIN_OFF_CID]);
         s_i.exp_cmd_sn = iscsi_be32(&b[ISCSI_OFF_CMDSN]);
         s_i.stat_sn = (uint32_t)timer_now() * 2654435761u;
         iscsi_neg_init(&s_i.neg);
+        if (b[3] > 0) return login_fail(ISCSI_LS_NO_VERSION, itt, csg, "VersionMin > 0");
         if (iscsi_be16(&b[ISCSI_LOGIN_OFF_TSIH]) != 0)
             return login_fail(ISCSI_LS_NO_SESSION, itt, csg, "接続の追加(TSIH != 0)は扱わない");
     }
-    if (csg == 2u || csg == 3u) return login_fail(ISCSI_LS_INVALID_REQUEST, itt, csg, "CSG が不正");
-    if (T && (nsg == 2u || nsg <= csg)) return login_fail(ISCSI_LS_INVALID_REQUEST, itt, csg, "NSG が不正");
+    /* C と T / 段の後戻り / ISID・TSIH・CID・ITT の変化(iscsit.c と同じ検査)。 */
+    const char *why;
+    const uint16_t ls = iscsi_login_check(&s_i.lst, b, &why);
+    if (ls) return login_fail(ls, itt, csg, why);
     if (s_i.text_len + dlen > sizeof(s_i.text)) return login_fail(ISCSI_LS_INIT_ERR, itt, csg, "鍵が長すぎる");
     memcpy(&s_i.text[s_i.text_len], data, dlen);
     s_i.text_len += dlen;
@@ -296,43 +340,87 @@ static int login_rx(const uint8_t *b, const uint8_t *data, uint32_t dlen)
         uart_printf("\n");
     }
     s_i.text_len = 0;
-    if (rl < 0) return login_fail(ISCSI_LS_INIT_ERR, itt, csg, "鍵の形式が不正");
     iscsi_neg_t *n = &s_i.neg;
+    if (rl < 0) return login_fail(n->fail_status ? n->fail_status : ISCSI_LS_INIT_ERR, itt, csg,
+                                  n->err ? n->err : "鍵の形式が不正");
     if (!n->got_initiator_name) return login_fail(ISCSI_LS_MISSING_PARAM, itt, csg, "InitiatorName が無い");
     if (n->p.discovery) return login_fail(ISCSI_LS_NO_SESSION_TYPE, itt, csg, "iSER では Discovery を扱わない");
     if (!n->got_target_name) return login_fail(ISCSI_LS_MISSING_PARAM, itt, csg, "TargetName が無い");
     if (strcmp(n->target_name, ISCSIT_DEFAULT_IQN) != 0) return login_fail(ISCSI_LS_NOT_FOUND, itt, csg, "TargetName が違う");
+    if (n->got_chap_a || n->got_chap_i || n->got_chap_c || n->got_chap_n || n->got_chap_r)
+        return login_fail(ISCSI_LS_INIT_ERR, itt, csg, "CHAP を使わないのに CHAP の鍵が来た");
     if (csg == ISCSI_STAGE_SEC && T && !n->auth_none)
         return login_fail(ISCSI_LS_AUTH_FAILED, itt, csg, "AuthMethod で None を選べない");
-    const int to_ffp = T && nsg == ISCSI_STAGE_FFP;
-    if (to_ffp && !n->p.rdma_ext)
-        return login_fail(ISCSI_LS_INIT_ERR, itt, csg, "RDMAExtensions=Yes になっていない");
+    int agree = T;
+    if (agree && nsg == ISCSI_STAGE_FFP && !n->p.rdma_ext) {
+        /* こちらが RDMAExtensions=Yes を申し出たばかりなら、相手の答えを待つ(移行を引き留める)。 */
+        if (n->rdma_offered && !n->rdma_answered) agree = 0;
+        else return login_fail(ISCSI_LS_INIT_ERR, itt, csg, "RDMAExtensions=Yes になっていない");
+    }
+    const int to_ffp = agree && nsg == ISCSI_STAGE_FFP;
     if (to_ffp) {
         if (++s_i.tsih_next == 0) s_i.tsih_next = 1;
         s_i.tsih = s_i.tsih_next;
     }
-    const uint8_t rfl = (uint8_t)((T ? ISCSI_LOGIN_T : 0) | (csg << 2) | (T ? nsg : 0));
+    const uint8_t rfl = (uint8_t)((agree ? ISCSI_LOGIN_T : 0) | (csg << 2) | (agree ? nsg : 0));
+    if (agree) iscsi_login_transit(&s_i.lst, nsg);
     if (send_login_rsp(rfl, ISCSI_LS_SUCCESS, itt, rsp, (uint32_t)rl) < 0) return -1;
     if (!to_ffp) return 0;
     s_i.ffp = 1;
     s_i.logins++;
-    uart_printf("[iser] ログイン完了: %s tsih=%u burst=%u/%u R2T=%s Imm=%s 受信長 I=%u T=%u\n",
+    uart_printf("[iser] ログイン完了: %s tsih=%u burst=%u/%u R2T=%s Imm=%s 受信長 I=%u T=%u TBSDO=%s\n",
                 n->initiator_name, s_i.tsih, n->p.first_burst, n->p.max_burst,
                 n->p.initial_r2t ? "Yes" : "No", n->p.immediate_data ? "Yes" : "No",
-                n->p.ini_recv_dsl, n->p.tgt_recv_dsl);
+                n->p.ini_recv_dsl, n->p.tgt_recv_dsl,
+                n->p.tbsdo_set ? (n->p.tbsdo ? "Yes" : "No") : "(無し = Linux の意味)");
     return 0;
 }
 
 /* ---------------------------------------------------------------- Full Feature Phase */
 
+/* CmdSN の確認(iscsit.c の cmdsn_accept() と同じ規則)。先回りは**受信スロットを投稿し直さずに保留**する
+ * (データを写さずに済む。RQ は 160 本あり、保留は 16 本まで)。戻り値 1 = 処理する / 0 = しない。 */
 static int cmdsn_accept(const uint8_t *b)
 {
     if (b[0] & ISCSI_OP_IMMEDIATE) return 1;
     const uint32_t sn = iscsi_be32(&b[ISCSI_OFF_CMDSN]);
+    if (__builtin_expect(sn == s_i.exp_cmd_sn, 1)) { s_i.exp_cmd_sn = sn + 1u; return 1; }
     const uint32_t max = s_i.exp_cmd_sn + ISERT_WINDOW - 1u;
     if (iscsi_sn_lt(sn, s_i.exp_cmd_sn) || iscsi_sn_lt(max, sn)) return 0;
-    s_i.exp_cmd_sn = sn + 1u;
-    return 1;
+    int freei = -1;
+    for (unsigned i = 0; i < ISERT_HOLD_MAX; i++) {
+        if (s_i.hold[i].used && s_i.hold[i].sn == sn) return 0;   /* 保留中と同じ CmdSN の重複 */
+        if (!s_i.hold[i].used && freei < 0) freei = (int)i;
+    }
+    if (freei < 0) {
+        uart_printf("[iser] CmdSN %u(ExpCmdSN %u)を保留できず捨てた\n", sn, s_i.exp_cmd_sn);
+        return 0;
+    }
+    s_i.hold[freei].used = 1;
+    s_i.hold[freei].phantom = 0;
+    s_i.hold[freei].sn = sn;
+    s_i.hold[freei].slot = s_i.cur_slot;
+    s_i.hold[freei].len = 0;   /* 長さは呼び出し側(isert_step)が控える */
+    s_i.hold_n++;
+    s_i.cur_held = 1;
+    return 0;
+}
+
+/* CmdSN を受け取ったことにする(ABORT TASK の RefCmdSN、11.5.1 の b))。 */
+static void cmdsn_plug(uint32_t sn)
+{
+    if (sn == s_i.exp_cmd_sn) { s_i.exp_cmd_sn++; return; }
+    for (unsigned i = 0; i < ISERT_HOLD_MAX; i++)
+        if (s_i.hold[i].used && s_i.hold[i].sn == sn) { s_i.hold[i].phantom = 1; return; }
+    for (unsigned i = 0; i < ISERT_HOLD_MAX; i++) {
+        if (s_i.hold[i].used) continue;
+        s_i.hold[i].used = 1;
+        s_i.hold[i].phantom = 1;
+        s_i.hold[i].sn = sn;
+        s_i.hold[i].slot = 0xFFFFu;   /* スロットを持たない印 */
+        s_i.hold_n++;
+        return;
+    }
 }
 
 static int issue_read(unsigned ti)
@@ -342,7 +430,38 @@ static int issue_read(unsigned ti)
         return -1;
     sq_push(SQ_READ, ti);
     s_i.rra_inflight++;
+    s_i.task[ti].issued = 1;
     return 0;
+}
+
+/* 普段と違う形の SCSI Command(iscsit.c の scsi_cmd_irregular() と同じ規則)。
+ * 戻り値 1 = 断った / 0 = 続ける / <0 = 失敗。 */
+static int scsi_cmd_irregular(unsigned ti, const uint8_t *b)
+{
+    if (!(b[1] & ISCSI_CMD_F)) {
+        /* InitialR2T=Yes にしか決めないので未要請の Data-Out は来てはならない(Reject、protocol error)。 */
+        s_i.task[ti].in_use = 0;
+        const int r = send_reject_cmd(ISCSI_REJECT_PROTOCOL_ERR, b);
+        return r < 0 ? r : 1;
+    }
+    int bad_field = (b[1] & ISCSI_CMD_ATTR_MASK) >= 4u ||
+                    ((b[1] & (ISCSI_CMD_R | ISCSI_CMD_W)) == (ISCSI_CMD_R | ISCSI_CMD_W));
+    const uint32_t ahs = (uint32_t)b[ISCSI_OFF_AHSLEN] * 4u;
+    const uint8_t *a = b + ISCSI_BHS_LEN;
+    for (uint32_t o = 0; o + 4u <= ahs; ) {
+        const uint32_t al = iscsi_be16(&a[o]);
+        const uint8_t type = a[o + 2];
+        if (type == ISCSI_AHS_EXT_CDB || type == ISCSI_AHS_BIDI_RLEN) bad_field = 1;
+        else {
+            s_i.task[ti].in_use = 0;
+            const int r = send_reject_cmd(ISCSI_REJECT_PROTOCOL_ERR, b);
+            return r < 0 ? r : 1;
+        }
+        o += (4u + al + 3u) & ~3u;
+    }
+    if (!bad_field) return 0;
+    const int r = send_check(ti, SCSI_SK_ILLEGAL_REQUEST, SCSI_ASC_INVALID_FIELD_CDB, 0x00, 0, 0);
+    return r < 0 ? r : 1;
 }
 
 static int handle_scsi_cmd(const uint8_t *iser, const uint8_t *b, const uint8_t *data, uint32_t dlen)
@@ -355,14 +474,27 @@ static int handle_scsi_cmd(const uint8_t *iser, const uint8_t *b, const uint8_t 
     t->edtl = iscsi_be32(&b[ISCSI_CMD_OFF_EDTL]);
     memcpy(t->lun8, &b[ISCSI_OFF_LUN], 8);
     s_i.cmds++;
+    /* 普段の形(F=1、タスク属性 0〜3、AHS 無し、R と W の両方は立たない)かを 1 回の分岐で見る。 */
+    if (__builtin_expect(((b[1] & (ISCSI_CMD_F | 0x04u)) != ISCSI_CMD_F) |
+                         (b[ISCSI_OFF_AHSLEN] != 0) |
+                         ((b[1] & (ISCSI_CMD_R | ISCSI_CMD_W)) == (ISCSI_CMD_R | ISCSI_CMD_W)), 0)) {
+        const int r = scsi_cmd_irregular((unsigned)ti, b);
+        if (r) return r < 0 ? r : 0;
+    }
+    const unsigned lun = scsi_decode_lun(&b[ISCSI_OFF_LUN]);
     scsi_result_t r;
-    scsi_exec(scsi_decode_lun(&b[ISCSI_OFF_LUN]), &b[ISCSI_CMD_OFF_CDB], t->buf, sizeof(t->buf), &r);    if (r.status != SCSI_STATUS_GOOD) return send_check((unsigned)ti, r.sk, r.asc, r.ascq, 0, 0);
+    scsi_exec(lun, &b[ISCSI_CMD_OFF_CDB], t->buf, sizeof(t->buf), &r);
+    if (__builtin_expect(s_i.ua.any | s_i.neg.p.proto_level, 0)) {
+        if (s_i.ua.any) (void)scsi_ua_apply(&s_i.ua, lun, &b[ISCSI_CMD_OFF_CDB], &r);
+        if (s_i.neg.p.proto_level) scsi_inquiry_set_iscsi_level(&b[ISCSI_CMD_OFF_CDB], &r, s_i.neg.p.proto_level);
+    }
+    if (r.status != SCSI_STATUS_GOOD) return send_check((unsigned)ti, r.sk, r.asc, r.ascq, 0, 0);
     if (r.dir == SCSI_DIR_READ) {
         const uint32_t n = r.len < t->edtl ? r.len : t->edtl;
         if (n) {
             if (!(iser[0] & ISER_F_RSV)) {   /* 読み出し先を教えてもらっていない */
                 t->in_use = 0;
-                return send_reject(ISCSI_REJECT_PROTOCOL_ERR, b);
+                return send_reject_cmd(ISCSI_REJECT_PROTOCOL_ERR, b);
             }
             const uint32_t stag = iscsi_be32(&iser[16]);
             const uint64_t va = ((uint64_t)iscsi_be32(&iser[20]) << 32) | iscsi_be32(&iser[24]);
@@ -386,7 +518,7 @@ static int handle_scsi_cmd(const uint8_t *iser, const uint8_t *b, const uint8_t 
         const uint32_t imm = dlen;
         if (imm > r.len || imm > s_i.neg.p.first_burst || (imm && !s_i.neg.p.immediate_data)) {
             t->in_use = 0;
-            return send_reject(ISCSI_REJECT_PROTOCOL_ERR, b);
+            return send_reject_cmd(ISCSI_REJECT_PROTOCOL_ERR, b);
         }
         if (imm) memcpy(r.data, data, imm);
         t->total = r.len;
@@ -395,10 +527,16 @@ static int handle_scsi_cmd(const uint8_t *iser, const uint8_t *b, const uint8_t 
         if (imm == r.len) return send_good((unsigned)ti, t->edtl, r.len);
         if (!(iser[0] & ISER_F_WSV)) {   /* 残りを引く先を教えてもらっていない */
             t->in_use = 0;
-            return send_reject(ISCSI_REJECT_PROTOCOL_ERR, b);
+            return send_reject_cmd(ISCSI_REJECT_PROTOCOL_ERR, b);
         }
         s_i.rd[ti].stag = iscsi_be32(&iser[4]);
         s_i.rd[ti].va = ((uint64_t)iscsi_be32(&iser[8]) << 32) | iscsi_be32(&iser[12]);
+        /* **TaggedBufferForSolicitedDataOnly**(RFC 7145 6.9): No なら write_va は I/O バッファ全体の先頭を
+         * 指すので、要請するデータ(即時データの後ろ)は va + imm から。Yes なら要請するデータだけを指す。
+         * **鍵が出ないときは今の Linux の意味(要請するデータだけ = Yes と同じ)にする** -- RFC の既定は No
+         * だが、Linux の iSER イニシエータは鍵を出さずに write_va を即時データのぶん進めて送ってくる
+         * (iser_prepare_write_cmd())。既定どおり va + imm にすると即時データのぶんずれて読む。 */
+        if (s_i.neg.p.tbsdo_set && !s_i.neg.p.tbsdo) s_i.rd[ti].va += imm;
         s_i.rd[ti].len = r.len - imm;
         s_i.rd[ti].dst = r.data + imm;
         if (s_i.rra_inflight >= s_i.rra_max) {
@@ -430,6 +568,7 @@ static int handle_nop(const uint8_t *b, const uint8_t *data, uint32_t dlen)
     return send_pdu(bhs, data, dlen);
 }
 
+/* Logout(iscsit.c の handle_logout() と同じ。reason 1 / 2 の知らない CID には 1 で答えて閉じない)。 */
 static int handle_logout(const uint8_t *b)
 {
     if (!cmdsn_accept(b)) return 0;
@@ -437,43 +576,144 @@ static int handle_logout(const uint8_t *b)
     bhs[0] = ISCSI_OP_LOGOUT_RSP;
     bhs[1] = 0x80;
     const uint8_t reason = b[1] & ISCSI_LOGOUT_REASON_MASK;
-    bhs[2] = (reason == 2u) ? 2u : 0u;
+    const uint16_t cid = iscsi_be16(&b[ISCSI_LOGOUT_OFF_CID]);
+    uint8_t rsp = ISCSI_LOGOUT_RSP_OK;
+    if (reason != 0u && cid != s_i.cid) rsp = ISCSI_LOGOUT_RSP_NO_CID;
+    else if (reason == 2u) rsp = ISCSI_LOGOUT_RSP_NO_RECOVERY;
+    bhs[2] = rsp;
     memcpy(&bhs[ISCSI_OFF_ITT], &b[ISCSI_OFF_ITT], 4);
     fill_sn(bhs, 1);
     s_i.logouts++;
-    s_i.logged_out = 1;
-    s_i.t_logout = timer_now();
-    uart_printf("[iser] ログアウト(reason=%u)\n", reason);
+    if (rsp == ISCSI_LOGOUT_RSP_OK) {
+        s_i.logged_out = 1;
+        s_i.t_logout = timer_now();
+    }
+    uart_printf("[iser] ログアウト(reason=%u CID=%u -> 応答 %u)\n", reason, cid, rsp);
     return send_pdu(bhs, NULL, 0);
 }
 
-static int handle_tmf(const uint8_t *b)
+static int send_tmf_rsp(uint32_t itt, uint8_t rsp)
 {
-    if (!cmdsn_accept(b)) return 0;
-    const uint8_t fn = b[1] & 0x7Fu;
-    const uint32_t ref = iscsi_be32(&b[20]);
-    uint8_t rsp = 0;   /* Function complete */
-    if (fn == 1) {      /* ABORT TASK: RDMA_READ を待っている書き込みだけが実行中になりうる */
-        rsp = 1;        /* Task does not exist */
-        for (unsigned i = 0; i < ISERT_TASKS; i++) {
-            if (s_i.task[i].in_use && !s_i.task[i].aborted && s_i.task[i].itt == ref && s_i.rd[i].len) {
-                s_i.task[i].aborted = 1;
-                rsp = 0;
-            }
-        }
-    } else if (fn == 3 || fn == 14) {
-        rsp = (fn == 3) ? 5u : 4u;   /* CLEAR ACA は対応しない / TASK REASSIGN は ERL=0 では持たない */
-    } else if (fn > 8) {
-        rsp = 255u;
-    }
-    s_i.tmf++;
     uint8_t bhs[ISCSI_BHS_LEN] = {0};
     bhs[0] = ISCSI_OP_TMF_RSP;
     bhs[1] = 0x80;
     bhs[2] = rsp;
-    memcpy(&bhs[ISCSI_OFF_ITT], &b[ISCSI_OFF_ITT], 4);
+    iscsi_put32(&bhs[ISCSI_OFF_ITT], itt);
     fill_sn(bhs, 1);
     return send_pdu(bhs, NULL, 0);
+}
+
+/*=================================================================
+ * 仕事を捨てる(iSER で「実行中」になりうるのは RDMA_READ で書き込みのデータを引いている / 引く順番を
+ * 待っているタスクと、CmdSN の穴の先で保留しているコマンド)。lun < 0 なら全部、by_itt なら ITT。
+ * count_wait = 1 なら、出した RDMA_READ の完了を TMF の応答の前に待つ数(tmf_wait)へ入れる
+ * -- **TMF の応答を返した後に、捨てたタスクの RDMA_READ がイニシエータのメモリを読むことの無いように**
+ * (応答を受けたイニシエータはバッファを返してしまう。RC の SQ では後の SEND は前の RDMA_READ の
+ * 完了を待たない)。まだ出していない RDMA_READ は rra_pend から出すときに捨てる。
+ * 戻り値 = 捨てた数(保留のぶんを含む)。
+ * ===============================================================*/
+static unsigned abort_tasks(int lun, uint32_t only_itt, int by_itt, int count_wait)
+{
+    unsigned n = 0;
+    for (unsigned i = 0; i < ISERT_TASKS; i++) {
+        isert_task_t *t = &s_i.task[i];
+        if (!t->in_use || t->aborted || !s_i.rd[i].len) continue;
+        if (by_itt && t->itt != only_itt) continue;
+        if (lun >= 0 && scsi_decode_lun(t->lun8) != (unsigned)lun) continue;
+        t->aborted = 1;
+        if (count_wait && t->issued) { t->tmf_waited = 1; s_i.tmf_wait++; }
+        n++;
+    }
+    for (unsigned i = 0; s_i.hold_n && i < ISERT_HOLD_MAX; i++) {
+        if (!s_i.hold[i].used || s_i.hold[i].phantom || s_i.hold[i].slot == 0xFFFFu) continue;
+        const uint8_t *hb = s_i.rx[s_i.hold[i].slot] + ISER_HDR_LEN;
+        if (by_itt && iscsi_be32(&hb[ISCSI_OFF_ITT]) != only_itt) continue;
+        if (lun >= 0 && scsi_decode_lun(&hb[ISCSI_OFF_LUN]) != (unsigned)lun) continue;
+        s_i.hold[i].phantom = 1;   /* 応答せずに CmdSN を数える。スロットは取り出すときに投稿し直す */
+        n++;
+    }
+    return n;
+}
+
+/*=================================================================
+ * タスク管理(RFC 7143 11.5 / 11.6。iscsit.c の handle_tmf() と同じ規則)。番号は 11.5.1(TASK REASSIGN = 8)
+ * と RFC 7144 4.1(9〜12)。以前は ABORT TASK だけ本当に捨て、ABORT / CLEAR TASK SET・LU RESET・
+ * TARGET RESET は何もせずに「完了」を返していた(RDMA_READ 待ちの書き込みの応答が TMF の応答の後に出た)。
+ * ===============================================================*/
+static int handle_tmf(const uint8_t *b)
+{
+    const uint32_t tmf_sn = iscsi_be32(&b[ISCSI_OFF_CMDSN]);
+    const uint32_t exp_before = s_i.exp_cmd_sn;
+    if (!cmdsn_accept(b)) return 0;
+    const uint8_t fn = b[1] & 0x7Fu;
+    const uint32_t itt = iscsi_be32(&b[ISCSI_OFF_ITT]);
+    const uint32_t ref = iscsi_be32(&b[20]);
+    const unsigned lun = scsi_decode_lun(&b[ISCSI_OFF_LUN]);
+    const int lun_ok = scsi_get_lun(lun) != NULL;
+    const unsigned lmask = lun_ok ? 1u << lun : 0u;
+    const unsigned all = (1u << SCSI_MAX_LUNS) - 1u;
+    uint8_t rsp = iscsi_tmf_static_rsp(fn);
+    int cold = 0;
+    s_i.tmf++;
+    if (rsp == 0 && s_i.tmf_pend) rsp = ISCSI_TMF_RSP_REJECTED;   /* 前の TMF の応答待ちの間は受けない */
+    if (rsp == 0) {
+        switch (fn) {
+        case ISCSI_TMF_ABORT_TASK:
+            if (abort_tasks(-1, ref, 1, 1)) {
+                rsp = ISCSI_TMF_RSP_COMPLETE;
+            } else {
+                const uint32_t ref_sn = iscsi_be32(&b[ISCSI_TMF_OFF_REFCMDSN]);
+                const uint32_t max = exp_before + ISERT_WINDOW - 1u;
+                if (iscsi_sn_le(s_i.exp_cmd_sn, ref_sn) && iscsi_sn_le(ref_sn, max) && iscsi_sn_lt(ref_sn, tmf_sn)) {
+                    cmdsn_plug(ref_sn);   /* 11.5.1 の b): その CmdSN を受け取ったことにする */
+                    rsp = ISCSI_TMF_RSP_COMPLETE;
+                } else {
+                    rsp = ISCSI_TMF_RSP_NO_TASK;
+                }
+            }
+            break;
+        case ISCSI_TMF_ABORT_TASK_SET:
+        case ISCSI_TMF_CLEAR_TASK_SET:
+            if (!lun_ok) { rsp = ISCSI_TMF_RSP_NO_LUN; break; }
+            (void)abort_tasks((int)lun, 0, 0, 1);
+            if (fn == ISCSI_TMF_CLEAR_TASK_SET) {
+                iscsit_iser_xreset(lmask, SCSI_ASC_CMDS_CLEARED, 0x00, 1u << 16, 0, s_cur);
+                iscsit_xreset(lmask, SCSI_ASC_CMDS_CLEARED, 0x00, 1u << 16, 0, NULL);
+            }
+            rsp = ISCSI_TMF_RSP_COMPLETE;
+            break;
+        case ISCSI_TMF_LU_RESET:
+            if (!lun_ok) { rsp = ISCSI_TMF_RSP_NO_LUN; break; }
+            (void)abort_tasks((int)lun, 0, 0, 1);
+            scsi_ua_set(&s_i.ua, lmask, SCSI_ASC_RESET_OCCURRED, SCSI_ASCQ_BUS_DEVICE_RESET);
+            iscsit_iser_xreset(lmask, SCSI_ASC_RESET_OCCURRED, SCSI_ASCQ_BUS_DEVICE_RESET, 0, 0, s_cur);
+            iscsit_xreset(lmask, SCSI_ASC_RESET_OCCURRED, SCSI_ASCQ_BUS_DEVICE_RESET, 0, 0, NULL);
+            rsp = ISCSI_TMF_RSP_COMPLETE;
+            break;
+        default:   /* TARGET WARM / COLD RESET */
+            (void)abort_tasks(-1, 0, 0, 1);
+            cold = (fn == ISCSI_TMF_TARGET_COLD_RESET);
+            scsi_ua_set(&s_i.ua, all, SCSI_ASC_RESET_OCCURRED, 0x00);
+            iscsit_iser_xreset(all, SCSI_ASC_RESET_OCCURRED, 0x00, 0, cold, s_cur);
+            iscsit_xreset(all, SCSI_ASC_RESET_OCCURRED, 0x00, 0, cold, NULL);
+            rsp = ISCSI_TMF_RSP_COMPLETE;
+            break;
+        }
+    }
+    if (rsp == ISCSI_TMF_RSP_COMPLETE && s_i.tmf_wait) {
+        /* 捨てた書き込みの RDMA_READ がまだ飛んでいる。終わってから応答する(isert_step の SQ_READ)。 */
+        s_i.tmf_pend = 1;
+        s_i.tmf_itt = itt;
+        s_i.tmf_cold = (uint8_t)cold;
+        return 0;
+    }
+    if (send_tmf_rsp(itt, rsp) < 0) return -1;
+    if (cold) {
+        /* TARGET COLD RESET: 応答の後に接続を閉じる(11.5.1)。logged_out の時間切れの経路で畳む。 */
+        s_i.logged_out = 1;
+        s_i.t_logout = timer_now();
+    }
+    return 0;
 }
 
 /* 受信した 1 メッセージ(iSER ヘッダ + BHS + データ)。 */
@@ -485,6 +725,7 @@ static int dispatch(const uint8_t *m, uint32_t len)
         uart_printf("[iser] 知らない iSER ヘッダ(flags=0x%02x)\n", iser[0]);
         return 0;
     }
+    if (s_i.login_failed) return 0;   /* Login reject を送った後に届いたものは捨てる */
     uint32_t ahs = (uint32_t)b[ISCSI_OFF_AHSLEN] * 4u;
     uint32_t dlen = iscsi_be24(&b[ISCSI_OFF_DSL]);
     if (ISER_HDR_LEN + ISCSI_BHS_LEN + ahs + dlen > len) {
@@ -494,7 +735,10 @@ static int dispatch(const uint8_t *m, uint32_t len)
     const uint8_t *data = b + ISCSI_BHS_LEN + ahs;
     const uint8_t op = b[0] & ISCSI_OP_MASK;
     if (!s_i.ffp) {
-        if (op != ISCSI_OP_LOGIN) return -1;
+        /* ログイン中は Login 以外を受けない。Login reject(0x020B)を送ってから閉じる(RFC 7143 6.3)。 */
+        if (op != ISCSI_OP_LOGIN)
+            return login_fail(ISCSI_LS_INVALID_REQUEST, iscsi_be32(&b[ISCSI_OFF_ITT]),
+                              s_i.lst.started ? s_i.lst.stage : 0u, "ログイン中にログイン要求以外の PDU");
         return login_rx(b, data, dlen);
     }
     switch (op) {
@@ -502,10 +746,64 @@ static int dispatch(const uint8_t *m, uint32_t len)
     case ISCSI_OP_NOOP_OUT: return handle_nop(b, data, dlen);
     case ISCSI_OP_LOGOUT:   return handle_logout(b);
     case ISCSI_OP_TMF_REQ:  return handle_tmf(b);
+    /* Full Feature Phase の Login / SNACK は「protocol error」(RFC 7145 7.3.9 / 7.3.11。SNACK は iSER では
+     * 使えない、Login は FFP では来ない)。Data-Out も InitialR2T=Yes なので来てはならない。 */
+    case ISCSI_OP_LOGIN:
+    case ISCSI_OP_SNACK:
+    case ISCSI_OP_DATA_OUT: return send_reject(ISCSI_REJECT_PROTOCOL_ERR, b);
     default:                return send_reject(ISCSI_REJECT_CMD_NOT_SUPP, b);
     }
 }
 
+/* 保留していたメッセージのうち、穴が埋まったものを順番どおりに処理する。戻り値 <0 = 畳む。 */
+static int isert_drain(void)
+{
+    while (s_i.hold_n && s_i.ffp) {
+        int hi = -1;
+        for (unsigned i = 0; i < ISERT_HOLD_MAX; i++)
+            if (s_i.hold[i].used && s_i.hold[i].sn == s_i.exp_cmd_sn) { hi = (int)i; break; }
+        if (hi < 0) return 0;
+        const uint16_t slot = s_i.hold[hi].slot;
+        const uint32_t len = s_i.hold[hi].len;
+        const int phantom = s_i.hold[hi].phantom;
+        if (!phantom && !sq_room()) return 0;   /* 送信の枠が空いてから(次の周回)*/
+        s_i.hold[hi].used = 0;
+        s_i.hold_n--;
+        if (phantom) {
+            s_i.exp_cmd_sn++;
+        } else {
+            s_i.cur_slot = slot;
+            s_i.cur_held = 0;
+            if (dispatch(s_i.rx[slot], len) < 0) return -1;
+            if (s_i.cur_held) continue;   /* 起きないはず(CmdSN = ExpCmdSN)*/
+        }
+        if (slot != 0xFFFFu && post_rx(slot) != 0) return -1;
+    }
+    return 0;
+}
+
+/* 他のセッションからの頼みを処理する(isert_step から、この実体のコアで)。 */
+static void apply_xreq(void)
+{
+    if (s_i.xcold) return;   /* 呼び出し側が先に畳む */
+    const uint32_t x = __atomic_exchange_n(&s_i.xreq, 0u, __ATOMIC_ACQ_REL);
+    const uint16_t ua = s_i.xreq_ua;
+    unsigned aborted = 0;
+    for (unsigned l = 0; l < SCSI_MAX_LUNS; l++)
+        if (x & (1u << l)) aborted += abort_tasks((int)l, 0, 0, 0);
+    if (!(x & (1u << 16)) || aborted) scsi_ua_set(&s_i.ua, x & 0xFFFFu, (uint8_t)(ua >> 8), (uint8_t)ua);
+}
+
+void iscsit_iser_xreset(unsigned lun_mask, uint8_t asc, uint8_t ascq, unsigned flags, int cold, const void *except)
+{
+    for (unsigned k = 0; k < ISERT_INSTANCES; k++) {
+        isert_t *o = &s_iser[k];
+        if ((const void *)o == except || !o->started || o->st != ST_RUN || !o->ffp) continue;
+        if (cold) { o->xcold = 1; continue; }
+        o->xreq_ua = (uint16_t)((asc << 8) | ascq);
+        __atomic_or_fetch(&o->xreq, (lun_mask & 0xFFFFu) | flags, __ATOMIC_ACQ_REL);
+    }
+}
 /* ---------------------------------------------------------------- 接続 */
 
 static int post_rx(unsigned slot)
@@ -517,12 +815,20 @@ static int post_rx(unsigned slot)
 
 static void session_reset(void)
 {
-    s_i.ffp = s_i.login_started = s_i.logged_out = s_i.login_busy = 0;
+    s_i.ffp = s_i.login_started = s_i.logged_out = s_i.login_busy = s_i.login_failed = 0;
     s_i.text_len = 0;
     s_i.rq_head = s_i.rq_tail = 0;
     s_i.sq_head = s_i.sq_tail = 0;
     s_i.rra_inflight = 0;
     s_i.rra_pend_head = s_i.rra_pend_tail = 0;
+    memset(&s_i.lst, 0, sizeof(s_i.lst));
+    s_i.hold_n = 0;
+    for (unsigned i = 0; i < ISERT_HOLD_MAX; i++) s_i.hold[i].used = 0;
+    s_i.tmf_pend = s_i.tmf_cold = 0;
+    s_i.tmf_wait = 0;
+    s_i.xreq = 0;
+    s_i.xcold = 0;
+    memset(&s_i.ua, 0, sizeof(s_i.ua));
     for (unsigned i = 0; i < ISERT_TASKS; i++) { s_i.task[i].in_use = 0; s_i.rd[i].len = 0; }
 }
 
@@ -597,6 +903,13 @@ static job_result_t isert_step(job_t *self)
 
     case ST_RUN: {
         if (check_dreq()) { conn_down("相手が切断した(DREQ)"); return JOB_WAITING; }
+        if (__builtin_expect(s_i.xcold, 0)) {
+            /* 他のセッションの TARGET COLD RESET(11.5.1: 全部の接続を閉じる)。 */
+            (void)rdma_cm_disconnect(&s_i.cm, 200u);
+            conn_down("TARGET COLD RESET");
+            return JOB_WAITING;
+        }
+        if (__builtin_expect(s_i.xreq != 0, 0)) apply_xreq();
         if (s_i.logged_out && timeout_ms(s_i.t_logout, ISERT_LINGER_MS)) {
             /* ログアウトの後、相手の DREQ が来ないまま。こちらから畳む。 */
             (void)rdma_cm_disconnect(&s_i.cm, 200u);
@@ -624,16 +937,42 @@ static job_result_t isert_step(job_t *self)
                     s_i.task[ti].in_use = 0;
                 } else if (op == SQ_SEND_LOGIN) {
                     s_i.login_busy = 0;
+                    if (s_i.login_failed) {
+                        /* Login reject が届いた。接続を閉じてログインの状態を戻す(RFC 7143 11.13.5)。 */
+                        (void)rdma_cm_disconnect(&s_i.cm, 200u);
+                        conn_down("Login を断った後");
+                        return JOB_WAITING;
+                    }
                 } else if (op == SQ_READ) {
                     s_i.rra_inflight--;
                     s_i.rd[ti].len = 0;
-                    if (s_i.task[ti].aborted) s_i.task[ti].in_use = 0;   /* 捨てたタスクには応答しない */
-                    else if (send_good(ti, s_i.task[ti].edtl, s_i.task[ti].total) < 0) {
+                    if (s_i.task[ti].aborted) {
+                        /* 捨てたタスクには応答しない。TMF の応答がこの RDMA_READ の終わりを待っていれば、
+                         * 最後の 1 つで応答する(handle_tmf())。 */
+                        s_i.task[ti].in_use = 0;
+                        if (s_i.task[ti].tmf_waited) {
+                            s_i.task[ti].tmf_waited = 0;
+                            if (s_i.tmf_wait) s_i.tmf_wait--;
+                            if (s_i.tmf_pend && s_i.tmf_wait == 0) {
+                                s_i.tmf_pend = 0;
+                                if (send_tmf_rsp(s_i.tmf_itt, ISCSI_TMF_RSP_COMPLETE) < 0) {
+                                    conn_down("TMF の応答を送れない");
+                                    return JOB_WAITING;
+                                }
+                                if (s_i.tmf_cold) { s_i.logged_out = 1; s_i.t_logout = timer_now(); }
+                            }
+                        }
+                    } else if (send_good(ti, s_i.task[ti].edtl, s_i.task[ti].total) < 0) {
                         conn_down("応答を送れない");
                         return JOB_WAITING;
                     }
                     while (s_i.rra_inflight < s_i.rra_max && s_i.rra_pend_head != s_i.rra_pend_tail) {
                         const unsigned nt = s_i.rra_pend[s_i.rra_pend_head++ % ISERT_TASKS];
+                        if (s_i.task[nt].aborted) {   /* 出す前に捨てられた(TMF)。応答しない */
+                            s_i.task[nt].in_use = 0;
+                            s_i.rd[nt].len = 0;
+                            continue;
+                        }
                         if (issue_read(nt) != 0) { conn_down("RDMA_READ を出せない"); return JOB_WAITING; }
                     }
                 }
@@ -647,11 +986,24 @@ static job_result_t isert_step(job_t *self)
                 conn_down("SQ があふれた");
                 return JOB_WAITING;
             }
+            s_i.cur_slot = (uint16_t)slot;
+            s_i.cur_held = 0;
             if (dispatch(s_i.rx[slot], rlen) < 0) {
                 conn_down("PDU を処理できない");
                 return JOB_WAITING;
             }
+            if (__builtin_expect(s_i.cur_held, 0)) {
+                /* CmdSN の先回り: スロットは投稿し直さずに保留する(長さをここで控える)。 */
+                for (unsigned i = 0; i < ISERT_HOLD_MAX; i++)
+                    if (s_i.hold[i].used && !s_i.hold[i].phantom && s_i.hold[i].slot == slot) s_i.hold[i].len = rlen;
+                continue;
+            }
             if (post_rx(slot) != 0) { conn_down("RECV を再投稿できない"); return JOB_WAITING; }
+            /* CmdSN の穴が埋まったら保留していたものを処理する(普段は hold_n = 0)。 */
+            if (__builtin_expect(s_i.hold_n != 0, 0) && isert_drain() < 0) {
+                conn_down("保留した PDU を処理できない");
+                return JOB_WAITING;
+            }
         }
         return JOB_WAITING;
     }

@@ -68,7 +68,14 @@ typedef struct {
     /* 統計 */
     uint32_t   outstanding, completed, errors, rejects, nop_in, r2t;
     int        logout_req;      /* 相手が Async Message でログアウトを求めた */
+    uint64_t   logout_at;       /* ログアウトの期限(Async の Parameter3、timer_now() の値)*/
     uint64_t   bytes;
+    /* ログインの交渉(RFC 7143 6.2): こちらが出した鍵の並び・相手の鍵の確かめ・相手の申し出への答え */
+    iscsi_ini_neg_t neg;
+    uint8_t    offers[4096];
+    uint32_t   olen;
+    uint8_t    ans[1024];
+    uint32_t   ans_len;
     ini_task_t task[INI_MAX_TASKS];
     uint8_t    data[INI_RX_DATA_MAX + 8u] __attribute__((aligned(64)));
 } ini_t;
@@ -129,17 +136,23 @@ static void task_done(ini_task_t *t, uint8_t status)
     }
 }
 
-static int send_data_out(ini_task_t *t, uint32_t ttt, uint32_t off, uint32_t want);
+static int send_data_out(ini_task_t *t, uint32_t ttt, uint32_t off, uint32_t want, const uint8_t lun8[8]);
+static int send_text_reneg(const uint8_t *rsp_bhs);
+
+/* 相手が求めた再交渉の Text の ITT(コマンドの ITT とは下位 16 ビットが INI_MAX_TASKS 以上で重ならない)。 */
+#define INI_RENEG_ITT 0x7FFFFFF2u
 
 /* 受信した PDU 1 つの処理。 */
 static int dispatch(void)
 {
     const uint8_t *b = s.bhs;
     const uint8_t op = b[0] & ISCSI_OP_MASK;
-    /* 窓の更新(ExpCmdSN / MaxCmdSN は Login 以外のほとんどの応答に入っている)。 */
+    /* 窓の更新(ExpCmdSN / MaxCmdSN は Login 以外のほとんどの応答に入っている)。
+     * **MaxCmdSN < ExpCmdSN - 1 なら両方とも無視する**(RFC 7143 4.2.2.1。窓が閉じた印ではなく不正な値)。 */
     if (op != ISCSI_OP_LOGIN_RSP) {
         const uint32_t mx = iscsi_be32(&b[ISCSI_OFF_MAXCMDSN]);
-        if (iscsi_sn_lt(s.maxcmdsn, mx)) s.maxcmdsn = mx;
+        const uint32_t ex = iscsi_be32(&b[ISCSI_OFF_EXPSTATSN]);
+        if (!iscsi_sn_lt(mx, ex - 1u) && iscsi_sn_lt(s.maxcmdsn, mx)) s.maxcmdsn = mx;
     }
     const int status_pdu = (op == ISCSI_OP_SCSI_RSP || op == ISCSI_OP_TEXT_RSP || op == ISCSI_OP_LOGOUT_RSP ||
                             op == ISCSI_OP_TMF_RSP || op == ISCSI_OP_REJECT || op == ISCSI_OP_ASYNC ||
@@ -166,7 +179,7 @@ static int dispatch(void)
     case ISCSI_OP_R2T:
         s.r2t++;
         if (!t) return 0;
-        return send_data_out(t, iscsi_be32(&b[ISCSI_OFF_TTT]), iscsi_be32(&b[40]), iscsi_be32(&b[44]));
+        return send_data_out(t, iscsi_be32(&b[ISCSI_OFF_TTT]), iscsi_be32(&b[40]), iscsi_be32(&b[44]), &b[ISCSI_OFF_LUN]);
     case ISCSI_OP_NOOP_IN:
         if (itt == ISCSI_RSVD_TAG && iscsi_be32(&b[ISCSI_OFF_TTT]) != ISCSI_RSVD_TAG) {
             /* 相手からの生存確認。同じ TTT とデータで NOP-Out を返す(Immediate)。 */
@@ -191,11 +204,33 @@ static int dispatch(void)
             if (rs < INI_MAX_TASKS && s.task[rs].in_use && s.task[rs].itt == ritt) task_done(&s.task[rs], 0xFFu);
         }
         return 0;
-    case ISCSI_OP_ASYNC:
-        uart_printf("[iscsi-ini] Async Message event=%u\n", b[36]);
-        /* 1 = ターゲットがログアウトを求めている。出しているコマンドを終えたら畳む
-         * (ベンチは新しいコマンドを出すのをやめる)。次の iscsibench で張り直す。 */
-        if (b[36] == 1) s.logout_req = 1;
+    case ISCSI_OP_ASYNC: {
+        const uint8_t ev = b[ISCSI_ASYNC_OFF_EVENT];
+        uart_printf("[iscsi-ini] Async Message event=%u\n", ev);
+        if (ev == ISCSI_ASYNC_LOGOUT_REQ || ev == ISCSI_ASYNC_DROP_CONN || ev == ISCSI_ASYNC_DROP_ALL) {
+            /* 1 = ターゲットがログアウトを求めている(Parameter3 秒のうちに Logout を送る。11.9.1)。
+             * 2 / 3 = ターゲットが接続を落とす予告。どれも出しているコマンドを終えたら(ただし期限まで)
+             * ログアウトして畳む(ベンチは新しいコマンドを出すのをやめる)。次の iscsibench で張り直す。 */
+            const uint32_t p3 = ev == ISCSI_ASYNC_LOGOUT_REQ ? iscsi_be16(&b[ISCSI_ASYNC_OFF_PARAM3]) : 0u;
+            if (!s.logout_req) s.logout_at = timer_now() + (uint64_t)p3 * 1000000000ull;
+            s.logout_req = 1;
+        } else if (ev == ISCSI_ASYNC_RENEGOTIATE) {
+            /* 4 = 再交渉の求め。「できるだけ早く同じ接続で Text 要求(空でよい)を出す」(11.9.1)。 */
+            uint8_t o[ISCSI_BHS_LEN];
+            memset(o, 0, sizeof(o));
+            return send_text_reneg(o);
+        }
+        return 0;
+    }
+    case ISCSI_OP_TEXT_RSP:
+        if (itt == INI_RENEG_ITT) {
+            /* 再交渉の答え。続き(F=0 / C=1)があれば TTT を返して続きを求める(11.11)。 */
+            if (!(b[1] & ISCSI_TEXT_F) || (b[1] & ISCSI_TEXT_C)) return send_text_reneg(b);
+            return 0;
+        }
+        memcpy(s.last_bhs, b, ISCSI_BHS_LEN);
+        s.last_dlen = s.dlen;
+        s.last_ready = 1;
         return 0;
     default:
         /* Login / Text / Logout の応答は同期の手続きが読む。 */
@@ -312,8 +347,24 @@ static int submit(ini_task_t *t, const uint8_t cdb[16])
     return iscsi_pdu_send(&s.tcp, s.hd, s.dd, b, t->buf, imm, 0);
 }
 
-/* R2T に応える: [off, off+want) を相手の MaxRecvDataSegmentLength ずつの Data-Out で送る。 */
-static int send_data_out(ini_task_t *t, uint32_t ttt, uint32_t off, uint32_t want)
+/* 相手が求めた再交渉(Async event 4)の Text 要求。rsp_bhs が Text Response なら、その TTT を返して
+ * 続きを求める(相手の申し出の鍵には答えない = 何も変えない。空の要求は「変えない」の意味になる)。 */
+static int send_text_reneg(const uint8_t *rsp_bhs)
+{
+    uint8_t o[ISCSI_BHS_LEN] = {0};
+    o[0] = ISCSI_OP_IMMEDIATE | ISCSI_OP_TEXT;
+    o[1] = ISCSI_TEXT_F;
+    iscsi_put32(&o[ISCSI_OFF_ITT], INI_RENEG_ITT);
+    const uint32_t ttt = (rsp_bhs[0] & ISCSI_OP_MASK) == ISCSI_OP_TEXT_RSP ? iscsi_be32(&rsp_bhs[ISCSI_OFF_TTT]) : ISCSI_RSVD_TAG;
+    iscsi_put32(&o[ISCSI_OFF_TTT], ttt);
+    iscsi_put32(&o[ISCSI_OFF_CMDSN], s.cmdsn);
+    iscsi_put32(&o[ISCSI_OFF_EXPSTATSN], s.expstatsn);
+    return iscsi_pdu_send(&s.tcp, s.hd, s.dd, o, NULL, 0, 0);
+}
+
+/* R2T に応える: [off, off+want) を相手の MaxRecvDataSegmentLength ずつの Data-Out で送る。
+ * LUN は R2T のものを写す(11.7.4: Data-Out の LUN は R2T の LUN と同じでなければならない)。 */
+static int send_data_out(ini_task_t *t, uint32_t ttt, uint32_t off, uint32_t want, const uint8_t lun8[8])
 {
     if (off + want > t->len) return -1;
     uint32_t sn = 0, pos = off;
@@ -323,6 +374,7 @@ static int send_data_out(ini_task_t *t, uint32_t ttt, uint32_t off, uint32_t wan
         uint8_t b[ISCSI_BHS_LEN] = {0};
         b[0] = ISCSI_OP_DATA_OUT;
         b[1] = (uint8_t)((pos + n == off + want) ? 0x80 : 0);
+        memcpy(&b[ISCSI_OFF_LUN], lun8, 8);
         iscsi_put32(&b[ISCSI_OFF_ITT], t->itt);
         iscsi_put32(&b[ISCSI_OFF_TTT], ttt);
         iscsi_put32(&b[ISCSI_OFF_EXPSTATSN], s.expstatsn);
@@ -368,35 +420,18 @@ static int tcp_open(const netaddr_t *dst, uint16_t port)
         net_poll_all_and_dispatch();
         const int r = tcp_connect_poll(&s.tcp);
         if (r > 0) break;
-        if (r < 0 || timeout_ms(t0, 5000u)) { uart_printf("[iscsi-ini] TCP 接続に失敗\n"); return -1; }
+        if (r < 0 || timeout_ms(t0, 5000u)) {
+            /* SYN を送り続けている接続を表から外してから戻る(残すと、次の接続で同じ構造体を
+             * 作り直したときに表へ 2 回載る)。 */
+            tcp_close(&s.tcp);
+            uart_printf("[iscsi-ini] TCP 接続に失敗\n");
+            return -1;
+        }
     }
     s.ph = PH_BHS;
     rx_expect(PH_BHS, s.bhs, ISCSI_BHS_LEN);
     s.hd = s.dd = 0;
     return 0;
-}
-
-/* 応答の鍵から結果を読む(イニシエータ側の交渉の結果)。 */
-static void parse_login_keys(const uint8_t *d, uint32_t len)
-{
-    const char *k, *v;
-    uint32_t kl, vl, pos = 0;
-    while (iscsi_kv_next(d, len, &pos, &k, &kl, &v, &vl)) {
-        uint32_t num = 0;
-        for (uint32_t i = 0; i < vl && v[i] >= '0' && v[i] <= '9'; i++) num = num * 10u + (uint32_t)(v[i] - '0');
-#define K(name) (kl == sizeof(name) - 1u && memcmp(k, name, kl) == 0)
-#define V(val)  (vl == sizeof(val) - 1u && memcmp(v, val, vl) == 0)
-        if (K("HeaderDigest")) s.hd = V("CRC32C");
-        else if (K("DataDigest")) s.dd = V("CRC32C");
-        else if (K("MaxRecvDataSegmentLength")) s.p.max_xmit_dsl = num;
-        else if (K("FirstBurstLength")) s.p.first_burst = num;
-        else if (K("MaxBurstLength")) s.p.max_burst = num;
-        else if (K("InitialR2T")) s.p.initial_r2t = V("Yes");
-        else if (K("ImmediateData")) s.p.immediate_data = V("Yes");
-        else if (K("MaxOutstandingR2T")) s.p.max_outstanding_r2t = num;
-#undef K
-#undef V
-    }
 }
 
 /* 応答の鍵から 1 つ取り出す(NUL 終端して out へ)。戻り値 1 = あった。 */
@@ -415,9 +450,43 @@ static int find_key(const uint8_t *d, uint32_t len, const char *name, char *out,
     return 0;
 }
 
-/* Login 要求を 1 つ送って応答を待つ。戻り値は応答の BHS(状態が 0 でなければ NULL)。 */
+/* カンマ区切りの数の並び(こちらが出した CHAP_A など)に x があるか。相手がこちらの並びに無いものを
+ * 選んだら「許されない選択」(RFC 7143 6.2 / 12.1.3)。 */
+static int list_has_num(const char *list, int x)
+{
+    const char *p = list;
+    while (*p) {
+        int v = 0, any = 0;
+        while (*p >= '0' && *p <= '9') { v = v * 10 + (*p - '0'); p++; any = 1; }
+        if (any && v == x) return 1;
+        if (*p) p++;
+    }
+    return 0;
+}
+
+/*=================================================================
+ * Login 要求を 1 つ送って応答を待つ。戻り値は応答の BHS(状態が 0 でない・交渉の規則に合わない
+ * なら NULL。呼び出し側が接続を閉じる = RFC 7143 6.2「イニシエータは接続を落とす」)。
+ *   - こちらが出した鍵は s.offers に溜める(相手の答えを確かめる元)。前の応答で相手が申し出た鍵への
+ *     答え(s.ans)は、この要求の頭に付ける。
+ *   - 応答の鍵は iscsi_ini_neg_rsp() で確かめる(重複・範囲・結果の決め方)。相手の新しい申し出への
+ *     答えは s.ans に溜まり、次の要求で送る。
+ *   - ダイジェストは**最後の応答の後**に有効にする(呼び出し側の login())。ここでは常に無し。
+ * ===============================================================*/
 static const uint8_t *login_pdu(uint8_t csg, uint8_t nsg, int T, const uint8_t *payload, uint32_t plen)
 {
+    uint8_t body[ISCSI_LOGIN_MAX_DSL];
+    uint32_t bl = 0;
+    if (s.ans_len + plen > sizeof(body)) return NULL;
+    memcpy(body, s.ans, s.ans_len);
+    bl = s.ans_len;
+    if (plen) memcpy(&body[bl], payload, plen);
+    bl += plen;
+    s.ans_len = 0;
+    if (s.olen + plen <= sizeof(s.offers)) {
+        if (plen) memcpy(&s.offers[s.olen], payload, plen);
+        s.olen += plen;
+    }
     uint8_t b[ISCSI_BHS_LEN] = {0};
     b[0] = ISCSI_OP_IMMEDIATE | ISCSI_OP_LOGIN;
     b[1] = (uint8_t)((T ? ISCSI_LOGIN_T : 0) | (csg << 2) | (T ? nsg : 0));
@@ -425,12 +494,16 @@ static const uint8_t *login_pdu(uint8_t csg, uint8_t nsg, int T, const uint8_t *
     iscsi_put32(&b[ISCSI_OFF_ITT], 0);
     iscsi_put32(&b[ISCSI_OFF_CMDSN], s.cmdsn);
     iscsi_put32(&b[ISCSI_OFF_EXPSTATSN], s.expstatsn);
-    if (iscsi_pdu_send(&s.tcp, 0, 0, b, payload, plen, 0) < 0) return NULL;
+    if (iscsi_pdu_send(&s.tcp, 0, 0, b, body, bl, 0) < 0) return NULL;
     if (wait_last(5000u) < 0) { uart_printf("[iscsi-ini] Login 応答が来ない\n"); return NULL; }
     const uint8_t *r = s.last_bhs;
     if ((r[0] & ISCSI_OP_MASK) != ISCSI_OP_LOGIN_RSP) { uart_printf("[iscsi-ini] Login 応答でない PDU\n"); return NULL; }
     const uint16_t st = (uint16_t)((r[ISCSI_LOGIN_OFF_STATUS] << 8) | r[ISCSI_LOGIN_OFF_STATUS + 1]);
     if (st != 0) { uart_printf("[iscsi-ini] Login を断られた(状態 0x%04x)\n", st); return NULL; }
+    if (iscsi_ini_neg_rsp(&s.neg, s.offers, s.olen, s.data, s.last_dlen, s.ans, sizeof(s.ans), &s.ans_len) < 0) {
+        uart_printf("[iscsi-ini] ターゲットの Login 応答が交渉の規則に合わない(%s)。接続を切る\n", s.neg.err);
+        return NULL;
+    }
     s.expstatsn = iscsi_be32(&r[ISCSI_OFF_CMDSN]) + 1u;
     s.cmdsn = iscsi_be32(&r[ISCSI_OFF_EXPSTATSN]);
     s.maxcmdsn = iscsi_be32(&r[ISCSI_OFF_MAXCMDSN]);
@@ -441,10 +514,18 @@ static const uint8_t *login_pdu(uint8_t csg, uint8_t nsg, int T, const uint8_t *
 static iscsi_chap_cfg_t s_chap;   /* `iscsichap` */
 static uint32_t s_chap_ok, s_chap_fail;
 
-void iscsi_ini_set_chap(const iscsi_chap_cfg_t *cfg)
+int iscsi_ini_set_chap(const iscsi_chap_cfg_t *cfg)
 {
+    /* 両方向に同じ秘密の設定は受けない(RFC 7143 12.1.3 の MUST NOT)。96 ビット未満は警告だけ。 */
+    const char *why, *warn;
+    if (iscsi_chap_cfg_check(cfg, &why, &warn) < 0) {
+        uart_printf("iscsi-ini: CHAP の設定を断った: %s\n", why);
+        return -1;
+    }
+    if (warn) uart_printf("iscsi-ini: 警告: %s\n", warn);
     if (cfg) s_chap = *cfg;
     else memset(&s_chap, 0, sizeof(s_chap));
+    return 0;
 }
 
 /*=================================================================
@@ -481,7 +562,7 @@ static int chap_login(const uint8_t *names, uint32_t nlen)
     const int alg = iscsi_chap_num(sa, (uint32_t)strlen(sa));
     const int id = iscsi_chap_num(si, (uint32_t)strlen(si));
     const int cl = iscsi_chap_decode(val, (uint32_t)strlen(val), chal, sizeof(chal));
-    if (iscsi_chap_hash(alg) < 0 || id < 0 || id > 255 || cl < 1) {
+    if (iscsi_chap_hash(alg) < 0 || id < 0 || id > 255 || cl < 1 || !list_has_num("7,6,5,8", alg)) {
         uart_printf("[iscsi-ini] 相手の CHAP_A / CHAP_I / CHAP_C が不正(%s / %s)\n", sa, si);
         return -1;
     }
@@ -494,7 +575,10 @@ static int chap_login(const uint8_t *names, uint32_t nlen)
     iscsi_kv_put(kv, sizeof(kv), &n, "CHAP_R", hex);
     const uint32_t hl = (uint32_t)crypto_hash_len((crypto_hash_id_t)iscsi_chap_hash(alg));
     if (s_chap.mutual) {
-        if (crypto_random(&my_id, 1) != 0 || crypto_random(my_chal, hl) != 0) return -1;
+        /* 相手の挑戦をそのまま投げ返さない(反射。RFC 7143 12.1.3)。乱数が偶然同じになったら作り直す。 */
+        do {
+            if (crypto_random(&my_id, 1) != 0 || crypto_random(my_chal, hl) != 0) return -1;
+        } while ((uint32_t)cl == hl && memcmp(my_chal, chal, hl) == 0);
         iscsi_kv_put_u32(kv, sizeof(kv), &n, "CHAP_I", my_id);
         iscsi_chap_hex(my_chal, hl, hex);
         iscsi_kv_put(kv, sizeof(kv), &n, "CHAP_C", hex);
@@ -515,6 +599,13 @@ static int chap_login(const uint8_t *names, uint32_t nlen)
             s_chap_fail++;
             return -1;
         }
+        /* **相手の答えが、こちらが同じ挑戦に自分の秘密で答えた値と等しければ失敗**(RFC 7143 12.1.3。
+         * 同じ秘密が両方向に使われている。設定の検査をすり抜けた場合の受信側の守り)。 */
+        if (iscsi_chap_is_own_response(alg, my_id, s_chap.secret, s_chap.slen, my_chal, hl, got, (uint32_t)gl)) {
+            uart_printf("[iscsi-ini] ターゲットの答えがこちらの秘密での答えと同じ(両方向に同じ秘密)\n");
+            s_chap_fail++;
+            return -1;
+        }
     }
     if (!(r[1] & ISCSI_LOGIN_T) || (r[1] & 3u) != ISCSI_STAGE_OP) {
         uart_printf("[iscsi-ini] CHAP の後に Op へ移れない\n");
@@ -526,7 +617,7 @@ static int chap_login(const uint8_t *names, uint32_t nlen)
 }
 
 /* ログイン。CHAP を使うなら認証の段を先に済ませ、Op -> FFP を 1 段で済ませる。
- * 相手が T=0 で引き留めたら空の Login を送り直す。 */
+ * 相手が T=0 で引き留めたら(前の応答への答えだけを載せた)Login を送り直す。 */
 static int login(int discovery, const char *target, int want_hd, int want_dd)
 {
     uint8_t kv[2048];
@@ -565,6 +656,19 @@ static int login(int discovery, const char *target, int want_hd, int want_dd)
     s.p.initial_r2t = 1;
     s.p.immediate_data = 1;
     s.p.max_outstanding_r2t = 1;
+    s.p.data_pdu_in_order = 1;
+    s.p.data_seq_in_order = 1;
+    s.p.max_connections = 1;
+    s.p.time2wait = 2;
+    s.p.time2retain = 20;
+    s.neg.p = s.p;
+    iscsi_ini_neg_init(&s.neg, discovery, 0);
+    s.olen = 0;
+    s.ans_len = 0;
+    /* **ダイジェストは最後の Login 応答を受けた後から**(RFC 7143 13.1。途中の応答に HeaderDigest=CRC32C が
+     * 載っていても、次の Login の PDU にはまだ付けない。以前は途中の応答を読んだ時点で受信側のダイジェストを
+     * 有効にしていたので、相手が段を分けると次の応答のヘッダを読み違えた)。 */
+    s.hd = s.dd = 0;
     s.isid[0] = 0x80; s.isid[1] = 'v'; s.isid[2] = 'f'; s.isid[3] = 'i'; s.isid[4] = 'o'; s.isid[5] = discovery ? 1 : (uint8_t)(INI_INST ? INI_INST + 1u : 0u);   /* 実体ごとに別の ISID(同じだと相手はセッションの作り直しとみなして前のを切る)*/
     s.cmdsn = 1;
     s.expstatsn = 0;
@@ -579,13 +683,20 @@ static int login(int discovery, const char *target, int want_hd, int want_dd)
     for (int step = 0; step < 4; step++) {
         const uint8_t *r = login_pdu(ISCSI_STAGE_OP, ISCSI_STAGE_FFP, 1, payload, plen);
         if (!r) return -1;
-        parse_login_keys(s.data, s.last_dlen);
         if ((r[1] & ISCSI_LOGIN_T) && (r[1] & 3u) == ISCSI_STAGE_FFP && !(r[1] & ISCSI_LOGIN_C)) {
-            s.hd = (s.hd && want_hd);
-            s.dd = (s.dd && want_dd);
+            if (s.ans_len) {
+                /* 移行に同意しながら、答えの要る申し出をした(6.2 の違反。答える機会が無い)。 */
+                uart_printf("[iscsi-ini] ターゲットが最後の応答で申し出をした。接続を切る\n");
+                return -1;
+            }
+            const uint32_t mx = s.p.max_xmit_dsl;
+            s.p = s.neg.p;
+            if (s.p.max_xmit_dsl == 0) s.p.max_xmit_dsl = mx;
+            s.hd = (s.neg.p.hdgst && want_hd);
+            s.dd = (s.neg.p.ddgst && want_dd);
             return 0;
         }
-        payload = NULL;   /* 引き留められた / 続きがある: 空の Login で先を求める */
+        payload = NULL;   /* 引き留められた / 続きがある: 答え(s.ans)だけの Login で先を求める */
         plen = 0;
     }
     uart_printf("[iscsi-ini] Login が終わらない\n");
@@ -621,11 +732,33 @@ int iscsi_ini_discover(const netaddr_t *dst, uint16_t port, char *first, unsigne
     iscsi_put32(&b[ISCSI_OFF_CMDSN], s.cmdsn);
     iscsi_put32(&b[ISCSI_OFF_EXPSTATSN], s.expstatsn);
     int ok = -1;
-    if (iscsi_pdu_send(&s.tcp, 0, 0, b, kv, n, 0) == 0 && wait_last(3000u) == 0 &&
-        (s.last_bhs[0] & ISCSI_OP_MASK) == ISCSI_OP_TEXT_RSP) {
+    /* 応答は F=0 / C=1 で何回かに分かれて来ることがある(11.11.6: 相手は MaxRecvDataSegmentLength を
+     * 超える応答を C ビットで分ける)。分かれていれば TTT を返す空の要求で続きを求め、全部つなげてから読む
+     * (key=value が PDU の境目で切れていてもよいように)。 */
+    static uint8_t all_i[SMP_MAX_CORES][16384];
+    uint8_t *all = all_i[INI_INST];
+    uint32_t alen = 0;
+    int sent = iscsi_pdu_send(&s.tcp, s.hd, s.dd, b, kv, n, 0) == 0;
+    for (int part = 0; sent && part < 16; part++) {
+        if (wait_last(3000u) != 0 || (s.last_bhs[0] & ISCSI_OP_MASK) != ISCSI_OP_TEXT_RSP) { sent = 0; break; }
+        if (alen + s.last_dlen > sizeof(all_i[0])) { sent = 0; break; }
+        memcpy(&all[alen], s.data, s.last_dlen);
+        alen += s.last_dlen;
+        const uint8_t fl = s.last_bhs[1];
+        if ((fl & ISCSI_TEXT_F) && !(fl & ISCSI_TEXT_C)) { ok = 0; break; }
+        memset(b, 0, sizeof(b));
+        b[0] = ISCSI_OP_IMMEDIATE | ISCSI_OP_TEXT;
+        b[1] = ISCSI_TEXT_F;
+        iscsi_put32(&b[ISCSI_OFF_ITT], 1);
+        memcpy(&b[ISCSI_OFF_TTT], &s.last_bhs[ISCSI_OFF_TTT], 4);
+        iscsi_put32(&b[ISCSI_OFF_CMDSN], s.cmdsn);
+        iscsi_put32(&b[ISCSI_OFF_EXPSTATSN], s.expstatsn);
+        sent = iscsi_pdu_send(&s.tcp, s.hd, s.dd, b, NULL, 0, 0) == 0;
+    }
+    if (ok == 0) {
         const char *k, *v;
         uint32_t kl, vl, pos = 0;
-        while (iscsi_kv_next(s.data, s.last_dlen, &pos, &k, &kl, &v, &vl)) {
+        while (iscsi_kv_next(all, alen, &pos, &k, &kl, &v, &vl)) {
             uart_printf("  %.*s=%.*s\n", (int)kl, k, (int)vl, v);
             if (first && !first[0] && kl == 10 && memcmp(k, "TargetName", 10) == 0 && vl < cap) {
                 memcpy(first, v, vl);
@@ -705,6 +838,22 @@ void iscsi_ini_close(void)
 
 int iscsi_ini_connected(void) { return s.connected; }
 
+/*=================================================================
+ * 何もしていない間の受信(冷たい経路)。このイニシエータはシェルの上で同期的に動くので、ベンチの
+ * 合間は誰も受信を回さない。ここを定期的に呼ぶと、相手の NOP-In に答え(LIO に 30 秒で切られる件)、
+ * Async のログアウト要求(event 1)に Parameter3 の期限内に答え、再交渉の求め(event 4)に Text で答える。
+ * **呼ぶ場所はシェルの待ちのループ(main.c)**。
+ * ===============================================================*/
+void iscsi_ini_poll(void)
+{
+    if (!s.connected) return;
+    if (rx_pump(16) < 0) { uart_printf("[iscsi-ini] 接続が切れた\n"); s.connected = 0; return; }
+    if (s.logout_req && s.outstanding == 0) {
+        uart_printf("[iscsi-ini] 相手がログアウトを求めたので畳む\n");
+        iscsi_ini_close();
+    }
+}
+
 int iscsi_ini_digest(int *hd, int *dd)
 {
     *hd = s.hd; *dd = s.dd;
@@ -765,6 +914,8 @@ int iscsi_ini_bench(int is_read, uint32_t chunk, uint32_t qd, uint32_t runtime_m
         }
         if (!stop && (timeout_ms(t0, runtime_ms) || s.logout_req)) stop = 1;
         if (stop && s.outstanding == 0) break;
+        /* 相手が求めたログアウトの期限(Async の Parameter3)を過ぎたら、残りを待たずに畳む(11.9.1)。 */
+        if (s.logout_req && (int64_t)(timer_now() - s.logout_at) >= 0) break;
         if (timeout_ms(t0, runtime_ms + 10000u)) { uart_printf("iscsibench: 応答が返らないコマンドが残った(%u)\n", s.outstanding); return -1; }
     }
     *elapsed_ms = (uint32_t)((timer_now() - t0) / 1000000ull);
