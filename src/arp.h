@@ -56,7 +56,8 @@ int arp_cache_lookup(uint32_t ip, uint8_t out_mac[6]);
 int arp_cache_lookup_nud(uint32_t ip, uint8_t out_mac[6], int confirmed);
 
 /* キャッシュを引かずにエントリの寿命だけを見る(`arptest` の観測用)。
- * 0=fresh、1=stale(猶予中)、-1=未登録。remain_ms は残り猶予/寿命。 */
+ * 0=fresh、1=stale、-1=未登録または確認要求がすべて無応答。remain_ms は fresh なら
+ * 失効まで、stale なら次の確認要求まで。 */
 int arp_cache_peek(uint32_t ip, uint32_t *remain_ms);
 
 int arp_resolve(uint32_t ip, uint8_t out_mac[6]);

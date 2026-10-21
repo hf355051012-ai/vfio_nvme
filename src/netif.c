@@ -25,47 +25,90 @@ uint64_t neigh_expiry_from_now(void)
 }
 
 /*=================================================================
- * 近隣キャッシュ 1 エントリの寿命を判定する(ARP/NDP 共通)。判定は
- * 3 段階で、失効しても猶予のあいだは使い続けてよい(netif.h の説明を参照)。
+ * DELAY の長さと確認要求の間隔(ミリ秒)。どちらも TTL に連動する。
+ *
+ * コール元:
+ *   neigh_check_age(), arp_cache_peek(), ndp_cache_peek(), shell_arpage()
+ * ===============================================================*/
+unsigned neigh_delay_ms(void)
+{
+    unsigned ms = g_neigh_cache_ttl_ms / NEIGH_DELAY_DIVISOR;
+    return ms < 10u ? 10u : ms;
+}
+
+unsigned neigh_probe_interval_ms(void)
+{
+    unsigned ms = g_neigh_cache_ttl_ms / 60u;
+    return ms < 10u ? 10u : ms;
+}
+
+/*=================================================================
+ * 近隣キャッシュ 1 エントリの寿命を判定する(ARP/NDP 共通、RFC 4861 7.3)。
+ * 失効しても**時間では捨てない**。使われたら DELAY を置き、その後は使われる
+ * たびに間隔を空けて確認要求を出し、NEIGH_MAX_UNICAST_SOLICIT 回とも応答が
+ * 無いまま間隔が過ぎたときだけ DEAD を返す(netif.h の説明を参照)。
  *
  * timer_now() が ns を返すので、除算の要る timeout_ms() ではなく絶対時刻の
- * 差で比較する。送信 1 セグメントごとに通る経路なので除算は入れない。
+ * 差で比較する。送信 1 セグメントごとに通る経路なので、fresh の判定より
+ * 先では除算をしない。
  *
  * 引数:
  *   now        - 現在時刻(呼び出し元が 1 回だけ読んで渡す)
  *   expires_at - このエントリの有効期限
- *   probe_at   - 次に確認要求を出してよい時刻。出す番なら更新して返す
+ *   probe_at   - 次に確認要求を出してよい時刻(0=失効後まだ使われていない)。
+ *                出す番なら更新して返す
+ *   probes     - 出した確認要求の数。DELAY に入るときに 0 へ戻す
  * 戻り値:
  *   NEIGH_FRESH / NEIGH_STALE / NEIGH_STALE_PROBE / NEIGH_DEAD
  * コール元:
- *   arp_cache_lookup(), ndp_cache_lookup()
+ *   arp_cache_lookup_nud(), ndp_cache_lookup_nud()
  * ===============================================================*/
-int neigh_check_age(uint64_t now, uint64_t expires_at, uint64_t *probe_at)
+int neigh_check_age(uint64_t now, uint64_t expires_at, uint64_t *probe_at,
+                    uint8_t *probes)
 {
     if ((int64_t)(now - expires_at) < 0) return NEIGH_FRESH;
 
-    uint32_t ttl_ms = g_neigh_cache_ttl_ms;
-    uint64_t grace_ns = (uint64_t)(ttl_ms / 6u) * 1000000ull;
-    if ((int64_t)(now - (expires_at + grace_ns)) >= 0) return NEIGH_DEAD;
-
     /* **失効してから初めて使われたときは確認要求を出さない**(RFC 4861 の
      * DELAY 相)。probe_at==0 が「まだ一度も使われていない」印なので、ここで
-     * DELAY の期限を入れて今回は黙って MAC を返す。この猶予のあいだに上位層
+     * DELAY の期限を入れて今回は黙って MAC を返す。この間に上位層
      * (TCP の累積 ACK 前進)が到達性を裏付ければ、確認要求は 1 個も出ない。 */
     if (*probe_at == 0u) {
-        uint32_t delay_ms = ttl_ms / NEIGH_DELAY_DIVISOR;
-        if (delay_ms < 10u) delay_ms = 10u;
-        *probe_at = now + (uint64_t)delay_ms * 1000000ull;
+        *probe_at = now + (uint64_t)neigh_delay_ms() * 1000000ull;
+        *probes = 0;
         return NEIGH_STALE;
     }
 
-    if ((int64_t)(now - *probe_at) >= 0) {
-        uint32_t interval_ms = ttl_ms / 60u;
-        if (interval_ms < 10u) interval_ms = 10u;
-        *probe_at = now + (uint64_t)interval_ms * 1000000ull;
-        return NEIGH_STALE_PROBE;
+    if ((int64_t)(now - *probe_at) < 0) return NEIGH_STALE;
+
+    /* 出す番。すでに上限まで出して、最後の 1 個からも間隔ぶん応答が無い。 */
+    if (*probes >= NEIGH_MAX_UNICAST_SOLICIT) return NEIGH_DEAD;
+
+    (*probes)++;
+    *probe_at = now + (uint64_t)neigh_probe_interval_ms() * 1000000ull;
+    return NEIGH_STALE_PROBE;
+}
+
+/*=================================================================
+ * エントリの状態を書き換えずに読む(arp_cache_peek() / ndp_cache_peek() 用)。
+ *
+ * 戻り値:
+ *   0=fresh、1=stale、-1=確認要求がすべて無応答(次の lookup で破棄される)
+ *   remain_ms は fresh なら失効まで、stale なら次の確認要求まで(0=まだ
+ *   使われていない、または出す番)
+ * コール元:
+ *   arp_cache_peek(), ndp_cache_peek()
+ * ===============================================================*/
+int neigh_peek_state(uint64_t now, uint64_t expires_at, uint64_t probe_at,
+                     uint8_t probes, uint32_t *remain_ms)
+{
+    if ((int64_t)(now - expires_at) < 0) {
+        if (remain_ms) *remain_ms = (uint32_t)((expires_at - now) / 1000000ull);
+        return 0;
     }
-    return NEIGH_STALE;
+    int due = (probe_at == 0u) || (int64_t)(now - probe_at) >= 0;
+    if (due && probe_at != 0u && probes >= NEIGH_MAX_UNICAST_SOLICIT) return -1;
+    if (remain_ms) *remain_ms = due ? 0u : (uint32_t)((probe_at - now) / 1000000ull);
+    return 1;
 }
 
 /* ---- 確認要求の観測フック(`nudtest` 用)---- */

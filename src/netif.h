@@ -57,8 +57,9 @@ typedef struct {
     uint32_t ip;
     uint8_t  mac[ETH_ALEN];
     int      valid;
+    uint8_t  probes;      /* 今回の確認で出したユニキャストの確認要求の数 */
     uint64_t expires_at;  /* この時刻(timer_now() の ns)を過ぎたら stale */
-    uint64_t probe_at;    /* stale 中、次に確認要求を出してよい時刻 */
+    uint64_t probe_at;    /* stale 中、次に確認要求を出してよい時刻(0=まだ使われていない) */
 } arp_cache_entry_t;
 
 /* IPv6 の近隣キャッシュ。ARP と役割は同じだが、解決手段が ARP ではなく
@@ -69,41 +70,48 @@ typedef struct {
     uint8_t  addr[16];
     uint8_t  mac[ETH_ALEN];
     int      valid;
+    uint8_t  probes;
     uint64_t expires_at;
     uint64_t probe_at;
 } ndp_cache_entry_t;
 
-/* ---- 近隣キャッシュ(ARP/NDP 共通)のエージング ----
+/* ---- 近隣キャッシュ(ARP/NDP 共通)のエージング(RFC 4861 7.3)----
  *
  * 一度入れたら永久に有効だと、相手の NIC 交換や IP 移動に追従できない。
- * ただし **失効したエントリを即座に捨ててはいけない**。捨てると次の送信で
- * arp_resolve()(最大 900ms のポーリング待ち)が tcp_send() のバルク送信
- * ループの内側で走り、しかもその中の net_poll_all_and_dispatch() が
- * tcp_input_addr() を再入させて別の送信 -> 再びキャッシュミス -> 入れ子の
- * arp_resolve() という連鎖を作る(深さに上限が無い)。
+ * ただし **失効したエントリを時間で捨ててはいけない**。期限切れは「届かない」
+ * ではなく「確かめ直していない」だけで、捨てると次の送信で arp_resolve()
+ * (最大 900ms のポーリング待ち)が tcp_send() のバルク送信ループの内側で走り、
+ * しかもその中の net_poll_all_and_dispatch() が tcp_input_addr() を再入させて
+ * 別の送信 -> 再びキャッシュミス -> 入れ子の arp_resolve() という連鎖を作る
+ * (深さに上限が無い)。
  *
- * そこで Linux の NUD と同じく「失効しても確認が取れるまでは使い続ける」形に
- * する。lookup は stale なエントリでも MAC を返し、代わりに確認要求
- * (ARP request / NS)を probe 間隔で投げる。相手が応答すれば insert が
- * 呼ばれて延命し、猶予時間ぶん応答が無ければそこで初めて破棄する。
- * これで送信ホットパスがブロックすることは一度も無い。 */
+ * そこで RFC 4861 の REACHABLE / STALE / DELAY / PROBE に合わせる。失効した
+ * エントリは使われない限り STALE のまま**いつまでも残る**。使われたら MAC を
+ * 返しつつ DELAY を置き、その後もまだ使われていればユニキャストの確認要求
+ * (ARP request / NS)を間隔を空けて最大 NEIGH_MAX_UNICAST_SOLICIT 回出す。
+ * 相手が応答すれば insert が呼ばれて fresh に戻り、**すべての確認要求に応答が
+ * 無かったときだけ**破棄する。破棄は「届かない」と分かったときにしか起きない
+ * ので、届く相手への送信がブロックすることは無い。
+ *
+ * RFC との違い: 確認要求はタイマではなく lookup(= 送信)のときに出す。
+ * 送信が止まれば確認の手順もそこで止まり、次の送信で続きから進む。 */
 #define NEIGH_FRESH        0   /* 有効期限内 */
-#define NEIGH_STALE        1   /* 失効したが猶予中。使ってよい */
+#define NEIGH_STALE        1   /* 失効したが確認が尽きていない。使ってよい */
 #define NEIGH_STALE_PROBE  2   /* 同上。加えて今回は確認要求を出す番 */
-#define NEIGH_DEAD        -1   /* 猶予も尽きた。破棄する */
+#define NEIGH_DEAD        -1   /* 確認要求がすべて無応答だった。破棄する */
 
 /* ---- 到達不能検出(NUD、RFC 4861 7.3)----
  *
  * **失効したエントリを使った瞬間に確認要求を出してはいけない。** RFC 4861 の
  * DELAY 相がこれで、「使われたら少し待ち、そのあいだに上位層が到達性を
- * 裏付けたら確認要求は出さない」という猶予を置く。TCP が順調に流れている
- * 相手へ、TTL が切れるたびに ARP/NS を 1 往復投げるのは無駄でしかない
- * (Linux の NUD も DELAY -> PROBE の順に進む)。
+ * 裏付けたら確認要求は出さない」という猶予を置く。途切れていた TCP が再開した
+ * ときは、再開した送信への ACK が往復時間のうちに返るので、確認要求は要らない。
  *
- * 猶予(TTL/6)の内訳: 前半 TTL/12 が DELAY、残りが PROBE。TTL に連動させて
- * あるので `arpage` で TTL を縮めれば検証時間も縮む(既定 60s なら DELAY は
- * 5 秒 = RFC 4861 の DELAY_FIRST_PROBE_TIME と同じ)。 */
+ * DELAY は TTL/12、確認要求の間隔は TTL/60。TTL に連動させてあるので `arpage`
+ * で TTL を縮めれば検証時間も縮む(既定 60s なら DELAY 5 秒 = RFC 4861 の
+ * DELAY_FIRST_PROBE_TIME、間隔 1 秒 = RETRANS_TIMER)。 */
 #define NEIGH_DELAY_DIVISOR 12u
+#define NEIGH_MAX_UNICAST_SOLICIT 3u   /* RFC 4861 の MAX_UNICAST_SOLICIT */
 
 /* 送信する確認要求を覗くフック(`nudtest` の観測用)。**確認要求がユニキャスト
  * で出ているか**は、相手側か送信直前でしか見えない。冷たい経路でしか
@@ -118,12 +126,17 @@ void neigh_probe_notify(int is_v6, int is_unicast, const uint8_t dst_mac[ETH_ALE
  * 区別できない。** この数が増えていることが効いた証拠になる。 */
 extern volatile uint32_t g_neigh_confirm_count;
 
-/* 有効期間(ミリ秒)。猶予は TTL/6、確認要求の間隔は TTL/60 として連動する。
+/* 有効期間(ミリ秒)。DELAY は TTL/12、確認要求の間隔は TTL/60 として連動する。
  * シェルの `arpage` で変更できる(短くして検証するため)。 */
 extern volatile uint32_t g_neigh_cache_ttl_ms;
 #define NEIGH_CACHE_TTL_DEFAULT_MS 60000u
 
-int neigh_check_age(uint64_t now, uint64_t expires_at, uint64_t *probe_at);
+int neigh_check_age(uint64_t now, uint64_t expires_at, uint64_t *probe_at,
+                    uint8_t *probes);
+unsigned neigh_probe_interval_ms(void);
+unsigned neigh_delay_ms(void);
+int neigh_peek_state(uint64_t now, uint64_t expires_at, uint64_t probe_at,
+                     uint8_t probes, uint32_t *remain_ms);
 uint64_t neigh_expiry_from_now(void);
 
 typedef struct {

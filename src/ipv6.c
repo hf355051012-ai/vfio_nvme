@@ -548,8 +548,8 @@ static int ipv6_send_icmpv6(const uint8_t dst[IPV6_ADDR_LEN], const uint8_t dst_
 
 /*=================================================================
  * 近隣キャッシュへ 1 件登録する(既存エントリがあれば MAC を更新)。空きが
- * 無ければ先頭を潰す。ARP キャッシュと同じく、アクティブなインターフェースの
- * キャッシュに入れる。
+ * 無ければ確認できた時刻がいちばん古いものを潰す。ARP キャッシュと同じく、
+ * アクティブなインターフェースのキャッシュに入れる。
  *
  * 引数:
  *   addr - 相手の IPv6 アドレス
@@ -580,7 +580,15 @@ void ndp_cache_insert(const uint8_t addr[IPV6_ADDR_LEN], const uint8_t mac[ETH_A
         }
     }
 
-    unsigned slot = (free_slot < NDP_CACHE_SIZE) ? free_slot : 0u;
+    /* 空きが無ければ、確認できた時刻がいちばん古いものを潰す(arp_cache_insert()
+     * と同じ。失効したエントリは時間では消えない)。 */
+    unsigned slot = free_slot;
+    if (slot == NDP_CACHE_SIZE) {
+        slot = 0;
+        for (unsigned i = 1; i < NDP_CACHE_SIZE; i++) {
+            if ((int64_t)(cache[i].expires_at - cache[slot].expires_at) < 0) slot = i;
+        }
+    }
     for (unsigned j = 0; j < IPV6_ADDR_LEN; j++) cache[slot].addr[j] = addr[j];
     for (unsigned j = 0; j < ETH_ALEN; j++) cache[slot].mac[j] = mac[j];
     cache[slot].valid      = 1;
@@ -652,8 +660,8 @@ void ndp_cache_update_na(const uint8_t addr[IPV6_ADDR_LEN], const uint8_t mac[ET
 }
 
 /*=================================================================
- * 近隣キャッシュを引く。有効期限を過ぎたエントリは即座に捨てず、猶予の
- * あいだは MAC を返しつつ Neighbor Solicitation を投げる(ARP 側の
+ * 近隣キャッシュを引く。有効期限を過ぎたエントリは時間では捨てず、MAC を
+ * 返しつつ DELAY の後に Neighbor Solicitation を投げる(ARP 側の
  * arp_cache_lookup() と同じ方針。理由は netif.h の説明にある)。
  *
  * 引数:
@@ -686,7 +694,8 @@ int ndp_cache_lookup_nud(const uint8_t addr[IPV6_ADDR_LEN], uint8_t out_mac[ETH_
         }
 
         /* 時刻の読み出しは照合が当たったときだけ(1 回)。 */
-        int age = neigh_check_age(timer_now(), cache[i].expires_at, &cache[i].probe_at);
+        int age = neigh_check_age(timer_now(), cache[i].expires_at, &cache[i].probe_at,
+                                  &cache[i].probes);
         if (age == NEIGH_DEAD) {
             cache[i].valid = 0;
             return -1;
@@ -716,9 +725,9 @@ int ndp_cache_lookup(const uint8_t addr[IPV6_ADDR_LEN], uint8_t out_mac[ETH_ALEN
  *
  * 引数:
  *   addr      - 探す IPv6 アドレス
- *   remain_ms - NULL 可。fresh なら失効まで、stale なら破棄までの残り
+ *   remain_ms - NULL 可。fresh なら失効まで、stale なら次の確認要求までの残り
  * 戻り値:
- *   0=fresh、1=stale(猶予中)、-1=未登録または猶予切れ
+ *   0=fresh、1=stale、-1=未登録、または確認要求がすべて無応答(次の lookup で破棄)
  * コール元:
  *   shell_arptest()
  * ===============================================================*/
@@ -735,20 +744,8 @@ int ndp_cache_peek(const uint8_t addr[IPV6_ADDR_LEN], uint32_t *remain_ms)
         }
         if (!same) continue;
 
-        uint64_t grace_ns = (uint64_t)(g_neigh_cache_ttl_ms / 6u) * 1000000ull;
-        uint64_t deadline;
-        int state;
-        if ((int64_t)(now - cache[i].expires_at) < 0) {
-            deadline = cache[i].expires_at;
-            state = 0;
-        } else if ((int64_t)(now - (cache[i].expires_at + grace_ns)) >= 0) {
-            return -1;
-        } else {
-            deadline = cache[i].expires_at + grace_ns;
-            state = 1;
-        }
-        if (remain_ms) *remain_ms = (uint32_t)((deadline - now) / 1000000ull);
-        return state;
+        return neigh_peek_state(now, cache[i].expires_at, cache[i].probe_at,
+                                cache[i].probes, remain_ms);
     }
     return -1;
 }

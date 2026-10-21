@@ -64,9 +64,13 @@ void arp_cache_insert(uint32_t ip, const uint8_t mac[ETH_ALEN])
             return;
         }
     }
-    unsigned slot = 0;  /* 空きが無ければ先頭を潰す */
+    /* 空きが無ければ、確認できた時刻がいちばん古いもの(期限がいちばん早い
+     * もの)を潰す。失効したエントリは時間では消えないので、空きが無くなるのは
+     * 普通に起きる。 */
+    unsigned slot = 0;
     for (unsigned i = 0; i < ARP_CACHE_SIZE; i++) {
         if (!cache[i].valid) { slot = i; break; }
+        if ((int64_t)(cache[i].expires_at - cache[slot].expires_at) < 0) slot = i;
     }
     cache[slot].ip = ip;
     for (int j = 0; j < ETH_ALEN; j++) cache[slot].mac[j] = mac[j];
@@ -76,10 +80,10 @@ void arp_cache_insert(uint32_t ip, const uint8_t mac[ETH_ALEN])
 }
 
 /*=================================================================
- * ARP キャッシュを引く。有効期限を過ぎたエントリは即座に捨てず、猶予の
- * あいだは MAC を返しつつ確認要求(ARP request)を投げる。**送信ホット
+ * ARP キャッシュを引く。有効期限を過ぎたエントリは時間では捨てず、MAC を
+ * 返しつつ DELAY の後に確認要求(ARP request)を投げる。**送信ホット
  * パスをブロックさせないため**で、理由の詳細は netif.h の説明にある。
- * 猶予も尽きたら無効化して未登録として返す。
+ * 確認要求がすべて無応答だったときだけ無効化して未登録として返す。
  *
  * 引数:
  *   ip        - 探す IPv4 アドレス(ホストバイトオーダー)
@@ -109,7 +113,8 @@ int arp_cache_lookup_nud(uint32_t ip, uint8_t out_mac[ETH_ALEN], int confirmed)
         }
 
         /* 時刻の読み出しは照合が当たったときだけ(1 回)。 */
-        int age = neigh_check_age(timer_now(), cache[i].expires_at, &cache[i].probe_at);
+        int age = neigh_check_age(timer_now(), cache[i].expires_at, &cache[i].probe_at,
+                                  &cache[i].probes);
         if (age == NEIGH_DEAD) {
             cache[i].valid = 0;
             return -1;
@@ -138,9 +143,10 @@ int arp_cache_lookup(uint32_t ip, uint8_t out_mac[ETH_ALEN])
  *
  * 引数:
  *   ip        - 探す IPv4 アドレス(ホストバイトオーダー)
- *   remain_ms - NULL 可。fresh なら失効まで、stale なら破棄までの残り
+ *   remain_ms - NULL 可。fresh なら失効まで、stale なら次の確認要求までの残り
+ *               (0=まだ使われていない、または出す番)
  * 戻り値:
- *   0=fresh、1=stale(猶予中)、-1=未登録または猶予切れ
+ *   0=fresh、1=stale、-1=未登録、または確認要求がすべて無応答(次の lookup で破棄)
  * コール元:
  *   shell_arptest()
  * ===============================================================*/
@@ -152,20 +158,8 @@ int arp_cache_peek(uint32_t ip, uint32_t *remain_ms)
     for (unsigned i = 0; i < ARP_CACHE_SIZE; i++) {
         if (!cache[i].valid || cache[i].ip != ip) continue;
 
-        uint64_t grace_ns = (uint64_t)(g_neigh_cache_ttl_ms / 6u) * 1000000ull;
-        uint64_t deadline;
-        int state;
-        if ((int64_t)(now - cache[i].expires_at) < 0) {
-            deadline = cache[i].expires_at;
-            state = 0;
-        } else if ((int64_t)(now - (cache[i].expires_at + grace_ns)) >= 0) {
-            return -1;  /* 次の lookup で破棄される */
-        } else {
-            deadline = cache[i].expires_at + grace_ns;
-            state = 1;
-        }
-        if (remain_ms) *remain_ms = (uint32_t)((deadline - now) / 1000000ull);
-        return state;
+        return neigh_peek_state(now, cache[i].expires_at, cache[i].probe_at,
+                                cache[i].probes, remain_ms);
     }
     return -1;
 }

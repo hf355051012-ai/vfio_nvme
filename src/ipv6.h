@@ -175,7 +175,7 @@ void ndp_cache_update_na(const uint8_t addr[IPV6_ADDR_LEN], const uint8_t mac[6]
                           int solicited, int override_flag);
 
 /* キャッシュを引かずに寿命だけを見る(`arptest` の観測用)。
- * 0=fresh、1=stale(猶予中)、-1=未登録。 */
+ * 0=fresh、1=stale、-1=未登録または確認要求がすべて無応答。 */
 int  ndp_cache_peek(const uint8_t addr[IPV6_ADDR_LEN], uint32_t *remain_ms);
 
 /* 受信した IPv6 断片を捨てる直前に呼ばれるフック(`ext6test` の観測用)。

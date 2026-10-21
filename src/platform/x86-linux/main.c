@@ -4176,11 +4176,9 @@ static void shell_nudtest(void)
     ipv6_link_local_addr(self_ll);
     for (unsigned i = 0; i < 6u; i++) self_mac[i] = self->mac[i];
 
-    /* **TTL は 1200ms**。猶予(TTL/6)が 200ms あるので、失効してから
-     * 「NA を注げて、状態を読み取れる」窓が十分に取れる。600ms だと猶予が
-     * 100ms しかなく、注入と読み取りのあいだに破棄されて誤判定した(実機)。 */
+    /* **TTL は 1200ms**(DELAY=100ms、確認要求の間隔=20ms)。 */
     const uint32_t saved_ttl = g_neigh_cache_ttl_ms;
-    const uint32_t ttl = 1200u;         /* 猶予=200ms、DELAY=100ms、probe 間隔=20ms */
+    const uint32_t ttl = 1200u;
     const uint32_t delay_ms = ttl / NEIGH_DELAY_DIVISOR;
     g_neigh_cache_ttl_ms = ttl;
 
@@ -4275,12 +4273,11 @@ static void shell_nudtest(void)
     /* ---- [5] TCP を流すと確認要求が 1 個も出ない ----
      * **TCP が到達確認フラグを立てていることの端から端までの確認。**
      * わざと失効させた状態で往復させる。 */
-    /* **この段だけ TTL を伸ばす。** 猶予(TTL/6)より長い停止が往復の途中に
-     * 入るとエントリが破棄され、NUD の確認要求ではなく `arp_resolve()` の
-     * ブロードキャスト再解決が走る。この経路(Pi5 のブリッジ越し)では
-     * **RTO による 200ms の停止が実際に起きる**ので、TTL=1200ms の猶予
-     * 200ms では足りなかった(実機で踏み、原因を取り違えかけた)。 */
-    const uint32_t ttl5 = 3000u;   /* 猶予 500ms > RTO 200ms */
+    /* **この段だけ TTL を伸ばす。** 往復の途中に DELAY(TTL/12)より長い停止が
+     * 入ると、ACK が進む前に DELAY が明けて確認要求が出る。ブリッジ越しの経路では
+     * **RTO による 200ms の停止が実際に起きる**ので、TTL=1200ms の DELAY
+     * 100ms では足りない。 */
+    const uint32_t ttl5 = 3000u;   /* DELAY 250ms > RTO 200ms */
     g_neigh_cache_ttl_ms = ttl5;
     netif_activate(self);
     /* **`arp_resolve()` では起点を作り直せない。** キャッシュが fresh なら
@@ -4354,16 +4351,8 @@ static void shell_nudtest(void)
                     changed ? "OK" : "NG");
         if (!changed) ok = 0;
 
-        /* [8] 非要請 NA(S=0)は延命しない。
-         * **猶予(TTL/6 = 200ms)の中で「注入 -> 読み取り」を 2 回やる**ので、
-         * 失効直後から始めて待ち時間を短く刻む。ここを雑にすると、猶予切れで
-         * 破棄されたものを「延命しなかった」と誤読する(ndp_cache_peek は
-         * 未登録と猶予切れをどちらも -1 で返す)。 */
-        /* **起点をここで作り直す。** 直前の段の待ち時間ぶん寿命が進んでいると、
-         * 猶予(TTL/6)の末尾で判定することになり「延命しなかった」と
-         * 「猶予切れで破棄された」を取り違える(実機で踏んだ。
-         * `ndp_cache_peek` はどちらも -1 ではなく…前者は 1、後者は -1 を返す
-         * ので、== 1 の判定が静かに落ちる)。 */
+        /* [8] 非要請 NA(S=0)は延命しない。起点を作り直して失効直後に
+         * 「注入 -> 読み取り」を 2 回やる。 */
         netif_activate(peer);
         shell_inject_na(self_ll, self_mac, fake, bogus, 1, 1);
         netif_activate(self);
@@ -4746,7 +4735,7 @@ static void shell_mldtest(char *args)
 /*=================================================================
  * シェルの `arpage`。近隣キャッシュ(ARP/NDP 共通)の有効期間を変更する。
  * 既定は 60 秒だが、それでは検証に 1 分以上かかるので短くできるようにして
- * ある。猶予(TTL/6)と確認要求の間隔(TTL/60)もこれに連動する。
+ * ある。DELAY(TTL/12)と確認要求の間隔(TTL/60)もこれに連動する。
  *
  * 引数:
  *   args - "" で現在値の表示、"<ms>" で設定
@@ -4764,10 +4753,9 @@ static void shell_arpage(char *args)
         }
         g_neigh_cache_ttl_ms = ms;
     }
-    uint32_t ttl = g_neigh_cache_ttl_ms;
-    uint32_t iv = ttl / 60u;
-    if (iv < 10u) iv = 10u;
-    uart_printf("arpage: TTL=%ums 猶予=%ums 確認要求の間隔=%ums\n", ttl, ttl / 6u, iv);
+    uart_printf("arpage: TTL=%ums DELAY=%ums 確認要求の間隔=%ums x 最大 %u 回\n",
+                g_neigh_cache_ttl_ms, neigh_delay_ms(), neigh_probe_interval_ms(),
+                NEIGH_MAX_UNICAST_SOLICIT);
 }
 
 /*=================================================================
@@ -4785,9 +4773,9 @@ static void shell_print_neigh(const char *label, int state, uint32_t remain_ms)
     if (state == 0) {
         uart_printf("  %s: fresh(失効まで %ums)\n", label, remain_ms);
     } else if (state == 1) {
-        uart_printf("  %s: stale -- 使いつつ確認要求中(破棄まで %ums)\n", label, remain_ms);
+        uart_printf("  %s: stale -- 使い続ける(次の確認要求まで %ums)\n", label, remain_ms);
     } else {
-        uart_printf("  %s: 未登録(破棄済み)\n", label);
+        uart_printf("  %s: 未登録(または確認要求がすべて無応答)\n", label);
     }
 }
 
@@ -4795,10 +4783,11 @@ static void shell_print_neigh(const char *label, int state, uint32_t remain_ms)
  * シェルの `arptest`。A2(ARP/NDP キャッシュのエージング)の検証。
  *
  * 見たいのは 3 つ。
- *  (a) 失効しても即座には捨てず、猶予のあいだ MAC を返し続けること
+ *  (a) 失効しても時間では捨てず、MAC を返し続けること
  *      (捨てると送信ホットパスで arp_resolve() がブロックする)
  *  (b) 相手が応答すれば延命して fresh へ戻ること
- *  (c) 応答が無ければ猶予切れで本当に破棄されること
+ *  (c) 確認要求(ユニキャスト、最大 NEIGH_MAX_UNICAST_SOLICIT 回)がすべて
+ *      無応答なら破棄されること
  *
  * (c) は「応答が返ってこない相手」が要るので、誰も名乗っていない IP の
  * エントリを arp_cache_insert() で直接仕込む。実際に居ない相手なので
@@ -4811,7 +4800,7 @@ static void shell_print_neigh(const char *label, int state, uint32_t remain_ms)
  * ===============================================================*/
 static void shell_arptest(void)
 {
-    const uint32_t test_ttl_ms = 600u;   /* 猶予 100ms、確認要求は 10ms 間隔 */
+    const uint32_t test_ttl_ms = 600u;   /* DELAY 50ms、確認要求は 10ms 間隔 */
     const uint32_t dead_ip = ip_from_octets(192, 168, 101, 99);  /* 誰も名乗っていない */
     const uint8_t  dead_mac[6] = { 0x02, 0x00, 0x00, 0x00, 0x10, 0x99 };
 
@@ -4830,8 +4819,8 @@ static void shell_arptest(void)
     uint8_t mac[6];
     uint32_t remain = 0;
 
-    uart_printf("arptest: TTL=%ums 猶予=%ums で検証(終了時に %ums へ戻します)\n",
-                test_ttl_ms, test_ttl_ms / 6u, saved_ttl);
+    uart_printf("arptest: TTL=%ums DELAY=%ums 確認要求の間隔=%ums で検証(終了時に %ums へ戻します)\n",
+                test_ttl_ms, neigh_delay_ms(), neigh_probe_interval_ms(), saved_ttl);
 
     /* --- 実在する相手(対向 PF)--- */
     netaddr_t peer_addr = netaddr_v4(peer_ip);
@@ -4841,6 +4830,11 @@ static void shell_arptest(void)
         g_neigh_cache_ttl_ms = saved_ttl;
         return;
     }
+    /* **解決だけでは起点を作り直せない。** 前の検査(`nudtest` など)が残した
+     * 期限切れのエントリは時間では消えないので、解決はそれを返すだけになる。
+     * `*_cache_insert()` は必ず現在の TTL で入れ直す。 */
+    arp_cache_insert(peer_ip, peer->mac);
+    ndp_cache_insert(peer_ll, peer->mac);
     /* peek の戻り値と remain は必ず別の文で受ける。同じ呼び出し式を
      * uart_printf の引数に並べると、C は引数の評価順序を規定していないので
      * remain が更新される前に読まれて 1 回ぶん古い値が出る(実際に踏んだ)。 */
@@ -4857,14 +4851,15 @@ static void shell_arptest(void)
     /* 応答の来ない相手を仕込む。以後この 2 つを並べて追いかける。 */
     arp_cache_insert(dead_ip, dead_mac);
 
-    /* --- TTL を過ぎるまで待つ(受信は回し続ける)--- */
+    /* --- TTL の 4 倍待つ(受信は回し続ける)。**使われないエントリは時間だけでは
+     *     破棄されない**ことを見るため、TTL ちょうどではなく十分長く待つ。 --- */
     uint64_t t0 = timer_now();
-    while (!timeout_ms(t0, test_ttl_ms + 20u)) {
+    while (!timeout_ms(t0, test_ttl_ms * 4u)) {
         net_poll_all_and_dispatch();
         job_scheduler_tick();
     }
 
-    uart_printf("arptest: [2] TTL 経過直後(まだ lookup していない)\n");
+    uart_printf("arptest: [2] TTL の 4 倍経過(まだ lookup していない)\n");
     int a2 = arp_cache_peek(peer_ip, &remain);
     shell_print_neigh("ARP 対向PF", a2, remain);
     int d2 = arp_cache_peek(dead_ip, &remain);
@@ -4873,7 +4868,7 @@ static void shell_arptest(void)
      * されて延命されることがある(それ自体は正しい動作)。ここで stale を
      * 断言できるのは、誰も触らない「応答の無い相手」のほうだけ。 */
     if (d2 != 1) {
-        uart_printf("arptest: NG [2] TTL を過ぎても stale になっていない\n");
+        uart_printf("arptest: NG [2] stale ではない(時間だけで破棄されたか、まだ fresh)\n");
         ok = 0;
     }
 
@@ -4920,17 +4915,36 @@ static void shell_arptest(void)
         ok = 0;
     }
 
-    /* --- (c) 応答の来ない相手は猶予切れで破棄される --- */
-    t0 = timer_now();
-    while (!timeout_ms(t0, test_ttl_ms + test_ttl_ms / 6u + 50u)) {
-        net_poll_all_and_dispatch();
-        job_scheduler_tick();
+    /* --- (c) 応答の来ない相手は、確認要求がすべて無応答になったところで破棄
+     *     される。[3] で DELAY に入っているので、確認要求の間隔ごとに引き直し、
+     *     **ユニキャストの確認要求の数**と、破棄されるまでに MAC を返した回数を
+     *     数える。 --- */
+    s_nud_self = self;
+    s_nud_uni = 0; s_nud_multi = 0; s_nud_other = 0;
+    neigh_set_probe_observer(shell_nud_observer);
+    unsigned returned = 0;
+    int discarded = 0;
+    for (unsigned k = 0; k < 20u && !discarded; k++) {
+        t0 = timer_now();
+        while (!timeout_ms(t0, neigh_probe_interval_ms() + 5u)) {
+            net_poll_all_and_dispatch();
+            job_scheduler_tick();
+        }
+        netif_activate(self);
+        if (arp_cache_lookup(dead_ip, mac) == 0) returned++; else discarded = 1;
     }
-    int dead_hit = (arp_cache_lookup(dead_ip, mac) == 0);
-    uart_printf("arptest: [5] 応答の無い相手 -- lookup は %s\n",
-                dead_hit ? "まだ MAC を返した" : "未登録を返した(破棄された)");
-    if (dead_hit) {
-        uart_printf("arptest: NG [5] 猶予を過ぎても破棄されていない\n");
+    int mac_ok = 1;
+    for (unsigned i = 0; i < 6u; i++) if (s_nud_last_mac[i] != dead_mac[i]) mac_ok = 0;
+    neigh_set_probe_observer(NULL);
+    s_nud_self = NULL;
+    uart_printf("arptest: [5] 応答の無い相手 -- 確認要求 ユニキャスト %u / ブロードキャスト %u"
+                "(宛先が仕込んだ MAC=%d)、MAC を返した %u 回の後に %s\n",
+                s_nud_uni, s_nud_multi, mac_ok, returned,
+                discarded ? "未登録を返した(破棄された)" : "まだ破棄されていない");
+    if (!discarded || s_nud_uni != NEIGH_MAX_UNICAST_SOLICIT || s_nud_multi != 0u ||
+        !mac_ok || returned != NEIGH_MAX_UNICAST_SOLICIT) {
+        uart_printf("arptest: NG [5] 期待は確認要求 %u 回(すべてユニキャスト)の後に破棄\n",
+                    NEIGH_MAX_UNICAST_SOLICIT);
         ok = 0;
     }
 
